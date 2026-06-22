@@ -1,0 +1,23 @@
+(def init
+  {:entries [{:id "a" :label "Walk" :duration "20:00"}
+             {:id "b" :label "Bike" :duration "45:00"}]})
+
+(defn update [state msg]
+  (match msg
+    {:kind :rename-a}
+      [(assoc state
+              :entries [{:id "a" :label "Run" :duration "20:00"}
+                        {:id "b" :label "Bike" :duration "45:00"}])
+       {:kind :none}]
+    _ [state {:kind :none}]))
+
+(defn view [state]
+  #html <section data-count={count state.entries}>
+          {(for [entry state.entries :key entry.id]
+             #html <article data-id={entry.id}>
+                     <span data-role="label">{entry.label}</span>
+                     <strong data-role="duration">{entry.duration}</strong>
+                   </article>)}
+          <button data-action="rename-a"
+                  on:click={{:kind :rename-a}}>Rename</button>
+        </section>)

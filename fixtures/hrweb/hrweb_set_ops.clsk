@@ -1,0 +1,35 @@
+(type TagSet
+  (Set String))
+
+(type TagSummary
+  {:count Number
+   :empty Bool
+   :hasZone2 Bool
+   :set Bool})
+
+(ann workout-tags TagSet)
+(def workout-tags
+  #{"steady" "zone2" "steady"})
+
+(ann workout-tag-set TagSet)
+(def workout-tag-set
+  (set "steady" "strength" "recovery" "steady"))
+
+(ann known-tag? (Fn [TagSet String] Bool))
+(defn known-tag? [tags tag]
+  (contains? tags tag))
+
+(ann add-tags (Fn [TagSet String String] TagSet))
+(defn add-tags [tags primary secondary]
+  (conj tags primary secondary))
+
+(ann remove-tag (Fn [TagSet String] TagSet))
+(defn remove-tag [tags tag]
+  (disj tags tag))
+
+(ann summarize-tags (Fn [TagSet] TagSummary))
+(defn summarize-tags [tags]
+  {:count (count tags)
+   :empty (empty? tags)
+   :hasZone2 (contains? tags "zone2")
+   :set (set? tags)})

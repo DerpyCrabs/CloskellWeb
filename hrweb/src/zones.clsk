@@ -1,0 +1,134 @@
+(import "./domain.clsk" [default-zones zones-storage-key])
+
+(defn clamp-bpm [value]
+  (max 30 (min 240 (round value))))
+
+(defn clamp-zone [zone]
+  {:id zone.id
+   :name zone.name
+   :min (clamp-bpm zone.min)
+   :max (clamp-bpm zone.max)
+   :color zone.color})
+
+(defn append-normalized-zone [normalized zone]
+  (let [clamped (clamp-zone zone)
+        previous (last normalized)
+        next-min (if (some? previous)
+                     (+ previous.max 1)
+                     clamped.min)
+        next-max (max next-min clamped.max)]
+    (conj normalized
+          (assoc clamped
+                 :min next-min
+                 :max next-max))))
+
+(defn normalize-zones [zones]
+  (reduce zones [] append-normalized-zone))
+
+(def default-zone-state
+  {:zones (normalize-zones default-zones)
+   :targetZoneId 3})
+
+(defn number-or [value fallback]
+  (let [coerced (to-number value)]
+    (if (and (number? coerced)
+             (not (= coerced 0)))
+        coerced
+        fallback)))
+
+(defn merge-stored-zone [zone stored-zone]
+  {:id zone.id
+   :name zone.name
+   :min (number-or (get stored-zone :min) zone.min)
+   :max (number-or (get stored-zone :max) zone.max)
+   :color zone.color})
+
+(defn load-zone-state [payload]
+  (let [stored-zones (get payload :zones)]
+    (if (and (some? payload)
+             (vector? stored-zones))
+        {:zones (normalize-zones
+                  (map-indexed default-zones
+                               (fn [zone index]
+                                 (merge-stored-zone zone (nth stored-zones index)))))
+         :targetZoneId (number-or (get payload :targetZoneId) 3)}
+        default-zone-state)))
+
+(defn zone-storage-entry [zone]
+  {:id zone.id
+   :min zone.min
+   :max zone.max})
+
+(defn zone-state-payload [zones target-zone-id]
+  {:zones (map zones zone-storage-entry)
+   :targetZoneId target-zone-id})
+
+(defn persist-zone-state-command [zones target-zone-id]
+  {:kind :storage/set
+   :key zones-storage-key
+   :value (zone-state-payload zones target-zone-id)
+   :msg {:kind :zones-saved}})
+
+(defn target-zone [zones target-zone-id]
+  (let [found (find zones (fn [zone] (= zone.id target-zone-id)))]
+    (if (some? found)
+        found
+        (nth zones 0))))
+
+(defn zone-for-bpm [zones bpm]
+  (find zones
+        (fn [zone]
+          (and (>= bpm zone.min)
+               (<= bpm zone.max)))))
+
+(defn zone-label-for-bpm [zones bpm]
+  (let [zone (zone-for-bpm zones bpm)]
+    (if (some? zone)
+        zone.name
+        "Out of zones")))
+
+(defn set-zone-boundary [zones index value]
+  (let [left (nth zones index)
+        right (nth zones (+ index 1))
+        boundary (max left.min (min (- right.max 1) (clamp-bpm value)))]
+    (map-indexed zones
+                 (fn [zone zone-index]
+                   (if (= zone-index index)
+                       (assoc zone :max boundary)
+                       (if (= zone-index (+ index 1))
+                           (assoc zone :min (+ boundary 1))
+                           zone))))))
+
+(defn set-zone-min [zones zone-id value]
+  (normalize-zones
+    (map zones
+         (fn [zone]
+           (if (= zone.id zone-id)
+               (assoc zone :min (number-or value zone.min))
+               zone)))))
+
+(defn set-zone-max [zones zone-id value]
+  (normalize-zones
+    (map zones
+         (fn [zone]
+           (if (= zone.id zone-id)
+               (assoc zone :max (number-or value zone.max))
+               zone)))))
+
+(defn boundary-controls [zones]
+  (let [first-zone (nth zones 0)
+        last-zone (last zones)
+        span (max 1 (- last-zone.max first-zone.min))]
+    (map-indexed (slice zones 0 (- (count zones) 1))
+                 (fn [zone index]
+                   (let [right (nth zones (+ index 1))]
+                     {:id zone.id
+                      :name zone.name
+                      :index index
+                      :min zone.min
+                      :max zone.max
+                      :nextMax (- right.max 1)
+                      :leftPercent (* (/ (- zone.max first-zone.min) span) 100)})))))
+
+(defn zone-option-label [zone]
+  (str zone.name " " zone.min "-" zone.max))

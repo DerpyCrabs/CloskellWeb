@@ -1,0 +1,76 @@
+(type ImportEntry
+  {:id String})
+
+(type ImportPayload
+  {:entries (Vector ImportEntry)})
+
+(type ImportState
+  {:status String
+   :clicks Number
+   :lastRef String
+   :entries (Vector ImportEntry)})
+
+(type ImportMsg
+  (Union {:kind :open-import}
+         {:kind :import-opened :value {:ref String}}
+         {:kind :read-import}
+         {:kind :log-imported :value ImportPayload}
+         {:kind :import-failed :error String}))
+
+(type UpdateResult [ImportState (Cmd ImportMsg)])
+
+(ann init ImportState)
+(def init
+  {:status "Ready"
+   :clicks 0
+   :lastRef ""
+   :entries []})
+
+(ann update (Fn [ImportState ImportMsg] UpdateResult))
+(defn update [state msg]
+  (match msg
+    {:kind :open-import}
+      [(merge state {:status "Opening"})
+       {:kind :dom-ref/click
+        :ref "import-file"
+        :onSuccess :import-opened
+        :onError :import-failed}]
+    {:kind :import-opened :value value}
+      [(merge state
+              {:status "Waiting for file"
+               :clicks (+ state.clicks 1)
+               :lastRef value.ref})
+       {:kind :none}]
+    {:kind :read-import}
+      [(merge state {:status "Reading"})
+       {:kind :file/read-selected
+        :ref "import-file"
+        :format :json
+        :onSuccess :log-imported
+        :onError :import-failed}]
+    {:kind :log-imported :value value}
+      [(merge state
+              {:status (str "Imported " (count value.entries))
+               :entries value.entries})
+       {:kind :none}]
+    {:kind :import-failed :error error}
+      [(merge state {:status error})
+       {:kind :none}]
+    _ [state {:kind :none}]))
+
+(defn view [state]
+  #html <section data-status={state.status}
+                 data-clicks={state.clicks}
+                 data-last-ref={state.lastRef}
+                 data-entry-count={count state.entries}>
+          <button type="button"
+                  on:click={{:kind :open-import}}>Import</button>
+          <input ref="import-file"
+                 class="hidden"
+                 type="file"
+                 accept="application/json,.json"
+                 on:change={{:kind :read-import}}></input>
+          <p>{state.status}</p>
+          <ul>{(for [entry state.entries :key entry.id]
+                 #html <li>{entry.id}</li>)}</ul>
+        </section>)

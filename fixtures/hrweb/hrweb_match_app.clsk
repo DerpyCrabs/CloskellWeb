@@ -1,0 +1,26 @@
+(def init
+  {:latest 0
+   :label "Start"
+   :buttonClass "primary"})
+
+(defn update [state msg]
+  (match msg
+    {:kind :start}
+    [{:latest state.latest
+      :label "Listening"
+      :buttonClass "secondary"}
+     {:kind :none}]
+
+    {:kind :heart-rate :bpm bpm}
+    [{:latest bpm
+      :label (str bpm)
+      :buttonClass "secondary"}
+     {:kind :none}]
+
+    _
+    [state {:kind :none}]))
+
+(defn view [state]
+  #html <button class={state.buttonClass}
+                data-bpm={state.latest}
+                on:click={{:kind :start}}>{state.label}</button>)

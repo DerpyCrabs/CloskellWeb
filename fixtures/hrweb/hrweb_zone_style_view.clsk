@@ -1,0 +1,68 @@
+(def init
+  {:targetZoneId 3
+   :status "Zone 3"
+   :zones [{:id 2 :name "Zone 2" :min 111 :max 130 :color "#2a9d8f"}
+           {:id 3 :name "Zone 3" :min 131 :max 150 :color "#d9184b"}
+           {:id 4 :name "Zone 4" :min 151 :max 170 :color "#f77f00"}]})
+
+(defn first-zone [zones]
+  (nth zones 0))
+
+(defn min-bpm [zones]
+  (let [zone (first-zone zones)]
+    zone.min))
+
+(defn max-bpm [zones]
+  (let [zone (last zones)]
+    zone.max))
+
+(defn zone-range [zone]
+  (+ (- zone.max zone.min) 1))
+
+(defn bpm-span [zones]
+  (zone-range {:min (min-bpm zones)
+               :max (max-bpm zones)}))
+
+(defn percent [part total]
+  (str (round (* (/ part total) 100)) "%"))
+
+(defn zone-style [zone total selected?]
+  (let [base (hash-map :background zone.color
+                       :borderColor zone.color
+                       :--zone-color zone.color
+                       :flex-basis (percent (zone-range zone) total)
+                       :opacity (if selected? "1" "0.75"))]
+    (if selected?
+        (map-assoc base :boxShadow "inset 0 0 0 3px rgba(23,32,25,0.28)")
+        base)))
+
+(defn zone-label [index zone]
+  (str (+ index 1) ". " zone.name))
+
+(defn update [state msg]
+  (match msg
+    {:kind :target-zone :id id :rank rank}
+      [(merge state
+              {:targetZoneId id
+               :status (str "Zone " id " rank " rank)})
+       {:kind :none}]
+    _ [state {:kind :none}]))
+
+(defn view [state]
+  #html <section data-target={state.targetZoneId}
+                 data-status={state.status}>
+          <div class="zones">
+            {(for [zone state.zones index :key zone.id]
+               #html <button style={zone-style zone
+                                                (bpm-span state.zones)
+                                                (= zone.id state.targetZoneId)}
+                             data-zone={zone.id}
+                             data-index={index}
+                             on:click={{:kind :target-zone
+                                        :id zone.id
+                                        :rank (+ index 1)}}>
+                       {(zone-label index zone)}
+                     </button>)}
+          </div>
+          <span>{state.status}</span>
+        </section>)

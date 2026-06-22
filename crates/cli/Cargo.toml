@@ -1,0 +1,17 @@
+[package]
+name = "cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "closkell"
+path = "src/main.rs"
+
+[dependencies]
+effects.workspace = true
+js_backend.workspace = true
+macro_expand.workspace = true
+syntax.workspace = true
+template_ir.workspace = true
+typecheck.workspace = true

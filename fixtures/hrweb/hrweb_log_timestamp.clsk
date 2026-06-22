@@ -1,0 +1,21 @@
+(type LogEntry {:id String :exerciseType String :stoppedAt Number :durationMs Number})
+(type LogRow {:id String :label String :dateLabel String :durationMs Number})
+
+(ann sample-log (Vector LogEntry))
+(def sample-log
+  [{:id "ride" :exerciseType "LISS" :stoppedAt 1704499200000 :durationMs 1800000}
+   {:id "lift" :exerciseType "Strength" :stoppedAt 1704585600000 :durationMs 2400000}])
+
+(ann log-date-label (Fn [LogEntry] String))
+(defn log-date-label [entry]
+  (date-format entry.stoppedAt :month-day-time))
+
+(ann log-row (Fn [LogEntry] LogRow))
+(defn log-row [entry]
+  {:id entry.id
+   :label (if (= entry.exerciseType "") "Untyped" entry.exerciseType)
+   :dateLabel (log-date-label entry)
+   :durationMs entry.durationMs})
+
+(def sample-log-rows
+  (map sample-log log-row))

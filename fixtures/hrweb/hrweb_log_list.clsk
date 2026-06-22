@@ -1,0 +1,12 @@
+(def init
+  {:entries [{:id "a" :label "Walk" :duration "20:00"}
+             {:id "b" :label "Bike" :duration "45:00"}]})
+
+(defn view [state]
+  #html <section>
+          {(for [entry state.entries :key entry.id]
+             #html <article data-id={entry.id}>
+                     <span>{entry.label}</span>
+                     <strong>{entry.duration}</strong>
+                   </article>)}
+        </section>)

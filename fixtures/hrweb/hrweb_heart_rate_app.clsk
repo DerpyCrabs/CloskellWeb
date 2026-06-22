@@ -1,0 +1,73 @@
+(def init
+  {:status "Idle"
+   :message ""
+   :connected? false
+   :deviceName ""
+   :latest 0})
+
+(defn update [state msg]
+  (match msg
+    {:kind :connect}
+      [{:status "Pairing"
+        :message "Pairing..."
+        :connected? false
+        :deviceName state.deviceName
+        :latest state.latest}
+       {:kind :bluetooth/connect-heart-rate
+        :id "hr-monitor"
+        :filters [{:services ["heart_rate"]}]
+        :optionalServices ["heart_rate"]
+        :service "heart_rate"
+        :characteristic "heart_rate_measurement"
+        :onSuccess :monitor-connected
+        :onReading :heart-rate
+        :onDisconnected :monitor-disconnected
+        :onError :monitor-error}]
+    {:kind :monitor-connected :value info}
+      [{:status "Live"
+        :message "Connected."
+        :connected? true
+        :deviceName info.deviceName
+        :latest state.latest}
+       {:kind :none}]
+    {:kind :heart-rate :bpm bpm}
+      [{:status "Live"
+        :message (str bpm)
+        :connected? true
+        :deviceName state.deviceName
+        :latest bpm}
+       {:kind :none}]
+    {:kind :disconnect}
+      [{:status "Disconnecting"
+        :message ""
+        :connected? state.connected?
+        :deviceName state.deviceName
+        :latest state.latest}
+       {:kind :bluetooth/disconnect
+        :id "hr-monitor"
+        :msg {:kind :monitor-disconnected}}]
+    {:kind :monitor-disconnected}
+      [{:status "Disconnected"
+        :message "Disconnected."
+        :connected? false
+        :deviceName ""
+        :latest 0}
+       {:kind :none}]
+    {:kind :monitor-error :error error}
+      [{:status "Idle"
+        :message (str "Bluetooth error: " error)
+        :connected? false
+        :deviceName state.deviceName
+        :latest state.latest}
+       {:kind :none}]
+    _ [state {:kind :none}]))
+
+(defn view [state]
+  #html <section data-connected={state.connected?}
+                 data-device={state.deviceName}
+                 data-latest={state.latest}
+                 data-message={state.message}>
+          <button on:click={{:kind :connect}}>Connect</button>
+          <button on:click={{:kind :disconnect}}>Disconnect</button>
+          <span>{state.status}</span>
+        </section>)

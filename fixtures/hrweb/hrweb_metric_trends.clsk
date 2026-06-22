@@ -1,0 +1,79 @@
+(import "./hrweb_metrics.clsk" [calculate-trimp])
+
+(def sample-trend-log
+  [{:id "jan-zone2"
+    :stoppedAt 1704326400000
+    :durationMs 60000
+    :readings [{:bpm 120 :time 0}
+               {:bpm 120 :time 60000}]
+    :zones [{:id 2 :min 111 :max 130}
+            {:id 3 :min 131 :max 150}]}
+   {:id "jan-zone3"
+    :stoppedAt 1704499200000
+    :durationMs 60000
+    :readings [{:bpm 140 :time 0}
+               {:bpm 140 :time 60000}]
+    :zones [{:id 2 :min 111 :max 130}
+            {:id 3 :min 131 :max 150}]}
+   {:id "feb-zone2"
+    :stoppedAt 1706918400000
+    :durationMs 60000
+    :readings [{:bpm 120 :time 0}
+               {:bpm 120 :time 60000}]
+    :zones [{:id 2 :min 111 :max 130}
+            {:id 3 :min 131 :max 150}]}])
+
+(defn bucket-start [timestamp grouping]
+  (if (= grouping :month)
+      (date-start-of-month timestamp)
+      (date-start-of-week timestamp)))
+
+(defn format-group-label [timestamp grouping]
+  (if (= grouping :month)
+      (date-format timestamp :month-year)
+      (let [end (date-add-days timestamp 6)]
+        (if (= (date-month timestamp) (date-month end))
+            (str (date-format timestamp :month) " " (date-day timestamp) "-" (date-day end))
+            (str (date-format timestamp :month-day) "-" (date-format end :day))))))
+
+(defn upsert-average-bucket [grouping value-for-entry buckets entry]
+  (let [value (value-for-entry entry)
+        timestamp (bucket-start entry.stoppedAt grouping)
+        found (find buckets (fn [bucket] (= bucket.timestamp timestamp)))]
+    (if (some? found)
+        (map buckets
+             (fn [bucket]
+               (if (= bucket.timestamp timestamp)
+                   (assoc bucket
+                          :sum (+ bucket.sum value)
+                          :count (+ bucket.count 1))
+                   bucket)))
+        (conj buckets {:timestamp timestamp :sum value :count 1}))))
+
+(defn bucket->trend-point [grouping bucket]
+  {:label (format-group-label bucket.timestamp grouping)
+   :value (/ (round (* (/ bucket.sum bucket.count) 10)) 10)
+   :timestamp bucket.timestamp})
+
+(defn group-average-trend [entries value-for-entry grouping]
+  (map (sort-by (reduce entries []
+                        (fn [buckets entry]
+                          (upsert-average-bucket grouping value-for-entry buckets entry)))
+                (fn [bucket] bucket.timestamp))
+       (fn [bucket] (bucket->trend-point grouping bucket))))
+
+(defn build-trimp-trend [entries grouping]
+  (group-average-trend entries calculate-trimp grouping))
+
+(defn build-trimp-bars [entries limit]
+  (map (take-last (sort-by entries (fn [entry] entry.stoppedAt)) limit)
+       (fn [entry]
+         {:label (date-format entry.stoppedAt :month-day)
+          :value (calculate-trimp entry)
+          :timestamp entry.stoppedAt})))
+
+(def weekly-trimp-trend (build-trimp-trend sample-trend-log :week))
+
+(def monthly-trimp-trend (build-trimp-trend sample-trend-log :month))
+
+(def trimp-bars (build-trimp-bars sample-trend-log 2))

@@ -1,0 +1,26 @@
+(def hrr-recovery-ms 60_000)
+(def hrr-min-peak-gap-ms 30_000)
+(def stop-hold-ms 1_500)
+
+(ann clamp-zone-boundary (Fn [Number Number Number] Number))
+(defn clamp-zone-boundary [value left-min right-max]
+  (max left-min (min (- right-max 1) (round value))))
+
+(ann hold-progress (Fn [Number Number] Number))
+(defn hold-progress [now-ms started-at-ms]
+  (min 1 (/ (max 0 (- now-ms started-at-ms)) stop-hold-ms)))
+
+(ann trend-delta-label (Fn [Number Number] String))
+(defn trend-delta-label [current previous]
+  (let [delta (- current previous)
+        direction (if (> delta 0) "up" "down")]
+    (if (= delta 0)
+        "Recording"
+        (str (abs delta) " bpm " direction))))
+
+(def numeric-idiom-summary
+  {:recoveryMs hrr-recovery-ms
+   :peakGapMs hrr-min-peak-gap-ms
+   :boundary (clamp-zone-boundary 189.7 30 190)
+   :progress (hold-progress 10_750 10_000)
+   :delta (trend-delta-label 121 135)})

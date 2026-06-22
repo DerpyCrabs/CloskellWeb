@@ -1,0 +1,36 @@
+(def init
+  {:entries [{:id "dup" :label "Walk"}
+             {:id "dup" :label "Bike"}]
+   :selected ""})
+
+(defn update [state msg]
+  (match msg
+    {:kind :select :label label}
+      [(assoc state :selected label) {:kind :none}]
+    {:kind :replace}
+      [(assoc state
+              :entries [{:id "dup" :label "Run"}
+                        {:id "dup" :label "Swim"}
+                        {:id "solo" :label "Yoga"}])
+       {:kind :none}]
+    {:kind :shrink}
+      [(assoc state
+              :entries [{:id "dup" :label "Only"}])
+       {:kind :none}]
+    _ [state {:kind :none}]))
+
+(defn view [state]
+  #html <section data-selected={state.selected}
+                 data-count={count state.entries}>
+          {(for [entry state.entries :key entry.id]
+             #html <article data-id={entry.id}
+                            data-label={entry.label}>
+                     <span>{entry.label}</span>
+                     <button on:click={{:kind :select
+                                        :label entry.label}}>Select</button>
+                   </article>)}
+          <button data-action="replace"
+                  on:click={{:kind :replace}}>Replace</button>
+          <button data-action="shrink"
+                  on:click={{:kind :shrink}}>Shrink</button>
+        </section>)

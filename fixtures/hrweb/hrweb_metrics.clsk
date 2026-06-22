@@ -1,0 +1,167 @@
+(defn in-zone? [zone bpm]
+  (and (>= bpm zone.min)
+       (<= bpm zone.max)))
+
+(defn zone2-adherence [entry zone2-ms]
+  (if (or (empty? entry.readings)
+          (<= entry.durationMs 0))
+      nil
+      (round (* (/ zone2-ms entry.durationMs) 100))))
+
+(defn fallback-interval [readings]
+  (if (> (count readings) 1)
+      (let [first-reading (nth readings 0)
+            second-reading (nth readings 1)]
+        (max 0 (- second-reading.time first-reading.time)))
+      0))
+
+(defn interval-ms [readings duration-ms index reading]
+  (let [next-reading (nth readings (+ index 1))
+        fallback (fallback-interval readings)
+        fallback-end (+ reading.time fallback)
+        workout-end (if (> duration-ms 0) duration-ms fallback-end)
+        next-time (if (some? next-reading)
+                      next-reading.time
+                      (max reading.time workout-end))]
+    (max 0 (- next-time reading.time))))
+
+(defn zone-duration-ms [entry zone-id]
+  (let [zone (find entry.zones (fn [zone] (= zone.id zone-id)))]
+    (if (some? zone)
+        (reduce-indexed entry.readings 0
+          (fn [sum reading index]
+            (let [interval (interval-ms entry.readings entry.durationMs index reading)]
+              (if (in-zone? zone reading.bpm)
+                  (+ sum interval)
+                  sum))))
+        0)))
+
+(defn calculate-zone2-adherence [entry]
+  (if (or (empty? entry.readings)
+          (<= entry.durationMs 0))
+      nil
+      (round (* (/ (zone-duration-ms entry 2) entry.durationMs) 100))))
+
+(defn trimp-zone-sum [entry zones]
+  (reduce zones 0
+    (fn [sum zone]
+      (+ sum (* (/ (zone-duration-ms entry zone.id) 60000) zone.id)))))
+
+(defn calculate-trimp [entry]
+  (if (empty? entry.readings)
+      0
+      (/ (round (* (trimp-zone-sum entry entry.zones) 10)) 10)))
+
+(defn normalized-exercise-type [exercise-type]
+  (if (some? exercise-type)
+      (lower-case (trim exercise-type))
+      ""))
+
+(defn matches-liss-type? [exercise-type]
+  (if (some? exercise-type)
+      (regex-test? (trim exercise-type) "liss|steady|aerob" "i")
+      false))
+
+(defn matches-strength-type? [exercise-type]
+  (if (some? exercise-type)
+      (regex-test? (trim exercise-type) "strength|weights?|weight" "i")
+      false))
+
+(defn matches-hiit-type? [exercise-type]
+  (if (some? exercise-type)
+      (regex-test? (trim exercise-type) "hiit|interval|tabata" "i")
+      false))
+
+(defn matches-hrr-type? [exercise-type]
+  (or (matches-strength-type? exercise-type)
+      (matches-hiit-type? exercise-type)))
+
+(defn get-metrics-for-type [exercise-type]
+  (if (matches-liss-type? exercise-type)
+      [:zone2 :trimp]
+      (if (matches-hrr-type? exercise-type)
+          [:hrr :trimp]
+          [:trimp])))
+
+(def hrr-recovery-ms 60000)
+(def hrr-min-peak-bpm 120)
+(def hrr-min-peak-gap-ms 30000)
+
+(defn reading-at-or-after [readings target-time]
+  (let [found (find readings (fn [reading] (>= reading.time target-time)))]
+    (if (some? found)
+        found
+        (nth readings (- (count readings) 1)))))
+
+(defn valid-hrr-peak? [readings index current]
+  (let [previous (nth readings (- index 1))
+        next (nth readings (+ index 1))]
+    (and (> index 0)
+         (< index (- (count readings) 1))
+         (>= current.bpm previous.bpm)
+         (> current.bpm next.bpm)
+         (>= current.bpm hrr-min-peak-bpm))))
+
+(defn valid-hrr-recovery? [current recovery-reading]
+  (and (some? recovery-reading)
+       (>= recovery-reading.time (+ current.time (* hrr-recovery-ms 0.9)))))
+
+(defn hrr-step [readings acc current index]
+  (if (valid-hrr-peak? readings index current)
+      (let [recovery-reading (reading-at-or-after readings (+ current.time hrr-recovery-ms))]
+        (if (valid-hrr-recovery? current recovery-reading)
+            (let [drop-bpm (- current.bpm recovery-reading.bpm)
+                  in-peak-gap? (and (some? acc.lastPeakTime)
+                                    (< (- current.time acc.lastPeakTime) hrr-min-peak-gap-ms))]
+              (if in-peak-gap?
+                  (if (> drop-bpm acc.lastDropBpm)
+                      {:sum (+ (- acc.sum acc.lastDropBpm) drop-bpm)
+                       :count acc.count
+                       :lastPeakTime current.time
+                       :lastDropBpm drop-bpm}
+                      acc)
+                  {:sum (+ acc.sum drop-bpm)
+                   :count (+ acc.count 1)
+                   :lastPeakTime current.time
+                   :lastDropBpm drop-bpm}))
+            acc))
+      acc))
+
+(defn calculate-workout-hrr [entry]
+  (if (< (count entry.readings) 3)
+      nil
+      (let [events (reduce-indexed entry.readings
+                     {:sum 0 :count 0 :lastPeakTime nil :lastDropBpm 0}
+                     (fn [acc reading index]
+                       (hrr-step entry.readings acc reading index)))]
+        (if (= events.count 0)
+            nil
+            (round (/ events.sum events.count))))))
+
+(def sample-entry
+  {:id "sample"
+   :durationMs 60000
+   :readings [{:bpm 120 :time 0}
+              {:bpm 140 :time 30000}]
+   :zones [{:id 2 :min 111 :max 130}
+           {:id 3 :min 131 :max 150}]})
+
+(def sample-hrr-entry
+  {:id "hrr"
+   :durationMs 80000
+   :readings [{:bpm 100 :time 0}
+              {:bpm 150 :time 10000}
+              {:bpm 130 :time 20000}
+              {:bpm 120 :time 70000}
+              {:bpm 125 :time 80000}]
+   :zones [{:id 2 :min 111 :max 130}
+           {:id 3 :min 131 :max 150}]})
+
+(def sample-flat-entry
+  {:id "flat"
+   :durationMs 70000
+   :readings [{:bpm 100 :time 0}
+              {:bpm 105 :time 10000}
+              {:bpm 102 :time 70000}]
+   :zones [{:id 2 :min 111 :max 130}
+           {:id 3 :min 131 :max 150}]})

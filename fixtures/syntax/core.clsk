@@ -1,0 +1,5 @@
+; Core expression forms
+(def answer (+ 40 2))
+(let [x 41] (+ x 1))
+{:ok true :items [1 2 nil]}
+#{:rest :active}

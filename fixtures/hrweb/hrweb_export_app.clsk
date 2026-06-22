@@ -1,0 +1,25 @@
+(def init
+  {:label "Export"
+   :downloaded? false
+   :exportJson "{\"version\":2,\"entries\":[]}"})
+
+(defn update [state msg]
+  (if (= msg :export)
+      [{:label "Exporting"
+        :downloaded? false
+        :exportJson state.exportJson}
+       {:kind :file/download
+        :name "exercise-log.json"
+        :content state.exportJson
+        :mime "application/json"
+        :msg :exported}]
+      (if (= msg :exported)
+          [{:label "Exported"
+            :downloaded? true
+            :exportJson state.exportJson}
+           {:kind :none}]
+          [state {:kind :none}])))
+
+(defn view [state]
+  #html <button data-downloaded={state.downloaded?}
+                on:click={:export}>{state.label}</button>)

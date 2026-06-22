@@ -1,0 +1,477 @@
+(import "./zones.clsk" [target-zone zone-for-bpm])
+(import "./log.clsk" [selected-log])
+(import "./model.clsk" [HeartReading HeartZone HeartChartRect WorkoutEntry])
+
+(type HeartChartMsg
+  (Union
+    {:kind :chart-resized
+     :id String
+     :ref String
+     :x Number
+     :y Number
+     :width Number
+     :height Number
+     :top Number
+     :right Number
+     :bottom Number
+     :left Number
+     :value HeartChartRect}
+    {:kind :chart-error
+     :error String}))
+
+(type HeartChartState
+  {:detailView String
+   :mobile? Bool
+   :chartWidth Number
+   :chartHeight Number
+   :displayElapsedMs Number
+   :readings (Vector HeartReading)
+   :entries (Vector WorkoutEntry)
+   :selectedLogId (Option String)
+   :targetZoneId Number
+   :zones (Vector HeartZone)})
+
+(def pi 3.14159265)
+
+(def live-chart-ref "live-heart-chart")
+(def log-chart-ref "log-heart-chart")
+(def chart-watch-id "heart-chart-active")
+(def one-minute-ms 60000)
+
+(def empty-canvas-op
+  {:op :none
+   :x 0
+   :y 0
+   :width 0
+   :height 0
+   :radius 0
+   :start 0
+   :end 0
+   :lineWidth 0
+   :strokeStyle ""
+   :fillStyle ""
+   :font ""
+   :text ""
+   :textAlign ""
+   :textBaseline ""
+   :lineCap ""
+   :lineJoin ""
+   :globalAlpha 1
+   :name ""
+   :value 0})
+
+(defn canvas-op [fields]
+  (merge empty-canvas-op fields))
+
+(defn first-reading-time [readings]
+  (let [reading (nth readings 0)]
+    (if (some? reading) reading.time 0)))
+
+(defn last-reading-time [readings]
+  (let [reading (last readings)]
+    (if (some? reading) reading.time 0)))
+
+(defn reading-span-ms [readings duration-ms]
+  (max 1
+       (- (last-reading-time readings)
+          (first-reading-time readings))))
+
+(defn low-zone-bpm [zones]
+  (let [zone (nth zones 0)]
+    zone.min))
+
+(defn high-zone-bpm [zones]
+  (let [zone (last zones)]
+    zone.max))
+
+(defn reading-bpms [readings]
+  (map readings (fn [reading] reading.bpm)))
+
+(defn chart-value-min [readings]
+  (if (empty? readings)
+      50
+      (min (min-of (reading-bpms readings) 50) 50)))
+
+(defn chart-value-max [readings]
+  (if (empty? readings)
+      170
+      (max (max-of (reading-bpms readings) 170) 170)))
+
+(defn raw-chart-min-bpm [readings zones]
+  (min (chart-value-min readings) (low-zone-bpm zones)))
+
+(defn raw-chart-max-bpm [readings zones]
+  (max (chart-value-max readings) (high-zone-bpm zones)))
+
+(defn chart-min-bpm [readings zones mobile?]
+  (let [chart-min (raw-chart-min-bpm readings zones)
+        chart-max (raw-chart-max-bpm readings zones)
+        span (max 20 (- chart-max chart-min))]
+    (if mobile?
+        chart-min
+        (max 35 (* (floor (/ (- chart-min (* span 0.08)) 5)) 5)))))
+
+(defn chart-max-bpm [readings zones mobile?]
+  (let [chart-min (raw-chart-min-bpm readings zones)
+        chart-max (raw-chart-max-bpm readings zones)
+        span (max 20 (- chart-max chart-min))]
+    (if mobile?
+        chart-max
+        (* (ceil (/ (+ chart-max (* span 0.08)) 5)) 5))))
+
+(defn chart-axis-label-px [width mobile?]
+  (max (if mobile? 11 12)
+       (round (/ width (if mobile? 58 52)))))
+
+(defn chart-font [width min-px divisor weight]
+  (let [size (max min-px (round (/ width divisor)))]
+    (str weight " " size "px system-ui, sans-serif")))
+
+(defn axis-max-ms [duration-ms readings]
+  (let [last-time (last-reading-time readings)
+        min-window (if (< duration-ms one-minute-ms)
+                       (max duration-ms 10000)
+                       one-minute-ms)]
+    (max (max min-window duration-ms) (max last-time 1))))
+
+(defn chart-css-width [state]
+  (round (max (if state.mobile? 300 520)
+              (if (> state.chartWidth 0)
+                  state.chartWidth
+                  (if state.mobile? 360 720)))))
+
+(defn chart-css-height [state width]
+  (round (max (if state.mobile? 190 250)
+              (if (> state.chartHeight 0)
+                  state.chartHeight
+                  (* width (if state.mobile? 0.58 0.42))))))
+
+(defn heart-chart-layout [state]
+  (let [width (chart-css-width state)
+        height (chart-css-height state width)
+        mobile? state.mobile?
+        base-pad (if mobile?
+                     (max 20 (round (* width 0.035)))
+                     (max 34 (round (* width 0.04))))
+        x-label-px (chart-axis-label-px width mobile?)
+        left (if mobile? (* base-pad 1.4) base-pad)
+        right (if mobile? (* base-pad 0.55) (* base-pad 0.5))
+        bottom-padding (+ base-pad (* x-label-px 1.55))
+        top (if mobile? 0 (* base-pad 0.55))
+        bottom (- height bottom-padding)
+        tick-height (max 4 (* base-pad 0.18))]
+    {:width width
+     :height height
+     :left left
+     :right right
+     :top top
+     :bottom (max (+ top 60) bottom)
+     :axisTop (+ (max (+ top 60) bottom) tick-height)
+     :tickHeight tick-height
+     :mobile? mobile?
+     :boundaryFont (chart-font width 11 88 400)
+     :axisFont (chart-font width 12 (if mobile? 58 52) 600)
+     :targetLineWidth (max 2 (round (/ width 720)))
+     :axisLineWidth (max 1 (round (/ width 1100)))
+     :lineWidth (max 3 (round (/ width 360)))
+     :pointRadius (max 5 (round (/ width 170)))
+     :minBpm (chart-min-bpm state.readings state.zones mobile?)
+     :maxBpm (chart-max-bpm state.readings state.zones mobile?)
+     :durationMs (axis-max-ms state.displayElapsedMs state.readings)}))
+
+(defn plot-width [chart]
+  (max 1 (- (- chart.width chart.left) chart.right)))
+
+(defn plot-height [chart]
+  (max 1 (- chart.bottom chart.top)))
+
+(defn plot-right [chart]
+  (+ chart.left (plot-width chart)))
+
+(defn y-for-bpm [chart bpm]
+  (- chart.bottom
+     (* (/ (- bpm chart.minBpm)
+           (max 1 (- chart.maxBpm chart.minBpm)))
+        (plot-height chart))))
+
+(defn x-for-reading [chart readings duration-ms reading]
+  (+ chart.left
+     (* (/ (- reading.time (first-reading-time readings))
+           (reading-span-ms readings duration-ms))
+        (plot-width chart))))
+
+(defn lower-boundary [zones zone index]
+  (let [previous (nth zones (- index 1))]
+    (if (some? previous)
+        (/ (+ previous.max zone.min) 2)
+        zone.min)))
+
+(defn upper-boundary [zones zone index]
+  (let [next (nth zones (+ index 1))]
+    (if (some? next)
+        (/ (+ zone.max next.min) 2)
+        zone.max)))
+
+(defn band-top [chart zones zone index]
+  (max chart.top
+       (floor (y-for-bpm chart (upper-boundary zones zone index)))))
+
+(defn band-bottom [chart zones zone index]
+  (min chart.bottom
+       (ceil (y-for-bpm chart (lower-boundary zones zone index)))))
+
+(defn append-zone-band-ops [ops chart zones target-zone-id zone index]
+  (let [top (band-top chart zones zone index)
+        bottom (band-bottom chart zones zone index)
+        height (max 1 (+ (- bottom top) 1))
+        target? (= zone.id target-zone-id)
+        fill-color (str zone.color (if target? "34" "14"))
+        with-fill (conj ops
+                        (canvas-op {:op :fill-rect
+                                    :x chart.left
+                                    :y top
+                                    :width (plot-width chart)
+                                    :height height
+                                    :fillStyle fill-color}))]
+    (if (and target? (not chart.mobile?))
+        (conj with-fill
+              (canvas-op {:op :stroke-rect
+                          :x chart.left
+                          :y top
+                          :width (plot-width chart)
+                          :height (max 1 (- bottom top))
+                          :strokeStyle zone.color
+                          :lineWidth chart.targetLineWidth}))
+        with-fill)))
+
+(defn zone-band-ops [chart zones target-zone-id]
+  (reduce-indexed zones
+    [(canvas-op {:op :clear
+                 :width chart.width
+                 :height chart.height})
+     (canvas-op {:op :fill-rect
+                 :x 0
+                 :y 0
+                 :width chart.width
+                 :height chart.height
+                 :fillStyle "#fffdfa"})]
+    (fn [ops zone index]
+      (append-zone-band-ops ops chart zones target-zone-id zone index))))
+
+(defn append-boundary-label [labels label value]
+  (conj labels {:label label :value value}))
+
+(defn boundary-labels [zones]
+  (let [first-zone (nth zones 0)
+        first-labels (append-boundary-label [] first-zone.min first-zone.min)]
+    (reduce-indexed zones
+      first-labels
+      (fn [labels zone index]
+        (let [next (nth zones (+ index 1))
+              value (if (some? next)
+                        (/ (+ zone.max next.min) 2)
+                        zone.max)]
+          (append-boundary-label labels zone.max value))))))
+
+(defn append-boundary-label-op [ops chart boundary]
+  (conj ops
+        (canvas-op {:op :fill-text
+                    :text (str boundary.label)
+                    :x (- chart.left 8)
+                    :y (y-for-bpm chart boundary.value)
+                    :fillStyle "#617066"
+                    :font chart.boundaryFont
+                    :textAlign "right"
+                    :textBaseline "middle"})))
+
+(defn boundary-label-ops [ops chart zones mobile?]
+  (if mobile?
+      ops
+      (reduce (boundary-labels zones)
+              ops
+              (fn [label-ops boundary]
+                (append-boundary-label-op label-ops chart boundary)))))
+
+(defn minute-label [duration-ms ratio]
+  (let [elapsed-minutes (/ (* duration-ms ratio) one-minute-ms)]
+    (if (>= elapsed-minutes 10)
+        (str (round elapsed-minutes) "m")
+        (str (to-fixed elapsed-minutes (if (>= elapsed-minutes 1) 1 0)) "m"))))
+
+(defn tick-align [index tick-count]
+  (if (= index 0)
+      "left"
+      (if (= index tick-count)
+          "right"
+          "center")))
+
+(defn append-time-axis-tick-ops [ops chart tick-count index]
+  (let [ratio (/ index tick-count)
+        x (+ chart.left (* ratio (plot-width chart)))
+        align (tick-align index tick-count)]
+    (conj ops
+          (canvas-op {:op :begin-path})
+          (canvas-op {:op :move-to :x x :y chart.bottom})
+          (canvas-op {:op :line-to :x x :y (+ chart.bottom chart.tickHeight)})
+          (canvas-op {:op :stroke :strokeStyle "#cbd5ce" :lineWidth chart.axisLineWidth})
+          (canvas-op {:op :fill-text
+                      :text (minute-label chart.durationMs ratio)
+                      :x (if (= index tick-count) (plot-right chart) x)
+                      :y chart.axisTop
+                      :fillStyle "#617066"
+                      :font chart.axisFont
+                      :textAlign align
+                      :textBaseline "top"}))))
+
+(defn time-axis-ops [ops chart tick-count]
+  (reduce (range 0 (+ tick-count 1))
+          (conj ops
+                (canvas-op {:op :begin-path})
+                (canvas-op {:op :move-to :x chart.left :y (+ chart.bottom 0.5)})
+                (canvas-op {:op :line-to :x (plot-right chart) :y (+ chart.bottom 0.5)})
+                (canvas-op {:op :stroke :strokeStyle "#cbd5ce" :lineWidth chart.axisLineWidth}))
+          (fn [axis-ops index]
+            (append-time-axis-tick-ops axis-ops chart tick-count index))))
+
+(defn reading-line-color [zones target target? reading]
+  (if target?
+      target.color
+      (let [zone (zone-for-bpm zones reading.bpm)]
+        (if (some? zone)
+            zone.color
+            "#172019"))))
+
+(defn append-reading-segment-ops [ops chart zones target-zone-id readings duration-ms reading index]
+  (if (= index 0)
+      ops
+      (let [previous (nth readings (- index 1))
+            target (target-zone zones target-zone-id)
+            target? (and (>= reading.bpm target.min)
+                         (<= reading.bpm target.max))
+            color (reading-line-color zones target target? reading)]
+        (conj ops
+              (canvas-op {:op :begin-path})
+              (canvas-op {:op :move-to
+                          :x (x-for-reading chart readings duration-ms previous)
+                          :y (y-for-bpm chart previous.bpm)})
+              (canvas-op {:op :line-to
+                          :x (x-for-reading chart readings duration-ms reading)
+                          :y (y-for-bpm chart reading.bpm)})
+              (canvas-op {:op :stroke
+                          :strokeStyle color
+                          :lineWidth chart.lineWidth
+                          :lineCap "round"
+                          :lineJoin "round"
+                          :globalAlpha (if target? 1 0.72)})
+              (canvas-op {:op :set
+                          :name "globalAlpha"
+                          :value 1})))))
+
+(defn reading-segment-ops [ops chart zones target-zone-id readings duration-ms]
+  (if (< (count readings) 2)
+      ops
+      (reduce-indexed readings
+        ops
+        (fn [line-ops reading index]
+          (append-reading-segment-ops line-ops
+                                      chart
+                                      zones
+                                      target-zone-id
+                                      readings
+                                      duration-ms
+                                      reading
+                                      index)))))
+
+(defn latest-point-ops [ops chart zones readings duration-ms]
+  (let [latest (last readings)
+        zone (zone-for-bpm zones latest.bpm)
+        color (if (some? zone) zone.color "#172019")]
+    (conj ops
+          (canvas-op {:op :begin-path})
+          (canvas-op {:op :arc
+                      :x (x-for-reading chart readings duration-ms latest)
+                      :y (y-for-bpm chart latest.bpm)
+                      :radius chart.pointRadius
+                      :start 0
+                      :end (* 2 pi)})
+          (canvas-op {:op :fill
+                      :fillStyle color}))))
+
+(defn heart-chart-ops [state]
+  (let [chart (heart-chart-layout state)
+        with-zones (zone-band-ops chart state.zones state.targetZoneId)
+        with-labels (boundary-label-ops with-zones chart state.zones state.mobile?)
+        with-axis (time-axis-ops with-labels chart (if state.mobile? 4 6))
+        with-readings (reading-segment-ops with-axis
+                                           chart
+                                           state.zones
+                                           state.targetZoneId
+                                            state.readings
+                                            chart.durationMs)]
+    (if (< (count state.readings) 2)
+        with-readings
+        (latest-point-ops with-readings chart state.zones state.readings chart.durationMs))))
+
+(ann selected-log-chart-state (Fn [HeartChartState] HeartChartState))
+(defn selected-log-chart-state [state]
+  (match (selected-log state.entries state.selectedLogId)
+    (some entry) (merge state
+                        {:readings entry.readings
+                         :targetZoneId entry.targetZoneId
+                         :zones entry.zones
+                         :displayElapsedMs entry.durationMs})
+    nil state))
+
+(ann active-heart-chart-state (Fn [HeartChartState] HeartChartState))
+(defn active-heart-chart-state [state]
+  (if (= state.detailView "log")
+      (selected-log-chart-state state)
+      state))
+
+(ann active-heart-chart-ref (Fn [HeartChartState] String))
+(defn active-heart-chart-ref [state]
+  (if (= state.detailView "log")
+      log-chart-ref
+      live-chart-ref))
+
+(ann heart-chart-active? (Fn [HeartChartState] Bool))
+(defn heart-chart-active? [state]
+  (if (= state.detailView "live")
+      true
+      (if (= state.detailView "log")
+          (match (selected-log state.entries state.selectedLogId)
+            (some entry) true
+            nil false)
+          false)))
+
+(ann watch-heart-chart-command (Fn [String] (Cmd HeartChartMsg)))
+(defn watch-heart-chart-command [ref]
+  {:kind :dom-ref/resize-watch
+   :id chart-watch-id
+   :ref ref
+   :onChange :chart-resized
+   :onError :chart-error})
+
+(ann heart-chart-command (Fn [HeartChartState] (Cmd HeartChartMsg)))
+(defn heart-chart-command [state]
+  (if (heart-chart-active? state)
+      (let [chart-state (active-heart-chart-state state)
+            chart (heart-chart-layout chart-state)
+            ref (active-heart-chart-ref state)]
+        {:kind :canvas/draw
+         :ref ref
+         :cssWidth chart.width
+         :cssHeight chart.height
+         :devicePixelRatio true
+         :ops (heart-chart-ops chart-state)
+         :onError :chart-error})
+      {:kind :none}))
+
+(ann heart-chart-batch (Fn [HeartChartState] (Cmd HeartChartMsg)))
+(defn heart-chart-batch [state]
+  (if (heart-chart-active? state)
+      (let [ref (active-heart-chart-ref state)]
+        {:kind :batch
+         :commands [(watch-heart-chart-command ref)
+                    (heart-chart-command state)]})
+      {:kind :none}))

@@ -1,0 +1,49 @@
+(type MetricVisibility {:zone2 Bool :hrr Bool :trimp Bool})
+
+(ann normalized-type (Fn [String] String))
+(defn normalized-type [exercise-type]
+  (lower-case (trim exercise-type)))
+
+(ann liss-type? (Fn [String] Bool))
+(defn liss-type? [exercise-type]
+  (let [label (normalized-type exercise-type)]
+    (or (includes? label "liss")
+        (includes? label "steady")
+        (includes? label "aerob"))))
+
+(ann hrr-type? (Fn [String] Bool))
+(defn hrr-type? [exercise-type]
+  (let [label (normalized-type exercise-type)]
+    (or (includes? label "strength")
+        (includes? label "hiit")
+        (includes? label "interval"))))
+
+(ann metrics-for-type (Fn [String] (Vector String)))
+(defn metrics-for-type [exercise-type]
+  (if (liss-type? exercise-type)
+      ["zone2" "trimp"]
+      (if (hrr-type? exercise-type)
+          ["hrr" "trimp"]
+          ["trimp"])))
+
+(ann metric-enabled? (Fn [(Vector String) String] Bool))
+(defn metric-enabled? [enabled metric]
+  (includes? enabled metric))
+
+(ann metric-visibility (Fn [(Vector String)] MetricVisibility))
+(defn metric-visibility [enabled]
+  {:zone2 (metric-enabled? enabled "zone2")
+   :hrr (metric-enabled? enabled "hrr")
+   :trimp (metric-enabled? enabled "trimp")})
+
+(def liss-metrics
+  (metrics-for-type "Easy LISS ride"))
+
+(def strength-metrics
+  (metrics-for-type "Strength circuit"))
+
+(def untyped-metrics
+  (metrics-for-type "Mobility"))
+
+(def liss-visibility
+  (metric-visibility liss-metrics))

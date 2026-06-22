@@ -1,0 +1,37 @@
+(def init
+  {:status "Idle"
+   :message ""
+   :connected? false
+   :deviceName ""})
+
+(defn update [state msg]
+  (match msg
+    {:kind :connect}
+      [{:status "Pairing"
+        :message "Pairing..."
+        :connected? false
+        :deviceName state.deviceName}
+       {:kind :bluetooth/request-device
+        :filters [{:services ["heart_rate"]}]
+        :optionalServices ["heart_rate"]
+        :onSuccess :bluetooth-connected
+        :onError :bluetooth-error}]
+    {:kind :bluetooth-connected :value device}
+      [{:status "Live"
+        :message "Connected."
+        :connected? true
+        :deviceName device.name}
+       {:kind :none}]
+    {:kind :bluetooth-error :error error}
+      [{:status "Idle"
+        :message (str "Bluetooth error: " error)
+        :connected? false
+        :deviceName state.deviceName}
+       {:kind :none}]
+    _ [state {:kind :none}]))
+
+(defn view [state]
+  #html <button data-connected={state.connected?}
+                data-device={state.deviceName}
+                data-message={state.message}
+                on:click={{:kind :connect}}>{state.status}</button>)

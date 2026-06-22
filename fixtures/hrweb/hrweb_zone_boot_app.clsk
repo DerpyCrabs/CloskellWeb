@@ -1,0 +1,56 @@
+(import "./hrweb_zone_state.clsk" [zones-storage-key default-zone-state load-zone-state zone-state-payload])
+
+(defn initial-state []
+  (merge default-zone-state
+         {:status "Loading zones"
+          :error ""}))
+
+(defn init []
+  [(initial-state)
+   {:kind :storage/get
+    :key zones-storage-key
+    :format :json
+    :onSuccess :zones-loaded
+    :onError :zones-load-failed}])
+
+(defn update [state msg]
+  (match msg
+    {:kind :zones-loaded :value payload}
+      (let [loaded (load-zone-state payload)]
+        [(merge state
+                loaded
+                {:status "Zones loaded"
+                 :error ""})
+         {:kind :none}])
+    {:kind :zones-load-failed :error error}
+      [(merge (initial-state)
+              {:status "Default zones"
+               :error error})
+       {:kind :none}]
+    {:kind :target-zone :id id}
+      [(merge state
+              {:targetZoneId id
+               :status (str "Zone " id " target")})
+       {:kind :storage/set
+        :key zones-storage-key
+        :value (zone-state-payload state.zones id)
+        :msg {:kind :zones-saved}}]
+    {:kind :zones-saved}
+      [(merge state {:status "Zones saved"}) {:kind :none}]
+    _ [state {:kind :none}]))
+
+(defn view [state]
+  #html <section data-target={state.targetZoneId}
+                 data-status={state.status}
+                 data-error={state.error}>
+          {(for [zone state.zones :key zone.id]
+             #html <button type="button"
+                           data-zone={zone.id}
+                           data-range={(str zone.min "-" zone.max)}
+                           data-selected={(= zone.id state.targetZoneId)}
+                           style={{:background zone.color}}
+                           on:click={{:kind :target-zone :id zone.id}}>
+                     {zone.name}
+                   </button>)}
+          <p>{state.status}</p>
+        </section>)

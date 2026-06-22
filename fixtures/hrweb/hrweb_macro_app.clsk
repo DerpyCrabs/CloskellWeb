@@ -1,0 +1,38 @@
+(defmacro cmd-none []
+  `{:kind :none})
+
+(defmacro storage-set [key value msg]
+  `{:kind :storage/set
+    :key ~key
+    :value ~value
+    :msg ~msg})
+
+(defmacro start-msg []
+  `:start)
+
+(def init
+  {:connected? false
+   :label "Start"
+   :buttonClass "primary"
+   :saved? false})
+
+(defn update [state msg]
+  (if (= msg :start)
+      [{:connected? true
+        :label "Saving"
+        :buttonClass "secondary"
+        :saved? false}
+       (storage-set "hrweb.last-action" "start" :stored)]
+      (if (= msg :stored)
+          [{:connected? true
+            :label "Saved"
+            :buttonClass "secondary"
+            :saved? true}
+           (cmd-none)]
+          [state (cmd-none)])))
+
+(defn view [state]
+  #html <button class={state.buttonClass}
+                disabled={not state.connected?}
+                data-saved={state.saved?}
+                on:click={(start-msg)}>{state.label}</button>)

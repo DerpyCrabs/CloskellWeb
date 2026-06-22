@@ -1,0 +1,93 @@
+(defn init []
+  [{:width 0
+    :height 0
+    :draws 0
+    :watching? true
+    :status "Watching"}
+   {:kind :dom-ref/resize-watch
+    :id "responsive-chart"
+    :ref "responsive-chart"
+    :onChange :chart-resized
+    :onError :resize-failed}])
+
+(defn chart-ops [width height]
+  [{:op :clear}
+   {:op :fill-rect
+    :x 0
+    :y 0
+    :width width
+    :height height
+    :fillStyle "#f7fbff"}
+   {:op :stroke-rect
+    :x 1
+    :y 1
+    :width (- width 2)
+    :height (- height 2)
+    :strokeStyle "#1f6feb"
+    :lineWidth 2}
+   {:op :begin-path}
+   {:op :move-to
+    :x 12
+    :y (- height 18)}
+   {:op :line-to
+    :x (/ width 2)
+    :y 22}
+   {:op :line-to
+    :x (- width 12)
+    :y (/ height 2)}
+   {:op :stroke
+    :strokeStyle "#d9184b"
+    :lineWidth 4
+    :lineCap "round"
+    :lineJoin "round"}
+   {:op :fill-text
+    :text (str (round width) "x" (round height))
+    :x 12
+    :y 18
+    :fillStyle "#172019"
+    :font "700 12px system-ui"}])
+
+(defn update [state msg]
+  (match msg
+    {:kind :chart-resized :value rect}
+      [(merge state
+              {:width rect.width
+               :height rect.height
+               :status (str "Resized " (round rect.width) "x" (round rect.height))})
+       {:kind :canvas/draw
+        :ref "responsive-chart"
+        :width rect.width
+        :height rect.height
+        :ops (chart-ops rect.width rect.height)
+        :msg {:kind :chart-drawn}}]
+    {:kind :chart-drawn}
+      [(merge state
+              {:draws (+ state.draws 1)
+               :status (str "Drawn " (round state.width) "x" (round state.height))})
+       {:kind :none}]
+    {:kind :stop-watch}
+      [(merge state
+              {:watching? false
+               :status "Stopped"})
+       {:kind :dom-ref/resize-unwatch
+        :id "responsive-chart"
+        :msg {:kind :watch-stopped}}]
+    {:kind :watch-stopped}
+      [state {:kind :none}]
+    {:kind :resize-failed :error error}
+      [(merge state {:status error}) {:kind :none}]
+    _ [state {:kind :none}]))
+
+(defn view [state]
+  #html <section data-width={state.width}
+                 data-height={state.height}
+                 data-draws={state.draws}
+                 data-watching={state.watching?}
+                 data-status={state.status}>
+          <canvas ref="responsive-chart"
+                  aria-label="Responsive heart rate chart"></canvas>
+          <button type="button"
+                  disabled={not state.watching?}
+                  on:click={{:kind :stop-watch}}>Stop resize</button>
+          <p>{state.status}</p>
+        </section>)

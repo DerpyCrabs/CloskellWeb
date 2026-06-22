@@ -1,0 +1,26 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/syntax",
+    "crates/hir",
+    "crates/macro_expand",
+    "crates/typecheck",
+    "crates/effects",
+    "crates/template_ir",
+    "crates/js_backend",
+    "crates/cli",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.dependencies]
+syntax = { path = "crates/syntax" }
+hir = { path = "crates/hir" }
+macro_expand = { path = "crates/macro_expand" }
+typecheck = { path = "crates/typecheck" }
+effects = { path = "crates/effects" }
+template_ir = { path = "crates/template_ir" }
+js_backend = { path = "crates/js_backend" }

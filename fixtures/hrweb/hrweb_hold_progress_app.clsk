@@ -1,0 +1,78 @@
+(def hold-ms 800)
+
+(def init
+  {:holding? false
+   :completed? false
+   :startedAt 0
+   :progress 0
+   :frames 0
+   :status "Idle"})
+
+(defn progress-for [started-at timestamp]
+  (max 0 (min 1 (/ (- timestamp started-at) hold-ms))))
+
+(defn update [state msg]
+  (match msg
+    {:kind :start-hold}
+      [(merge state
+              {:holding? true
+               :completed? false
+               :progress 0
+               :frames 0
+               :status "Holding"})
+       {:kind :time/now
+        :onSuccess :hold-started}]
+    {:kind :hold-started :value timestamp}
+      [(merge state {:startedAt timestamp})
+       {:kind :animation/frame
+        :id "hold-progress"
+        :onFrame :hold-frame}]
+    {:kind :hold-frame :timestamp timestamp}
+      (if state.holding?
+          (let [progress (progress-for state.startedAt timestamp)
+                next-state (merge state
+                                  {:progress progress
+                                   :frames (+ state.frames 1)
+                                   :status (str "Progress " (round (* progress 100)) "%")})]
+            (if (< progress 1)
+                [next-state
+                 {:kind :animation/frame
+                  :id "hold-progress"
+                  :onFrame :hold-frame}]
+                [(merge next-state
+                        {:holding? false
+                         :completed? true
+                         :status "Complete"})
+                 {:kind :none}]))
+          [state {:kind :none}])
+    {:kind :cancel-hold}
+      (if state.holding?
+          [(merge state
+                  {:holding? false
+                   :completed? false
+                   :progress 0
+                   :status "Cancelled"})
+           {:kind :animation/cancel
+            :id "hold-progress"
+            :msg {:kind :hold-cancelled}}]
+          [state {:kind :none}])
+    {:kind :hold-cancelled}
+      [state {:kind :none}]
+    _ [state {:kind :none}]))
+
+(defn view [state]
+  #html <section data-holding={state.holding?}
+                 data-completed={state.completed?}
+                 data-progress={state.progress}
+                 data-frames={state.frames}
+                 data-status={state.status}>
+          <button type="button"
+                  on:pointerdown={(do (event.preventDefault)
+                                      {:kind :start-hold})}
+                  on:pointerup={{:kind :cancel-hold}}
+                  on:pointercancel={{:kind :cancel-hold}}>
+            Hold to stop
+          </button>
+          <progress value={state.progress} max="1"></progress>
+          <p>{state.status}</p>
+        </section>)

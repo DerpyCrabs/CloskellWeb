@@ -1,0 +1,99 @@
+(def css-width 240)
+(def css-height 120)
+
+(def init
+  [{:draws 0
+    :backingWidth 0
+    :backingHeight 0
+    :cssWidth css-width
+    :cssHeight css-height
+    :pixelRatio 1
+    :status "Ready"}
+   {:kind :canvas/draw
+    :ref "dpr-chart"
+    :width css-width
+    :height css-height
+    :pixelRatio :device
+    :ops [{:op :clear
+           :width css-width
+           :height css-height}
+          {:op :fill-rect
+           :x 0
+           :y 0
+           :width css-width
+           :height css-height
+           :fillStyle "#fffdfa"}
+          {:op :begin-path}
+          {:op :move-to
+           :x 12
+           :y (- css-height 18)}
+          {:op :line-to
+           :x (/ css-width 2)
+           :y 24}
+          {:op :line-to
+           :x (- css-width 12)
+           :y (/ css-height 2)}
+          {:op :stroke
+           :strokeStyle "#d9184b"
+           :lineWidth 4
+           :lineCap "round"
+           :lineJoin "round"}
+          {:op :fill-text
+           :text "DPR"
+           :x 12
+           :y 18
+           :fillStyle "#172019"
+           :font "700 12px system-ui"}]
+    :onSuccess :canvas-drawn}])
+
+(defn update [state msg]
+  (match msg
+    {:kind :canvas-drawn :value result}
+      [(merge state
+              {:draws (+ state.draws 1)
+               :backingWidth result.width
+               :backingHeight result.height
+               :cssWidth result.cssWidth
+               :cssHeight result.cssHeight
+               :pixelRatio result.pixelRatio
+               :status (str "Drawn " result.width "x" result.height)})
+       {:kind :none}]
+    {:kind :redraw}
+      [state
+       {:kind :canvas/draw
+        :ref "dpr-chart"
+        :width state.cssWidth
+        :height state.cssHeight
+        :pixelRatio :device
+        :ops [{:op :clear
+               :width state.cssWidth
+               :height state.cssHeight}
+              {:op :fill-rect
+               :x 0
+               :y 0
+               :width state.cssWidth
+               :height state.cssHeight
+               :fillStyle "#fffdfa"}
+              {:op :fill-text
+               :text (str "DPR " state.pixelRatio)
+               :x 12
+               :y 18
+               :fillStyle "#172019"
+               :font "700 12px system-ui"}]
+        :onSuccess :canvas-drawn}]
+    _ [state {:kind :none}]))
+
+(defn view [state]
+  #html <section data-draws={state.draws}
+                 data-backing-width={state.backingWidth}
+                 data-backing-height={state.backingHeight}
+                 data-css-width={state.cssWidth}
+                 data-css-height={state.cssHeight}
+                 data-pixel-ratio={state.pixelRatio}
+                 data-status={state.status}>
+          <canvas ref="dpr-chart"
+                  aria-label="Device pixel ratio chart"></canvas>
+          <button type="button"
+                  on:click={{:kind :redraw}}>Redraw</button>
+          <p>{state.status}</p>
+        </section>)

@@ -1,0 +1,47 @@
+(def init
+  {:zonesVisible? true
+   :autosave? false
+   :status "Zones visible"})
+
+(defn zone-status [visible?]
+  (if visible?
+      "Zones visible"
+      "Zones hidden"))
+
+(defn save-mode [autosave?]
+  (if autosave?
+      "Auto save"
+      "Manual save"))
+
+(defn update [state msg]
+  (match msg
+    {:kind :zones-visible :checked checked?}
+      [(merge state
+              {:zonesVisible? checked?
+               :status (zone-status checked?)})
+       {:kind :none}]
+    {:kind :autosave :checked checked?}
+      [(merge state
+              {:autosave? checked?
+               :status (save-mode checked?)})
+       {:kind :none}]
+    _ [state {:kind :none}]))
+
+(defn view [state]
+  #html <section data-zones-visible={state.zonesVisible?}
+                 data-autosave={state.autosave?}>
+          <label>
+            <input type="checkbox"
+                   checked={state.zonesVisible?}
+                   on:change={{:kind :zones-visible
+                               :checked event.currentTarget.checked}}></input>
+            <span>{state.status}</span>
+          </label>
+          <label>
+            <input type="checkbox"
+                   checked={state.autosave?}
+                   on:change={{:kind :autosave
+                               :checked event.currentTarget.checked}}></input>
+            <strong>{(save-mode state.autosave?)}</strong>
+          </label>
+        </section>)

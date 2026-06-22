@@ -1,0 +1,109 @@
+(def zones-storage-key "heartRateExercise.zones.v1")
+
+(def init
+  {:zones [{:id 1 :name "Zone 1" :min 90 :max 110 :color "#2a9d8f"}
+           {:id 2 :name "Zone 2" :min 111 :max 130 :color "#70b62c"}
+           {:id 3 :name "Zone 3" :min 131 :max 150 :color "#f0b429"}]
+   :targetZoneId 2
+   :status "Ready"})
+
+(defn clamp-boundary [low high value]
+  (max low (min high (round value))))
+
+(defn set-zone-boundary [zones index value]
+  (let [left (nth zones index)
+        right (nth zones (+ index 1))
+        boundary (clamp-boundary left.min (- right.max 1) value)]
+    (map-indexed zones
+                 (fn [zone zone-index]
+                   (if (= zone-index index)
+                       (assoc zone :max boundary)
+                       (if (= zone-index (+ index 1))
+                           (assoc zone :min (+ boundary 1))
+                           zone))))))
+
+(defn zone-storage-entry [zone]
+  {:id zone.id
+   :min zone.min
+   :max zone.max})
+
+(defn zone-state-payload [zones target-zone-id]
+  {:zones (map zones zone-storage-entry)
+   :targetZoneId target-zone-id})
+
+(defn boundary-controls [zones]
+  (map-indexed (slice zones 0 (- (count zones) 1))
+               (fn [zone index]
+                 (let [right (nth zones (+ index 1))]
+                   {:id zone.id
+                    :name zone.name
+                    :index index
+                    :min zone.min
+                    :max zone.max
+                    :nextMax (- right.max 1)}))))
+
+(defn update [state msg]
+  (match msg
+    {:kind :zone-boundary :index index :value value}
+      (let [next-zones (set-zone-boundary state.zones index value)]
+        [(merge state
+                {:zones next-zones
+                 :status (str "Boundary " value)})
+         {:kind :storage/set
+          :key zones-storage-key
+          :value (zone-state-payload next-zones state.targetZoneId)
+          :msg {:kind :zones-saved}}])
+    {:kind :target-zone :id id}
+      [(merge state
+              {:targetZoneId id
+               :status (str "Zone " id " target")})
+       {:kind :storage/set
+        :key zones-storage-key
+        :value (zone-state-payload state.zones id)
+        :msg {:kind :zones-saved}}]
+    {:kind :zones-saved}
+      [(merge state {:status "Zones saved"}) {:kind :none}]
+    _ [state {:kind :none}]))
+
+(defn view [state]
+  #html <section data-target={state.targetZoneId}
+                 data-status={state.status}>
+          <div class="zone-strip">
+            {(for [zone state.zones :key zone.id]
+               #html <button type="button"
+                             data-zone={zone.id}
+                             data-selected={(= zone.id state.targetZoneId)}
+                             style={{:background zone.color}}
+                             on:click={{:kind :target-zone :id zone.id}}>
+                       {zone.name}
+                     </button>)}
+          </div>
+          <div class="zone-boundaries">
+            {(for [control (boundary-controls state.zones) :key control.id]
+               #html <label data-boundary={control.id}>
+                       <span>{control.name}</span>
+                       <input type="range"
+                              min={control.min}
+                              max={control.nextMax}
+                              value={control.max}
+                              on:input={{:kind :zone-boundary
+                                         :index control.index
+                                         :value event.currentTarget.valueAsNumber}}
+                              on:keydown={(if (or (= event.key "ArrowLeft")
+                                                   (= event.key "ArrowDown"))
+                                               (do (event.preventDefault)
+                                                   {:kind :zone-boundary
+                                                    :index control.index
+                                                    :value (- control.max 1)})
+                                               (if (or (= event.key "ArrowRight")
+                                                       (= event.key "ArrowUp"))
+                                                   (do (event.preventDefault)
+                                                       {:kind :zone-boundary
+                                                        :index control.index
+                                                        :value (+ control.max 1)})
+                                                   {:kind :none}))}></input>
+                       <strong>{control.max}</strong>
+                     </label>)}
+          </div>
+          <p>{state.status}</p>
+        </section>)

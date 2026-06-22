@@ -1,0 +1,38 @@
+(defn pass [condition]
+  (if condition 1 0))
+
+(def sample-list
+  (list 2 3))
+
+(def prefixed
+  (cons 1 sample-list))
+
+(def appended
+  (conj prefixed 4))
+
+(def tail
+  (rest appended))
+
+(def tests
+  [{:name "constructs persistent lists"
+    :actual (pass (and (list? prefixed)
+                       (= (count prefixed) 3)
+                       (= (first prefixed) 1)
+                       (= (second prefixed) 2)
+                       (= (nth prefixed 2) 3)
+                       (= (last prefixed) 3)))
+    :expected 1}
+   {:name "rest returns a fresh list"
+    :actual (pass (and (list? tail)
+                       (= (count tail) 3)
+                       (= (first tail) 2)
+                       (= (last tail) 4)
+                       (= (count appended) 4)))
+    :expected 1}
+   {:name "list updates do not mutate original list"
+    :actual (pass (and (= (count sample-list) 2)
+                       (= (first sample-list) 2)
+                       (= (last sample-list) 3)
+                       (= (count prefixed) 3)
+                       (= (count appended) 4)))
+    :expected 1}])

@@ -1,0 +1,41 @@
+(type LogEntry {:id String :hiddenAt (Option Number)})
+(type LogState {:entries (Vector LogEntry) :selectedLogId String})
+
+(ann sample-state LogState)
+(def sample-state
+  {:entries [{:id "warmup" :hiddenAt nil}
+             {:id "lift" :hiddenAt nil}
+             {:id "archived" :hiddenAt 42}]
+   :selectedLogId "lift"})
+
+(ann visible-entries (Fn [(Vector LogEntry)] (Vector LogEntry)))
+(defn visible-entries [entries]
+  (filter entries (fn [entry] (not (some? entry.hiddenAt)))))
+
+(ann selected-id-visible? (Fn [(Vector LogEntry) String] Bool))
+(defn selected-id-visible? [entries selected-id]
+  (any? entries (fn [entry] (= entry.id selected-id))))
+
+(ann first-visible-id (Fn [(Vector LogEntry)] String))
+(defn first-visible-id [entries]
+  (let [first-entry (nth entries 0)]
+    (if (some? first-entry) first-entry.id "")))
+
+(ann reconcile-selected-log (Fn [LogState] LogState))
+(defn reconcile-selected-log [state]
+  (let [visible (visible-entries state.entries)]
+    (if (selected-id-visible? visible state.selectedLogId)
+        state
+        (assoc state :selectedLogId (first-visible-id visible)))))
+
+(def reconciled-selected
+  (reconcile-selected-log sample-state))
+
+(def reconciled-missing
+  (reconcile-selected-log
+    (assoc sample-state :selectedLogId "archived")))
+
+(def reconciled-empty
+  (reconcile-selected-log
+    {:entries [{:id "archived" :hiddenAt 42}]
+     :selectedLogId "archived"}))

@@ -1,0 +1,25 @@
+(def init {:active? false
+           :count 0})
+
+(defn panel-classes [state]
+  {:panel true
+   :active state.active?
+   :idle (not state.active?)
+   :even (= (mod state.count 2) 0)})
+
+(defn update [state msg]
+  (match msg
+    {:kind :toggle}
+      [(assoc state
+              :active? (not state.active?)
+              :count (+ state.count 1))
+       {:kind :none}]
+    _ [state {:kind :none}]))
+
+(defn view [state]
+  #html <section class={(panel-classes state)}
+                 data-active={state.active?}
+                 data-count={state.count}>
+          <button type="button" on:click={{:kind :toggle}}>Toggle</button>
+          <span>{state.count}</span>
+        </section>)

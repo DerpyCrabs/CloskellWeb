@@ -1,0 +1,35 @@
+(def init
+  [{:draft ""
+    :status "Idle"
+    :focused? false}
+   {:kind :none}])
+
+(defn update [state msg]
+  (match msg
+    {:kind :edit}
+      [(merge state {:status "Focusing"})
+       {:kind :dom-ref/focus
+        :ref "exercise-type"
+        :msg {:kind :focused}}]
+    {:kind :focused}
+      [(merge state
+              {:status "Editing"
+               :focused? true})
+       {:kind :none}]
+    {:kind :draft :value value}
+      [(merge state
+              {:draft value
+               :status "Editing"})
+       {:kind :none}]
+    _ [state {:kind :none}]))
+
+(defn view [state]
+  #html <section data-status={state.status}
+                 data-focused={state.focused?}>
+          <input ref="exercise-type"
+                 value={state.draft}
+                 aria-label="Exercise type"
+                 on:input={{:kind :draft :value event.currentTarget.value}}></input>
+          <button on:click={{:kind :edit}}>Edit type</button>
+          <span>{state.status}</span>
+        </section>)

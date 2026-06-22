@@ -1,0 +1,38 @@
+(def init
+  {:connected? false
+   :label "Idle"
+   :detail "Tap connect"})
+
+(defn update [state msg]
+  (match msg
+    {:kind :connect}
+      [{:connected? true
+        :label "Live"
+        :detail "Heart-rate monitor connected"}
+       {:kind :none}]
+    {:kind :rename :label label}
+      [{:connected? state.connected?
+        :label label
+        :detail state.detail}
+       {:kind :none}]
+    {:kind :disconnect}
+      [{:connected? false
+        :label "Idle"
+        :detail "Disconnected"}
+       {:kind :none}]
+    _ [state {:kind :none}]))
+
+(defn view [state]
+  #html <section data-connected={state.connected?}>
+          {(if state.connected?
+              #html <article data-kind="live">
+                      <strong>{state.label}</strong>
+                      <p>{state.detail}</p>
+                      <button on:click={{:kind :disconnect}}>Disconnect</button>
+                    </article>
+              #html <article data-kind="idle">
+                      <em>{state.label}</em>
+                      <p>{state.detail}</p>
+                      <button on:click={{:kind :connect}}>Connect</button>
+                    </article>)}
+        </section>)

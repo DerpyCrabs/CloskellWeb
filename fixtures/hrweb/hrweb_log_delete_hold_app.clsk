@@ -1,0 +1,210 @@
+(def exercise-log-storage-key "heartRateExercise.log.v1")
+(def delete-hold-ms 1000)
+(def delete-hold-timer-id "delete-log-hold")
+(def delete-hold-frame-id "delete-log-progress")
+
+(def init
+  {:entries [{:id "warmup"
+              :label "Warmup walk"
+              :duration "12:00"
+              :exerciseType "LISS"
+              :hiddenAt nil}
+             {:id "intervals"
+              :label "Short intervals"
+              :duration "18:30"
+              :exerciseType "HIIT"
+              :hiddenAt nil}
+             {:id "recovery"
+              :label "Hidden recovery"
+              :duration "08:15"
+              :exerciseType "Recovery"
+              :hiddenAt 1000}]
+   :selectedLogId "warmup"
+   :deleteHold? false
+   :deleteHoldStartedAt 0
+   :deleteHoldProgress 0
+   :status "Ready"})
+
+(defn visible-entries [entries]
+  (filter entries (fn [entry] (not (some? entry.hiddenAt)))))
+
+(defn hidden-entries [entries]
+  (filter entries (fn [entry] (some? entry.hiddenAt))))
+
+(defn selected-log [entries selected-id]
+  (find (visible-entries entries) (fn [entry] (= entry.id selected-id))))
+
+(defn first-visible-id [entries]
+  (let [entry (nth (visible-entries entries) 0)]
+    (if (some? entry)
+        entry.id
+        nil)))
+
+(defn hide-entry [entries entry-id hidden-at]
+  (map entries
+       (fn [entry]
+         (if (= entry.id entry-id)
+             (assoc entry :hiddenAt hidden-at)
+             entry))))
+
+(defn log-payload [entries]
+  {:version 2
+   :entries entries})
+
+(defn progress-for [started-at timestamp]
+  (max 0 (min 1 (/ (- timestamp started-at) delete-hold-ms))))
+
+(defn progress-width [progress]
+  (str (round (* progress 100)) "%"))
+
+(defn delete-label [holding?]
+  (if holding?
+      "Hold"
+      "Delete"))
+
+(defn cancel-delete-command []
+  {:kind :batch
+   :commands [{:kind :timer/cancel
+               :id delete-hold-timer-id}
+              {:kind :animation/cancel
+               :id delete-hold-frame-id
+               :msg {:kind :delete-hold-cancelled}}]})
+
+(defn start-delete-progress-command []
+  {:kind :batch
+   :commands [{:kind :timer/after
+               :id delete-hold-timer-id
+               :ms delete-hold-ms
+               :msg {:kind :delete-hold-complete}}
+              {:kind :animation/frame
+               :id delete-hold-frame-id
+               :onFrame :delete-hold-frame}]})
+
+(defn persist-log-command [entries]
+  {:kind :storage/set
+   :key exercise-log-storage-key
+   :value (log-payload entries)
+   :msg {:kind :log-saved}})
+
+(defn update [state msg]
+  (match msg
+    {:kind :select-log :id id}
+      [(merge state
+              {:selectedLogId id
+               :status (str "Selected " id)})
+       {:kind :none}]
+    {:kind :delete-hold-start}
+      (if (and (some? (selected-log state.entries state.selectedLogId))
+               (not state.deleteHold?))
+          [(merge state
+                  {:deleteHold? true
+                   :deleteHoldStartedAt 0
+                   :deleteHoldProgress 0
+                   :status "Hold to delete"})
+           {:kind :time/now
+            :onSuccess :delete-hold-started}]
+          [state {:kind :none}])
+    {:kind :delete-hold-started :value timestamp}
+      (if state.deleteHold?
+          [(merge state {:deleteHoldStartedAt timestamp})
+           (start-delete-progress-command)]
+          [state {:kind :none}])
+    {:kind :delete-hold-frame :timestamp timestamp}
+      (if state.deleteHold?
+          (let [progress (progress-for state.deleteHoldStartedAt timestamp)
+                next-state (merge state
+                                  {:deleteHoldProgress progress
+                                   :status (str "Deleting " (progress-width progress))})]
+            (if (< progress 1)
+                [next-state
+                 {:kind :animation/frame
+                  :id delete-hold-frame-id
+                  :onFrame :delete-hold-frame}]
+                [next-state {:kind :none}]))
+          [state {:kind :none}])
+    {:kind :delete-hold-cancel}
+      (if state.deleteHold?
+          [(merge state
+                  {:deleteHold? false
+                   :deleteHoldStartedAt 0
+                   :deleteHoldProgress 0
+                   :status "Delete cancelled"})
+           (cancel-delete-command)]
+          [state {:kind :none}])
+    {:kind :delete-hold-cancelled}
+      [state {:kind :none}]
+    {:kind :delete-hold-complete}
+      (if state.deleteHold?
+          [(merge state
+                  {:deleteHoldProgress 1
+                   :status "Deleting"})
+           {:kind :time/now
+            :onSuccess :delete-selected-at}]
+          [state {:kind :none}])
+    {:kind :delete-selected-at :value timestamp}
+      (let [entries (hide-entry state.entries state.selectedLogId timestamp)
+            next-id (first-visible-id entries)]
+        [(merge state
+                {:entries entries
+                 :selectedLogId next-id
+                 :deleteHold? false
+                 :deleteHoldStartedAt 0
+                 :deleteHoldProgress 0
+                 :status (if (some? next-id)
+                             (str "Deleted, selected " next-id)
+                             "Deleted last log")})
+         (persist-log-command entries)])
+    {:kind :log-saved}
+      [(merge state {:status (str state.status " and saved")}) {:kind :none}]
+    _ [state {:kind :none}]))
+
+(defn view [state]
+  (let [visible (visible-entries state.entries)
+        hidden (hidden-entries state.entries)
+        entry (selected-log state.entries state.selectedLogId)]
+    #html <section data-selected={state.selectedLogId}
+                   data-visible-count={count visible}
+                   data-hidden-count={count hidden}
+                   data-holding={state.deleteHold?}
+                   data-progress={state.deleteHoldProgress}
+                   data-status={state.status}>
+            <div data-list="exercise-log">
+              {(for [item visible :key item.id]
+                 #html <button type="button"
+                               data-id={item.id}
+                               data-selected={(= item.id state.selectedLogId)}
+                               on:click={{:kind :select-log
+                                          :id item.id}}>
+                         <span>{item.label}</span>
+                         <small>{item.duration}</small>
+                       </button>)}
+            </div>
+            {(if (some? entry)
+                #html <article data-detail={entry.id}>
+                        <h2>{entry.label}</h2>
+                        <p>{entry.exerciseType}</p>
+                      </article>
+                #html <p>No log selected</p>)}
+            <button type="button"
+                    data-action="delete"
+                    disabled={not (some? entry)}
+                    data-holding={state.deleteHold?}
+                    on:pointerdown={(do (event.preventDefault)
+                                        {:kind :delete-hold-start})}
+                    on:pointerup={{:kind :delete-hold-cancel}}
+                    on:pointerleave={{:kind :delete-hold-cancel}}
+                    on:pointercancel={{:kind :delete-hold-cancel}}
+                    on:keydown={(if (or (= event.key "Enter")
+                                         (= event.key " "))
+                                     (do (event.preventDefault)
+                                         {:kind :delete-hold-start})
+                                     {:kind :none})}
+                    on:keyup={(if (or (= event.key "Enter")
+                                       (= event.key " "))
+                                   {:kind :delete-hold-cancel}
+                                   {:kind :none})}>
+              <span style={{:width (progress-width state.deleteHoldProgress)}}></span>
+              <strong>{(delete-label state.deleteHold?)}</strong>
+            </button>
+            <p>{state.status}</p>
+          </section>))

@@ -1,0 +1,37 @@
+(type ZoneDurations (Map Number Number))
+
+(ann sample-zone-durations ZoneDurations)
+(def sample-zone-durations
+  (hash-map 1 0
+            2 45000
+            3 15000
+            4 0
+            5 0))
+
+(ann total-tracked-ms (Fn [ZoneDurations] Number))
+(defn total-tracked-ms [durations]
+  (reduce (map-values durations)
+          0
+          (fn [sum duration-ms]
+            (+ sum duration-ms))))
+
+(ann trimp-from-durations (Fn [ZoneDurations] Number))
+(defn trimp-from-durations [durations]
+  (/ (round (* (reduce (map-entries durations)
+                       0
+                       (fn [sum entry]
+                         (+ sum (* (/ entry.value 60000) entry.key))))
+               10))
+     10))
+
+(ann active-zone-ids (Fn [ZoneDurations] (Vector Number)))
+(defn active-zone-ids [durations]
+  (map (filter (map-entries durations)
+               (fn [entry] (> entry.value 0)))
+       (fn [entry] entry.key)))
+
+(def zone-duration-summary
+  {:zoneIds (map-keys sample-zone-durations)
+   :totalMs (total-tracked-ms sample-zone-durations)
+   :trimp (trimp-from-durations sample-zone-durations)
+   :activeZoneIds (active-zone-ids sample-zone-durations)})

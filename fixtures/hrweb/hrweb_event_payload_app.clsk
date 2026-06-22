@@ -1,0 +1,44 @@
+(def init
+  {:draft ""
+   :confirmed ""
+   :grouping "week"
+   :status "Editing"})
+
+(defn update [state msg]
+  (match msg
+    {:kind :draft :value value}
+      [{:draft value
+        :confirmed state.confirmed
+        :grouping state.grouping
+        :status "Editing"}
+       {:kind :none}]
+    {:kind :grouping :value value}
+      [{:draft state.draft
+        :confirmed state.confirmed
+        :grouping value
+        :status "Editing"}
+       {:kind :none}]
+    {:kind :confirm}
+      [{:draft state.draft
+        :confirmed state.draft
+        :grouping state.grouping
+        :status (str "Saved " state.draft " (" state.grouping ")")}
+       {:kind :none}]
+    _ [state {:kind :none}]))
+
+(defn view [state]
+  #html <section data-grouping={state.grouping}>
+          <input ref="exercise-type"
+                 value={state.draft}
+                 on:input={{:kind :draft :value event.currentTarget.value}}
+                 on:keydown={(if (= event.key "Enter")
+                                  {:kind :confirm}
+                                  {:kind :none})}></input>
+          <select value={state.grouping}
+                  on:change={{:kind :grouping :value event.currentTarget.value}}>
+            <option value="week">Week</option>
+            <option value="month">Month</option>
+          </select>
+          <button on:click={{:kind :confirm}}>Save</button>
+          <p>{state.status}</p>
+        </section>)

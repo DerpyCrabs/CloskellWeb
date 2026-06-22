@@ -1,0 +1,36 @@
+(def init
+  {:label "Import"
+   :entries []
+   :message ""
+   :importing? false})
+
+(defn update [state msg]
+  (match msg
+    {:kind :import}
+      [{:label "Importing"
+        :entries state.entries
+        :message ""
+        :importing? true}
+       {:kind :file/import
+        :accept "application/json,.json"
+        :format :json
+        :onSuccess :log-imported
+        :onError :import-failed}]
+    {:kind :log-imported :value value}
+      [{:label (str "Imported " (count value.entries))
+        :entries value.entries
+        :message "Import complete"
+        :importing? false}
+       {:kind :none}]
+    {:kind :import-failed :error error}
+      [{:label "Import"
+        :entries state.entries
+        :message error
+        :importing? false}
+       {:kind :none}]
+    _ [state {:kind :none}]))
+
+(defn view [state]
+  #html <button data-importing={state.importing?}
+                data-message={state.message}
+                on:click={{:kind :import}}>{state.label}</button>)

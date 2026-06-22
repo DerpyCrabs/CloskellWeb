@@ -1,0 +1,40 @@
+(type Zone {:id Number :name String :min Number :max Number})
+(type ZoneBoundary {:leftId Number :rightId Number :value Number})
+(type ZoneEdgeSummary {:firstMin Number :secondMin Number :lastMax Number :boundaryCount Number})
+
+(ann sample-zones (Vector Zone))
+(def sample-zones
+  [{:id 1 :name "Recovery" :min 90 :max 119}
+   {:id 2 :name "Zone 2" :min 120 :max 139}
+   {:id 3 :name "Tempo" :min 140 :max 159}
+   {:id 4 :name "Threshold" :min 160 :max 179}])
+
+(ann zone-boundary (Fn [(Vector Zone) Zone Number] ZoneBoundary))
+(defn zone-boundary [zones zone index]
+  (let [right-zone (nth zones (+ index 1))]
+    {:leftId zone.id
+     :rightId right-zone.id
+     :value zone.max}))
+
+(ann zone-boundaries (Fn [(Vector Zone)] (Vector ZoneBoundary)))
+(defn zone-boundaries [zones]
+  (map-indexed (drop-last zones)
+               (fn [zone index]
+                 (zone-boundary zones zone index))))
+
+(ann zone-edge-summary (Fn [(Vector Zone)] ZoneEdgeSummary))
+(defn zone-edge-summary [zones]
+  (let [first-zone (first zones)
+        second-zone (second zones)
+        last-zone (last zones)
+        boundaries (zone-boundaries zones)]
+    {:firstMin first-zone.min
+     :secondMin second-zone.min
+     :lastMax last-zone.max
+     :boundaryCount (count boundaries)}))
+
+(def sample-boundaries
+  (zone-boundaries sample-zones))
+
+(def sample-edge-summary
+  (zone-edge-summary sample-zones))

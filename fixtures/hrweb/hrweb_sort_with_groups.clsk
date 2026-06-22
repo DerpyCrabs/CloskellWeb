@@ -1,0 +1,41 @@
+(def untyped-key "__untyped__")
+(def untyped-label "Untyped")
+
+(type LogEntry {:id String :exerciseType String :stoppedAt Number})
+(type TypeGroup {:type String :entries (Vector LogEntry)})
+
+(def sample-type-groups
+  [{:type "Strength"
+    :entries [{:id "lift-old" :exerciseType "Strength" :stoppedAt 1000}
+              {:id "lift-new" :exerciseType "Strength" :stoppedAt 4000}]}
+   {:type untyped-key
+    :entries [{:id "mystery" :exerciseType "" :stoppedAt 3000}]}
+   {:type "LISS"
+    :entries [{:id "walk" :exerciseType "LISS" :stoppedAt 2000}
+              {:id "jog" :exerciseType "LISS" :stoppedAt 5000}]}])
+
+(ann compare-type-groups (Fn [TypeGroup TypeGroup] Number))
+(defn compare-type-groups [first second]
+  (if (= first.type untyped-key)
+      1
+      (if (= second.type untyped-key)
+          -1
+          (locale-compare first.type second.type))))
+
+(ann compare-newest-entry (Fn [LogEntry LogEntry] Number))
+(defn compare-newest-entry [first second]
+  (- second.stoppedAt first.stoppedAt))
+
+(ann display-type-label (Fn [String] String))
+(defn display-type-label [type]
+  (if (= type untyped-key) untyped-label type))
+
+(ann sort-type-groups (Fn [(Vector TypeGroup)] (Vector TypeGroup)))
+(defn sort-type-groups [groups]
+  (map (sort-with groups compare-type-groups)
+       (fn [group]
+         {:type (display-type-label group.type)
+          :entries (sort-with group.entries compare-newest-entry)})))
+
+(def sorted-type-groups
+  (sort-type-groups sample-type-groups))

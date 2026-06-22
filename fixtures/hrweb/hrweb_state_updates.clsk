@@ -1,0 +1,53 @@
+(def initial-state
+  {:message "Ready"
+   :selectedLogId "warmup"
+   :entries [{:id "warmup"
+              :exerciseType "LISS"
+              :hiddenAt nil}
+             {:id "intervals"
+              :exerciseType "HIIT"
+              :hiddenAt nil}]
+   :zones [{:id 1 :min 90 :max 110}
+           {:id 2 :min 111 :max 130}]})
+
+(defn set-exercise-type [entries entry-id exercise-type]
+  (map entries
+       (fn [entry]
+         (if (= entry.id entry-id)
+             (assoc entry :exerciseType exercise-type)
+             entry))))
+
+(defn hide-entry [entries entry-id hidden-at]
+  (map entries
+       (fn [entry]
+         (if (= entry.id entry-id)
+             (assoc entry :hiddenAt hidden-at)
+             entry))))
+
+(defn set-zone-boundary [zones index value]
+  (map-indexed zones
+               (fn [zone zone-index]
+                 (if (= zone-index index)
+                     (assoc zone :max value)
+                     (if (= zone-index (+ index 1))
+                         (assoc zone :min (+ value 1))
+                         zone)))))
+
+(defn import-complete [state entries]
+  (merge state
+         {:entries entries
+          :selectedLogId (let [first-entry (nth entries 0)]
+                           first-entry.id)
+          :message "Imported"}))
+
+(defn clear-message [state]
+  (dissoc state :message))
+
+(def updated-state
+  (let [typed (set-exercise-type initial-state.entries "warmup" "Strength")
+        hidden (hide-entry typed "intervals" 4242)
+        zones (set-zone-boundary initial-state.zones 0 125)
+        imported (import-complete initial-state hidden)]
+    (assoc (clear-message imported)
+           :zones zones
+           :visibleCount (count (filter hidden (fn [entry] (not (some? entry.hiddenAt))))))))

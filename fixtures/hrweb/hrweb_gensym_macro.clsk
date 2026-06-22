@@ -1,0 +1,28 @@
+(defmacro with-reading-temp [value]
+  (let [tmp (gensym "reading")]
+    `(let [~tmp ~value]
+       {:bpm ~tmp
+        :label (str "HR " ~tmp)})))
+
+(defmacro with-reading-pair [left right]
+  (with-gensyms [first second]
+    `(let [~first ~left
+           ~second ~right]
+       {:sum (+ ~first ~second)
+        :label (str ~first "/" ~second)})))
+
+(def reading-summary
+  (with-reading-temp 142))
+
+(def reading-pair
+  (with-reading-pair 60 82))
+
+(def tests
+  [{:name "explicit gensym macro reuses fresh binding"
+    :actual reading-summary
+    :expected {:bpm 142
+               :label "HR 142"}}
+   {:name "with-gensyms macro binds multiple fresh symbols"
+    :actual reading-pair
+    :expected {:sum 142
+               :label "60/82"}}])

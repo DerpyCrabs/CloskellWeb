@@ -1,0 +1,34 @@
+(type LogEntry {:id String :exerciseType String :hiddenAt (Option Number)})
+(type TypeSet (Set String))
+
+(ann sample-log (Vector LogEntry))
+(def sample-log
+  [{:id "warmup" :exerciseType "LISS" :hiddenAt nil}
+   {:id "lift" :exerciseType "Strength" :hiddenAt nil}
+   {:id "hidden-lift" :exerciseType "Strength" :hiddenAt 42}
+   {:id "untyped" :exerciseType "" :hiddenAt nil}
+   {:id "jog" :exerciseType "LISS" :hiddenAt nil}])
+
+(ann visible-log (Fn [(Vector LogEntry)] (Vector LogEntry)))
+(defn visible-log [entries]
+  (filter entries (fn [entry] (not (some? entry.hiddenAt)))))
+
+(ann collect-type-set (Fn [(Vector LogEntry)] TypeSet))
+(defn collect-type-set [entries]
+  (reduce (visible-log entries)
+          (set)
+          (fn [types entry]
+            (if (= entry.exerciseType "")
+                types
+                (conj types entry.exerciseType)))))
+
+(ann sorted-exercise-types (Fn [(Vector LogEntry)] (Vector String)))
+(defn sorted-exercise-types [entries]
+  (sort-with (set-values (collect-type-set entries))
+             (fn [first second] (locale-compare first second))))
+
+(def exercise-type-set
+  (collect-type-set sample-log))
+
+(def exercise-type-options
+  (sorted-exercise-types sample-log))

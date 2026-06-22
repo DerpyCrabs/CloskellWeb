@@ -1,0 +1,38 @@
+(def init
+  {:summary {:label "Resting"
+             :value "64 bpm"}
+   :status "Idle"})
+
+(defn update [state msg]
+  (match msg
+    {:kind :refresh}
+      [{:summary {:label "Workout"
+                  :value "142 bpm"}
+        :status "Live"}
+       {:kind :none}]
+    {:kind :reset}
+      [{:summary {:label "Resting"
+                  :value "64 bpm"}
+        :status "Idle"}
+       {:kind :none}]
+    {:kind :pulse}
+      [{:summary {:label "Resting"
+                  :value "68 bpm"}
+        :status "Idle"}
+       {:kind :none}]
+    _ [state {:kind :none}]))
+
+(defn summary-card [summary]
+  #html <article data-kind="summary">
+          <strong>{summary.label}</strong>
+          <span>{summary.value}</span>
+        </article>)
+
+(defn view [state]
+  #html <section data-status={state.status}>
+          <h1>{state.status}</h1>
+          {(summary-card state.summary)}
+          <button on:click={{:kind :refresh}}>Refresh</button>
+          <button on:click={{:kind :reset}}>Reset</button>
+          <button on:click={{:kind :pulse}}>Pulse</button>
+        </section>)

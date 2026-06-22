@@ -1,0 +1,53 @@
+(type ImportedEntry
+  {:id String
+   :durationMs Number})
+
+(type ImportResult
+  (Result (Vector ImportedEntry) String))
+
+(def valid-json
+  (json-stringify
+    {:entries [{:id "warmup" :durationMs 300000}
+               {:id "intervals" :durationMs 900000}]}
+    2))
+
+(def invalid-json
+  (json-stringify {:items []} 2))
+
+(defn valid-entry? [entry]
+  (and (string? (get entry :id))
+       (number? (get entry :durationMs))))
+
+(ann parse-import (Fn [String] ImportResult))
+(defn parse-import [text]
+  (let [payload (json-parse text)
+        entries (get payload :entries)]
+    (if (and (vector? entries)
+             (every? entries valid-entry?))
+        (ok entries)
+        (err "import payload is missing valid entries"))))
+
+(ann valid-result ImportResult)
+(def valid-result
+  (parse-import valid-json))
+
+(ann invalid-result ImportResult)
+(def invalid-result
+  (parse-import invalid-json))
+
+(ann imported-count Number)
+(def imported-count
+  (count (unwrap-or valid-result [])))
+
+(ann fallback-count Number)
+(def fallback-count
+  (count (unwrap-or invalid-result [])))
+
+(ann import-message (Option String))
+(def import-message
+  (result-error invalid-result))
+
+(ann import-flags {:valid Bool :invalid Bool})
+(def import-flags
+  {:valid (ok? valid-result)
+   :invalid (err? invalid-result)})

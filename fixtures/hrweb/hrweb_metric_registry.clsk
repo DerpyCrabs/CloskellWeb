@@ -1,0 +1,34 @@
+(type Metric {:id String :label String :value Number :unit String})
+(type MetricRegistry (Map String Metric))
+
+(ann metric-registry MetricRegistry)
+(def metric-registry
+  (hash-map "zone2" {:id "zone2" :label "Zone 2" :value 50 :unit "%"}
+            "trimp" {:id "trimp" :label "TRIMP" :value 12.5 :unit "points"}))
+
+(ann select-metric (Fn [MetricRegistry String] (Option Metric)))
+(defn select-metric [registry id]
+  (map-get registry id))
+
+(ann register-metric (Fn [MetricRegistry Metric] MetricRegistry))
+(defn register-metric [registry metric]
+  (map-assoc registry metric.id metric))
+
+(ann remove-metric (Fn [MetricRegistry String] MetricRegistry))
+(defn remove-metric [registry id]
+  (map-dissoc registry id))
+
+(def expanded-registry
+  (register-metric metric-registry
+                   {:id "hrr" :label "Heart-rate recovery" :value 35 :unit "bpm"}))
+
+(def pruned-registry
+  (remove-metric expanded-registry "trimp"))
+
+(def registry-summary
+  {:map (map? metric-registry)
+   :knownZone2 (contains? metric-registry "zone2")
+   :originalCount (count metric-registry)
+   :expandedCount (count expanded-registry)
+   :prunedCount (count pruned-registry)
+   :selected (select-metric pruned-registry "hrr")})

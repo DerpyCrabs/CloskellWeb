@@ -1,0 +1,89 @@
+(type Reading {:bpm Number :time Number})
+(type Zone {:id Number :min Number :max Number})
+(type WorkoutEntry
+  {:id String
+   :startedAt Number
+   :stoppedAt Number
+   :durationMs Number
+   :readings (Vector Reading)
+   :targetZoneId Number
+   :zones (Vector Zone)})
+(type WorkoutState
+  {:status String
+   :elapsedMs Number
+   :sessionStartedAt Number
+   :pendingStoppedAt (Option Number)
+   :readings (Vector Reading)
+   :targetZoneId Number
+   :zones (Vector Zone)
+   :entries (Vector WorkoutEntry)
+   :selectedLogId (Option String)})
+(type WorkoutMsg
+  (Union {:kind :stop-requested}
+         {:kind :stopped-at :value Number}
+         {:kind :id-roll :value Number}
+         {:kind :ignored}))
+(type UpdateResult [WorkoutState (Cmd WorkoutMsg)])
+
+(ann init WorkoutState)
+(def init
+  {:status "Recording"
+   :elapsedMs 180000
+   :sessionStartedAt 1704499000000
+   :pendingStoppedAt nil
+   :readings [{:bpm 132 :time 0} {:bpm 145 :time 60000}]
+   :targetZoneId 2
+   :zones [{:id 1 :min 90 :max 119}
+           {:id 2 :min 120 :max 139}]
+   :entries []
+   :selectedLogId nil})
+
+(ann random-id-suffix (Fn [Number] String))
+(defn random-id-suffix [roll]
+  (string-slice (to-radix roll 36) 2 9))
+
+(ann workout-entry-id (Fn [Number Number] String))
+(defn workout-entry-id [stopped-at roll]
+  (str stopped-at "-" (random-id-suffix roll)))
+
+(ann workout-entry (Fn [WorkoutState Number Number] WorkoutEntry))
+(defn workout-entry [state stopped-at roll]
+  (let [started-at (if (> state.sessionStartedAt 0)
+                       state.sessionStartedAt
+                       (- stopped-at state.elapsedMs))]
+    {:id (workout-entry-id stopped-at roll)
+     :startedAt started-at
+     :stoppedAt stopped-at
+     :durationMs state.elapsedMs
+     :readings state.readings
+     :targetZoneId state.targetZoneId
+     :zones state.zones}))
+
+(ann update (Fn [WorkoutState WorkoutMsg] UpdateResult))
+(defn update [state msg]
+  (match msg
+    {:kind :stop-requested}
+      [(merge state {:status "Stopping"})
+       {:kind :time/now
+        :onSuccess :stopped-at}]
+    {:kind :stopped-at :value stopped-at}
+      [(merge state {:pendingStoppedAt stopped-at})
+       {:kind :random/number
+        :min 0
+        :max 1
+        :onSuccess :id-roll}]
+    {:kind :id-roll :value roll}
+      (let [stopped-at (if (some? state.pendingStoppedAt)
+                           state.pendingStoppedAt
+                           0)
+            entry (workout-entry state stopped-at roll)]
+        [(merge state
+                {:status "Logged"
+                 :pendingStoppedAt nil
+                 :entries (conj state.entries entry)
+                 :selectedLogId entry.id})
+         {:kind :none}])
+    _ [state {:kind :none}]))
+
+(def sample-entry-id
+  (workout-entry-id 1704499200000 0.5))

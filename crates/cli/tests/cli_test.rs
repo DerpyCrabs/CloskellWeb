@@ -1,0 +1,1075 @@
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
+
+#[test]
+fn cli_test_runs_hrweb_pure_suite() {
+    if !node_available() {
+        eprintln!("skipping closkell test integration test because node is unavailable");
+        return;
+    }
+
+    let run = Command::new(env!("CARGO_BIN_EXE_closkell"))
+        .arg("test")
+        .arg(
+            workspace_root()
+                .join("fixtures")
+                .join("hrweb")
+                .join("hrweb_test_suite.clsk"),
+        )
+        .output()
+        .expect("closkell test should run");
+
+    assert!(
+        run.status.success(),
+        "closkell test failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok 1 - formats short workout duration"),
+        "test runner did not report named tests:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("ok 7 - binds whole values with as patterns"),
+        "test runner did not report the as-pattern suite case:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("ok 9 - matches option constructors"),
+        "test runner did not report the option-pattern suite case:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("ok 10 - matches fixed list patterns"),
+        "test runner did not report the list-pattern suite case:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("ok 11 - matches cons list patterns"),
+        "test runner did not report the cons-pattern suite case:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("ok 12 - destructures let binding patterns"),
+        "test runner did not report the let-destructuring suite case:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("ok 13 - destructures fn parameter patterns"),
+        "test runner did not report the fn-parameter destructuring suite case:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("ok 14 - destructures defn parameter patterns"),
+        "test runner did not report the defn-parameter destructuring suite case:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("ok 14 tests"),
+        "test runner did not report a passing summary:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn cli_test_runs_explicit_gensym_macro_suite() {
+    if !node_available() {
+        eprintln!("skipping closkell gensym macro integration test because node is unavailable");
+        return;
+    }
+
+    let run = Command::new(env!("CARGO_BIN_EXE_closkell"))
+        .arg("test")
+        .arg(
+            workspace_root()
+                .join("fixtures")
+                .join("hrweb")
+                .join("hrweb_gensym_macro.clsk"),
+        )
+        .output()
+        .expect("closkell test should run");
+
+    assert!(
+        run.status.success(),
+        "closkell test failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok 1 - explicit gensym macro reuses fresh binding"),
+        "test runner did not report the gensym macro test:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("ok 2 - with-gensyms macro binds multiple fresh symbols"),
+        "test runner did not report the with-gensyms macro test:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("ok 2 tests"),
+        "test runner did not report a passing summary:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn cli_test_runs_list_ops_suite() {
+    if !node_available() {
+        eprintln!("skipping closkell list ops integration test because node is unavailable");
+        return;
+    }
+
+    let run = Command::new(env!("CARGO_BIN_EXE_closkell"))
+        .arg("test")
+        .arg(
+            workspace_root()
+                .join("fixtures")
+                .join("hrweb")
+                .join("hrweb_list_ops.clsk"),
+        )
+        .output()
+        .expect("closkell test should run");
+
+    assert!(
+        run.status.success(),
+        "closkell list ops test failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("ok 1 - constructs persistent lists") && stdout.contains("ok 3 tests"),
+        "test runner did not report the list ops suite:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn cli_test_reports_failing_module_test() {
+    if !node_available() {
+        eprintln!("skipping closkell test failure integration test because node is unavailable");
+        return;
+    }
+
+    let temp_dir = temp_dir("closkell-cli-test-fail");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+    let source = temp_dir.join("failing.clsk");
+    fs::write(
+        &source,
+        "(def tests\n  [{:name \"detects mismatch\"\n    :actual (+ 1 1)\n    :expected 3}])\n",
+    )
+    .expect("failing test module should be written");
+
+    let run = Command::new(env!("CARGO_BIN_EXE_closkell"))
+        .arg("test")
+        .arg(&source)
+        .output()
+        .expect("closkell test should run");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+
+    assert!(
+        !run.status.success(),
+        "closkell test unexpectedly passed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let output = combined_output(&run.stdout, &run.stderr);
+    assert!(
+        output.contains("not ok 1 - detects mismatch"),
+        "test runner did not report the failing test:\n{}",
+        output
+    );
+    assert!(
+        output.contains("expected 3") && output.contains("actual   2"),
+        "test runner did not show expected and actual values:\n{}",
+        output
+    );
+}
+
+#[test]
+fn cli_test_requires_tests_export() {
+    if !node_available() {
+        eprintln!(
+            "skipping closkell test missing-export integration test because node is unavailable"
+        );
+        return;
+    }
+
+    let temp_dir = temp_dir("closkell-cli-test-missing-export");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+    let source = temp_dir.join("missing.clsk");
+    fs::write(&source, "(def answer 42)\n").expect("test module should be written");
+
+    let run = Command::new(env!("CARGO_BIN_EXE_closkell"))
+        .arg("test")
+        .arg(&source)
+        .output()
+        .expect("closkell test should run");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+
+    assert!(
+        !run.status.success(),
+        "closkell test unexpectedly passed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let output = combined_output(&run.stdout, &run.stderr);
+    assert!(
+        output.contains("expected module to export `tests`"),
+        "test runner did not explain the missing tests export:\n{}",
+        output
+    );
+}
+
+#[test]
+fn cli_check_rejects_browser_api_access_inside_html() {
+    let temp_dir = temp_dir("closkell-cli-check-html-browser-api");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+    let source = temp_dir.join("bad-view.clsk");
+    fs::write(
+        &source,
+        "(defn view [state]\n  #html <button on:click={(fetch \"/api/workouts\")}>{document.title}</button>)\n",
+    )
+    .expect("bad html module should be written");
+
+    let run = Command::new(env!("CARGO_BIN_EXE_closkell"))
+        .arg("check")
+        .arg(&source)
+        .output()
+        .expect("closkell check should run");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+
+    assert!(
+        !run.status.success(),
+        "closkell check unexpectedly passed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let output = combined_output(&run.stdout, &run.stderr);
+    assert!(
+        output.contains("fetch") && output.contains("document.title"),
+        "check did not report browser API access in html expressions:\n{}",
+        output
+    );
+}
+
+#[test]
+fn cli_check_is_quiet_on_success_by_default() {
+    let temp_dir = temp_dir("closkell-cli-check-quiet");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+    let source = temp_dir.join("app.clsk");
+    fs::write(
+        &source,
+        "(def answer 42)\n(defn view [state] #html <p>{state.label}</p>)\n",
+    )
+    .expect("source module should be written");
+
+    let run = Command::new(env!("CARGO_BIN_EXE_closkell"))
+        .arg("check")
+        .arg(&source)
+        .output()
+        .expect("closkell check should run");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+
+    assert!(
+        run.status.success(),
+        "closkell check failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).trim().is_empty(),
+        "successful check should not dump inferred forms by default:\n{}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+}
+
+#[test]
+fn cli_check_types_flag_prints_inferred_forms_and_templates() {
+    let temp_dir = temp_dir("closkell-cli-check-types");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+    let source = temp_dir.join("app.clsk");
+    fs::write(
+        &source,
+        "(def answer 42)\n(defn view [state] #html <p>{state.label}</p>)\n",
+    )
+    .expect("source module should be written");
+
+    let run = Command::new(env!("CARGO_BIN_EXE_closkell"))
+        .arg("check")
+        .arg("--types")
+        .arg(&source)
+        .output()
+        .expect("closkell check --types should run");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+
+    assert!(
+        run.status.success(),
+        "closkell check --types failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("(def answer 42) : Number")
+            && stdout.contains("(defn view [state]")
+            && stdout.contains("Html")
+            && stdout.contains("templates: 1"),
+        "check --types did not print inferred forms and template count:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn cli_build_writes_source_maps_for_entry_and_imports() {
+    let temp_dir = temp_dir("closkell-cli-build-sourcemap");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+
+    let dep = temp_dir.join("dep.clsk");
+    let app = temp_dir.join("app.clsk");
+    let output = temp_dir.join("dist").join("app.mjs");
+    let dep_output = temp_dir.join("dist").join("dep.mjs");
+    let app_map = temp_dir.join("dist").join("app.mjs.map");
+    let dep_map = temp_dir.join("dist").join("dep.mjs.map");
+
+    fs::write(&dep, "(def value 41)\n").expect("dependency should be written");
+    fs::write(
+        &app,
+        "(import \"./dep.clsk\" [value])\n(def answer (+ value 1))\n",
+    )
+    .expect("app should be written");
+
+    let run = Command::new(env!("CARGO_BIN_EXE_closkell"))
+        .arg("build")
+        .arg(&app)
+        .arg("--out")
+        .arg(&output)
+        .arg("--sourcemap")
+        .output()
+        .expect("closkell build should run");
+
+    assert!(
+        run.status.success(),
+        "closkell build --sourcemap failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let app_js = fs::read_to_string(&output).expect("entry JS should be readable");
+    let dep_js = fs::read_to_string(&dep_output).expect("imported JS should be readable");
+    assert!(app_js.contains("//# sourceMappingURL=app.mjs.map"));
+    assert!(dep_js.contains("//# sourceMappingURL=dep.mjs.map"));
+
+    let app_map = fs::read_to_string(&app_map).expect("entry source map should be readable");
+    let dep_map = fs::read_to_string(&dep_map).expect("imported source map should be readable");
+    assert!(app_map.contains("\"version\": 3"));
+    assert!(app_map.contains("\"file\": \"app.mjs\""));
+    assert!(app_map.contains("app.clsk"));
+    assert!(app_map.contains("(def answer (+ value 1))"));
+    assert!(app_map.contains("\"mappings\":"));
+    assert!(dep_map.contains("\"file\": \"dep.mjs\""));
+    assert!(dep_map.contains("dep.clsk"));
+    assert!(dep_map.contains("(def value 41)"));
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn cli_build_expands_imported_macros_and_erases_macro_imports() {
+    if !node_available() {
+        eprintln!("skipping imported macro build integration test because node is unavailable");
+        return;
+    }
+
+    let temp_dir = temp_dir("closkell-cli-build-imported-macros");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+
+    let macros = temp_dir.join("macros.clsk");
+    let app = temp_dir.join("app.clsk");
+    let output = temp_dir.join("dist").join("app.mjs");
+    let macro_output = temp_dir.join("dist").join("macros.mjs");
+
+    fs::write(
+        &macros,
+        "(defmacro cmd-none [] `{:kind :none})\n\
+         (defmacro with-reading-temp [value]\n  (let [tmp (gensym \"reading\")]\n    `(let [~tmp ~value]\n       {:bpm ~tmp\n        :label (str \"HR \" ~tmp)})))\n",
+    )
+    .expect("macro module should be written");
+    fs::write(
+        &app,
+        "(import \"./macros.clsk\" [cmd-none with-reading-temp])\n\
+         (def reading-summary (with-reading-temp 142))\n\
+         (defn update [state msg]\n  [state (cmd-none)])\n",
+    )
+    .expect("app module should be written");
+
+    let run = Command::new(env!("CARGO_BIN_EXE_closkell"))
+        .arg("build")
+        .arg(&app)
+        .arg("--out")
+        .arg(&output)
+        .output()
+        .expect("closkell build should run");
+
+    assert!(
+        run.status.success(),
+        "closkell build failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let app_js = fs::read_to_string(&output).expect("app JS should be readable");
+    assert!(
+        !app_js.contains("macros.mjs"),
+        "macro-only import survived in emitted JS:\n{}",
+        app_js
+    );
+    assert!(
+        !macro_output.exists(),
+        "macro-only module output should not be written"
+    );
+    assert!(app_js.contains("reading__gensym0"));
+
+    let script = format!(
+        r#"
+const mod = await import(fileUrl({module_path}));
+if (mod.reading_summary.bpm !== 142) throw new Error("imported gensym macro did not expand reading bpm");
+if (mod.reading_summary.label !== "HR 142") throw new Error("imported gensym macro did not reuse the fresh binding");
+const [, command] = mod.update({{}}, Symbol.for("noop"));
+if (command.kind !== Symbol.for("none")) throw new Error("imported cmd-none macro did not expand");
+
+function fileUrl(path) {{
+  return "file:///" + path.replace(/\\/g, "/").replace(/^([A-Za-z]):/, "$1:");
+}}
+"#,
+        module_path = json_string_for_test(&output.display().to_string())
+    );
+    let node = Command::new("node")
+        .arg("--input-type=module")
+        .arg("--eval")
+        .arg(script)
+        .output()
+        .expect("node should run");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+
+    assert!(
+        node.status.success(),
+        "generated imported-macro module failed under Node\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&node.stdout),
+        String::from_utf8_lossy(&node.stderr)
+    );
+}
+
+#[test]
+fn cli_build_erases_type_only_imports_across_modules() {
+    let temp_dir = temp_dir("closkell-cli-build-type-only-imports");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+
+    let model = temp_dir.join("model.clsk");
+    let helper = temp_dir.join("helper.clsk");
+    let app = temp_dir.join("app.clsk");
+    let output = temp_dir.join("dist").join("app.mjs");
+    let helper_output = temp_dir.join("dist").join("helper.mjs");
+    let model_output = temp_dir.join("dist").join("model.mjs");
+    let model_map = temp_dir.join("dist").join("model.mjs.map");
+
+    fs::write(
+        &model,
+        "(type Reading\n  {:bpm Number\n   :label String})\n\
+         \n\
+         (type Readout\n  {:latest Reading\n   :summary String})\n",
+    )
+    .expect("model module should be written");
+    fs::write(
+        &helper,
+        "(import \"./model.clsk\" [Reading])\n\
+         \n\
+         (ann format-reading (Fn [Reading] String))\n\
+         (defn format-reading [reading]\n  (str reading.label \" \" reading.bpm))\n",
+    )
+    .expect("helper module should be written");
+    fs::write(
+        &app,
+        "(import \"./model.clsk\" [Reading Readout])\n\
+         (import \"./helper.clsk\" [format-reading])\n\
+         \n\
+         (ann sample-reading Reading)\n\
+         (def sample-reading {:bpm 142 :label \"Tempo\"})\n\
+         \n\
+         (ann sample-readout Readout)\n\
+         (def sample-readout\n  {:latest sample-reading\n   :summary (format-reading sample-reading)})\n",
+    )
+    .expect("app module should be written");
+    fs::create_dir_all(temp_dir.join("dist")).expect("dist dir should be created");
+    fs::write(&model_output, "stale model js").expect("stale model output should be written");
+    fs::write(&model_map, "stale model map").expect("stale model map should be written");
+
+    let run = Command::new(env!("CARGO_BIN_EXE_closkell"))
+        .arg("build")
+        .arg(&app)
+        .arg("--out")
+        .arg(&output)
+        .arg("--sourcemap")
+        .output()
+        .expect("closkell build should run");
+
+    assert!(
+        run.status.success(),
+        "closkell build failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let app_js = fs::read_to_string(&output).expect("entry JS should be readable");
+    let helper_js = fs::read_to_string(&helper_output).expect("helper JS should be readable");
+    assert!(
+        app_js.contains("import { format_reading } from \"./helper.mjs\";"),
+        "entry JS did not keep the runtime helper import:\n{}",
+        app_js
+    );
+    assert!(
+        !app_js.contains("model.mjs"),
+        "entry JS kept a type-only model import:\n{}",
+        app_js
+    );
+    assert!(
+        !helper_js.contains("model.mjs"),
+        "helper JS kept a type-only model import:\n{}",
+        helper_js
+    );
+    assert!(
+        !model_output.exists(),
+        "type-only model output was not removed"
+    );
+    assert!(
+        !model_map.exists(),
+        "type-only model source map was not removed"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn cli_build_app_writes_vite_entry_bootstrap() {
+    let temp_dir = temp_dir("closkell-cli-build-app");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+
+    let app = temp_dir.join("app.clsk");
+    let package_json = temp_dir.join("package.json");
+    let output = temp_dir.join("dist").join("main.mjs");
+    let app_map = temp_dir.join("dist").join("main.mjs.map");
+    let runtime_package = temp_dir
+        .join("node_modules")
+        .join("@closkell")
+        .join("runtime")
+        .join("package.json");
+    let runtime_entry = temp_dir
+        .join("node_modules")
+        .join("@closkell")
+        .join("runtime")
+        .join("src")
+        .join("index.js");
+
+    fs::write(&package_json, "{\"type\":\"module\"}\n").expect("package.json should be written");
+    fs::write(
+        &app,
+        "(def init {:count 0})\n\
+         (defn update [state msg] [state {:kind :none}])\n\
+         (def card-class \"rounded\")\n\
+         (defn view [state]\n  #html <button class={card-class} on:click={{:kind :tick}}>{state.count}</button>)\n",
+    )
+    .expect("app source should be written");
+
+    let run = Command::new(env!("CARGO_BIN_EXE_closkell"))
+        .arg("build")
+        .arg(&app)
+        .arg("--out")
+        .arg(&output)
+        .arg("--app")
+        .arg("--root")
+        .arg("app")
+        .arg("--css")
+        .arg("./styles.css")
+        .arg("--vendor-runtime")
+        .arg("--sourcemap")
+        .output()
+        .expect("closkell build --app should run");
+
+    assert!(
+        run.status.success(),
+        "closkell build --app failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let app_js = fs::read_to_string(&output).expect("app entry JS should be readable");
+    assert!(
+        app_js.starts_with(
+            "import { createCommandHandlers as __closkellCreateCommandHandlers, createDevtoolsOverlay as __closkellCreateDevtoolsOverlay, startApp as __closkellStartApp } from \"@closkell/runtime\";"
+        ),
+        "app bootstrap did not import the runtime first:\n{}",
+        app_js
+    );
+    assert!(app_js.contains("import \"./styles.css\";"));
+    assert!(app_js.contains("document.getElementById(\"app\")"));
+    assert!(app_js.contains("export const __closkellApp = __closkellStartApp({"));
+    assert!(app_js.contains("handlers: __closkellCreateCommandHandlers()"));
+    assert!(
+        app_js.contains("__closkellCreateDevtoolsOverlay(globalThis.__closkellDevtoolsOverlay)")
+    );
+    assert!(app_js.contains("globalThis.__closkellDevtoolsOverlayInstance = __closkellDevtools"));
+    assert!(app_js.contains("devtools: __closkellDevtools"));
+    assert!(app_js.contains("//# sourceMappingURL=main.mjs.map"));
+    let card_class_index = app_js
+        .find("export const card_class")
+        .expect("class constant should be emitted");
+    let app_start_index = app_js
+        .find("export const __closkellApp")
+        .expect("app start should be emitted");
+    assert!(
+        card_class_index < app_start_index,
+        "app startup should run after generated constants:\n{}",
+        app_js
+    );
+
+    let app_map = fs::read_to_string(&app_map).expect("app source map should be readable");
+    assert!(app_map.contains("\"file\": \"main.mjs\""));
+    assert!(app_map.contains("app.clsk"));
+    assert!(app_map.contains("(defn view [state]"));
+    assert!(
+        runtime_package.is_file(),
+        "runtime package was not vendored"
+    );
+    let runtime_package =
+        fs::read_to_string(&runtime_package).expect("runtime package should be readable");
+    assert!(runtime_package.contains("\"name\": \"@closkell/runtime\""));
+    assert!(runtime_entry.is_file(), "runtime entry was not vendored");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn cli_build_app_requires_app_exports() {
+    let temp_dir = temp_dir("closkell-cli-build-app-missing-exports");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+
+    let app = temp_dir.join("app.clsk");
+    let output = temp_dir.join("dist").join("main.mjs");
+    fs::write(&app, "(def init {:count 0})\n").expect("app source should be written");
+
+    let run = Command::new(env!("CARGO_BIN_EXE_closkell"))
+        .arg("build")
+        .arg(&app)
+        .arg("--out")
+        .arg(&output)
+        .arg("--app")
+        .output()
+        .expect("closkell build --app should run");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+
+    assert!(
+        !run.status.success(),
+        "closkell build --app unexpectedly passed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let output = combined_output(&run.stdout, &run.stderr);
+    assert!(
+        output.contains("build --app expects") && output.contains("missing update, view"),
+        "missing app exports were not reported clearly:\n{}",
+        output
+    );
+}
+
+#[test]
+fn cli_inspect_reports_api_type_declarations() {
+    let inspect = Command::new(env!("CARGO_BIN_EXE_closkell"))
+        .arg("inspect")
+        .arg(
+            workspace_root()
+                .join("fixtures")
+                .join("hrweb")
+                .join("hrweb_api_types.clsk"),
+        )
+        .output()
+        .expect("closkell inspect should run");
+
+    assert!(
+        inspect.status.success(),
+        "closkell inspect failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&inspect.stdout),
+        String::from_utf8_lossy(&inspect.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&inspect.stdout);
+    assert!(
+        stdout.contains("\"types\":"),
+        "inspect did not include type declarations:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("\"annotations\":"),
+        "inspect did not include type annotations:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("\"name\":\"WorkoutMsg\""),
+        "inspect did not report WorkoutMsg:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("(Union {:kind :start} {:kind :pause}"),
+        "inspect did not render the tagged union schema:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("\"name\":\"UpdateResult\"")
+            && stdout.contains("[WorkoutState (Cmd WorkoutMsg)]"),
+        "inspect did not report the update result type:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("\"name\":\"reading-label\"")
+            && stdout.contains("(Fn [HeartReading] String)"),
+        "inspect did not report the reading-label annotation:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("\"name\":\"api-type-count\"") && stdout.contains("\"schema\":\"Number\""),
+        "inspect did not report the api-type-count annotation:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("\"name\":\"api-update\"")
+            && stdout.contains("(Fn [WorkoutState WorkoutMsg] UpdateResult)"),
+        "inspect did not report the api-update Cmd annotation:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn cli_inspect_includes_imported_command_helper_schema() {
+    let temp_dir = temp_dir("closkell-cli-inspect-imported-commands");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+
+    let commands = temp_dir.join("commands.clsk");
+    fs::write(
+        &commands,
+        "(type ChartMsg (Union {:kind :drawn}))\n\
+         (defn canvas-command []\n  {:kind :canvas/draw\n   :ref \"chart\"\n   :ops [{:op :clear}]\n   :msg {:kind :drawn}})\n\
+         (ann chart-command (Fn [] (Cmd ChartMsg)))\n\
+         (defn chart-command []\n  {:kind :batch\n   :commands [(canvas-command)]})\n",
+    )
+    .expect("command module should be written");
+
+    let app = temp_dir.join("app.clsk");
+    fs::write(
+        &app,
+        "(import \"./commands.clsk\" [chart-command])\n\
+         (def init {:ready true})\n\
+         (defn update [state msg]\n  [state (chart-command)])\n\
+         (defn view [state]\n  #html <button>{state.ready}</button>)\n",
+    )
+    .expect("app module should be written");
+
+    let inspect = Command::new(env!("CARGO_BIN_EXE_closkell"))
+        .arg("inspect")
+        .arg(&app)
+        .output()
+        .expect("closkell inspect should run");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+
+    assert!(
+        inspect.status.success(),
+        "closkell inspect failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&inspect.stdout),
+        String::from_utf8_lossy(&inspect.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&inspect.stdout);
+    assert!(
+        stdout.contains("\"kind\":\"batch\",\"fields\":[\"commands\",\"kind\"]"),
+        "inspect did not include the imported batch command shape:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("\"kind\":\"canvas/draw\",\"fields\":[\"kind\",\"msg\",\"ops\",\"ref\"]"),
+        "inspect did not follow the imported command helper to canvas/draw:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn cli_inspect_includes_imported_match_command_helper_schema() {
+    let temp_dir = temp_dir("closkell-cli-inspect-imported-match-commands");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+
+    let commands = temp_dir.join("commands.clsk");
+    fs::write(
+        &commands,
+        "(type ChartMsg (Union {:kind :drawn}))\n\
+         (type ChartState {:live Bool})\n\
+         (ann chart-command (Fn [ChartState] (Cmd ChartMsg)))\n\
+         (defn chart-command [state]\n  (match state.live\n    true {:kind :canvas/draw\n          :ref \"chart\"\n          :ops [{:op :clear}]\n          :msg {:kind :drawn}}\n    _ {:kind :timer/cancel\n       :id \"chart-redraw\"}))\n",
+    )
+    .expect("command module should be written");
+
+    let app = temp_dir.join("app.clsk");
+    fs::write(
+        &app,
+        "(import \"./commands.clsk\" [chart-command])\n\
+         (def init {:live true})\n\
+         (defn update [state msg]\n  [state {:kind :batch\n          :commands [(chart-command state)]}])\n\
+         (defn view [state]\n  #html <button>{state.live}</button>)\n",
+    )
+    .expect("app module should be written");
+
+    let inspect = Command::new(env!("CARGO_BIN_EXE_closkell"))
+        .arg("inspect")
+        .arg(&app)
+        .output()
+        .expect("closkell inspect should run");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+
+    assert!(
+        inspect.status.success(),
+        "closkell inspect failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&inspect.stdout),
+        String::from_utf8_lossy(&inspect.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&inspect.stdout);
+    assert!(
+        stdout.contains("\"kind\":\"batch\",\"fields\":[\"commands\",\"kind\"]"),
+        "inspect did not include the update batch command shape:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("\"kind\":\"canvas/draw\",\"fields\":[\"kind\",\"msg\",\"ops\",\"ref\"],\"sources\":[\"chart-command\"]"),
+        "inspect did not follow the imported match helper to canvas/draw:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains(
+            "\"kind\":\"timer/cancel\",\"fields\":[\"id\",\"kind\"],\"sources\":[\"chart-command\"]"
+        ),
+        "inspect did not include the alternate match branch command:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn cli_inspect_reports_hrweb_wrapped_panes_and_source_reads() {
+    let inspect = Command::new(env!("CARGO_BIN_EXE_closkell"))
+        .arg("inspect")
+        .arg(workspace_root().join("hrweb").join("src").join("app.clsk"))
+        .output()
+        .expect("closkell inspect should run");
+
+    assert!(
+        inspect.status.success(),
+        "closkell inspect failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&inspect.stdout),
+        String::from_utf8_lossy(&inspect.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&inspect.stdout);
+    for component in ["live-pane", "log-pane", "metrics-pane"] {
+        assert!(
+            stdout.contains(&format!("\"name\":{}", json_string_for_test(component))),
+            "inspect did not include wrapped HRWeb pane `{}`:\n{}",
+            component,
+            stdout
+        );
+    }
+    assert!(
+        stdout.contains(
+            "\"component\":\"detail-pane\",\"uses\":[\"live-pane\",\"log-pane\",\"metrics-pane\"]"
+        ),
+        "inspect did not report detail-pane branch component dependencies:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("\"path\":\"state.readings\"")
+            && stdout.contains("\"template\":\"summary-stat-grid\""),
+        "inspect did not map summary stat derived reads back to state.readings:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("\"path\":\"state.entries\"")
+            && stdout.contains("\"template\":\"log-pane\""),
+        "inspect did not map log-pane derived reads back to state.entries:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("\"expr\":\"(latest-bpm-label state)\",\"reads\":[\"state.latestBpm\"]"),
+        "inspect did not project the live-pane helper read to state.latestBpm:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("\"expr\":\"(monitor-status-label state)\",\"reads\":[\"state.appStatus\",\"state.connected?\",\"state.simulated?\",\"state.statusMode\"]"),
+        "inspect did not project the connection helper reads to precise state paths:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains(
+            "\"expr\":\"(tab-class state view)\",\"reads\":[\"state.detailView\",\"view\"]"
+        ),
+        "inspect did not project tab component reads through parameters:\n{}",
+        stdout
+    );
+    assert!(
+        !stdout.contains("\"summary.avg\"")
+            && !stdout.contains("\"summary.zones\"")
+            && !stdout.contains("\"summary.trimp\"")
+            && !stdout.contains("\"summary.hrr\""),
+        "inspect leaked local summary bindings into HRWeb state reads:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("\"name\":\"AppMsg\"") && stdout.contains(":monitor-connected"),
+        "inspect did not report the HRWeb message union:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("\"name\":\"UpdateResult\"") && stdout.contains("[AppState (Cmd AppMsg)]"),
+        "inspect did not report the HRWeb update result type:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("\"name\":\"update\"")
+            && stdout.contains("(Fn [AppState AppMsg] UpdateResult)"),
+        "inspect did not report the HRWeb update annotation:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("\"name\":\"startup-command\"")
+            && stdout.contains("(Fn [Bool] (Cmd AppMsg))"),
+        "inspect did not report the HRWeb startup command annotation:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("\"kind\":\"storage/get\",\"fields\":[\"format\",\"key\",\"kind\",\"onError\",\"toMessage\"],\"sources\":[\"startup-command\"]"),
+        "inspect did not report command schema source for startup storage load:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("\"kind\":\"canvas/draw\"")
+            && stdout.contains(
+                "\"sources\":[\"heart-chart-batch\",\"heart-chart-command\",\"metric-chart-batch\",\"metric-chart-command\"]"
+            ),
+        "inspect did not preserve imported chart command sources:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("\"kind\":\"dom-ref/resize-watch\"")
+            && stdout.contains("\"sources\":[\"heart-chart-batch\",\"metric-chart-batch\"]"),
+        "inspect did not preserve imported chart resize sources:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn cli_inspect_reports_detail_tabs_alias_reads_without_broad_state() {
+    let inspect = Command::new(env!("CARGO_BIN_EXE_closkell"))
+        .arg("inspect")
+        .arg(
+            workspace_root()
+                .join("fixtures")
+                .join("hrweb")
+                .join("hrweb_detail_tabs_app.clsk"),
+        )
+        .output()
+        .expect("closkell inspect should run");
+
+    assert!(
+        inspect.status.success(),
+        "closkell inspect failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&inspect.stdout),
+        String::from_utf8_lossy(&inspect.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&inspect.stdout);
+    assert!(
+        !stdout.contains("\"path\":\"state\""),
+        "inspect should not collapse detail-tabs aliases to broad state reads:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("\"expr\":\"(count readings)\",\"reads\":[\"state.detailView\",\"state.entries\",\"state.readings\",\"state.selectedLogId\"]"),
+        "inspect did not project readings alias through display-readings:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("\"path\":\"state.entries\",\"slots\"")
+            && stdout.contains("\"template\":\"view\",\"slot\":2,\"node\":0,\"kind\":{\"attr\":\"data-readings\"},\"expr\":\"(count readings)\",\"reads\":[\"state.detailView\",\"state.entries\",\"state.readings\",\"state.selectedLogId\"]"),
+        "statePathToSlots did not include expression/read details for the readings alias:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains(
+            "\"expr\":\"selected-label\",\"reads\":[\"state.entries\",\"state.selectedLogId\"]"
+        ),
+        "inspect did not project selected-label alias through selected-log-label:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("\"expr\":\"(stat-tile \\\"Time\\\" stats.duration)\",\"reads\":[\"state.detailView\",\"state.entries\",\"state.liveStats\",\"state.selectedLogId\"]"),
+        "inspect did not project stats alias through display-stats:\n{}",
+        stdout
+    );
+}
+
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
+}
+
+fn temp_dir(name: &str) -> PathBuf {
+    env::temp_dir().join(format!("{}-{}", name, std::process::id()))
+}
+
+fn node_available() -> bool {
+    Command::new("node").arg("--version").output().is_ok()
+}
+
+fn combined_output(stdout: &[u8], stderr: &[u8]) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(stdout),
+        String::from_utf8_lossy(stderr)
+    )
+}
+
+fn json_string_for_test(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}

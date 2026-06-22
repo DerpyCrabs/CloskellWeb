@@ -1,0 +1,31 @@
+(defn init []
+  [{:mobile? false
+    :label "Desktop"
+    :watching? true}
+   {:kind :media-query/watch
+    :id "mobile"
+    :query "(max-width: 700px)"
+    :onChange :media-changed}])
+
+(defn update [state msg]
+  (match msg
+    {:kind :media-changed :matches matches}
+      [{:mobile? matches
+        :label (if matches "Mobile" "Desktop")
+        :watching? state.watching?}
+       {:kind :none}]
+    {:kind :stop}
+      [{:mobile? state.mobile?
+        :label state.label
+        :watching? false}
+       {:kind :media-query/unwatch
+        :id "mobile"
+        :msg :stopped}]
+    _ [state {:kind :none}]))
+
+(defn view [state]
+  #html <section data-mobile={state.mobile?}
+                 data-watching={state.watching?}>
+          <strong>{state.label}</strong>
+          <button on:click={{:kind :stop}}>Stop watching</button>
+        </section>)

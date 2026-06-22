@@ -1,0 +1,4 @@
+(defn status-view [state]
+  #html <button class={state.buttonClass}
+                disabled={not state.connected?}
+                on:click={:start}>{state.label}</button>)

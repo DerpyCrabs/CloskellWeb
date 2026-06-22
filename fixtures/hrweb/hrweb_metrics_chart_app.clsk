@@ -1,0 +1,397 @@
+(def pi 3.14159265)
+
+(def empty-canvas-op
+  {:op :none
+   :x 0
+   :y 0
+   :width 0
+   :height 0
+   :radius 0
+   :start 0
+   :end 0
+   :lineWidth 0
+   :strokeStyle ""
+   :fillStyle ""
+   :font ""
+   :text ""
+   :textAlign ""
+   :textBaseline ""
+   :lineCap ""
+   :lineJoin ""})
+
+(defn canvas-op [fields]
+  (merge empty-canvas-op fields))
+
+(def trend-layout
+  {:width 360
+   :height 180
+   :left 34
+   :right 10
+   :top 16
+   :bottom 140
+   :yMin 0
+   :yMax 100})
+
+(def bar-layout
+  {:width 360
+   :height 180
+   :left 22
+   :right 10
+   :top 16
+   :bottom 140})
+
+(def sample-trend-points
+  [{:label "Jan 1-7" :value 40 :timestamp 1704067200000}
+   {:label "Jan 8-14" :value 70 :timestamp 1704672000000}
+   {:label "Jan 15-21" :value 55 :timestamp 1705276800000}])
+
+(def sample-bar-points
+  [{:label "Jan 3" :value 2.5 :timestamp 1704240000000 :labelWidth 30}
+   {:label "Jan 10" :value 4.0 :timestamp 1704844800000 :labelWidth 36}
+   {:label "Jan 17" :value 3.2 :timestamp 1705449600000 :labelWidth 36}])
+
+(defn plot-width [layout]
+  (- (- layout.width layout.left) layout.right))
+
+(defn plot-height [layout]
+  (- layout.bottom layout.top))
+
+(defn plot-right [layout]
+  (+ layout.left (plot-width layout)))
+
+(defn x-for-index [layout point-count index]
+  (+ layout.left
+     (if (= point-count 1)
+         (/ (plot-width layout) 2)
+         (* (/ index (- point-count 1)) (plot-width layout)))))
+
+(defn y-for-value [layout value]
+  (- layout.bottom
+     (* (/ (- value layout.yMin)
+           (max 1 (- layout.yMax layout.yMin)))
+        (plot-height layout))))
+
+(defn axis-value [layout index]
+  (- layout.yMax
+     (* (/ index 4)
+        (- layout.yMax layout.yMin))))
+
+(defn axis-y [layout index]
+  (+ layout.top (* (/ index 4) (plot-height layout))))
+
+(defn visible-label-indices [count step]
+  (filter (range 0 count)
+          (fn [index]
+            (or (= (mod index step) 0)
+                (= index (- count 1))))))
+
+(defn edge-label-align [visible-index visible-count]
+  (if (and (= visible-index 0)
+           (= visible-count 1))
+      "center"
+      (if (= visible-index 0)
+          "left"
+          (if (= visible-index (- visible-count 1))
+              "right"
+              "center"))))
+
+(defn edge-label-x [visible-index visible-count left right ideal-x]
+  (if (and (= visible-index 0)
+           (= visible-count 1))
+      (/ (+ left right) 2)
+      (if (= visible-index 0)
+          left
+          (if (= visible-index (- visible-count 1))
+              right
+              ideal-x))))
+
+(defn clamp [low value high]
+  (max low (min high value)))
+
+(defn append-trend-grid-ops [ops layout index]
+  (let [y (axis-y layout index)
+        value (axis-value layout index)]
+    (conj ops
+          (canvas-op {:op :begin-path})
+          (canvas-op {:op :move-to :x layout.left :y y})
+          (canvas-op {:op :line-to :x (plot-right layout) :y y})
+          (canvas-op {:op :stroke :strokeStyle "#e5ebe6" :lineWidth 1})
+          (canvas-op {:op :fill-text
+                      :text (str (round value) "%")
+                      :x (- layout.left 6)
+                      :y y
+                      :fillStyle "#617066"
+                      :font "600 10px system-ui"
+                      :textAlign "right"
+                      :textBaseline "middle"}))))
+
+(defn trend-background-ops [layout]
+  (reduce (range 0 5)
+          [(canvas-op {:op :clear})
+           (canvas-op {:op :fill-rect
+                       :x 0
+                       :y 0
+                       :width layout.width
+                       :height layout.height
+                       :fillStyle "#fffdfa"})]
+          (fn [ops index] (append-trend-grid-ops ops layout index))))
+
+(defn append-trend-path-point [layout point-count ops point index]
+  (let [x (x-for-index layout point-count index)
+        y (y-for-value layout point.value)]
+    (conj ops
+          (if (= index 0)
+              (canvas-op {:op :move-to :x x :y y})
+              (canvas-op {:op :line-to :x x :y y})))))
+
+(defn append-trend-line-ops [ops layout points color]
+  (if (> (count points) 1)
+      (conj (reduce-indexed points
+               (conj ops (canvas-op {:op :begin-path}))
+               (fn [line-ops point index]
+                 (append-trend-path-point layout (count points) line-ops point index)))
+            (canvas-op {:op :stroke
+                        :strokeStyle color
+                        :lineWidth 3
+                        :lineCap "round"
+                        :lineJoin "round"}))
+      ops))
+
+(defn append-trend-dot-ops [ops layout points color]
+  (reduce-indexed points
+    ops
+    (fn [dot-ops point index]
+      (conj dot-ops
+            (canvas-op {:op :begin-path})
+            (canvas-op {:op :arc
+                        :x (x-for-index layout (count points) index)
+                        :y (y-for-value layout point.value)
+                        :radius 4
+                        :start 0
+                        :end (* 2 pi)})
+            (canvas-op {:op :fill
+                        :fillStyle color})))))
+
+(defn label-step [count limit]
+  (if (> count limit)
+      (ceil (/ count (- limit 2)))
+      1))
+
+(defn append-trend-label-ops [ops layout points]
+  (let [indices (visible-label-indices (count points) (label-step (count points) 8))]
+    (reduce-indexed indices
+      ops
+      (fn [label-ops point-index visible-index]
+        (let [point (nth points point-index)
+              ideal-x (x-for-index layout (count points) point-index)]
+          (conj label-ops
+                (canvas-op {:op :fill-text
+                            :text point.label
+                            :x (edge-label-x visible-index
+                                             (count indices)
+                                             layout.left
+                                             (plot-right layout)
+                                             ideal-x)
+                            :y (+ layout.bottom 10)
+                            :fillStyle "#617066"
+                            :font "600 12px system-ui"
+                            :textAlign (edge-label-align visible-index (count indices))
+                            :textBaseline "top"})))))))
+
+(defn empty-chart-ops [layout]
+  [(canvas-op {:op :clear})
+   (canvas-op {:op :fill-rect
+               :x 0
+               :y 0
+               :width layout.width
+               :height layout.height
+               :fillStyle "#fffdfa"})
+   (canvas-op {:op :fill-text
+               :text "Not enough data yet"
+               :x (/ layout.width 2)
+               :y (/ layout.height 2)
+               :fillStyle "#617066"
+               :font "600 12px system-ui"
+               :textAlign "center"
+               :textBaseline "middle"})])
+
+(defn trend-chart-ops [layout points color]
+  (if (empty? points)
+      (empty-chart-ops layout)
+      (append-trend-label-ops
+        (append-trend-dot-ops
+          (append-trend-line-ops (trend-background-ops layout) layout points color)
+          layout
+          points
+          color)
+        layout
+        points)))
+
+(defn max-bar-value [points]
+  (reduce points 1 (fn [value point] (max value point.value))))
+
+(defn bar-gap [layout points]
+  (max 2 (round (/ (plot-width layout) (* (count points) 8)))))
+
+(defn bar-width [layout points]
+  (let [gap (bar-gap layout points)]
+    (max 6
+         (/ (- (plot-width layout)
+               (* gap (+ (count points) 1)))
+            (count points)))))
+
+(defn x-for-bar [layout points index]
+  (let [gap (bar-gap layout points)
+        width (bar-width layout points)]
+    (+ layout.left gap (* index (+ width gap)))))
+
+(defn append-bar-op [layout points max-value ops point index]
+  (let [width (bar-width layout points)
+        height (* (/ point.value max-value) (plot-height layout))
+        x (x-for-bar layout points index)
+        y (- layout.bottom height)]
+    (conj ops
+          (canvas-op {:op :fill-rect
+                      :x x
+                      :y y
+                      :width width
+                      :height height
+                      :fillStyle "#d9184b"}))))
+
+(defn centered-label-x [point ideal-x min-x max-x]
+  (let [half-width (/ point.labelWidth 2)]
+    (clamp (+ min-x half-width)
+           ideal-x
+           (- max-x half-width))))
+
+(defn append-bar-label-op [layout points ops point-index visible-index]
+  (let [point (nth points point-index)
+        width (bar-width layout points)
+        ideal-x (+ (x-for-bar layout points point-index) (/ width 2))]
+    (conj ops
+          (canvas-op {:op :fill-text
+                      :text point.label
+                      :x (centered-label-x point ideal-x 4 (- layout.width 4))
+                      :y (+ layout.bottom 10)
+                      :fillStyle "#617066"
+                      :font "600 12px system-ui"
+                      :textAlign "center"
+                      :textBaseline "top"}))))
+
+(defn bar-label-ops [ops layout points]
+  (let [indices (visible-label-indices (count points) (label-step (count points) 10))]
+    (reduce-indexed indices
+      ops
+      (fn [label-ops point-index visible-index]
+        (append-bar-label-op layout points label-ops point-index visible-index)))))
+
+(defn bar-chart-ops [layout points]
+  (if (empty? points)
+      (empty-chart-ops layout)
+      (let [max-value (max-bar-value points)
+            base-ops [(canvas-op {:op :clear})
+                      (canvas-op {:op :fill-rect
+                                  :x 0
+                                  :y 0
+                                  :width layout.width
+                                  :height layout.height
+                                  :fillStyle "#fffdfa"})
+                      (canvas-op {:op :begin-path})
+                      (canvas-op {:op :move-to :x layout.left :y layout.bottom})
+                      (canvas-op {:op :line-to :x (plot-right layout) :y layout.bottom})
+                      (canvas-op {:op :stroke :strokeStyle "#e5ebe6" :lineWidth 1})]
+            bars (reduce-indexed points
+                   base-ops
+                   (fn [ops point index]
+                     (append-bar-op layout points max-value ops point index)))]
+        (bar-label-ops bars layout points))))
+
+(defn trend-command [points]
+  {:kind :canvas/draw
+   :ref "zone2-trend"
+   :width trend-layout.width
+   :height trend-layout.height
+   :ops (trend-chart-ops trend-layout points "#2a9d8f")
+   :msg {:kind :chart-drawn :chart "trend"}})
+
+(defn bar-command [points]
+  {:kind :canvas/draw
+   :ref "trimp-bars"
+   :width bar-layout.width
+   :height bar-layout.height
+   :ops (bar-chart-ops bar-layout points)
+   :msg {:kind :chart-drawn :chart "bars"}})
+
+(defn draw-all-command [state]
+  {:kind :batch
+   :commands [(trend-command state.trendPoints)
+              (bar-command state.barPoints)]})
+
+(defn init []
+  (let [state {:trendPoints sample-trend-points
+               :barPoints sample-bar-points
+               :draws 0
+               :status "Ready"}]
+    [state
+     {:kind :batch
+      :commands [{:kind :canvas/draw
+                  :ref "zone2-trend"
+                  :width trend-layout.width
+                  :height trend-layout.height
+                  :ops (trend-chart-ops trend-layout state.trendPoints "#2a9d8f")
+                  :msg {:kind :chart-drawn :chart "trend"}}
+                 {:kind :canvas/draw
+                  :ref "trimp-bars"
+                  :width bar-layout.width
+                  :height bar-layout.height
+                  :ops (bar-chart-ops bar-layout state.barPoints)
+                  :msg {:kind :chart-drawn :chart "bars"}}]}]))
+
+(defn update [state msg]
+  (match msg
+    {:kind :chart-drawn :chart chart}
+      [(merge state
+              {:draws (+ state.draws 1)
+               :status (str "Drawn " chart)})
+       {:kind :none}]
+    {:kind :redraw}
+      [(merge state {:status "Drawing"})
+       {:kind :batch
+        :commands [{:kind :canvas/draw
+                    :ref "zone2-trend"
+                    :width trend-layout.width
+                    :height trend-layout.height
+                    :ops (trend-chart-ops trend-layout state.trendPoints "#2a9d8f")
+                    :msg {:kind :chart-drawn :chart "trend"}}
+                   {:kind :canvas/draw
+                    :ref "trimp-bars"
+                    :width bar-layout.width
+                    :height bar-layout.height
+                    :ops (bar-chart-ops bar-layout state.barPoints)
+                    :msg {:kind :chart-drawn :chart "bars"}}]}]
+    _ [state {:kind :none}]))
+
+(defn view [state]
+  #html <section data-draws={state.draws}
+                 data-status={state.status}>
+          <canvas ref="zone2-trend"
+                  width="360"
+                  height="180"
+                  aria-label="Zone 2 adherence trend"></canvas>
+          <canvas ref="trimp-bars"
+                  width="360"
+                  height="180"
+                  aria-label="TRIMP bars"></canvas>
+          <button type="button"
+                  on:click={{:kind :redraw}}>Redraw</button>
+          <p>{state.status}</p>
+        </section>)
+
+(def sample-trend-ops
+  (trend-chart-ops trend-layout sample-trend-points "#2a9d8f"))
+
+(def sample-empty-trend-ops
+  (trend-chart-ops trend-layout [] "#2a9d8f"))
+
+(def sample-bar-ops
+  (bar-chart-ops bar-layout sample-bar-points))

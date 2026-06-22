@@ -1,0 +1,38 @@
+(def init
+  {:tags #{"steady"}
+   :durations (hash-map "zone2" 1)
+   :tick 0})
+
+(defn update [state msg]
+  (match msg
+    {:kind :add-tag}
+      [(assoc state :tags (conj state.tags "tempo")) {:kind :none}]
+    {:kind :inc-zone}
+      [(assoc state
+              :durations
+              (map-assoc state.durations
+                         "zone2"
+                         (+ (map-get state.durations "zone2") 1)))
+       {:kind :none}]
+    {:kind :tick}
+      [(assoc state :tick (+ state.tick 1)) {:kind :none}]
+    _ [state {:kind :none}]))
+
+(defn view [state]
+  #html <section data-testid="collections">
+          <button type="button"
+                  data-testid="tag-button"
+                  on:click={{:kind :add-tag}}>
+            {(str "Tags " (count state.tags) " " (if (contains? state.tags "tempo") "tempo" "steady"))}
+          </button>
+          <button type="button"
+                  data-testid="map-button"
+                  on:click={{:kind :inc-zone}}>
+            {(str "Zone2 " (map-get state.durations "zone2"))}
+          </button>
+          <button type="button"
+                  data-testid="tick-button"
+                  on:click={{:kind :tick}}>
+            {(str "Tick " state.tick)}
+          </button>
+        </section>)

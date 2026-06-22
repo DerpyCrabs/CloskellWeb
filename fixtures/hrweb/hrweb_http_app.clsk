@@ -1,0 +1,41 @@
+(def init
+  {:status "Idle"
+   :message ""
+   :entries []
+   :loaded? false})
+
+(defn update [state msg]
+  (match msg
+    {:kind :load-log}
+      [(merge state
+              {:status "Loading"
+               :message ""})
+       {:kind :http/request
+        :request {:url "/api/exercise-log"
+                  :method "GET"}
+        :response :json
+        :onSuccess :log-loaded
+        :onError :log-load-failed}]
+    {:kind :log-loaded :value response}
+      [(merge state
+              {:status (if response.ok "Loaded" "HTTP error")
+               :message (str "Status " response.status)
+               :entries response.body.entries
+               :loaded? response.ok})
+       {:kind :none}]
+    {:kind :log-load-failed :error error}
+      [(merge state
+              {:status "Offline"
+               :message error
+               :loaded? false})
+       {:kind :none}]
+    _ [state {:kind :none}]))
+
+(defn view [state]
+  #html <section data-status={state.status}
+                 data-loaded={state.loaded?}
+                 data-count={count state.entries}>
+          <button on:click={{:kind :load-log}}>Load log</button>
+          <span>{state.status}</span>
+          <small>{state.message}</small>
+        </section>)

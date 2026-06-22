@@ -1,0 +1,163 @@
+(def init
+  {:detailView "live"
+   :mobile? false
+   :message "Live chart"
+   :liveStats {:duration "04:30"
+               :min 96
+               :avg 124
+               :max 149}
+   :readings [{:time 0 :bpm 101}
+              {:time 30000 :bpm 121}
+              {:time 60000 :bpm 143}]
+   :selectedLogId "warmup"
+   :entries [{:id "warmup"
+              :label "Warmup walk"
+              :duration "12:00"
+              :exerciseType "LISS"
+              :hiddenAt nil
+              :stats {:duration "12:00" :min 93 :avg 118 :max 132}
+              :readings [{:time 0 :bpm 93}
+                         {:time 60000 :bpm 118}
+                         {:time 120000 :bpm 132}]}
+             {:id "intervals"
+              :label "Short intervals"
+              :duration "18:30"
+              :exerciseType "HIIT"
+              :hiddenAt nil
+              :stats {:duration "18:30" :min 104 :avg 151 :max 176}
+              :readings [{:time 0 :bpm 104}
+                         {:time 45000 :bpm 155}
+                         {:time 90000 :bpm 176}]}
+             {:id "deleted"
+              :label "Hidden recovery"
+              :duration "08:15"
+              :exerciseType "Recovery"
+              :hiddenAt 2000
+              :stats {:duration "08:15" :min 88 :avg 101 :max 115}
+              :readings []}]})
+
+(defn visible-entries [entries]
+  (filter entries (fn [entry] (not (some? entry.hiddenAt)))))
+
+(defn selected-log [entries selected-id]
+  (find (visible-entries entries) (fn [entry] (= entry.id selected-id))))
+
+(defn display-stats [state]
+  (let [entry (selected-log state.entries state.selectedLogId)]
+    (if (= state.detailView "log")
+        (if (some? entry) entry.stats state.liveStats)
+        state.liveStats)))
+
+(defn display-readings [state]
+  (let [entry (selected-log state.entries state.selectedLogId)]
+    (if (= state.detailView "log")
+        (if (some? entry) entry.readings [])
+        state.readings)))
+
+(defn selected-log-label [state]
+  (let [entry (selected-log state.entries state.selectedLogId)]
+    (if (some? entry)
+        entry.label
+        "No exercise selected")))
+
+(defn update [state msg]
+  (match msg
+    {:kind :select-view :view view}
+      [(merge state
+              {:detailView view
+               :message (str "Showing " view)})
+       {:kind :none}]
+    {:kind :select-log :id id}
+      [(merge state
+              {:detailView "log"
+               :selectedLogId id
+               :message (str "Selected " id)})
+       {:kind :none}]
+    {:kind :toggle-mobile}
+      [(merge state {:mobile? (not state.mobile?)}) {:kind :none}]
+    _ [state {:kind :none}]))
+
+(defn tab-button [current view label]
+  #html <button type="button"
+                data-view={view}
+                data-selected={(= current view)}
+                on:click={{:kind :select-view
+                           :view view}}>{label}</button>)
+
+(defn stat-tile [label value]
+  #html <article data-stat={label}>
+          <strong>{value}</strong>
+          <span>{label}</span>
+        </article>)
+
+(defn live-pane [state]
+  #html <section data-pane="live"
+                 data-points={count state.readings}>
+          <div data-chart="heart-chart">HeartChart</div>
+          <p>{state.message}</p>
+        </section>)
+
+(defn metrics-pane [state]
+  (let [entries (visible-entries state.entries)]
+    #html <section data-pane="metrics"
+                   data-count={count entries}>
+            <h2>Metrics</h2>
+            {(for [entry entries :key entry.id]
+               #html <article data-metric={entry.id}>
+                       <strong>{entry.exerciseType}</strong>
+                       <span>{entry.duration}</span>
+                     </article>)}
+          </section>))
+
+(defn log-pane [state]
+  (let [entries (visible-entries state.entries)
+        entry (selected-log state.entries state.selectedLogId)]
+    #html <section data-pane="log"
+                   data-selected={state.selectedLogId}>
+            <div data-list="exercise-log">
+              {(for [item entries :key item.id]
+                 #html <button type="button"
+                               data-id={item.id}
+                               data-selected={(= item.id state.selectedLogId)}
+                               on:click={{:kind :select-log
+                                          :id item.id}}>
+                         <span>{item.label}</span>
+                         <small>{item.duration}</small>
+                       </button>)}
+            </div>
+            {(if (some? entry)
+                #html <article data-detail={entry.id}>
+                        <h2>{entry.label}</h2>
+                        <p>{entry.exerciseType}</p>
+                      </article>
+                #html <p>No log selected</p>)}
+          </section>))
+
+(defn view [state]
+  (let [stats (display-stats state)
+        readings (display-readings state)
+        selected-label (selected-log-label state)]
+    #html <main data-view={state.detailView}
+                data-mobile={state.mobile?}
+                data-readings={count readings}>
+            <nav data-tabs="detail">
+              {(tab-button state.detailView "live" "Live")}
+              {(tab-button state.detailView "log" "Log")}
+              {(tab-button state.detailView "metrics" "Metrics")}
+            </nav>
+            <section data-stats="summary"
+                     data-selected-label={selected-label}>
+              {(stat-tile "Time" stats.duration)}
+              {(stat-tile "Min HR" stats.min)}
+              {(stat-tile "Avg HR" stats.avg)}
+              {(stat-tile "Max HR" stats.max)}
+            </section>
+            {(if (= state.detailView "metrics")
+                (metrics-pane state)
+                (if (= state.detailView "log")
+                    (log-pane state)
+                    (live-pane state)))}
+            <button type="button"
+                    data-action="mobile"
+                    on:click={{:kind :toggle-mobile}}>Toggle mobile</button>
+          </main>))

@@ -1,0 +1,55 @@
+(defn init []
+  (let [dev? (env-dev?)]
+    [{:dev? dev?
+      :opens 0
+      :lastKey ""
+      :status (if dev? "Dev tools ready" "Production")}
+     (if dev?
+         {:kind :window/event-watch
+          :id "dev-hotkey"
+          :type "keydown"
+          :preventDefault {:key "h"
+                           :ctrlKey true
+                           :shiftKey true
+                           :altKey false
+                           :metaKey false}
+          :onEvent :dev-key}
+         {:kind :none})]))
+
+(defn update [state msg]
+  (match msg
+    {:kind :dev-key :key key :ctrlKey ctrl? :shiftKey shift? :altKey alt? :metaKey meta?}
+      (if (and state.dev?
+               ctrl?
+               shift?
+               (not alt?)
+               (not meta?)
+               (= (lower-case key) "h"))
+          [(merge state
+                  {:lastKey key
+                   :status "Opening simulator"})
+           {:kind :dom-ref/click
+            :ref "simulate-monitor"
+            :msg {:kind :dev-opened}}]
+          [(merge state
+                  {:lastKey key
+                   :status "Ignored key"})
+           {:kind :none}])
+    {:kind :dev-opened}
+      [(merge state
+              {:opens (+ state.opens 1)
+               :status "Simulator opened"})
+       {:kind :none}]
+    {:kind :simulated-click}
+      [state {:kind :none}]
+    _ [state {:kind :none}]))
+
+(defn view [state]
+  #html <section data-dev={state.dev?}
+                 data-opens={state.opens}
+                 data-last-key={state.lastKey}>
+          <button ref="simulate-monitor"
+                  data-action="simulate"
+                  on:click={{:kind :simulated-click}}>Simulate monitor</button>
+          <span>{state.status}</span>
+        </section>)

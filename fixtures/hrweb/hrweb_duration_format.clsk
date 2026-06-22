@@ -1,0 +1,30 @@
+(defn pad2 [value]
+  (pad-start (str value) 2 "0"))
+
+(defn format-duration [ms]
+  (let [total-seconds (floor (/ ms 1000))
+        minutes (floor (/ total-seconds 60))
+        seconds (mod total-seconds 60)]
+    (str (pad2 minutes) ":" (pad2 seconds))))
+
+(defn format-zone-duration [ms]
+  (if (<= ms 0)
+      "0:00"
+      (let [total-seconds (floor (/ ms 1000))
+            hours (floor (/ total-seconds 3600))
+            minutes (floor (/ (mod total-seconds 3600) 60))
+            seconds (mod total-seconds 60)]
+        (if (> hours 0)
+            (str hours ":" (pad2 minutes) ":" (pad2 seconds))
+            (str minutes ":" (pad2 seconds))))))
+
+(def sample-duration-labels
+  [(format-duration 0)
+   (format-duration 61000)
+   (format-duration 3601000)])
+
+(def sample-zone-duration-labels
+  [(format-zone-duration 0)
+   (format-zone-duration 59000)
+   (format-zone-duration 61000)
+   (format-zone-duration 3661000)])

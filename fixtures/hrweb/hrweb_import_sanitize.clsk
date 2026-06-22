@@ -1,0 +1,154 @@
+(def default-zones
+  [{:id 2 :name "Z2" :min 111 :max 130 :color "#2a9d8f"}
+   {:id 3 :name "Z3" :min 131 :max 150 :color "#f77f00"}])
+
+(def imported-json
+  (json-stringify
+    {:version 2
+     :entries [{:id "valid"
+                :startedAt 1000
+                :stoppedAt 70000
+                :durationMs 69000
+                :readings [{:bpm 121.7 :time 0}
+                           {:bpm nil :time 100}
+                           nil
+                           {:bpm 142.2 :time 45000}]
+                :targetZoneId 3
+                :zones [{:id 2 :name "Z2" :min 110 :max 130 :color "#2a9d8f"}
+                        {:id nil :name "Broken" :min 0 :max 0 :color "#000"}]
+                :exerciseType " LISS "
+                :hiddenAt nil}
+               {:id 42
+                :readings []}
+               nil]}
+    2))
+
+(def legacy-json
+  (json-stringify
+    [{:id "legacy"
+      :startedAt 2000
+      :stoppedAt 62000
+      :durationMs 60000
+      :readings [{:bpm 130 :time 0}]
+      :targetZoneId nil
+      :zones nil}]
+    2))
+
+(def missing-entries-json
+  (json-stringify {:version 2 :workouts []} 2))
+
+(def malformed-entries-json
+  (json-stringify {:version 2
+                   :entries [{:id "bad" :readings []}
+                             nil]}
+                  2))
+
+(defn valid-reading? [reading]
+  (and (number? (get reading :bpm))
+       (number? (get reading :time))))
+
+(defn sanitize-reading [reading]
+  {:bpm (round (get reading :bpm))
+   :time (max 0 (round (get reading :time)))})
+
+(defn valid-zone? [zone]
+  (and (number? (get zone :id))
+       (string? (get zone :name))
+       (number? (get zone :min))
+       (number? (get zone :max))
+       (string? (get zone :color))))
+
+(defn sanitize-zone [zone]
+  {:id (round (get zone :id))
+   :name (trim (get zone :name))
+   :min (round (get zone :min))
+   :max (round (get zone :max))
+   :color (str (get zone :color))})
+
+(defn sanitize-zones [entry]
+  (let [zones (get entry :zones)]
+    (if (and (vector? zones)
+             (every? zones valid-zone?))
+        (map zones sanitize-zone)
+        default-zones)))
+
+(defn valid-log-entry? [entry]
+  (and (string? (get entry :id))
+       (number? (get entry :startedAt))
+       (number? (get entry :stoppedAt))
+       (number? (get entry :durationMs))
+       (vector? (get entry :readings))))
+
+(defn normalized-exercise-type [entry]
+  (if (string? (get entry :exerciseType))
+      (let [trimmed (trim (get entry :exerciseType))]
+        (if (= trimmed "") nil trimmed))
+      nil))
+
+(defn normalized-hidden-at [entry]
+  (if (number? (get entry :hiddenAt))
+      (+ 0 (get entry :hiddenAt))
+      nil))
+
+(defn normalized-target-zone-id [entry]
+  (if (number? (get entry :targetZoneId))
+      (round (get entry :targetZoneId))
+      3))
+
+(defn sanitize-log-entry [entry]
+  {:id (str (get entry :id))
+   :startedAt (+ 0 (get entry :startedAt))
+   :stoppedAt (+ 0 (get entry :stoppedAt))
+   :durationMs (max 0 (get entry :durationMs))
+   :readings (map (filter (get entry :readings) valid-reading?) sanitize-reading)
+   :targetZoneId (normalized-target-zone-id entry)
+   :zones (sanitize-zones entry)
+   :exerciseType (normalized-exercise-type entry)
+   :hiddenAt (normalized-hidden-at entry)})
+
+(defn payload-entries [payload]
+  (if (vector? payload)
+      payload
+      (get payload :entries)))
+
+(defn sanitize-entries [items]
+  (sort-by-desc
+    (reduce items []
+      (fn [entries entry]
+        (if (valid-log-entry? entry)
+            (conj entries (sanitize-log-entry entry))
+            entries)))
+    (fn [entry] entry.stoppedAt)))
+
+(defn import-log [text]
+  (let [payload (json-parse text)
+        entries (payload-entries payload)]
+    (if (vector? entries)
+        (sanitize-entries entries)
+        [])))
+
+(defn import-log-error [text]
+  (let [payload (json-parse text)
+        items (payload-entries payload)
+        entries (if (vector? items)
+                    (sanitize-entries items)
+                    [])]
+    (if (not (vector? items))
+        "File does not contain an exercise log."
+        (if (= (count entries) 0)
+            "No valid exercise entries were found."
+            nil))))
+
+(defn import-success-message [entry-count]
+  (str "Replaced log with "
+       entry-count
+       " exercise"
+       (if (= entry-count 1) "" "s")
+       "."))
+
+(def sanitized-entries (import-log imported-json))
+(def legacy-entries (import-log legacy-json))
+(def missing-entries-error (import-log-error missing-entries-json))
+(def malformed-entries-error (import-log-error malformed-entries-json))
+(def singular-success-message (import-success-message 1))
+(def plural-success-message (import-success-message 2))

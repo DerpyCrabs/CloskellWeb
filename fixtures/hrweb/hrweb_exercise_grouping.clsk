@@ -1,0 +1,53 @@
+(def untyped-label "Untyped")
+
+(def sample-group-log
+  [{:id "warmup"
+    :exerciseType "LISS"
+    :stoppedAt 1000}
+   {:id "lift"
+    :exerciseType "Strength"
+    :stoppedAt 3000}
+   {:id "untagged"
+    :exerciseType nil
+    :stoppedAt 2000}
+   {:id "intervals"
+    :exerciseType "HIIT"
+    :stoppedAt 4000}
+   {:id "jog"
+    :exerciseType " LISS "
+    :stoppedAt 5000}])
+
+(defn normalized-type-label [exercise-type]
+  (let [trimmed (if (some? exercise-type)
+                    (trim exercise-type)
+                    "")]
+    (if (= trimmed "")
+        untyped-label
+        trimmed)))
+
+(defn type-sort-key [label]
+  (if (= label untyped-label)
+      "~~~~"
+      (lower-case label)))
+
+(defn upsert-entry-group [groups entry]
+  (let [label (normalized-type-label entry.exerciseType)
+        found (find groups (fn [group] (= group.type label)))]
+    (if (some? found)
+        (map groups
+             (fn [group]
+               (if (= group.type label)
+                   (assoc group :entries (conj group.entries entry))
+                   group)))
+        (conj groups {:type label :entries [entry]}))))
+
+(defn sorted-group [group]
+  {:type group.type
+   :entries (sort-by-desc group.entries (fn [entry] entry.stoppedAt))})
+
+(defn group-entries-by-type [entries]
+  (map (sort-by (reduce entries [] upsert-entry-group)
+                (fn [group] (type-sort-key group.type)))
+       sorted-group))
+
+(def grouped-by-type (group-entries-by-type sample-group-log))

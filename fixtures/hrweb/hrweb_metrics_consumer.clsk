@@ -1,0 +1,9 @@
+(import "./hrweb_metrics.clsk" [calculate-trimp get-metrics-for-type matches-hrr-type? sample-entry])
+
+(defn metric-summary [entry exercise-type]
+  {:trimp (calculate-trimp entry)
+   :hrr? (matches-hrr-type? exercise-type)
+   :metrics (get-metrics-for-type exercise-type)})
+
+(def summary
+  (metric-summary sample-entry "HIIT tabata"))

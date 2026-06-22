@@ -1,0 +1,141 @@
+(import "./hrweb_duration_format.clsk" [format-duration format-zone-duration])
+(import "./hrweb_metrics.clsk" [calculate-zone2-adherence calculate-trimp sample-entry])
+(import "./hrweb_log_transforms.clsk" [newest-first sample-log visible-log])
+(import "./hrweb_result_helpers.clsk" [valid-result invalid-result import-message])
+
+(defn pass [condition]
+  (if condition 1 0))
+
+(defn normalize-reading-message [msg]
+  (match msg
+    (as {:kind :heart-rate :bpm bpm} original)
+    (assoc original :bpm (round bpm))
+
+    _
+    msg))
+
+(defn import-summary [result]
+  (match result
+    (ok entries)
+    (str "Imported " (count entries))
+
+    (err message)
+    message))
+
+(defn import-error-label [maybe-message]
+  (match maybe-message
+    (some message)
+    (str "Error: " message)
+
+    nil
+    "No error"))
+
+(defn list-window-delta [samples]
+  (match samples
+    (list first second _)
+    (- second first)
+
+    _
+    0))
+
+(defn list-total [samples]
+  (match samples
+    (cons head tail)
+    (+ head (list-total tail))
+
+    (list)
+    0))
+
+(defn reading-payload-summary [payload]
+  (let [{:reading {:bpm bpm}
+         :samples (cons first rest)} payload
+        (cons second tail) rest]
+    {:bpm (+ bpm 0)
+     :delta (- second first)
+     :remaining (count tail)}))
+
+(defn destructured-reading-summary [{:reading {:bpm bpm}
+                                     :samples (cons head rest)}]
+  {:bpm (+ bpm 0)
+   :delta (- (first rest) head)
+   :remaining (count rest)})
+
+(defn reading-deltas [payloads]
+  (map payloads
+       (fn [{:reading {:bpm bpm}
+             :samples (cons head rest)}]
+         {:bpm (+ bpm 0)
+          :delta (- (first rest) head)
+          :remaining (count rest)})))
+
+(def tests
+  [{:name "formats short workout duration"
+    :actual (pass (= (format-duration 61000) "01:01"))
+    :expected 1}
+   {:name "formats hourly zone duration"
+    :actual (pass (= (format-zone-duration 3661000) "1:01:01"))
+    :expected 1}
+   {:name "calculates sample zone adherence"
+    :actual (calculate-zone2-adherence sample-entry)
+    :expected 50}
+   {:name "calculates sample trimp"
+    :actual (calculate-trimp sample-entry)
+    :expected 2.5}
+   {:name "filters hidden log entries"
+    :actual (count (visible-log sample-log))
+    :expected 2}
+   {:name "sorts visible log newest first"
+    :actual (let [entries (newest-first sample-log)
+                  first-entry (nth entries 0)
+                  second-entry (nth entries 1)]
+              (pass (and (= first-entry.id "intervals")
+                         (= second-entry.id "warmup"))))
+    :expected 1}
+   {:name "binds whole values with as patterns"
+    :actual (let [normalized (normalize-reading-message {:kind :heart-rate
+                                                         :bpm 139.6
+                                                         :source "strap"})]
+              (pass (and (= normalized.kind :heart-rate)
+                         (= normalized.bpm 140)
+                         (= normalized.source "strap"))))
+    :expected 1}
+   {:name "matches result constructors"
+    :actual (pass (and (= (import-summary valid-result) "Imported 2")
+                       (= (import-summary invalid-result)
+                          "import payload is missing valid entries")))
+    :expected 1}
+   {:name "matches option constructors"
+    :actual (pass (and (= (import-error-label import-message)
+                          "Error: import payload is missing valid entries")
+                       (= (import-error-label nil) "No error")))
+    :expected 1}
+   {:name "matches fixed list patterns"
+    :actual (pass (and (= (list-window-delta (list 100 142 150)) 42)
+                       (= (list-window-delta (list 5 8)) 0)))
+    :expected 1}
+   {:name "matches cons list patterns"
+    :actual (pass (and (= (list-total (list 5 8 13)) 26)
+                       (= (list-total (list)) 0)))
+    :expected 1}
+   {:name "destructures let binding patterns"
+    :actual (let [summary (reading-payload-summary {:reading {:bpm 142}
+                                                    :samples (list 100 136 150)})]
+              (pass (and (= summary.bpm 142)
+                         (= summary.delta 36)
+                         (= summary.remaining 1))))
+    :expected 1}
+   {:name "destructures fn parameter patterns"
+    :actual (let [summaries (reading-deltas [{:reading {:bpm 142}
+                                              :samples (list 100 136 150)}])
+                  summary (first summaries)]
+              (pass (and (= summary.bpm 142)
+                         (= summary.delta 36)
+                         (= summary.remaining 2))))
+    :expected 1}
+   {:name "destructures defn parameter patterns"
+    :actual (let [summary (destructured-reading-summary {:reading {:bpm 142}
+                                                         :samples (list 100 136 150)})]
+              (pass (and (= summary.bpm 142)
+                         (= summary.delta 36)
+                         (= summary.remaining 2))))
+    :expected 1}])

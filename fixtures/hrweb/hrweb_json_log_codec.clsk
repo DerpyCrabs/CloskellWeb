@@ -1,0 +1,28 @@
+(def sample-log
+  [{:id "warmup"
+    :durationMs 300000
+    :hiddenAt nil}
+   {:id "intervals"
+    :durationMs 900000
+    :hiddenAt nil}])
+
+(defn export-log [entries]
+  (json-stringify {:version 2 :entries entries} 2))
+
+(defn export-log-filename [timestamp]
+  (str "exercise-log-" (date-format timestamp :iso-date) ".json"))
+
+(defn imported-entries [text]
+  (let [parsed (json-parse text)]
+    parsed.entries))
+
+(defn imported-count [text]
+  (count (imported-entries text)))
+
+(def payload (export-log sample-log))
+
+(def roundtrip-entries (imported-entries payload))
+
+(def roundtrip-count (imported-count payload))
+
+(def export-filename (export-log-filename 1704499200000))

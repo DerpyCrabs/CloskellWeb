@@ -1,0 +1,13 @@
+/target/
+**/*.rs.bk
+runtime-js/node_modules/
+hrweb/node_modules/
+hrweb/dist/
+hrweb/.closkell/
+hrweb/.tmp/
+hrweb/test-results/
+hrweb/playwright-report/
+hrweb/src/generated/
+hrweb/*.log
+hrweb/.*.log
+hrweb/dev-server*.log

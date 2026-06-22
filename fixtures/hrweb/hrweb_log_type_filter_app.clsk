@@ -1,0 +1,145 @@
+(def untyped-label "Untyped")
+(def all-types-filter "")
+(def untyped-filter "__untyped__")
+
+(def init
+  {:entries [{:id "warmup" :label "Warmup walk" :exerciseType "LISS" :stoppedAt 1000}
+             {:id "lift" :label "Lower body" :exerciseType "Strength" :stoppedAt 3000}
+             {:id "untagged" :label "Mystery session" :exerciseType nil :stoppedAt 2000}
+             {:id "intervals" :label "Tabata" :exerciseType "HIIT" :stoppedAt 4000}
+             {:id "jog" :label "Easy jog" :exerciseType " LISS " :stoppedAt 5000}]
+   :filter all-types-filter
+   :typePickerEntryId ""
+   :typeDraft ""
+   :status "Ready"})
+
+(defn normalized-type-label [exercise-type]
+  (let [trimmed (if (some? exercise-type)
+                    (trim exercise-type)
+                    "")]
+    (if (= trimmed "")
+        untyped-label
+        trimmed)))
+
+(defn entry-type-label [entry]
+  (normalized-type-label entry.exerciseType))
+
+(defn upsert-type [types entry]
+  (let [label (entry-type-label entry)
+        found (find types (fn [type] (= type label)))]
+    (if (= label untyped-label)
+        types
+        (if (some? found)
+            types
+            (conj types label)))))
+
+(defn exercise-types [entries]
+  (sort-by (reduce entries [] upsert-type) (fn [type] (lower-case type))))
+
+(defn filter-matches-entry? [filter entry]
+  (if (= filter all-types-filter)
+      true
+      (if (= filter untyped-filter)
+          (= (entry-type-label entry) untyped-label)
+          (= (entry-type-label entry) filter))))
+
+(defn filtered-entries [entries filter]
+  (filter entries (fn [entry] (filter-matches-entry? filter entry))))
+
+(defn draft-for-entry [entry]
+  (if (= (entry-type-label entry) untyped-label)
+      ""
+      (entry-type-label entry)))
+
+(defn normalized-draft-type [draft]
+  (let [trimmed (trim draft)]
+    (if (= trimmed "")
+        nil
+        trimmed)))
+
+(defn assign-entry-type [entries entry-id draft]
+  (map entries
+       (fn [entry]
+         (if (= entry.id entry-id)
+             (assoc entry :exerciseType (normalized-draft-type draft))
+             entry))))
+
+(defn update [state msg]
+  (match msg
+    {:kind :filter-type :value value}
+      [(merge state
+              {:filter value
+               :typePickerEntryId ""
+               :status (if (= value all-types-filter)
+                           "Showing all"
+                           (if (= value untyped-filter)
+                               "Showing untyped"
+                               (str "Showing " value)))})
+       {:kind :none}]
+    {:kind :edit-entry :id id}
+      (let [entry (find state.entries (fn [item] (= item.id id)))]
+        [(merge state
+                {:typePickerEntryId id
+                 :typeDraft (if (some? entry) (draft-for-entry entry) "")
+                 :status (str "Editing " id)})
+         {:kind :dom-ref/focus
+          :ref "exercise-type"
+          :msg {:kind :type-focused}}])
+    {:kind :type-focused}
+      [state {:kind :none}]
+    {:kind :draft-type :value value}
+      [(merge state {:typeDraft value}) {:kind :none}]
+    {:kind :save-type}
+      (if (not (= state.typePickerEntryId ""))
+          [(merge state
+                  {:entries (assign-entry-type state.entries state.typePickerEntryId state.typeDraft)
+                   :typePickerEntryId ""
+                   :status (str "Saved " state.typeDraft)})
+           {:kind :none}]
+          [state {:kind :none}])
+    _ [state {:kind :none}]))
+
+(defn view [state]
+  (let [types (exercise-types state.entries)
+        visible (filtered-entries state.entries state.filter)]
+    #html <section data-filter={state.filter}
+                   data-count={count visible}
+                   data-status={state.status}>
+            <select value={state.filter}
+                    on:change={{:kind :filter-type
+                                :value event.currentTarget.value}}>
+              <option value="">All types</option>
+              <option value={untyped-filter}>Untyped</option>
+              {(for [type types :key type]
+                 #html <option value={type}>{type}</option>)}
+            </select>
+            {(if (> (count visible) 0)
+                #html <div data-list="exercise-log">
+                        {(for [entry visible :key entry.id]
+                           #html <article data-id={entry.id}
+                                          data-type={entry-type-label entry}>
+                                   <button type="button"
+                                           on:click={{:kind :edit-entry
+                                                      :id entry.id}}>
+                                     {entry.label}
+                                   </button>
+                                   {(if (= entry.id state.typePickerEntryId)
+                                       #html <label data-picker={entry.id}>
+                                               <input ref="exercise-type"
+                                                      list="exercise-type-options"
+                                                      value={state.typeDraft}
+                                                      on:input={{:kind :draft-type
+                                                                 :value event.currentTarget.value}} />
+                                               <button type="button"
+                                                       on:click={{:kind :save-type}}>Save</button>
+                                               <datalist id="exercise-type-options">
+                                                 {(for [type types :key type]
+                                                    #html <option value={type} />)}
+                                               </datalist>
+                                             </label>
+                                       #html <span>{entry-type-label entry}</span>)}
+                                 </article>)}
+                      </div>
+                #html <p>No exercises match this type filter.</p>)}
+            <strong>{state.status}</strong>
+          </section>))

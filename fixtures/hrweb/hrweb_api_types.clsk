@@ -1,0 +1,67 @@
+(type HeartReading
+  {:bpm Number
+   :time Number})
+
+(type HeartZone
+  {:id Number
+   :label String
+   :min Number
+   :max Number})
+
+(type WorkoutEntry
+  {:id String
+   :startedAt Number
+   :durationMs Number
+   :hiddenAt (Option Number)
+   :exerciseType (Option String)
+   :readings (Vector HeartReading)
+   :zones (Vector HeartZone)})
+
+(type WorkoutMsg
+  (Union
+    {:kind :start}
+    {:kind :pause}
+    {:kind :clear-selection}
+    {:kind :heart-rate :reading HeartReading}
+    {:kind :started-at :value Number}
+    {:kind :stop :stoppedAt Number}
+    {:kind :storage-loaded :entries (Result (Vector WorkoutEntry) String)}))
+
+(type WorkoutState
+  {:connected? Bool
+   :activeEntry (Option WorkoutEntry)
+   :entries (Vector WorkoutEntry)
+   :selectedLogId (Option String)})
+
+(type UpdateResult
+  [WorkoutState (Cmd WorkoutMsg)])
+
+(ann reading-label (Fn [HeartReading] String))
+(defn reading-label [reading]
+  (str reading.bpm " bpm"))
+
+(ann in-heart-zone? (Fn [HeartReading HeartZone] Bool))
+(defn in-heart-zone? [reading zone]
+  (and (>= reading.bpm zone.min)
+       (<= reading.bpm zone.max)))
+
+(ann api-update (Fn [WorkoutState WorkoutMsg] UpdateResult))
+(defn api-update [state msg]
+  (match msg
+    {:kind :start}
+      [state {:kind :time/now :onSuccess :started-at}]
+    {:kind :pause}
+      [state {:kind :none}]
+    {:kind :clear-selection}
+      [(merge state {:selectedLogId nil}) {:kind :none}]
+    {:kind :heart-rate :reading reading}
+      [state {:kind :none}]
+    {:kind :started-at :value startedAt}
+      [state {:kind :none}]
+    {:kind :stop :stoppedAt stoppedAt}
+      [state {:kind :none}]
+    {:kind :storage-loaded :entries entries}
+      [state {:kind :none}]))
+
+(ann api-type-count Number)
+(def api-type-count 6)

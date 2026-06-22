@@ -1,0 +1,38 @@
+(defn init []
+  [{:label "Loading log"
+    :entries []
+    :loaded? false
+    :error ""}
+   {:kind :storage/get
+    :key "heartRateExercise.log.v1"
+    :format :json
+    :onSuccess :log-loaded
+    :onError :log-load-failed}])
+
+(defn loaded-entries [value]
+  (if (some? value)
+      value.entries
+      []))
+
+(defn update [state msg]
+  (match msg
+    {:kind :log-loaded :value value}
+      (let [entries (loaded-entries value)]
+        [{:label (str "Loaded " (count entries))
+          :entries entries
+          :loaded? true
+          :error ""}
+         {:kind :none}])
+    {:kind :log-load-failed :error error}
+      [{:label "Loaded 0"
+        :entries []
+        :loaded? true
+        :error error}
+       {:kind :none}]
+    _ [state {:kind :none}]))
+
+(defn view [state]
+  #html <section data-loaded={state.loaded?}
+                 data-error={state.error}>
+          <span>{state.label}</span>
+        </section>)

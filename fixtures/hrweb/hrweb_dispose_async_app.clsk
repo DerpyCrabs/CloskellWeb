@@ -1,0 +1,38 @@
+(def init
+  {:status "Idle"
+   :message ""
+   :loaded? false})
+
+(defn update [state msg]
+  (match msg
+    {:kind :load}
+      [(merge state
+              {:status "Loading"
+               :message ""})
+       {:kind :http/request
+        :request {:url "/api/later"
+                  :method "GET"}
+        :response :json
+        :onSuccess :loaded
+        :onError :failed}]
+    {:kind :loaded :value response}
+      [(merge state
+              {:status "Loaded"
+               :message (str "Status " response.status)
+               :loaded? true})
+       {:kind :none}]
+    {:kind :failed :error error}
+      [(merge state
+              {:status "Failed"
+               :message error
+               :loaded? false})
+       {:kind :none}]
+    _ [state {:kind :none}]))
+
+(defn view [state]
+  #html <section data-status={state.status}
+                 data-loaded={state.loaded?}>
+          <button on:click={{:kind :load}}>Load</button>
+          <span>{state.status}</span>
+          <small>{state.message}</small>
+        </section>)

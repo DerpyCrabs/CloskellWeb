@@ -1,0 +1,149 @@
+(def init
+  {:status "Idle"
+   :exerciseState :idle
+   :connected? true
+   :elapsedMs 0
+   :displayElapsedMs 0
+   :startedAt nil
+   :sessionStartedAt nil
+   :readings []
+   :entries []
+   :selectedLogId nil
+   :targetZoneId 3
+   :zones [{:id 2 :min 111 :max 130}
+           {:id 3 :min 131 :max 150}]})
+
+(defn current-elapsed [state now]
+  (if (some? state.startedAt)
+      (+ state.elapsedMs (- now state.startedAt))
+      state.elapsedMs))
+
+(defn workout-entry [state stopped-at]
+  (let [duration (current-elapsed state stopped-at)
+        started-at (if (some? state.sessionStartedAt)
+                       state.sessionStartedAt
+                       (- stopped-at duration))]
+    {:id (str "entry-" stopped-at)
+     :startedAt started-at
+     :stoppedAt stopped-at
+     :durationMs duration
+     :readings state.readings
+     :targetZoneId state.targetZoneId
+     :zones state.zones}))
+
+(defn sorted-log [entries]
+  (sort-by-desc entries (fn [entry] entry.stoppedAt)))
+
+(defn hide-entry [entries entry-id hidden-at]
+  (map entries
+       (fn [entry]
+         (if (= entry.id entry-id)
+             (assoc entry :hiddenAt hidden-at)
+             entry))))
+
+(defn first-visible-id [entries]
+  (let [first-entry (nth (filter entries (fn [entry] (not (some? entry.hiddenAt)))) 0)]
+    (if (some? first-entry)
+        first-entry.id
+        nil)))
+
+(defn update [state msg]
+  (match msg
+    {:kind :start}
+      [(merge state {:status "Starting"})
+       {:kind :time/now
+        :onSuccess :started-at}]
+    {:kind :started-at :value now}
+      [(merge state
+              {:status "Recording"
+               :exerciseState :running
+               :elapsedMs 0
+               :displayElapsedMs 0
+               :startedAt now
+               :sessionStartedAt now
+               :readings []})
+       {:kind :timer/every
+        :id "exercise-clock"
+        :ms 250
+        :msg {:kind :clock-tick}}]
+    {:kind :pause}
+      [(merge state {:status "Pausing"})
+       {:kind :time/now
+        :onSuccess :paused-at}]
+    {:kind :paused-at :value now}
+      [(merge state
+              {:status "Paused"
+               :exerciseState :paused
+               :elapsedMs (current-elapsed state now)
+               :displayElapsedMs (current-elapsed state now)
+               :startedAt nil})
+       {:kind :timer/cancel
+        :id "exercise-clock"}]
+    {:kind :resume}
+      [(merge state {:status "Resuming"})
+       {:kind :time/now
+        :onSuccess :resumed-at}]
+    {:kind :resumed-at :value now}
+      [(merge state
+              {:status "Recording"
+               :exerciseState :running
+               :startedAt now})
+       {:kind :timer/every
+        :id "exercise-clock"
+        :ms 250
+        :msg {:kind :clock-tick}}]
+    {:kind :clock-tick}
+      [state {:kind :time/now
+              :onSuccess :clocked-at}]
+    {:kind :clocked-at :value now}
+      [(merge state {:displayElapsedMs (current-elapsed state now)})
+       {:kind :none}]
+    {:kind :heart-rate :bpm bpm :receivedAt received-at}
+      (if (= state.exerciseState :running)
+          [(merge state
+                  {:readings (conj state.readings
+                                   {:bpm bpm
+                                    :time (current-elapsed state received-at)})})
+           {:kind :none}]
+          [state {:kind :none}])
+    {:kind :stop}
+      [(merge state {:status "Stopping"})
+       {:kind :time/now
+        :onSuccess :stopped-at}]
+    {:kind :stopped-at :value now}
+      (let [entry (workout-entry state now)
+            entries (sorted-log (conj state.entries entry))]
+        [(merge state
+                {:status "Done"
+                 :exerciseState :idle
+                 :elapsedMs 0
+                 :displayElapsedMs 0
+                 :startedAt nil
+                 :sessionStartedAt nil
+                 :readings []
+                 :entries entries
+                 :selectedLogId entry.id})
+         {:kind :batch
+          :commands [{:kind :timer/cancel
+                      :id "exercise-clock"}]}])
+    {:kind :delete-selected}
+      [state {:kind :time/now
+              :onSuccess :deleted-at}]
+    {:kind :deleted-at :value now}
+      (let [entries (hide-entry state.entries state.selectedLogId now)]
+        [(merge state
+                {:entries entries
+                 :selectedLogId (first-visible-id entries)})
+         {:kind :none}])
+    _ [state {:kind :none}]))
+
+(defn view [state]
+  #html <section data-running={= state.exerciseState :running}
+                 data-elapsed={state.displayElapsedMs}
+                 data-entries={count state.entries}>
+          <button on:click={{:kind :start}}>Start</button>
+          <button on:click={{:kind :pause}}>Pause</button>
+          <button on:click={{:kind :resume}}>Resume</button>
+          <button on:click={{:kind :stop}}>Stop</button>
+          <span>{state.status}</span>
+        </section>)

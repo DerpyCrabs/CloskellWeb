@@ -1,0 +1,178 @@
+(def all-types-filter "")
+(def untyped-filter "__untyped__")
+
+(def init
+  {:entries [{:id "warmup" :label "Warmup walk" :exerciseType "LISS" :hiddenAt nil :stoppedAt 1000}
+             {:id "lift" :label "Lower body" :exerciseType "Strength" :hiddenAt nil :stoppedAt 3000}
+             {:id "untagged" :label "Mystery session" :exerciseType nil :hiddenAt nil :stoppedAt 2000}
+             {:id "intervals" :label "Tabata" :exerciseType "HIIT" :hiddenAt nil :stoppedAt 4000}]
+   :selectedLogId "warmup"
+   :logTypeFilter all-types-filter
+   :editTypeDraft "LISS"
+   :status "Ready"})
+
+(defn visible-entries [entries]
+  (filter entries (fn [entry] (not (some? entry.hiddenAt)))))
+
+(defn normalized-type [value]
+  (let [trimmed (if (some? value) (trim value) "")]
+    (if (= trimmed "") nil trimmed)))
+
+(defn entry-type-label [entry]
+  (let [trimmed (if (some? entry.exerciseType) (trim entry.exerciseType) "")]
+    (if (= trimmed "") "Untyped" trimmed)))
+
+(defn entry-type-key [entry]
+  (let [label (entry-type-label entry)]
+    (if (= label "Untyped") untyped-filter label)))
+
+(defn upsert-type [types entry]
+  (let [kind (entry-type-label entry)]
+    (if (= kind "Untyped")
+        types
+        (if (some? (find types (fn [item] (= item kind))))
+            types
+            (conj types kind)))))
+
+(defn exercise-types [entries]
+  (sort-by (reduce (visible-entries entries) [] upsert-type) (fn [kind] (lower-case kind))))
+
+(defn filter-matches-entry? [filter entry]
+  (if (= filter all-types-filter)
+      true
+      (if (= filter untyped-filter)
+          (= (entry-type-key entry) untyped-filter)
+          (= (entry-type-label entry) filter))))
+
+(defn filtered-entries [entries filter]
+  (filter (visible-entries entries) (fn [entry] (filter-matches-entry? filter entry))))
+
+(defn first-entry-id [entries]
+  (let [entry (nth entries 0)]
+    (if (some? entry) entry.id "")))
+
+(defn selected-id-visible? [entries selected-id]
+  (any? entries (fn [entry] (= entry.id selected-id))))
+
+(defn selected-log [entries selected-id]
+  (find (visible-entries entries) (fn [entry] (= entry.id selected-id))))
+
+(defn selected-draft [entries selected-id]
+  (let [entry (selected-log entries selected-id)]
+    (if (some? entry)
+        (if (= (entry-type-key entry) untyped-filter)
+            ""
+            (entry-type-label entry))
+        "")))
+
+(defn reconcile-visible-selection [state]
+  (let [visible (visible-entries state.entries)]
+    (if (= state.selectedLogId "")
+        (assoc state :selectedLogId (first-entry-id visible))
+        (if (selected-id-visible? visible state.selectedLogId)
+            state
+            (assoc state :selectedLogId (first-entry-id visible))))))
+
+(defn reconcile-filter-selection [state]
+  (let [filtered (filtered-entries state.entries state.logTypeFilter)]
+    (if (= state.logTypeFilter all-types-filter)
+        state
+        (if (or (empty? filtered)
+                (selected-id-visible? filtered state.selectedLogId))
+            state
+            (assoc state :selectedLogId (first-entry-id filtered))))))
+
+(defn reconcile-draft [state]
+  (assoc state :editTypeDraft (selected-draft state.entries state.selectedLogId)))
+
+(defn reconcile-log-state [state]
+  (reconcile-draft (reconcile-filter-selection (reconcile-visible-selection state))))
+
+(defn hide-entry [entries entry-id hidden-at]
+  (map entries
+       (fn [entry]
+         (if (= entry.id entry-id)
+             (assoc entry :hiddenAt hidden-at)
+             entry))))
+
+(defn assign-entry-type [entries entry-id draft]
+  (map entries
+       (fn [entry]
+         (if (= entry.id entry-id)
+             (assoc entry :exerciseType (normalized-type draft))
+             entry))))
+
+(defn update [state msg]
+  (match msg
+    {:kind :filter-type :value value}
+      [(merge (reconcile-log-state
+                (merge state {:logTypeFilter value}))
+              {:status (if (= value all-types-filter)
+                           "Showing all"
+                           (if (= value untyped-filter)
+                               "Showing untyped"
+                               (str "Showing " value)))})
+       {:kind :none}]
+    {:kind :select-log :id id}
+      [(merge (reconcile-log-state (merge state {:selectedLogId id}))
+              {:status (str "Selected " id)})
+       {:kind :none}]
+    {:kind :hide-selected :hiddenAt hidden-at}
+      [(merge (reconcile-log-state
+                (merge state {:entries (hide-entry state.entries state.selectedLogId hidden-at)}))
+              {:status "Hidden selected"})
+       {:kind :none}]
+    {:kind :draft-type :value value}
+      [(merge state {:editTypeDraft value}) {:kind :none}]
+    {:kind :save-selected-type}
+      [(merge (reconcile-log-state
+                (merge state {:entries (assign-entry-type state.entries state.selectedLogId state.editTypeDraft)}))
+              {:status "Saved type"})
+       {:kind :none}]
+    _ [state {:kind :none}]))
+
+(defn view [state]
+  (let [types (exercise-types state.entries)
+        filtered (filtered-entries state.entries state.logTypeFilter)
+        selected (selected-log state.entries state.selectedLogId)]
+    #html <section data-filter={state.logTypeFilter}
+                   data-selected={state.selectedLogId}
+                   data-draft={state.editTypeDraft}
+                   data-count={count filtered}
+                   data-status={state.status}>
+            <select value={state.logTypeFilter}
+                    on:change={{:kind :filter-type
+                                :value event.currentTarget.value}}>
+              <option value="">All</option>
+              <option value={untyped-filter}>Untyped</option>
+              {(for [kind types :key kind]
+                 #html <option value={kind}>{kind}</option>)}
+            </select>
+            <div data-list="exercise-log">
+              {(for [entry filtered :key entry.id]
+                 #html <article data-id={entry.id}
+                                data-type={entry-type-label entry}
+                                data-selected={(= entry.id state.selectedLogId)}>
+                         <button type="button"
+                                 on:click={{:kind :select-log
+                                            :id entry.id}}>
+                           {entry.label}
+                         </button>
+                       </article>)}
+            </div>
+            {(if (some? selected)
+                #html <label data-editor={selected.id}>
+                        <input value={state.editTypeDraft}
+                               on:input={{:kind :draft-type
+                                          :value event.currentTarget.value}} />
+                        <button type="button"
+                                data-action="save"
+                                on:click={{:kind :save-selected-type}}>Save type</button>
+                        <button type="button"
+                                data-action="hide"
+                                on:click={{:kind :hide-selected
+                                           :hiddenAt 4242}}>Hide selected</button>
+                      </label>
+                #html <p>No visible exercises</p>)}
+            <strong>{state.status}</strong>
+          </section>))

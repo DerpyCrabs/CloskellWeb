@@ -1,0 +1,166 @@
+(def zones-storage-key "heartRateExercise.zones.v1")
+
+(defn init []
+  [{:zones [{:id 1 :name "Zone 1" :min 90 :max 110 :color "#2a9d8f"}
+            {:id 2 :name "Zone 2" :min 111 :max 130 :color "#70b62c"}
+            {:id 3 :name "Zone 3" :min 131 :max 150 :color "#f0b429"}]
+    :targetZoneId 2
+    :trackLeft 0
+    :trackWidth 1
+    :draggingIndex nil
+    :status "Ready"}
+   {:kind :dom-ref/resize-watch
+    :id "zone-track"
+    :ref "zone-track"
+    :onChange :track-resized}])
+
+(defn clamp-boundary [low high value]
+  (max low (min high (round value))))
+
+(defn set-zone-boundary [zones index value]
+  (let [left (nth zones index)
+        right (nth zones (+ index 1))
+        boundary (clamp-boundary left.min (- right.max 1) value)]
+    (map-indexed zones
+                 (fn [zone zone-index]
+                   (if (= zone-index index)
+                       (assoc zone :max boundary)
+                       (if (= zone-index (+ index 1))
+                           (assoc zone :min (+ boundary 1))
+                           zone))))))
+
+(defn zone-storage-entry [zone]
+  {:id zone.id
+   :min zone.min
+   :max zone.max})
+
+(defn zone-state-payload [zones target-zone-id]
+  {:zones (map zones zone-storage-entry)
+   :targetZoneId target-zone-id})
+
+(defn value-from-client-x [state client-x]
+  (let [first-zone (nth state.zones 0)
+        last-zone (last state.zones)
+        width (max 1 state.trackWidth)
+        ratio (max 0 (min 1 (/ (- client-x state.trackLeft) width)))]
+    (+ first-zone.min (* ratio (- last-zone.max first-zone.min)))))
+
+(defn boundary-controls [zones]
+  (let [first-zone (nth zones 0)
+        last-zone (last zones)
+        span (max 1 (- last-zone.max first-zone.min))]
+    (map-indexed (slice zones 0 (- (count zones) 1))
+                 (fn [zone index]
+                   (let [right (nth zones (+ index 1))]
+                     {:id zone.id
+                      :name zone.name
+                      :index index
+                      :min zone.min
+                      :max zone.max
+                      :nextMax (- right.max 1)
+                      :leftPercent (* (/ (- zone.max first-zone.min) span) 100)})))))
+
+(defn update [state msg]
+  (match msg
+    {:kind :track-resized :value rect}
+      [(merge state
+              {:trackLeft rect.left
+               :trackWidth (max 1 rect.width)})
+       {:kind :none}]
+    {:kind :start-drag :index index :clientX client-x}
+      (let [next-zones (set-zone-boundary state.zones index (value-from-client-x state client-x))
+            boundary (nth next-zones index)]
+        [(merge state
+                {:zones next-zones
+                 :draggingIndex index
+                 :status (str "Dragging " boundary.max)})
+         {:kind :storage/set
+          :key zones-storage-key
+          :value (zone-state-payload next-zones state.targetZoneId)
+          :msg {:kind :drag-start-saved}}])
+    {:kind :drag-start-saved}
+      [state
+       {:kind :window/event-watch
+        :id "zone-drag-move"
+        :type "pointermove"
+        :onEvent :drag-move
+        :options {:passive true}
+        :msg {:kind :drag-move-watch-ready}}]
+    {:kind :drag-move-watch-ready}
+      [state
+       {:kind :window/event-watch
+        :id "zone-drag-up"
+        :type "pointerup"
+        :onEvent :drag-end
+        :msg {:kind :drag-up-watch-ready}}]
+    {:kind :drag-up-watch-ready}
+      [state
+       {:kind :window/event-watch
+        :id "zone-drag-cancel"
+        :type "pointercancel"
+        :onEvent :drag-end
+        :msg {:kind :drag-watch-ready}}]
+    {:kind :drag-watch-ready}
+      [state {:kind :none}]
+    {:kind :drag-move :clientX client-x}
+      (if (some? state.draggingIndex)
+          (let [next-zones (set-zone-boundary state.zones state.draggingIndex (value-from-client-x state client-x))
+                boundary (nth next-zones state.draggingIndex)]
+            [(merge state
+                    {:zones next-zones
+                     :status (str "Dragging " boundary.max)})
+             {:kind :storage/set
+              :key zones-storage-key
+              :value (zone-state-payload next-zones state.targetZoneId)
+              :msg {:kind :zones-saved}}])
+          [state {:kind :none}])
+    {:kind :drag-end}
+      [(merge state
+              {:draggingIndex nil
+               :status "Drag complete"})
+       {:kind :window/event-unwatch
+        :id "zone-drag-move"
+        :msg {:kind :drag-move-unwatched}}]
+    {:kind :drag-move-unwatched}
+      [state
+       {:kind :window/event-unwatch
+        :id "zone-drag-up"
+        :msg {:kind :drag-up-unwatched}}]
+    {:kind :drag-up-unwatched}
+      [state
+       {:kind :window/event-unwatch
+        :id "zone-drag-cancel"
+        :msg {:kind :drag-cancel-unwatched}}]
+    {:kind :drag-cancel-unwatched}
+      [state {:kind :none}]
+    {:kind :zones-saved}
+      [state {:kind :none}]
+    _ [state {:kind :none}]))
+
+(defn view [state]
+  #html <section data-target={state.targetZoneId}
+                 data-status={state.status}
+                 data-dragging={(some? state.draggingIndex)}
+                 data-track-width={state.trackWidth}>
+          <div class="zone-strip" ref="zone-track">
+            {(for [zone state.zones :key zone.id]
+               #html <button type="button"
+                             data-zone={zone.id}
+                             data-selected={(= zone.id state.targetZoneId)}
+                             style={{:background zone.color}}>
+                       {zone.name}
+                     </button>)}
+            {(for [control (boundary-controls state.zones) :key control.id]
+               #html <button type="button"
+                             class="zone-handle"
+                             data-boundary={control.id}
+                             style={{:left (str control.leftPercent "%")}}
+                             on:pointerdown={(do (event.preventDefault)
+                                                 {:kind :start-drag
+                                                  :index control.index
+                                                  :clientX event.clientX})}>
+                       {control.max}
+                     </button>)}
+          </div>
+          <p>{state.status}</p>
+        </section>)

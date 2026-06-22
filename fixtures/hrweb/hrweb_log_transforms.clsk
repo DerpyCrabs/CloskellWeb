@@ -1,0 +1,40 @@
+(def sample-log
+  [{:id "warmup"
+    :durationMs 300000
+    :stoppedAt 1000
+    :hiddenAt nil
+    :exerciseType "LISS"}
+   {:id "intervals"
+    :durationMs 900000
+    :stoppedAt 3000
+    :hiddenAt nil
+    :exerciseType "HIIT"}
+   {:id "deleted"
+    :durationMs 600000
+    :stoppedAt 2000
+    :hiddenAt 2500
+    :exerciseType "Strength"}])
+
+(defn visible-log [entries]
+  (filter entries (fn [entry] (not (some? entry.hiddenAt)))))
+
+(defn newest-first [entries]
+  (sort-by-desc (visible-log entries) (fn [entry] entry.stoppedAt)))
+
+(defn recent-bars [entries limit]
+  (map (take-last (sort-by (visible-log entries) (fn [entry] entry.stoppedAt)) limit)
+       (fn [entry]
+         {:label entry.id
+          :value entry.durationMs})))
+
+(defn ranked-options [entries]
+  (map-indexed (newest-first entries)
+               (fn [entry index]
+                 {:id entry.id
+                  :rank (+ index 1)})))
+
+(def summary
+  {:visibleCount (count (visible-log sample-log))
+   :firstPage (slice (newest-first sample-log) 0 1)
+   :bars (recent-bars sample-log 2)
+   :ranked (ranked-options sample-log)})

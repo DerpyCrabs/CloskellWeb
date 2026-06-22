@@ -1,0 +1,12 @@
+[package]
+name = "template_ir"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+syntax.workspace = true
+typecheck.workspace = true
+
+[lib]
+path = "src/lib.rs"

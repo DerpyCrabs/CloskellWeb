@@ -1,0 +1,108 @@
+(def chart
+  {:width 640
+   :height 300
+   :left 52
+   :right 24
+   :top 28
+   :bottom 244
+   :minBpm 80
+   :maxBpm 180
+   :durationMs 120000})
+
+(def target-zone
+  {:id 3
+   :min 131
+   :max 150
+   :color "#d9184b"})
+
+(defn plot-width [chart]
+  (- (- chart.width chart.left) chart.right))
+
+(defn plot-height [chart]
+  (- chart.bottom chart.top))
+
+(defn x-for-time [chart time-ms]
+  (+ chart.left (* (/ time-ms chart.durationMs) (plot-width chart))))
+
+(defn y-for-bpm [chart bpm]
+  (- chart.bottom (* (/ (- bpm chart.minBpm)
+                        (- chart.maxBpm chart.minBpm))
+                     (plot-height chart))))
+
+(defn band-top [chart zone]
+  (y-for-bpm chart zone.max))
+
+(defn band-height [chart zone]
+  (- (y-for-bpm chart zone.min)
+     (y-for-bpm chart zone.max)))
+
+(def chart-detail-ops
+  [{:op :clear}
+   {:op :fill-rect
+    :x 0
+    :y 0
+    :width chart.width
+    :height chart.height
+    :fillStyle "#fffdfa"}
+   {:op :fill-rect
+    :x chart.left
+    :y (band-top chart target-zone)
+    :width (plot-width chart)
+    :height (band-height chart target-zone)
+    :fillStyle target-zone.color
+    :globalAlpha 0.14}
+   {:op :stroke-rect
+    :x chart.left
+    :y (band-top chart target-zone)
+    :width (plot-width chart)
+    :height (band-height chart target-zone)
+    :strokeStyle target-zone.color
+    :lineWidth 2
+    :globalAlpha 0.34}
+   {:op :set
+    :name "globalAlpha"
+    :value 1}
+   {:op :begin-path}
+   {:op :move-to
+    :x (x-for-time chart 0)
+    :y (y-for-bpm chart 132)}
+   {:op :line-to
+    :x (x-for-time chart 60000)
+    :y (y-for-bpm chart 146)}
+   {:op :line-to
+    :x (x-for-time chart 120000)
+    :y (y-for-bpm chart 158)}
+   {:op :stroke
+    :strokeStyle target-zone.color
+    :lineWidth 4
+    :lineCap "round"
+    :lineJoin "round"
+    :globalAlpha 0.72}
+   {:op :set
+    :name "globalAlpha"
+    :value 1}
+   {:op :begin-path}
+   {:op :arc
+    :x (x-for-time chart 120000)
+    :y (y-for-bpm chart 158)
+    :radius 7
+    :start 0
+    :end (* 2 3.14159265)}
+   {:op :fill
+    :fillStyle target-zone.color}
+   {:op :fill-text
+    :text "158 bpm"
+    :x (x-for-time chart 120000)
+    :y (- (y-for-bpm chart 158) 14)
+    :fillStyle "#172019"
+    :font "700 12px system-ui"
+    :textAlign "right"
+    :textBaseline "bottom"}])
+
+(def chart-detail-command
+  {:kind :canvas/draw
+   :ref "trend-chart"
+   :width chart.width
+   :height chart.height
+   :ops chart-detail-ops
+   :msg :chart-drawn})

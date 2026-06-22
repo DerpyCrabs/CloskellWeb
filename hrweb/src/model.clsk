@@ -1,0 +1,60 @@
+(type HeartReading
+  {:bpm Number
+   :time Number})
+
+(type HeartZone
+  {:id Number
+   :name String
+   :min Number
+   :max Number
+   :color String})
+
+(type WorkoutEntry
+  {:id String
+   :startedAt Number
+   :stoppedAt Number
+   :durationMs Number
+   :readings (Vector HeartReading)
+   :targetZoneId Number
+   :zones (Vector HeartZone)
+   :exerciseType (Option String)
+   :hiddenAt (Option Number)})
+
+(type MonitorInfo
+  {:id String
+   :deviceName String
+   :connected Bool})
+
+(type JsonPayload {})
+
+(type HeartChartRect
+  {:x Number
+   :y Number
+   :width Number
+   :height Number
+   :top Number
+   :right Number
+   :bottom Number
+   :left Number})
+
+(type WindowEventPayload
+  {:type String
+   :clientX Number
+   :clientY Number
+   :pageX Number
+   :pageY Number
+   :screenX Number
+   :screenY Number
+   :movementX Number
+   :movementY Number
+   :button Number
+   :buttons Number
+   :pointerId Number
+   :pointerType String
+   :isPrimary Bool
+   :key String
+   :code String
+   :altKey Bool
+   :ctrlKey Bool
+   :metaKey Bool
+   :shiftKey Bool})

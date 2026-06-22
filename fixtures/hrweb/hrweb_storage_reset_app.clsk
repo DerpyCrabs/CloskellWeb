@@ -1,0 +1,46 @@
+(type ResetMsg
+  (Union
+    {:kind :reset-log}
+    {:kind :reset-complete :value {:key String}}))
+
+(type ResetState
+  {:status String
+   :entries (Vector String)
+   :removedKey (Option String)})
+
+(type ResetResult
+  [ResetState (Cmd ResetMsg)])
+
+(def storage-key
+  "heartRateExercise.log.v1")
+
+(def init
+  {:status "Ready"
+   :entries ["warmup" "intervals"]
+   :removedKey nil})
+
+(ann update (Fn [ResetState ResetMsg] ResetResult))
+(defn update [state msg]
+  (match msg
+    {:kind :reset-log}
+    [(merge state {:status "Resetting"})
+     {:kind :storage/remove
+      :key storage-key
+      :onSuccess :reset-complete}]
+
+    {:kind :reset-complete :value removed}
+    [(merge state {:status "Reset"
+                   :entries []
+                   :removedKey removed.key})
+     {:kind :none}]
+
+    _
+    [state {:kind :none}]))
+
+(defn view [state]
+  #html <section data-status={state.status}
+                 data-removed={state.removedKey}>
+          <p>{state.status}</p>
+          <strong>{(str (count state.entries))}</strong>
+          <button on:click={{:kind :reset-log}}>Reset log</button>
+        </section>)

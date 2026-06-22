@@ -1,0 +1,31 @@
+(def init
+  {:entries [{:id "a" :label "Walk"}
+             {:id "b" :label "Bike"}]
+   :selected ""})
+
+(defn remove-entry [entries id]
+  (filter entries (fn [entry] (not (= entry.id id)))))
+
+(defn update [state msg]
+  (match msg
+    {:kind :select :id id}
+      [(assoc state :selected id) {:kind :none}]
+    {:kind :hide :id id}
+      [(merge state {:entries (remove-entry state.entries id)})
+       {:kind :none}]
+    _ [state {:kind :none}]))
+
+(defn view [state]
+  #html <section data-selected={state.selected}
+                 data-count={count state.entries}>
+          {(for [entry state.entries :key entry.id]
+             #html <article data-id={entry.id}>
+                     <span>{entry.label}</span>
+                     <button data-action="select"
+                             on:click={{:kind :select
+                                        :id entry.id}}>Select</button>
+                     <button data-action="hide"
+                             on:click={{:kind :hide
+                                        :id entry.id}}>Hide</button>
+                   </article>)}
+        </section>)

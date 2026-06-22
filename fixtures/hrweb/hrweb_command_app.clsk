@@ -1,0 +1,29 @@
+(def init
+  {:connected? false
+   :label "Start"
+   :buttonClass "primary"
+   :saved? false})
+
+(defn update [state msg]
+  (if (= msg :start)
+      [{:connected? true
+        :label "Saving"
+        :buttonClass "secondary"
+        :saved? false}
+       {:kind :storage/set
+        :key "hrweb.last-action"
+        :value "start"
+        :msg :stored}]
+      (if (= msg :stored)
+          [{:connected? true
+            :label "Saved"
+            :buttonClass "secondary"
+            :saved? true}
+           {:kind :none}]
+          [state {:kind :none}])))
+
+(defn view [state]
+  #html <button class={state.buttonClass}
+                disabled={not state.connected?}
+                data-saved={state.saved?}
+                on:click={:start}>{state.label}</button>)

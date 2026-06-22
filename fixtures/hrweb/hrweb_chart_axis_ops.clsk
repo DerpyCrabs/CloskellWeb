@@ -1,0 +1,87 @@
+(def sample-axis
+  {:width 600
+   :height 260
+   :left 48
+   :right 18
+   :bottom 214
+   :tickHeight 6
+   :axisTop 224
+   :durationMs 3600000})
+
+(def empty-canvas-op
+  {:op :none
+   :x 0
+   :y 0
+   :lineWidth 0
+   :strokeStyle ""
+   :fillStyle ""
+   :font ""
+   :text ""
+   :textAlign ""
+   :textBaseline ""})
+
+(defn canvas-op [fields]
+  (merge empty-canvas-op fields))
+
+(defn plot-width [axis]
+  (- (- axis.width axis.left) axis.right))
+
+(defn tick-ratio [index tick-count]
+  (/ index tick-count))
+
+(defn tick-x [axis ratio]
+  (+ axis.left (* ratio (plot-width axis))))
+
+(defn minute-label [duration-ms ratio]
+  (str (round (/ (* duration-ms ratio) 60000)) "m"))
+
+(defn tick-align [index tick-count]
+  (if (= index 0)
+      "left"
+      (if (= index tick-count)
+          "right"
+          "center")))
+
+(defn append-axis-tick-ops [ops axis tick-count index]
+  (let [ratio (tick-ratio index tick-count)
+        x (tick-x axis ratio)
+        label (minute-label axis.durationMs ratio)
+        align (tick-align index tick-count)]
+    (conj ops
+          (canvas-op {:op :begin-path})
+          (canvas-op {:op :move-to :x x :y axis.bottom})
+          (canvas-op {:op :line-to :x x :y (+ axis.bottom axis.tickHeight)})
+          (canvas-op {:op :stroke :strokeStyle "#cbd5ce" :lineWidth 1})
+          (canvas-op {:op :fill-text
+                      :text label
+                      :x x
+                      :y axis.axisTop
+                      :fillStyle "#617066"
+                      :font "600 12px system-ui"
+                      :textAlign align
+                      :textBaseline "top"}))))
+
+(defn append-axis-base-ops [ops axis]
+  (conj ops
+        (canvas-op {:op :begin-path})
+        (canvas-op {:op :move-to :x axis.left :y axis.bottom})
+        (canvas-op {:op :line-to :x (+ axis.left (plot-width axis)) :y axis.bottom})
+        (canvas-op {:op :stroke :strokeStyle "#cbd5ce" :lineWidth 1})))
+
+(defn axis-ops [axis tick-count]
+  (reduce (range 0 (+ tick-count 1))
+          (append-axis-base-ops [] axis)
+          (fn [ops index]
+            (append-axis-tick-ops ops axis tick-count index))))
+
+(def sample-tick-indices (range 0 5))
+(def reverse-tick-indices (range 4 -1 -2))
+(def sample-axis-ops (axis-ops sample-axis 4))
+
+(def chart-axis-command
+  {:kind :canvas/draw
+   :ref "heart-chart"
+   :width sample-axis.width
+   :height sample-axis.height
+   :ops sample-axis-ops
+   :msg :axis-drawn})

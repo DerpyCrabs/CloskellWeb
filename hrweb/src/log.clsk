@@ -1,0 +1,275 @@
+(import "./domain.clsk" [exercise-log-storage-key])
+(import "./model.clsk" [HeartReading HeartZone WorkoutEntry])
+(import "./zones.clsk" [normalize-zones default-zone-state])
+
+(def all-types-filter "")
+(def untyped-filter "__untyped__")
+(def untyped-label "Untyped")
+
+(defn current-elapsed [state now]
+  (if (some? state.startedAt)
+      (+ state.elapsedMs (- now state.startedAt))
+      state.elapsedMs))
+
+(defn random-id-suffix [roll]
+  (string-slice (to-radix roll 36) 2 9))
+
+(defn workout-entry-id [stopped-at roll]
+  (str stopped-at "-" (random-id-suffix roll)))
+
+(defn workout-entry [state stopped-at roll]
+  (let [duration (current-elapsed state stopped-at)
+        started-at (if (some? state.sessionStartedAt)
+                       state.sessionStartedAt
+                       (- stopped-at duration))]
+    {:id (workout-entry-id stopped-at roll)
+     :startedAt started-at
+     :stoppedAt stopped-at
+     :durationMs duration
+     :readings state.readings
+     :targetZoneId state.targetZoneId
+     :zones state.zones
+     :exerciseType nil
+     :hiddenAt nil}))
+
+(defn visible-log [entries]
+  (filter entries (fn [entry] (not (some? entry.hiddenAt)))))
+
+(defn newest-first [entries]
+  (sort-by-desc (visible-log entries) (fn [entry] entry.stoppedAt)))
+
+(ann normalize-exercise-type (Fn [String] (Option String)))
+(defn normalize-exercise-type [value]
+  (if (string? value)
+      (let [trimmed (trim value)]
+        (if (= trimmed "") nil trimmed))
+      nil))
+
+(ann first-entry-id (Fn [(Vector WorkoutEntry)] (Option String)))
+(defn first-entry-id [entries]
+  (let [entry (nth entries 0)]
+    (if (some? entry)
+        entry.id
+        nil)))
+
+(ann entry-type-label (Fn [WorkoutEntry] String))
+(defn entry-type-label [entry]
+  (let [trimmed (if (some? entry.exerciseType)
+                    (trim entry.exerciseType)
+                    "")]
+    (if (= trimmed "")
+        untyped-label
+        trimmed)))
+
+(ann upsert-exercise-type (Fn [(Vector String) WorkoutEntry] (Vector String)))
+(defn upsert-exercise-type [types entry]
+  (let [label (entry-type-label entry)]
+    (if (= label untyped-label)
+        types
+        (if (some? (find types (fn [item] (= item label))))
+            types
+            (conj types label)))))
+
+(ann exercise-types (Fn [(Vector WorkoutEntry)] (Vector String)))
+(defn exercise-types [entries]
+  (sort-by (reduce (visible-log entries) [] upsert-exercise-type)
+           (fn [kind] (lower-case kind))))
+
+(ann filter-matches-entry? (Fn [String WorkoutEntry] Bool))
+(defn filter-matches-entry? [type-filter entry]
+  (if (= type-filter all-types-filter)
+      true
+      (if (= type-filter untyped-filter)
+          (= (entry-type-label entry) untyped-label)
+          (= (entry-type-label entry) type-filter))))
+
+(ann filtered-log (Fn [(Vector WorkoutEntry) String] (Vector WorkoutEntry)))
+(defn filtered-log [entries type-filter]
+  (sort-by-desc
+    (filter (visible-log entries)
+            (fn [entry] (filter-matches-entry? type-filter entry)))
+    (fn [entry] entry.stoppedAt)))
+
+(ann selected-id-in-list? (Fn [(Vector WorkoutEntry) (Option String)] Bool))
+(defn selected-id-in-list? [entries selected-id]
+  (match selected-id
+    (some id) (any? entries (fn [entry] (= entry.id id)))
+    nil false))
+
+(ann reconciled-selected-id (Fn [(Vector WorkoutEntry) String (Option String)] (Option String)))
+(defn reconciled-selected-id [entries type-filter selected-id]
+  (let [visible (newest-first entries)
+        visible-id (if (selected-id-in-list? visible selected-id)
+                       selected-id
+                       (first-entry-id visible))
+        filtered (filtered-log entries type-filter)]
+    (if (= type-filter all-types-filter)
+        visible-id
+        (if (or (empty? filtered)
+                (selected-id-in-list? filtered visible-id))
+            visible-id
+            (first-entry-id filtered)))))
+
+(ann selected-log (Fn [(Vector WorkoutEntry) (Option String)] (Option WorkoutEntry)))
+(defn selected-log [entries selected-id]
+  (match selected-id
+    (some id) (find (visible-log entries) (fn [entry] (= entry.id id)))
+    nil nil))
+
+(ann first-visible-id (Fn [(Vector WorkoutEntry)] (Option String)))
+(defn first-visible-id [entries]
+  (let [entry (nth (newest-first entries) 0)]
+    (if (some? entry)
+        entry.id
+        nil)))
+
+(ann hide-entry (Fn [(Vector WorkoutEntry) (Option String) Number] (Vector WorkoutEntry)))
+(defn hide-entry [entries entry-id hidden-at]
+  (match entry-id
+    (some id)
+      (map entries
+           (fn [entry]
+             (if (= entry.id id)
+                 (assoc entry :hiddenAt hidden-at)
+                 entry)))
+    nil entries))
+
+(ann update-entry-type (Fn [(Vector WorkoutEntry) (Option String) String] (Vector WorkoutEntry)))
+(defn update-entry-type [entries entry-id value]
+  (match entry-id
+    (some id)
+      (let [normalized (normalize-exercise-type value)]
+        (map entries
+             (fn [entry]
+               (if (= entry.id id)
+                   (assoc entry :exerciseType normalized)
+                   entry))))
+    nil entries))
+
+(defn valid-reading? [reading]
+  (and (number? (get reading :bpm))
+       (number? (get reading :time))))
+
+(defn sanitize-reading [reading]
+  {:bpm (round (get reading :bpm))
+   :time (max 0 (round (get reading :time)))})
+
+(defn valid-zone? [zone]
+  (and (number? (get zone :id))
+       (string? (get zone :name))
+       (number? (get zone :min))
+       (number? (get zone :max))
+       (string? (get zone :color))))
+
+(defn sanitize-zone [zone]
+  {:id (round (get zone :id))
+   :name (trim (get zone :name))
+   :min (round (get zone :min))
+   :max (round (get zone :max))
+   :color (str (get zone :color))})
+
+(defn sanitize-zones [entry]
+  (let [zones (get entry :zones)]
+    (if (and (vector? zones)
+             (every? zones valid-zone?))
+        (normalize-zones (map zones sanitize-zone))
+        default-zone-state.zones)))
+
+(defn valid-log-entry? [entry]
+  (and (string? (get entry :id))
+       (number? (get entry :startedAt))
+       (number? (get entry :stoppedAt))
+       (number? (get entry :durationMs))
+       (vector? (get entry :readings))))
+
+(defn normalized-hidden-at [entry]
+  (if (number? (get entry :hiddenAt))
+      (+ 0 (get entry :hiddenAt))
+      nil))
+
+(defn normalized-target-zone-id [entry]
+  (if (number? (get entry :targetZoneId))
+      (round (get entry :targetZoneId))
+      3))
+
+(defn sanitize-log-entry [entry]
+  {:id (str (get entry :id))
+   :startedAt (+ 0 (get entry :startedAt))
+   :stoppedAt (+ 0 (get entry :stoppedAt))
+   :durationMs (max 0 (get entry :durationMs))
+   :readings (map (filter (get entry :readings) valid-reading?) sanitize-reading)
+   :targetZoneId (normalized-target-zone-id entry)
+   :zones (sanitize-zones entry)
+   :exerciseType (normalize-exercise-type (get entry :exerciseType))
+   :hiddenAt (normalized-hidden-at entry)})
+
+(defn payload-entries [payload]
+  (if (vector? payload)
+      payload
+      (get payload :entries)))
+
+(defn sanitize-entries [items]
+  (sort-by-desc
+    (reduce items []
+      (fn [entries entry]
+        (if (valid-log-entry? entry)
+            (conj entries (sanitize-log-entry entry))
+            entries)))
+    (fn [entry] entry.stoppedAt)))
+
+(defn load-log-entries [payload]
+  (let [entries (payload-entries payload)]
+    (if (vector? entries)
+        (sanitize-entries entries)
+        [])))
+
+(defn import-log-error [payload entries]
+  (let [items (payload-entries payload)]
+    (if (not (vector? items))
+        "File does not contain an exercise log."
+        (if (= (count entries) 0)
+            "No valid exercise entries were found."
+            nil))))
+
+(defn import-success-message [entry-count]
+  (str "Replaced log with "
+       entry-count
+       " exercise"
+       (if (= entry-count 1) "" "s")
+       "."))
+
+(defn log-payload [entries]
+  {:version 2
+   :entries entries})
+
+(defn persist-log-command [entries]
+  {:kind :storage/set
+   :key exercise-log-storage-key
+   :value (log-payload entries)
+   :msg {:kind :log-saved}})
+
+(defn export-log-json [entries]
+  (json-stringify (log-payload entries) 2))
+
+(ann export-log-filename (Fn [Number] String))
+(defn export-log-filename [timestamp]
+  (str "exercise-log-" (date-format timestamp :iso-date) ".json"))
+
+(defn pad-two [value]
+  (pad-start (str value) 2 "0"))
+
+(defn duration-label [duration-ms]
+  (let [total-seconds (floor (/ (max 0 duration-ms) 1000))
+        minutes (floor (/ total-seconds 60))
+        seconds (mod total-seconds 60)]
+    (str minutes ":" (pad-two seconds))))
+
+(defn date-label [timestamp]
+  (date-format timestamp :month-day-time))
+
+(ann log-title (Fn [WorkoutEntry] String))
+(defn log-title [entry]
+  (let [label (entry-type-label entry)]
+    (if (= label untyped-label)
+        "Workout"
+        label)))

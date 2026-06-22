@@ -1,0 +1,75 @@
+(def init
+  {:width 0
+   :height 0
+   :draws 0
+   :status "Ready"})
+
+(defn chart-ops [width height]
+  [{:op :clear}
+   {:op :fill-rect
+    :x 0
+    :y 0
+    :width width
+    :height height
+    :fillStyle "#fffdfa"}
+   {:op :begin-path}
+   {:op :move-to
+    :x 12
+    :y (- height 18)}
+   {:op :line-to
+    :x (/ width 2)
+    :y 24}
+   {:op :line-to
+    :x (- width 12)
+    :y (/ height 2)}
+   {:op :stroke
+    :strokeStyle "#d9184b"
+    :lineWidth 4
+    :lineCap "round"
+    :lineJoin "round"}
+   {:op :fill-text
+    :text (str (round width) "x" (round height))
+    :x 12
+    :y 18
+    :fillStyle "#172019"
+    :font "700 12px system-ui"}])
+
+(defn update [state msg]
+  (match msg
+    {:kind :measure-chart}
+      [state
+       {:kind :dom-ref/measure
+        :ref "responsive-chart"
+        :onSuccess :chart-measured
+        :onError :measure-failed}]
+    {:kind :chart-measured :value rect}
+      [(merge state
+              {:width rect.width
+               :height rect.height
+               :status (str "Measured " (round rect.width) "x" (round rect.height))})
+       {:kind :canvas/draw
+        :ref "responsive-chart"
+        :width rect.width
+        :height rect.height
+        :ops (chart-ops rect.width rect.height)
+        :msg {:kind :chart-drawn}}]
+    {:kind :chart-drawn}
+      [(merge state
+              {:draws (+ state.draws 1)
+               :status (str "Drawn " (round state.width) "x" (round state.height))})
+       {:kind :none}]
+    {:kind :measure-failed :error error}
+      [(merge state {:status error}) {:kind :none}]
+    _ [state {:kind :none}]))
+
+(defn view [state]
+  #html <section data-width={state.width}
+                 data-height={state.height}
+                 data-draws={state.draws}
+                 data-status={state.status}>
+          <canvas ref="responsive-chart"
+                  aria-label="Responsive heart rate chart"></canvas>
+          <button type="button"
+                  on:click={{:kind :measure-chart}}>Measure</button>
+          <p>{state.status}</p>
+        </section>)

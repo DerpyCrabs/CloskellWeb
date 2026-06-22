@@ -1,0 +1,37 @@
+(def init
+  {:label "Idle"
+   :ticks 0
+   :running? false})
+
+(defn update [state msg]
+  (match msg
+    :start
+      [{:label "Running"
+        :ticks state.ticks
+        :running? true}
+       {:kind :timer/every
+        :id "exercise-clock"
+        :ms 250
+        :msg :tick}]
+    :tick
+      (let [next-ticks (+ state.ticks 1)]
+        [{:label (str "Ticks " next-ticks)
+          :ticks next-ticks
+          :running? true}
+         {:kind :none}])
+    :stop
+      [{:label "Stopped"
+        :ticks state.ticks
+        :running? false}
+       {:kind :timer/cancel
+        :id "exercise-clock"
+        :msg :stopped}]
+    _ [state {:kind :none}]))
+
+(defn view [state]
+  #html <section data-running={state.running?}
+                 data-ticks={state.ticks}>
+          <button on:click={:start}>Start</button>
+          <button on:click={:stop}>Stop</button>
+          <span>{state.label}</span>
+        </section>)

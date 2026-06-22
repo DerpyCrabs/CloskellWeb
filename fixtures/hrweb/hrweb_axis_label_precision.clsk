@@ -1,0 +1,18 @@
+(def one-minute-ms 60_000)
+
+(ann axis-minute-label (Fn [Number Number] String))
+(defn axis-minute-label [axis-max-ms ratio]
+  (let [elapsed-minutes (/ (* axis-max-ms ratio) one-minute-ms)]
+    (if (>= elapsed-minutes 10)
+        (str (round elapsed-minutes) "m")
+        (str (to-fixed elapsed-minutes (if (>= elapsed-minutes 1) 1 0)) "m"))))
+
+(ann axis-labels (Fn [Number (Vector Number)] (Vector String)))
+(defn axis-labels [axis-max-ms ratios]
+  (map ratios (fn [ratio] (axis-minute-label axis-max-ms ratio))))
+
+(def sample-axis-labels
+  (axis-labels 60_000 [0.0 0.25 0.5 1.0]))
+
+(def long-axis-labels
+  (axis-labels 3_600_000 [0.0 0.5 1.0]))

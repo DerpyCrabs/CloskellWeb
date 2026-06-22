@@ -1,0 +1,17 @@
+(def init
+  {:connected? false
+   :label "Start"
+   :buttonClass "primary"})
+
+(defn update [state msg]
+  (if (= msg :start)
+      [{:connected? true
+        :label "Pause"
+        :buttonClass "secondary"}
+       {:kind :none}]
+      [state {:kind :none}]))
+
+(defn view [state]
+  #html <button class={state.buttonClass}
+                disabled={not state.connected?}
+                on:click={:start}>{state.label}</button>)

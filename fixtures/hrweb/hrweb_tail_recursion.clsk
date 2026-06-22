@@ -1,0 +1,24 @@
+(type Reading
+  {:bpm Number
+   :time Number})
+
+(ann sum-bpm-from (Fn [(Vector Reading) Number Number] Number))
+(defn sum-bpm-from [readings index total]
+  (if (>= index (count readings))
+      total
+      (let [reading (nth readings index)]
+        (sum-bpm-from readings (+ index 1) (+ total reading.bpm)))))
+
+(ann sum-bpm (Fn [(Vector Reading)] Number))
+(defn sum-bpm [readings]
+  (sum-bpm-from readings 0 0))
+
+(ann sample-readings (Vector Reading))
+(def sample-readings
+  [{:bpm 120 :time 0}
+   {:bpm 128 :time 1000}
+   {:bpm 132 :time 2000}])
+
+(ann sample-total Number)
+(def sample-total
+  (sum-bpm sample-readings))

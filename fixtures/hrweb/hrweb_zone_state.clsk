@@ -1,0 +1,92 @@
+(def zones-storage-key "heartRateExercise.zones.v1")
+
+(def default-zones
+  [{:id 1 :name "Zone 1" :min 90 :max 110 :color "#2a9d8f"}
+   {:id 2 :name "Zone 2" :min 111 :max 130 :color "#70b62c"}
+   {:id 3 :name "Zone 3" :min 131 :max 150 :color "#f0b429"}
+   {:id 4 :name "Zone 4" :min 151 :max 170 :color "#f77f00"}
+   {:id 5 :name "Zone 5" :min 171 :max 190 :color "#d9184b"}])
+
+(defn clamp-bpm [value]
+  (max 30 (min 240 (round value))))
+
+(defn clamp-zone [zone]
+  {:id zone.id
+   :name zone.name
+   :min (clamp-bpm zone.min)
+   :max (clamp-bpm zone.max)
+   :color zone.color})
+
+(defn append-normalized-zone [normalized zone]
+  (let [clamped (clamp-zone zone)
+        previous (last normalized)
+        next-min (if (some? previous)
+                     (+ previous.max 1)
+                     clamped.min)
+        next-max (max next-min clamped.max)]
+    (conj normalized
+          (assoc clamped
+                 :min next-min
+                 :max next-max))))
+
+(defn normalize-zones [zones]
+  (reduce zones [] append-normalized-zone))
+
+(def default-zone-state
+  {:zones (normalize-zones default-zones)
+   :targetZoneId 3})
+
+(defn number-or [value fallback]
+  (let [coerced (to-number value)]
+    (if (and (number? coerced)
+             (not (= coerced 0)))
+        coerced
+        fallback)))
+
+(defn merge-stored-zone [zone stored-zone]
+  {:id zone.id
+   :name zone.name
+   :min (number-or (get stored-zone :min) zone.min)
+   :max (number-or (get stored-zone :max) zone.max)
+   :color zone.color})
+
+(defn load-zone-state [payload]
+  (let [stored-zones (get payload :zones)]
+    (if (and (some? payload)
+             (vector? stored-zones))
+        {:zones (normalize-zones
+                  (map-indexed default-zones
+                               (fn [zone index]
+                                 (merge-stored-zone zone (nth stored-zones index)))))
+         :targetZoneId (number-or (get payload :targetZoneId) 3)}
+        default-zone-state)))
+
+(defn zone-storage-entry [zone]
+  {:id zone.id
+   :min zone.min
+   :max zone.max})
+
+(defn zone-state-payload [zones target-zone-id]
+  {:zones (map zones zone-storage-entry)
+   :targetZoneId target-zone-id})
+
+(defn save-zone-state [zones target-zone-id]
+  (json-stringify (zone-state-payload zones target-zone-id)))
+
+(defn persist-zone-state-command [zones target-zone-id]
+  {:kind :storage/set
+   :key zones-storage-key
+   :value (zone-state-payload zones target-zone-id)
+   :msg :zones-saved})
+
+(def stored-zone-state
+  {:zones [{:min "95" :max "106"}
+           {:min "106" :max "120"}
+           {:min 500 :max 100}
+           nil]
+   :targetZoneId "4"})
+
+(def loaded-zone-state (load-zone-state stored-zone-state))
+(def fallback-zone-state (load-zone-state nil))
+(def saved-zone-json (save-zone-state loaded-zone-state.zones loaded-zone-state.targetZoneId))
+(def persist-zone-command (persist-zone-state-command loaded-zone-state.zones loaded-zone-state.targetZoneId))

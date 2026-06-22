@@ -1,0 +1,530 @@
+(import "./metrics.clsk" [get-metrics-for-type metric-enabled? group-entries-by-type build-zone2-trend build-hrr-trend build-trimp-bars])
+(import "./log.clsk" [visible-log])
+(import "./model.clsk" [HeartReading HeartZone WorkoutEntry HeartChartRect])
+
+(type MetricChartMsg
+  (Union
+    {:kind :chart-resized
+     :id String
+     :ref String
+     :x Number
+     :y Number
+     :width Number
+     :height Number
+     :top Number
+     :right Number
+     :bottom Number
+     :left Number
+     :value HeartChartRect}
+    {:kind :chart-error
+     :error String}))
+
+(type MetricChartState
+  {:detailView String
+   :mobile? Bool
+   :chartWidth Number
+   :chartHeight Number
+   :entries (Vector WorkoutEntry)
+   :metricsGrouping String})
+
+(def pi 3.14159265)
+
+(def empty-canvas-op
+  {:op :none
+   :x 0
+   :y 0
+   :width 0
+   :height 0
+   :radius 0
+   :start 0
+   :end 0
+   :lineWidth 0
+   :strokeStyle ""
+   :fillStyle ""
+   :font ""
+   :text ""
+   :textAlign ""
+   :textBaseline ""
+   :lineCap ""
+   :lineJoin ""
+   :globalAlpha 1
+   :name ""
+   :value 0})
+
+(defn canvas-op [fields]
+  (merge empty-canvas-op fields))
+
+(defn metric-chart-ref [group-type metric]
+  (str "metric-chart-" metric "-" group-type))
+
+(defn chart-width [state]
+  (round (max (if state.mobile? 300 520)
+              (if (> state.chartWidth 0)
+                  state.chartWidth
+                  (if state.mobile? 340 520)))))
+
+(defn chart-height [state]
+  (round (max (if state.mobile? 130 220)
+              (if (> state.chartHeight 0)
+                  state.chartHeight
+                  (if state.mobile? 170 220)))))
+
+(defn axis-label-size [width mobile?]
+  (max (if mobile? 11 12)
+       (round (/ width (if mobile? 58 52)))))
+
+(defn scaled-font-size [width min-px divisor]
+  (max min-px (round (/ width divisor))))
+
+(defn scaled-font [width min-px divisor weight]
+  (str weight " " (scaled-font-size width min-px divisor) "px system-ui, sans-serif"))
+
+(defn base-padding [width mobile?]
+  (if mobile?
+      (max 18 (round (* width 0.04)))
+      (max 28 (round (* width 0.045)))))
+
+(defn y-axis-label [y-min y-max unit index]
+  (str (round (- y-max (* (/ index 4) (- y-max y-min)))) unit))
+
+(defn approx-text-width [text size]
+  (* (count (str text)) size 0.62))
+
+(defn y-axis-plot-left [width mobile? y-min y-max unit]
+  (let [font-size (scaled-font-size width 10 (if mobile? 108 95))
+        labels (map (range 0 5)
+                    (fn [index]
+                      (y-axis-label y-min y-max unit index)))
+        widest (max-of (map labels (fn [label]
+                                     (approx-text-width label font-size)))
+                       0)]
+    (+ widest 10)))
+
+(defn trend-layout [state y-min y-max unit]
+  (let [width (chart-width state)
+        height (chart-height state)
+        mobile? state.mobile?
+        base-pad (base-padding width mobile?)
+        x-label-px (axis-label-size width mobile?)
+        left (y-axis-plot-left width mobile? y-min y-max unit)
+        right (* base-pad 0.55)
+        top (* base-pad 0.65)
+        bottom (- height (+ base-pad (* x-label-px 1.55)))]
+    {:width width
+     :height height
+     :left left
+     :right right
+     :top top
+     :bottom (max (+ top 60) bottom)
+     :gridLineWidth (max 1 (round (/ width 900)))
+     :axisFont (scaled-font width 10 (if mobile? 108 95) 600)
+     :labelFont (scaled-font width 12 52 600)
+     :lineWidth (max 2.5 (round (/ width 420)))
+     :dotRadius (max 4 (round (/ width 180)))
+     :yMin y-min
+     :yMax (max (+ y-min 1) y-max)}))
+
+(defn bar-layout [state]
+  (let [width (chart-width state)
+        height (chart-height state)
+        mobile? state.mobile?
+        base-pad (base-padding width mobile?)
+        x-label-px (axis-label-size width mobile?)
+        left (* base-pad 1.2)
+        right (* base-pad 0.45)
+        top (* base-pad 0.65)
+        bottom (- height (+ base-pad (* x-label-px 1.55)))]
+    {:width width
+     :height height
+     :left left
+     :right right
+     :top top
+     :bottom (max (+ top 60) bottom)
+     :gridLineWidth (max 1 (round (/ width 900)))
+     :labelFont (scaled-font width 12 52 600)
+     :yMin 0
+     :yMax 1}))
+
+(defn plot-width [layout]
+  (max 1 (- (- layout.width layout.left) layout.right)))
+
+(defn plot-height [layout]
+  (max 1 (- layout.bottom layout.top)))
+
+(defn plot-right [layout]
+  (+ layout.left (plot-width layout)))
+
+(defn x-for-index [layout point-count index]
+  (+ layout.left
+     (if (= point-count 1)
+         (/ (plot-width layout) 2)
+         (* (/ index (- point-count 1)) (plot-width layout)))))
+
+(defn y-for-value [layout value]
+  (- layout.bottom
+     (* (/ (- value layout.yMin)
+           (max 1 (- layout.yMax layout.yMin)))
+        (plot-height layout))))
+
+(defn axis-value [layout index]
+  (- layout.yMax
+     (* (/ index 4)
+        (- layout.yMax layout.yMin))))
+
+(defn axis-y [layout index]
+  (+ layout.top (* (/ index 4) (plot-height layout))))
+
+(defn point-values [points]
+  (map points (fn [point] point.value)))
+
+(defn dynamic-y-min [points]
+  (if (empty? points)
+      0
+      (let [values (point-values points)
+            data-min (min-of values)
+            data-max (max-of values)
+            span (max 1 (- data-max data-min))]
+        (max 0 (floor (- data-min (* span 0.15)))))))
+
+(defn dynamic-y-max [points]
+  (if (empty? points)
+      10
+      (let [values (point-values points)
+            data-min (min-of values)
+            data-max (max-of values)
+            span (max 1 (- data-max data-min))]
+        (ceil (+ data-max (* span 0.15))))))
+
+(defn visible-label-indices [count limit]
+  (let [step (if (> count limit)
+                 (ceil (/ count (- limit 2)))
+                 1)]
+    (filter (range 0 count)
+            (fn [index]
+              (or (= (mod index step) 0)
+                  (= index (- count 1)))))))
+
+(defn edge-label-align [visible-index visible-count]
+  (if (and (= visible-index 0)
+           (= visible-count 1))
+      "center"
+      (if (= visible-index 0)
+          "left"
+          (if (= visible-index (- visible-count 1))
+              "right"
+              "center"))))
+
+(defn edge-label-x [visible-index visible-count left right ideal-x]
+  (if (and (= visible-index 0)
+           (= visible-count 1))
+      (/ (+ left right) 2)
+      (if (= visible-index 0)
+          left
+          (if (= visible-index (- visible-count 1))
+              right
+              ideal-x))))
+
+(defn append-trend-grid-ops [ops layout index unit]
+  (let [y (axis-y layout index)
+        value (axis-value layout index)]
+    (conj ops
+          (canvas-op {:op :begin-path})
+          (canvas-op {:op :move-to
+                      :x layout.left
+                      :y y})
+          (canvas-op {:op :line-to
+                      :x (plot-right layout)
+                      :y y})
+          (canvas-op {:op :stroke
+                      :strokeStyle "#e5ebe6"
+                      :lineWidth layout.gridLineWidth})
+          (canvas-op {:op :fill-text
+                      :text (str (round value) unit)
+                      :x (- layout.left 6)
+                      :y y
+                      :fillStyle "#617066"
+                      :font layout.axisFont
+                      :textAlign "right"
+                      :textBaseline "middle"}))))
+
+(defn trend-background-ops [layout unit]
+  (reduce (range 0 5)
+          [(canvas-op {:op :clear
+                       :width layout.width
+                       :height layout.height})
+           (canvas-op {:op :fill-rect
+                       :x 0
+                       :y 0
+                       :width layout.width
+                       :height layout.height
+                       :fillStyle "#fffdfa"})]
+          (fn [ops index]
+            (append-trend-grid-ops ops layout index unit))))
+
+(defn append-trend-path-point [layout point-count ops point index]
+  (let [x (x-for-index layout point-count index)
+        y (y-for-value layout point.value)]
+    (conj ops
+          (if (= index 0)
+              (canvas-op {:op :move-to
+                          :x x
+                          :y y})
+              (canvas-op {:op :line-to
+                          :x x
+                          :y y})))))
+
+(defn append-trend-line-ops [ops layout points color]
+  (if (> (count points) 1)
+      (conj (reduce-indexed points
+               (conj ops (canvas-op {:op :begin-path}))
+               (fn [line-ops point index]
+                 (append-trend-path-point layout (count points) line-ops point index)))
+            (canvas-op {:op :stroke
+                        :strokeStyle color
+                        :lineWidth layout.lineWidth
+                        :lineCap "round"
+                        :lineJoin "round"}))
+      ops))
+
+(defn append-trend-dot-ops [ops layout points color]
+  (reduce-indexed points
+    ops
+    (fn [dot-ops point index]
+      (conj dot-ops
+            (canvas-op {:op :begin-path})
+            (canvas-op {:op :arc
+                        :x (x-for-index layout (count points) index)
+                        :y (y-for-value layout point.value)
+                        :radius layout.dotRadius
+                        :start 0
+                        :end (* 2 pi)})
+            (canvas-op {:op :fill
+                        :fillStyle color})))))
+
+(defn append-trend-label-ops [ops layout points]
+  (let [indices (visible-label-indices (count points) 8)]
+    (reduce-indexed indices
+      ops
+      (fn [label-ops point-index visible-index]
+        (let [point (nth points point-index)
+              ideal-x (x-for-index layout (count points) point-index)]
+          (conj label-ops
+                (canvas-op {:op :fill-text
+                            :text point.label
+                            :x (edge-label-x visible-index
+                                             (count indices)
+                                             layout.left
+                                             (plot-right layout)
+                                             ideal-x)
+                            :y (+ layout.bottom 10)
+                            :fillStyle "#617066"
+                            :font layout.labelFont
+                            :textAlign (edge-label-align visible-index (count indices))
+                            :textBaseline "top"})))))))
+
+(defn empty-chart-ops [layout]
+  [(canvas-op {:op :clear
+               :width layout.width
+               :height layout.height})
+   (canvas-op {:op :fill-rect
+               :x 0
+               :y 0
+               :width layout.width
+               :height layout.height
+               :fillStyle "#fffdfa"})
+   (canvas-op {:op :fill-text
+               :text "Not enough data yet"
+               :x (/ layout.width 2)
+               :y (/ layout.height 2)
+               :fillStyle "#617066"
+               :font (scaled-font layout.width 12 90 600)
+               :textAlign "center"
+               :textBaseline "middle"})])
+
+(defn trend-chart-ops [layout points color unit]
+  (if (empty? points)
+      (empty-chart-ops layout)
+      (append-trend-label-ops
+        (append-trend-dot-ops
+          (append-trend-line-ops (trend-background-ops layout unit) layout points color)
+          layout
+          points
+          color)
+        layout
+        points)))
+
+(defn max-bar-value [points]
+  (reduce points 1 (fn [value point] (max value point.value))))
+
+(defn bar-gap [layout points]
+  (max 2 (round (/ (plot-width layout) (* (count points) 8)))))
+
+(defn bar-width [layout points]
+  (let [gap (bar-gap layout points)]
+    (max 6
+         (/ (- (plot-width layout)
+               (* gap (+ (count points) 1)))
+            (count points)))))
+
+(defn x-for-bar [layout points index]
+  (let [gap (bar-gap layout points)
+        width (bar-width layout points)]
+    (+ layout.left gap (* index (+ width gap)))))
+
+(defn append-bar-op [layout points max-value ops point index]
+  (let [width (bar-width layout points)
+        height (* (/ point.value max-value) (plot-height layout))
+        x (x-for-bar layout points index)
+        y (- layout.bottom height)]
+    (conj ops
+          (canvas-op {:op :fill-rect
+                      :x x
+                      :y y
+                      :width width
+                      :height height
+                      :fillStyle "#d9184b"}))))
+
+(defn append-bar-label-op [layout points ops point-index visible-index]
+  (let [point (nth points point-index)
+        width (bar-width layout points)
+        ideal-x (+ (x-for-bar layout points point-index) (/ width 2))]
+    (conj ops
+          (canvas-op {:op :fill-text
+                      :text point.label
+                      :x ideal-x
+                      :y (+ layout.bottom 10)
+                      :fillStyle "#617066"
+                      :font layout.labelFont
+                      :textAlign "center"
+                      :textBaseline "top"}))))
+
+(defn bar-label-ops [ops layout points]
+  (let [indices (visible-label-indices (count points) 10)]
+    (reduce-indexed indices
+      ops
+      (fn [label-ops point-index visible-index]
+        (append-bar-label-op layout points label-ops point-index visible-index)))))
+
+(defn bar-chart-ops [layout points]
+  (if (empty? points)
+      (empty-chart-ops layout)
+      (let [max-value (max-bar-value points)
+            base-ops [(canvas-op {:op :clear
+                                  :width layout.width
+                                  :height layout.height})
+                      (canvas-op {:op :fill-rect
+                                  :x 0
+                                  :y 0
+                                  :width layout.width
+                                  :height layout.height
+                                  :fillStyle "#fffdfa"})
+                      (canvas-op {:op :begin-path})
+                      (canvas-op {:op :move-to
+                                  :x layout.left
+                                  :y layout.bottom})
+                      (canvas-op {:op :line-to
+                                  :x (plot-right layout)
+                                  :y layout.bottom})
+                      (canvas-op {:op :stroke
+                                  :strokeStyle "#e5ebe6"
+                                  :lineWidth layout.gridLineWidth})]
+            bars (reduce-indexed points
+                   base-ops
+                   (fn [ops point index]
+                     (append-bar-op layout points max-value ops point index)))]
+        (bar-label-ops bars layout points))))
+
+(defn canvas-command [ref layout ops]
+  {:kind :canvas/draw
+   :ref ref
+   :cssWidth layout.width
+   :cssHeight layout.height
+   :devicePixelRatio true
+   :ops ops
+   :onError :chart-error})
+
+(defn metric-watch-command [ref]
+  {:kind :dom-ref/resize-watch
+   :id (str "metric-resize-" ref)
+   :ref ref
+   :onChange :chart-resized
+   :onError :chart-error})
+
+(defn zone2-command [state group]
+  (let [points (build-zone2-trend group.entries state.metricsGrouping)
+        layout (trend-layout state 0 100 "%")]
+    (canvas-command (metric-chart-ref group.type "zone2")
+                    layout
+                    (trend-chart-ops layout points "#2a9d8f" "%"))))
+
+(defn hrr-command [state group]
+  (let [points (build-hrr-trend group.entries state.metricsGrouping)
+        layout (trend-layout state (dynamic-y-min points) (dynamic-y-max points) "")]
+    (canvas-command (metric-chart-ref group.type "hrr")
+                    layout
+                    (trend-chart-ops layout points "#f77f00" ""))))
+
+(defn trimp-command [state group]
+  (let [points (build-trimp-bars group.entries 20)
+        layout (bar-layout state)]
+    (canvas-command (metric-chart-ref group.type "trimp")
+                    layout
+                    (bar-chart-ops layout points))))
+
+(defn zone2-watch-command [group]
+  (metric-watch-command (metric-chart-ref group.type "zone2")))
+
+(defn hrr-watch-command [group]
+  (metric-watch-command (metric-chart-ref group.type "hrr")))
+
+(defn trimp-watch-command [group]
+  (metric-watch-command (metric-chart-ref group.type "trimp")))
+
+(defn metric-group-chart-command [state group]
+  (let [enabled (get-metrics-for-type group.type)]
+    {:kind :batch
+     :commands [(if (metric-enabled? enabled "zone2")
+                    (zone2-command state group)
+                    {:kind :none})
+                (if (metric-enabled? enabled "hrr")
+                    (hrr-command state group)
+                    {:kind :none})
+                (if (metric-enabled? enabled "trimp")
+                    (trimp-command state group)
+                    {:kind :none})]}))
+
+(defn metric-group-watch-command [group]
+  (let [enabled (get-metrics-for-type group.type)]
+    {:kind :batch
+     :commands [(if (metric-enabled? enabled "zone2")
+                    (zone2-watch-command group)
+                    {:kind :none})
+                (if (metric-enabled? enabled "hrr")
+                    (hrr-watch-command group)
+                    {:kind :none})
+                (if (metric-enabled? enabled "trimp")
+                    (trimp-watch-command group)
+                    {:kind :none})]}))
+
+(ann metric-chart-command (Fn [MetricChartState] (Cmd MetricChartMsg)))
+(defn metric-chart-command [state]
+  (if (= state.detailView "metrics")
+      {:kind :batch
+       :commands (map (group-entries-by-type (visible-log state.entries))
+                      (fn [group]
+                        (metric-group-chart-command state group)))}
+      {:kind :none}))
+
+(defn metric-group-chart-batch [state group]
+  {:kind :batch
+   :commands [(metric-group-chart-command state group)
+              (metric-group-watch-command group)]})
+
+(ann metric-chart-batch (Fn [MetricChartState] (Cmd MetricChartMsg)))
+(defn metric-chart-batch [state]
+  (if (= state.detailView "metrics")
+      {:kind :batch
+       :commands (map (group-entries-by-type (visible-log state.entries))
+                      (fn [group]
+                        (metric-group-chart-batch state group)))}
+      {:kind :none}))

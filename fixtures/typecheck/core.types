@@ -1,0 +1,4 @@
+(def answer (+ 40 2)) : Number
+(let [x 41] (+ x 1)) : Number
+(fn [x] x) : (Fn [t0] t0)
+(defn view [label] #html <button>{label}</button>) : (Fn [t1] Html)

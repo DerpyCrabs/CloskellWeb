@@ -1,0 +1,91 @@
+(def init
+  [{:status "Idle"
+    :connected? false
+    :elapsedMs 0
+    :latestBpm 0
+    :targetZoneId 3
+    :zones [{:id 2 :min 111 :max 130}
+            {:id 3 :min 131 :max 150}]
+    :readings []}
+   {:kind :none}])
+
+(defn min-bpm [zones]
+  (let [first-zone (nth zones 0)]
+    first-zone.min))
+
+(defn max-bpm [zones]
+  (let [last-zone (last zones)]
+    last-zone.max))
+
+(defn clamp [value low high]
+  (max low (min high value)))
+
+(defn target-zone [zones roll]
+  (nth zones (floor roll)))
+
+(defn reading [bpm elapsed-ms]
+  {:bpm bpm
+   :time elapsed-ms})
+
+(defn update [state msg]
+  (match msg
+    {:kind :connect-simulated}
+      (if (or (not (env-dev?)) state.connected?)
+          [state {:kind :none}]
+          [(merge state {:status "Choosing simulated zone"})
+           {:kind :random/number
+            :min 0
+            :max (count state.zones)
+            :onSuccess :sim-zone-picked}])
+    {:kind :sim-zone-picked :value roll}
+      (let [zone (target-zone state.zones roll)]
+        [(merge state
+                {:targetZoneId zone.id
+                 :status "Choosing simulated BPM"})
+         {:kind :random/number
+          :min zone.min
+          :max zone.max
+          :onSuccess :sim-bpm-picked}])
+    {:kind :sim-bpm-picked :value value}
+      (let [bpm (round value)]
+        [(merge state
+                {:connected? true
+                 :status "Simulated monitor"
+                 :latestBpm bpm
+                 :readings (conj state.readings (reading bpm state.elapsedMs))})
+         {:kind :simulation/heart-rate
+          :id "simulated-monitor"
+          :ms 1000
+          :min (min-bpm state.zones)
+          :max (max-bpm state.zones)
+          :jitter 3.5
+          :start bpm
+          :onSuccess :sim-connected
+          :onReading :heart-rate}])
+    {:kind :sim-connected}
+      [state {:kind :none}]
+    {:kind :heart-rate :bpm bpm}
+      (let [elapsed-ms (+ state.elapsedMs 1000)
+            next-bpm (clamp bpm (min-bpm state.zones) (max-bpm state.zones))]
+        [(merge state
+                {:elapsedMs elapsed-ms
+                 :latestBpm next-bpm
+                 :readings (conj state.readings (reading next-bpm elapsed-ms))})
+         {:kind :none}])
+    {:kind :stop-simulated}
+      [(merge state
+              {:connected? false
+               :status "Disconnected"})
+       {:kind :simulation/stop
+        :id "simulated-monitor"}]
+    _ [state {:kind :none}]))
+
+(defn view [state]
+  #html <section data-connected={state.connected?}
+                 data-bpm={state.latestBpm}
+                 data-status={state.status}>
+          <button on:click={{:kind :connect-simulated}}>Simulate</button>
+          <button on:click={{:kind :stop-simulated}}>Stop</button>
+          <span>{state.status}</span>
+          <strong>{str state.latestBpm}</strong>
+        </section>)

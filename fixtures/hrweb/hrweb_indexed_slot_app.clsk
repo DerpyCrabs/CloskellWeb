@@ -1,0 +1,34 @@
+(def init
+  {:entries [{:id "warmup"
+              :label "Warmup"
+              :duration "10:00"}
+             {:id "tempo"
+              :label "Tempo"
+              :duration "20:00"}]})
+
+(defn update [state msg]
+  (match msg
+    {:kind :rename-second}
+    [(assoc state
+            :entries [{:id "warmup"
+                       :label "Warmup"
+                       :duration "10:00"}
+                      {:id "tempo"
+                       :label "Intervals"
+                       :duration "20:00"}])
+     {:kind :none}]
+
+    _
+    [state {:kind :none}]))
+
+(defn view [state]
+  (let [first-entry (first state.entries)
+        second-entry (nth state.entries 1)]
+    #html <section data-first={first-entry.label}
+                   data-second={second-entry.label}>
+            <button type="button"
+                    data-action="rename-second"
+                    on:click={{:kind :rename-second}}>Second</button>
+            <span data-slot="first">{first-entry.label}</span>
+            <strong data-slot="second">{second-entry.label}</strong>
+          </section>))

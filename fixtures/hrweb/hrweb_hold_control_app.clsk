@@ -1,0 +1,127 @@
+(def stop-hold-id "hold-stop")
+(def delete-hold-id "hold-delete")
+
+(def init
+  {:exerciseState :running
+   :selectedLogId "entry-1"
+   :stopHold? false
+   :deleteHold? false
+   :deleted? false
+   :status "Recording"})
+
+(defn hold-width [active?]
+  (if active?
+      "100%"
+      "0%"))
+
+(defn stop-label [active?]
+  (if active?
+      "Hold..."
+      "Stop"))
+
+(defn delete-label [active?]
+  (if active?
+      "Hold"
+      "Delete"))
+
+(defn update [state msg]
+  (match msg
+    {:kind :stop-hold-start}
+      (if (= state.exerciseState :running)
+          [(merge state
+                  {:stopHold? true
+                   :status "Hold to stop"})
+           {:kind :timer/after
+            :id stop-hold-id
+            :ms 800
+            :msg {:kind :stop-hold-complete}}]
+          [state {:kind :none}])
+    {:kind :stop-hold-cancel}
+      (if state.stopHold?
+          [(merge state
+                  {:stopHold? false
+                   :status "Recording"})
+           {:kind :timer/cancel
+            :id stop-hold-id}]
+          [state {:kind :none}])
+    {:kind :stop-hold-complete}
+      (if state.stopHold?
+          [(merge state
+                  {:exerciseState :idle
+                   :stopHold? false
+                   :status "Stopped"})
+           {:kind :none}]
+          [state {:kind :none}])
+    {:kind :delete-hold-start}
+      (if (some? state.selectedLogId)
+          [(merge state
+                  {:deleteHold? true
+                   :status "Hold to delete"})
+           {:kind :timer/after
+            :id delete-hold-id
+            :ms 800
+            :msg {:kind :delete-hold-complete}}]
+          [state {:kind :none}])
+    {:kind :delete-hold-cancel}
+      (if state.deleteHold?
+          [(merge state
+                  {:deleteHold? false
+                   :status "Delete cancelled"})
+           {:kind :timer/cancel
+            :id delete-hold-id}]
+          [state {:kind :none}])
+    {:kind :delete-hold-complete}
+      (if state.deleteHold?
+          [(merge state
+                  {:deleteHold? false
+                   :deleted? true
+                   :selectedLogId nil
+                   :status "Deleted"})
+           {:kind :none}]
+          [state {:kind :none}])
+    _ [state {:kind :none}]))
+
+(defn view [state]
+  #html <section data-status={state.status}
+                 data-stopped={= state.exerciseState :idle}
+                 data-deleted={state.deleted?}>
+          <button type="button"
+                  disabled={not (= state.exerciseState :running)}
+                  data-holding={state.stopHold?}
+                  on:pointerdown={{:kind :stop-hold-start}}
+                  on:pointerup={{:kind :stop-hold-cancel}}
+                  on:pointerleave={{:kind :stop-hold-cancel}}
+                  on:pointercancel={{:kind :stop-hold-cancel}}
+                  on:keydown={(if (or (= event.key "Enter")
+                                       (= event.key " "))
+                                   (do (event.preventDefault)
+                                       {:kind :stop-hold-start})
+                                   {:kind :none})}
+                  on:keyup={(if (or (= event.key "Enter")
+                                     (= event.key " "))
+                                 {:kind :stop-hold-cancel}
+                                 {:kind :none})}>
+            <span style={{:width (hold-width state.stopHold?)}}></span>
+            <strong>{(stop-label state.stopHold?)}</strong>
+          </button>
+          <button type="button"
+                  disabled={not (some? state.selectedLogId)}
+                  data-holding={state.deleteHold?}
+                  on:pointerdown={{:kind :delete-hold-start}}
+                  on:pointerup={{:kind :delete-hold-cancel}}
+                  on:pointerleave={{:kind :delete-hold-cancel}}
+                  on:pointercancel={{:kind :delete-hold-cancel}}
+                  on:keydown={(if (or (= event.key "Enter")
+                                       (= event.key " "))
+                                   (do (event.preventDefault)
+                                       {:kind :delete-hold-start})
+                                   {:kind :none})}
+                  on:keyup={(if (or (= event.key "Enter")
+                                     (= event.key " "))
+                                 {:kind :delete-hold-cancel}
+                                 {:kind :none})}>
+            <span style={{:width (hold-width state.deleteHold?)}}></span>
+            <strong>{(delete-label state.deleteHold?)}</strong>
+          </button>
+          <p>{state.status}</p>
+        </section>)

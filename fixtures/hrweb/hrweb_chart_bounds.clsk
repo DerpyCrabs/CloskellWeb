@@ -1,0 +1,54 @@
+(type Reading {:bpm Number :time Number})
+(type Zone {:id Number :min Number :max Number})
+(type ChartBounds {:min Number :max Number :span Number :avg Number})
+
+(ann sample-readings (Vector Reading))
+(def sample-readings
+  [{:bpm 112 :time 0}
+   {:bpm 138 :time 1000}
+   {:bpm 151 :time 2000}
+   {:bpm 145 :time 3000}])
+
+(ann sample-zones (Vector Zone))
+(def sample-zones
+  [{:id 1 :min 95 :max 119}
+   {:id 2 :min 120 :max 139}
+   {:id 3 :min 140 :max 159}])
+
+(ann reading-values (Fn [(Vector Reading)] (Vector Number)))
+(defn reading-values [readings]
+  (map readings (fn [reading] reading.bpm)))
+
+(ann zone-min-values (Fn [(Vector Zone)] (Vector Number)))
+(defn zone-min-values [zones]
+  (map zones (fn [zone] zone.min)))
+
+(ann zone-max-values (Fn [(Vector Zone)] (Vector Number)))
+(defn zone-max-values [zones]
+  (map zones (fn [zone] zone.max)))
+
+(ann chart-bounds (Fn [(Vector Reading) (Vector Zone) Bool] ChartBounds))
+(defn chart-bounds [readings zones mobile?]
+  (let [values (reading-values readings)
+        zone-mins (zone-min-values zones)
+        zone-maxes (zone-max-values zones)
+        reading-min (if (empty? values) 50 (min-of values))
+        reading-max (if (empty? values) 170 (max-of values))
+        chart-min (if mobile?
+                      (min reading-min (min-of zone-mins reading-min))
+                      (min-of zone-mins reading-min 50))
+        chart-max (if mobile?
+                      (max reading-max (max-of zone-maxes reading-max))
+                      (max-of zone-maxes reading-max 170))
+        span (max 20 (- chart-max chart-min))
+        average (round (/ (sum values) (max 1 (count values))))]
+    {:min chart-min
+     :max chart-max
+     :span span
+     :avg average}))
+
+(def desktop-bounds
+  (chart-bounds sample-readings sample-zones false))
+
+(def mobile-bounds
+  (chart-bounds sample-readings sample-zones true))

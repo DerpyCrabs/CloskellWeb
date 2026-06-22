@@ -1,0 +1,41 @@
+(def init
+  [{:draws 0
+    :status "Ready"}
+   {:kind :canvas/draw
+    :ref "heart-chart"
+    :width 120
+    :height 60
+    :ops [{:op :clear}
+          {:op :fill-rect :x 0 :y 0 :width 120 :height 60 :fillStyle "#fffdfa"}
+          {:op :begin-path}
+          {:op :move-to :x 10 :y 48}
+          {:op :line-to :x 60 :y 18}
+          {:op :line-to :x 110 :y 34}
+          {:op :stroke :strokeStyle "#d9184b" :lineWidth 4}
+          {:op :fill-text :text "HR" :x 12 :y 18 :fillStyle "#172019" :font "700 12px system-ui"}]
+    :msg :drawn}])
+
+(defn update [state msg]
+  (match msg
+    :draw
+      [state
+       {:kind :canvas/draw
+        :ref "heart-chart"
+        :width 120
+        :height 60
+        :ops [{:op :clear}
+              {:op :fill-rect :x 0 :y 0 :width 120 :height 60 :fillStyle "#fffdfa"}
+              {:op :fill-rect :x 12 :y 20 :width 96 :height 18 :fillStyle "#d9184b"}]
+        :msg :drawn}]
+    :drawn
+      [{:draws (+ state.draws 1)
+        :status (str "Drawn " (+ state.draws 1))}
+       {:kind :none}]
+    _ [state {:kind :none}]))
+
+(defn view [state]
+  #html <section data-status={state.status}>
+          <canvas ref="heart-chart" width="120" height="60" aria-label="Heart rate preview"></canvas>
+          <button on:click={:draw}>Draw</button>
+          <span>{state.status}</span>
+        </section>)

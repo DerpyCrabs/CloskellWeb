@@ -1,0 +1,1 @@
+#html <button class={classes.start} disabled={not connected?} on:click={Msg.Start}>{label}</button>

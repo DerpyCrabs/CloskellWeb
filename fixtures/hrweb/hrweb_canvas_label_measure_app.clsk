@@ -1,0 +1,81 @@
+(def chart-width 260)
+(def chart-height 120)
+(def label-font "700 12px system-ui")
+(def metric-labels ["Zone 2 adherence" "Training load"])
+
+(def init
+  [{:draws 0
+    :zoneWidth 0
+    :loadWidth 0
+    :stacked? false
+    :status "Measuring"}
+   {:kind :canvas/measure-text
+    :ref "metrics-chart"
+    :texts metric-labels
+    :font label-font
+    :onSuccess :labels-measured
+    :onError :measure-failed}])
+
+(defn label-ops [zone-label load-label stacked?]
+  [{:op :clear
+    :width chart-width
+    :height chart-height}
+   {:op :fill-rect
+    :x 0
+    :y 0
+    :width chart-width
+    :height chart-height
+    :fillStyle "#fffdfa"}
+   {:op :fill-text
+    :text zone-label.text
+    :x 14
+    :y 22
+    :fillStyle "#2a9d8f"
+    :font label-font
+    :textAlign "left"
+    :textBaseline "top"}
+   {:op :fill-text
+    :text load-label.text
+    :x (if stacked? 14 (- chart-width 14))
+    :y (if stacked? 46 22)
+    :fillStyle "#d9184b"
+    :font label-font
+    :textAlign (if stacked? "left" "right")
+    :textBaseline "top"}])
+
+(defn update [state msg]
+  (match msg
+    {:kind :labels-measured :value result}
+      (let [zone-label (nth result.measurements 0)
+            load-label (nth result.measurements 1)
+            stacked? (> (+ zone-label.width load-label.width) 180)]
+        [(merge state
+                {:zoneWidth zone-label.width
+                 :loadWidth load-label.width
+                 :stacked? stacked?
+                 :status (if stacked? "Stacked labels" "Inline labels")})
+         {:kind :canvas/draw
+          :ref "metrics-chart"
+          :width chart-width
+          :height chart-height
+          :ops (label-ops zone-label load-label stacked?)
+          :msg {:kind :chart-drawn}}])
+    {:kind :chart-drawn}
+      [(merge state
+              {:draws (+ state.draws 1)
+               :status (str state.status " drawn")})
+       {:kind :none}]
+    {:kind :measure-failed :error error}
+      [(merge state {:status error}) {:kind :none}]
+    _ [state {:kind :none}]))
+
+(defn view [state]
+  #html <section data-draws={state.draws}
+                 data-zone-width={state.zoneWidth}
+                 data-load-width={state.loadWidth}
+                 data-stacked={state.stacked?}
+                 data-status={state.status}>
+          <canvas ref="metrics-chart"
+                  aria-label="Measured metric labels"></canvas>
+          <p>{state.status}</p>
+        </section>)

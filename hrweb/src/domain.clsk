@@ -1,0 +1,68 @@
+(def zones-storage-key "heartRateExercise.zones.v1")
+(def exercise-log-storage-key "heartRateExercise.log.v1")
+(def clock-timer-id "exercise-clock")
+(def simulated-monitor-id "simulated-monitor")
+(def stop-hold-timer-id "stop-workout-hold")
+(def stop-hold-frame-id "stop-workout-progress")
+(def stop-hold-ms 1000)
+(def delete-hold-timer-id "delete-log-hold")
+(def delete-hold-frame-id "delete-log-progress")
+(def delete-hold-ms 900)
+(def zone-drag-move-id "zone-boundary-drag-move")
+(def zone-drag-up-id "zone-boundary-drag-up")
+(def zone-drag-cancel-id "zone-boundary-drag-cancel")
+
+(def default-zones
+  [{:id 1 :name "Zone 1" :min 90 :max 110 :color "#2a9d8f"}
+   {:id 2 :name "Zone 2" :min 111 :max 130 :color "#70b62c"}
+   {:id 3 :name "Zone 3" :min 131 :max 150 :color "#f0b429"}
+   {:id 4 :name "Zone 4" :min 151 :max 170 :color "#f77f00"}
+   {:id 5 :name "Zone 5" :min 171 :max 190 :color "#d9184b"}])
+
+(def initial-state
+  {:appStatus "Loading"
+   :message "Loading saved HRWeb state"
+   :statusMode "muted"
+   :dev? false
+   :mobile? false
+   :detailView "live"
+   :exerciseState "idle"
+   :connected? false
+   :simulated? false
+   :deviceName ""
+   :elapsedMs 0
+   :displayElapsedMs 0
+   :startedAt nil
+   :sessionStartedAt nil
+   :idleStartedAt nil
+   :pendingStoppedAt nil
+   :latestBpm 0
+   :lastRate nil
+   :trend "Idle"
+   :readings []
+   :entries []
+   :selectedLogId nil
+   :logTypeFilter ""
+   :targetZoneId 3
+   :zones default-zones
+   :activeExerciseType "LISS"
+   :typeDraft ""
+   :typePickerEntryId nil
+   :typePickerDraft ""
+   :stopHold? false
+   :stopHoldStartedAt 0
+   :stopHoldProgress 0
+   :deleteHold? false
+   :deleteHoldStartedAt 0
+   :deleteHoldProgress 0
+   :chartWidth 0
+   :chartHeight 0
+   :zoneTrackLeft 0
+   :zoneTrackWidth 1
+   :zoneDragIndex nil
+   :zoneStatus "Ready"
+   :importStatus "Ready"
+   :metricsGrouping "week"})
+
+(defn status-text [state]
+  (str state.appStatus " - " state.message))
