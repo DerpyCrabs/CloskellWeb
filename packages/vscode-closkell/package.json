@@ -1,0 +1,91 @@
+{
+  "name": "closkell",
+  "displayName": "Closkell",
+  "description": "Syntax highlighting, formatting, and linting support for Closkell.",
+  "version": "0.1.0",
+  "private": true,
+  "publisher": "closkell",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.92.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Formatters",
+    "Linters"
+  ],
+  "activationEvents": [
+    "onLanguage:closkell",
+    "workspaceContains:**/*.clsk"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "closkell",
+        "aliases": [
+          "Closkell",
+          "closkell"
+        ],
+        "extensions": [
+          ".clsk"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "closkell",
+        "scopeName": "source.closkell",
+        "path": "./syntaxes/closkell.tmLanguage.json"
+      }
+    ],
+    "commands": [
+      {
+        "command": "closkell.checkDocument",
+        "title": "Closkell: Check Current File"
+      }
+    ],
+    "configuration": {
+      "title": "Closkell",
+      "properties": {
+        "closkell.executablePath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the closkell executable. When empty, the extension tries target/debug, target/release, cargo run -p cli, then PATH."
+        },
+        "closkell.cargoCommand": {
+          "type": "string",
+          "default": "cargo",
+          "description": "Cargo executable used when the extension runs the workspace compiler with cargo run -p cli."
+        },
+        "closkell.commandTimeoutMs": {
+          "type": "number",
+          "default": 10000,
+          "minimum": 1000,
+          "description": "Maximum time to wait for Closkell formatter and checker commands."
+        },
+        "closkell.format.enable": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable Closkell document formatting through closkell fmt."
+        },
+        "closkell.lint.enable": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable Closkell diagnostics through closkell check --json."
+        },
+        "closkell.lint.onChange": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run Closkell diagnostics after edits with a short debounce."
+        },
+        "closkell.lint.onSave": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run Closkell diagnostics when a Closkell document is saved."
+        }
+      }
+    }
+  }
+}

@@ -1,7 +1,8 @@
 use std::{
     env, fs,
+    io::Write,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
 };
 
 #[test]
@@ -269,6 +270,115 @@ fn cli_check_rejects_browser_api_access_inside_html() {
 }
 
 #[test]
+fn cli_check_json_reports_machine_readable_diagnostics() {
+    let temp_dir = temp_dir("closkell-cli-check-json");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+    let source = temp_dir.join("bad-view.clsk");
+    fs::write(
+        &source,
+        "(defn view [state]\n  #html <button on:click={(fetch \"/api/workouts\")}>{state.label}</button>)\n",
+    )
+    .expect("bad html module should be written");
+
+    let run = Command::new(env!("CARGO_BIN_EXE_closkell"))
+        .arg("check")
+        .arg("--json")
+        .arg(&source)
+        .output()
+        .expect("closkell check --json should run");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+
+    assert!(
+        !run.status.success(),
+        "closkell check --json unexpectedly passed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.trim_start().starts_with("{\"diagnostics\":["),
+        "check --json did not emit a diagnostics object:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("bad-view.clsk")
+            && stdout.contains("\"severity\":\"error\"")
+            && stdout.contains("browser API")
+            && stdout.contains("fetch")
+            && stdout.contains("\"range\":{\"start\":{\"line\":2"),
+        "check --json did not include the expected diagnostic fields:\n{}",
+        stdout
+    );
+    assert!(
+        !stdout.contains("Error at"),
+        "check --json should not mix human diagnostics into stdout:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn cli_check_stdin_uses_buffer_without_creating_side_files() {
+    let temp_dir = temp_dir("closkell-cli-check-stdin");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+    let source = temp_dir.join("app.clsk");
+    fs::write(&source, "(def answer 42)\n").expect("source module should be written");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_closkell"))
+        .arg("check")
+        .arg("--json")
+        .arg("--stdin")
+        .arg(&source)
+        .current_dir(&temp_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("closkell check --stdin should start");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin should be piped")
+        .write_all(b"(def answer (fetch \"/api/workouts\"))\n")
+        .expect("stdin source should be written");
+
+    let run = child
+        .wait_with_output()
+        .expect("closkell check --stdin should run");
+    let files = fs::read_dir(&temp_dir)
+        .expect("temp dir should be readable")
+        .map(|entry| {
+            entry
+                .expect("temp dir entry should be readable")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>();
+    let _ = fs::remove_dir_all(&temp_dir);
+
+    assert!(
+        !run.status.success(),
+        "closkell check --stdin unexpectedly passed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("browser API") && stdout.contains("fetch"),
+        "check --stdin did not use the piped buffer:\n{}",
+        stdout
+    );
+    assert_eq!(
+        files,
+        vec!["app.clsk".to_string()],
+        "check --stdin should not create temporary side files"
+    );
+}
+
+#[test]
 fn cli_check_is_quiet_on_success_by_default() {
     let temp_dir = temp_dir("closkell-cli-check-quiet");
     let _ = fs::remove_dir_all(&temp_dir);
@@ -298,6 +408,74 @@ fn cli_check_is_quiet_on_success_by_default() {
         String::from_utf8_lossy(&run.stdout).trim().is_empty(),
         "successful check should not dump inferred forms by default:\n{}",
         String::from_utf8_lossy(&run.stdout)
+    );
+}
+
+#[test]
+fn cli_fmt_rejects_parse_errors_without_partial_output() {
+    let temp_dir = temp_dir("closkell-cli-fmt-parse-error");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+    let source = temp_dir.join("broken.clsk");
+    fs::write(&source, "#html <div>{name}\n").expect("broken source should be written");
+
+    let run = Command::new(env!("CARGO_BIN_EXE_closkell"))
+        .arg("fmt")
+        .arg(&source)
+        .output()
+        .expect("closkell fmt should run");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+
+    assert!(
+        !run.status.success(),
+        "closkell fmt unexpectedly passed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).trim().is_empty(),
+        "fmt should not emit a partial pretty-print for parse errors:\n{}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        stderr.contains("fmt failed during parsing") && stderr.contains("missing closing tag"),
+        "fmt did not explain the parse failure:\n{}",
+        stderr
+    );
+}
+
+#[test]
+fn cli_fmt_stdin_formats_buffer_without_source_file() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_closkell"))
+        .arg("fmt")
+        .arg("--stdin")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("closkell fmt --stdin should start");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin should be piped")
+        .write_all(b"(def answer (+ 40 2))\n")
+        .expect("stdin source should be written");
+
+    let run = child
+        .wait_with_output()
+        .expect("closkell fmt --stdin should run");
+
+    assert!(
+        run.status.success(),
+        "closkell fmt --stdin failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout).trim(),
+        "(def answer (+ 40 2))"
     );
 }
 

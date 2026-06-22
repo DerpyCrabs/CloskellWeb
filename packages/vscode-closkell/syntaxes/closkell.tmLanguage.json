@@ -1,0 +1,221 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Closkell",
+  "scopeName": "source.closkell",
+  "fileTypes": [
+    "clsk"
+  ],
+  "patterns": [
+    {
+      "include": "#comments"
+    },
+    {
+      "include": "#strings"
+    },
+    {
+      "include": "#reader-macros"
+    },
+    {
+      "include": "#html"
+    },
+    {
+      "include": "#definitions"
+    },
+    {
+      "include": "#keywords"
+    },
+    {
+      "include": "#constants"
+    },
+    {
+      "include": "#numbers"
+    },
+    {
+      "include": "#types"
+    },
+    {
+      "include": "#special-forms"
+    },
+    {
+      "include": "#builtins"
+    }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.semicolon.closkell",
+          "match": ";.*$"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.closkell",
+          "begin": "\"",
+          "beginCaptures": {
+            "0": {
+              "name": "punctuation.definition.string.begin.closkell"
+            }
+          },
+          "end": "\"",
+          "endCaptures": {
+            "0": {
+              "name": "punctuation.definition.string.end.closkell"
+            }
+          },
+          "patterns": [
+            {
+              "name": "constant.character.escape.closkell",
+              "match": "\\\\."
+            }
+          ]
+        }
+      ]
+    },
+    "reader-macros": {
+      "patterns": [
+        {
+          "name": "keyword.operator.reader.closkell",
+          "match": "(#html|#\\{|~@|['`~])"
+        }
+      ]
+    },
+    "html": {
+      "patterns": [
+        {
+          "name": "meta.tag.closkell.html",
+          "begin": "(</?)([A-Za-z][A-Za-z0-9:_\\.-]*)",
+          "beginCaptures": {
+            "1": {
+              "name": "punctuation.definition.tag.begin.closkell.html"
+            },
+            "2": {
+              "name": "entity.name.tag.closkell.html"
+            }
+          },
+          "end": "(/?>)",
+          "endCaptures": {
+            "1": {
+              "name": "punctuation.definition.tag.end.closkell.html"
+            }
+          },
+          "patterns": [
+            {
+              "include": "#html-attributes"
+            },
+            {
+              "include": "#html-expressions"
+            },
+            {
+              "include": "#strings"
+            }
+          ]
+        },
+        {
+          "include": "#html-expressions"
+        }
+      ]
+    },
+    "html-attributes": {
+      "patterns": [
+        {
+          "name": "entity.other.attribute-name.closkell.html",
+          "match": "\\b[A-Za-z_:][A-Za-z0-9:_\\.-]*(?=\\s*(=|/?>|\\s))"
+        }
+      ]
+    },
+    "html-expressions": {
+      "patterns": [
+        {
+          "name": "meta.embedded.expression.closkell.html",
+          "begin": "\\{",
+          "beginCaptures": {
+            "0": {
+              "name": "punctuation.section.embedded.begin.closkell.html"
+            }
+          },
+          "end": "\\}",
+          "endCaptures": {
+            "0": {
+              "name": "punctuation.section.embedded.end.closkell.html"
+            }
+          },
+          "patterns": [
+            {
+              "include": "$self"
+            }
+          ]
+        }
+      ]
+    },
+    "definitions": {
+      "patterns": [
+        {
+          "name": "meta.definition.closkell",
+          "match": "(\\()\\s*(defn|def|defmacro|type|ann)\\s+([^\\s\\)\\]\\{]+)",
+          "captures": {
+            "1": {
+              "name": "punctuation.section.list.begin.closkell"
+            },
+            "2": {
+              "name": "keyword.declaration.closkell"
+            },
+            "3": {
+              "name": "entity.name.function.closkell"
+            }
+          }
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "constant.other.keyword.closkell",
+          "match": "(?<!\\S):[A-Za-z0-9_?!*+<>=/%\\.-]+"
+        }
+      ]
+    },
+    "constants": {
+      "patterns": [
+        {
+          "name": "constant.language.closkell",
+          "match": "(?<![^\\s\\(\\[\\{])(nil|true|false)(?![^\\s\\)\\]\\}])"
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.closkell",
+          "match": "(?<![^\\s\\(\\[\\{])-?(?:\\d[\\d_]*)(?:\\.\\d[\\d_]*)?(?![^\\s\\)\\]\\}])"
+        }
+      ]
+    },
+    "types": {
+      "patterns": [
+        {
+          "name": "support.type.closkell",
+          "match": "(?<![^\\s\\(\\[\\{])(Number|String|Bool|Nil|Option|Result|Cmd|Fn|Union|Vector|List|Set|Map|Tuple|Html|Syntax)(?![^\\s\\)\\]\\}])"
+        }
+      ]
+    },
+    "special-forms": {
+      "patterns": [
+        {
+          "name": "keyword.control.closkell",
+          "match": "(?<![^\\s\\(\\[\\{])(import|fn|let|if|match|do|for|as|some|ok|err|list|cons|with-gensyms|gensym|compile-error)(?![^\\s\\)\\]\\}])"
+        }
+      ]
+    },
+    "builtins": {
+      "patterns": [
+        {
+          "name": "support.function.closkell",
+          "match": "(?<![^\\s\\(\\[\\{])(\\+|-|\\*|/|=|<|>|<=|>=|%|mod|max|min|min-of|max-of|sum|abs|round|floor|ceil|to-number|to-fixed|date-format|date-start-of-week|date-start-of-month|date-month|date-day|date-add-days|not|and|or|env-dev\\?|hash-map|map-get|map-assoc|map-dissoc|map-entries|map-keys|map-values|assoc|merge|dissoc|count|empty\\?|some\\?|nil\\?|number\\?|string\\?|bool\\?|keyword\\?|list\\?|vector\\?|set\\?|map\\?|get|first|second|nth|last|rest|find|map|map-indexed|filter|any\\?|every\\?|range|conj|disj|set-values|sort-by|sort-by-desc|sort-with|slice|drop-last|take-last|reduce|reduce-indexed|trim|lower-case|to-radix|string-slice|pad-start|regex-test\\?|includes\\?|contains\\?|locale-compare|json-stringify|json-parse|str|unwrap-or|result-value|result-error|ok\\?|err\\?)(?![^\\s\\)\\]\\}])"
+        }
+      ]
+    }
+  }
+}

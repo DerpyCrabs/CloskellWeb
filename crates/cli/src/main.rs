@@ -1,13 +1,16 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     env, fs,
+    io::{self, Read},
     path::{Component, Path, PathBuf},
     process::{Command, ExitCode},
     thread,
     time::{Duration, SystemTime},
 };
 
-use syntax::{Diagnostic, Expr, ExprKind, SourceFile, parse_source, render_diagnostics};
+use syntax::{
+    Diagnostic, Expr, ExprKind, Severity, SourceFile, line_column, parse_source, render_diagnostics,
+};
 use template_ir::{NamedTemplate, NodeKind, SlotKind};
 
 fn main() -> ExitCode {
@@ -29,11 +32,28 @@ fn run(args: Vec<String>) -> Result<(), String> {
     match command {
         "check" => {
             let path = require_check_path(&args)?;
-            let print_forms = has_flag(&args, "--types") || has_flag(&args, "--verbose");
+            let json = has_flag(&args, "--json");
+            let print_forms = !json && (has_flag(&args, "--types") || has_flag(&args, "--verbose"));
+            let source_override = if has_flag(&args, "--stdin") {
+                Some(SourceOverride::read(&path)?)
+            } else {
+                None
+            };
             let mut modules = HashMap::new();
             let mut checking = HashSet::new();
-            check_file(&path, &mut modules, &mut checking, print_forms)?;
-            Ok(())
+            let mut reporter = CheckReporter::new(!json);
+            let result = check_file_with_reporter(
+                &path,
+                &mut modules,
+                &mut checking,
+                print_forms,
+                &mut reporter,
+                source_override.as_ref(),
+            );
+            if json {
+                println!("{}", diagnostics_json(&reporter.diagnostics));
+            }
+            result.map(|_| ())
         }
         "expand" => {
             let path = require_path(&args)?;
@@ -86,8 +106,20 @@ fn run(args: Vec<String>) -> Result<(), String> {
             Ok(())
         }
         "fmt" => {
-            let path = require_path(&args)?;
-            let (_, source) = parse_file(&path)?;
+            let (input, source) = if has_flag(&args, "--stdin") {
+                let input = read_stdin()?;
+                let source = parse_source(&input);
+                (input, source)
+            } else {
+                let path = require_path(&args)?;
+                parse_file(&path)?
+            };
+            if source.has_errors() {
+                return Err(format!(
+                    "fmt failed during parsing:\n{}",
+                    render_diagnostics(&input, &source.diagnostics)
+                ));
+            }
             println!("{}", source.pretty());
             Ok(())
         }
@@ -121,6 +153,79 @@ struct ModuleInfo {
     type_declarations: Vec<typecheck::TypeDeclaration>,
     macros: HashMap<String, macro_expand::MacroDef>,
     command_shapes_by_binding: HashMap<String, Vec<CommandShape>>,
+}
+
+#[derive(Clone, Debug)]
+struct CollectedDiagnostic {
+    file: String,
+    severity: Severity,
+    message: String,
+    start: usize,
+    end: usize,
+    line: usize,
+    column: usize,
+    end_line: usize,
+    end_column: usize,
+}
+
+#[derive(Clone, Debug)]
+struct CheckReporter {
+    print_diagnostics: bool,
+    diagnostics: Vec<CollectedDiagnostic>,
+}
+
+#[derive(Clone, Debug)]
+struct SourceOverride {
+    canonical: PathBuf,
+    input: String,
+}
+
+impl CheckReporter {
+    fn new(print_diagnostics: bool) -> Self {
+        Self {
+            print_diagnostics,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn report(&mut self, path: &Path, input: &str, diagnostics: &[Diagnostic]) {
+        if diagnostics.is_empty() {
+            return;
+        }
+
+        if self.print_diagnostics {
+            println!("{}", render_diagnostics(input, diagnostics));
+        }
+
+        let file =
+            output_path_string(&fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()));
+        for diagnostic in diagnostics {
+            let (line, column) = line_column(input, diagnostic.span.start);
+            let (end_line, end_column) = line_column(input, diagnostic.span.end);
+            self.diagnostics.push(CollectedDiagnostic {
+                file: file.clone(),
+                severity: diagnostic.severity.clone(),
+                message: diagnostic.message.clone(),
+                start: diagnostic.span.start,
+                end: diagnostic.span.end,
+                line,
+                column,
+                end_line,
+                end_column,
+            });
+        }
+    }
+}
+
+impl SourceOverride {
+    fn read(path: &Path) -> Result<Self, String> {
+        let canonical = fs::canonicalize(path)
+            .map_err(|err| format!("failed to resolve {}: {}", path.display(), err))?;
+        Ok(Self {
+            canonical,
+            input: read_stdin()?,
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -615,6 +720,18 @@ fn check_file(
     checking: &mut HashSet<PathBuf>,
     print_forms: bool,
 ) -> Result<ModuleInfo, String> {
+    let mut reporter = CheckReporter::new(true);
+    check_file_with_reporter(path, modules, checking, print_forms, &mut reporter, None)
+}
+
+fn check_file_with_reporter(
+    path: &Path,
+    modules: &mut HashMap<PathBuf, ModuleInfo>,
+    checking: &mut HashSet<PathBuf>,
+    print_forms: bool,
+    reporter: &mut CheckReporter,
+    source_override: Option<&SourceOverride>,
+) -> Result<ModuleInfo, String> {
     let canonical = fs::canonicalize(path)
         .map_err(|err| format!("failed to resolve {}: {}", path.display(), err))?;
     if let Some(info) = modules.get(&canonical) {
@@ -624,7 +741,14 @@ fn check_file(
         return Err(format!("cyclic import while checking {}", path.display()));
     }
 
-    let result = check_file_inner(path, modules, checking, print_forms);
+    let result = check_file_inner(
+        path,
+        modules,
+        checking,
+        print_forms,
+        reporter,
+        source_override,
+    );
     checking.remove(&canonical);
     if let Ok(info) = &result {
         modules.insert(canonical, info.clone());
@@ -637,9 +761,11 @@ fn check_file_inner(
     modules: &mut HashMap<PathBuf, ModuleInfo>,
     checking: &mut HashSet<PathBuf>,
     print_forms: bool,
+    reporter: &mut CheckReporter,
+    source_override: Option<&SourceOverride>,
 ) -> Result<ModuleInfo, String> {
-    let (input, source) = parse_file(path)?;
-    print_parse_diagnostics(&input, &source);
+    let (input, source) = parse_check_file(path, source_override)?;
+    reporter.report(path, &input, &source.diagnostics);
     if source.has_errors() {
         return Err(format!("check failed during parsing: {}", path.display()));
     }
@@ -652,7 +778,14 @@ fn check_file_inner(
     let mut imported_command_shapes = HashMap::new();
     for import in &imports {
         let import_source = resolve_import_source(path, &import.path)?;
-        let imported = check_file(&import_source, modules, checking, false)?;
+        let imported = check_file_with_reporter(
+            &import_source,
+            modules,
+            checking,
+            false,
+            reporter,
+            source_override,
+        )?;
         for name in &import.names {
             if !imported.exports.contains(&name.name) {
                 import_diagnostics.push(Diagnostic::error(
@@ -686,24 +819,18 @@ fn check_file_inner(
             }
         }
     }
-    if !import_diagnostics.is_empty() {
-        println!("{}", render_diagnostics(&input, &import_diagnostics));
-    }
+    reporter.report(path, &input, &import_diagnostics);
 
     let local_macros = macro_expand::collect_macro_defs(&source).macros;
     let expansion = macro_expand::expand_source_with_imported_macros(&source, &imported_macros);
-    if !expansion.diagnostics.is_empty() {
-        println!("{}", render_diagnostics(&input, &expansion.diagnostics));
-    }
+    reporter.report(path, &input, &expansion.diagnostics);
 
     let type_result = typecheck::check_source_with_module_imports(
         &expansion.source,
         &import_bindings,
         &import_type_declarations,
     );
-    if !type_result.diagnostics.is_empty() {
-        println!("{}", render_diagnostics(&input, &type_result.diagnostics));
-    }
+    reporter.report(path, &input, &type_result.diagnostics);
 
     let imported_command_helpers = import_bindings
         .iter()
@@ -714,9 +841,7 @@ fn check_file_inner(
         &expansion.source,
         &imported_command_helpers,
     );
-    if !effect_report.diagnostics.is_empty() {
-        println!("{}", render_diagnostics(&input, &effect_report.diagnostics));
-    }
+    reporter.report(path, &input, &effect_report.diagnostics);
 
     if print_forms {
         for form in type_result.forms {
@@ -1937,6 +2062,46 @@ fn json_string_array(values: &[String]) -> String {
     format!("[{}]", entries)
 }
 
+fn diagnostics_json(diagnostics: &[CollectedDiagnostic]) -> String {
+    let entries = diagnostics
+        .iter()
+        .map(|diagnostic| {
+            format!(
+                "{{\"file\":{},\"severity\":{},\"message\":{},\"span\":{{\"start\":{},\"end\":{}}},\"range\":{{\"start\":{{\"line\":{},\"column\":{}}},\"end\":{{\"line\":{},\"column\":{}}}}}}}",
+                json_string(&diagnostic.file),
+                json_string(severity_name(&diagnostic.severity)),
+                json_string(&diagnostic.message),
+                diagnostic.start,
+                diagnostic.end,
+                diagnostic.line,
+                diagnostic.column,
+                diagnostic.end_line,
+                diagnostic.end_column
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{\"diagnostics\":[{}]}}", entries)
+}
+
+fn severity_name(severity: &Severity) -> &'static str {
+    match severity {
+        Severity::Error => "error",
+        Severity::Warning => "warning",
+    }
+}
+
+fn output_path_string(path: &Path) -> String {
+    let value = path.display().to_string();
+    if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{}", rest);
+    }
+    if let Some(rest) = value.strip_prefix(r"\\?\") {
+        return rest.to_string();
+    }
+    value
+}
+
 fn json_string(value: &str) -> String {
     let mut output = String::from("\"");
     for ch in value.chars() {
@@ -1958,11 +2123,36 @@ fn matches_symbol(expr: &Expr, expected: &str) -> bool {
     matches!(&expr.kind, ExprKind::Symbol(name) if name == expected)
 }
 
+fn parse_check_file(
+    path: &Path,
+    source_override: Option<&SourceOverride>,
+) -> Result<(String, SourceFile), String> {
+    if let Some(source_override) = source_override {
+        let canonical = fs::canonicalize(path)
+            .map_err(|err| format!("failed to resolve {}: {}", path.display(), err))?;
+        if canonical == source_override.canonical {
+            return Ok((
+                source_override.input.clone(),
+                parse_source(&source_override.input),
+            ));
+        }
+    }
+    parse_file(path)
+}
+
 fn parse_file(path: &Path) -> Result<(String, SourceFile), String> {
     let input = fs::read_to_string(path)
         .map_err(|err| format!("failed to read {}: {}", path.display(), err))?;
     let source = parse_source(&input);
     Ok((input, source))
+}
+
+fn read_stdin() -> Result<String, String> {
+    let mut input = String::new();
+    io::stdin()
+        .read_to_string(&mut input)
+        .map_err(|err| format!("failed to read stdin: {}", err))?;
+    Ok(input)
 }
 
 fn print_parse_diagnostics(input: &str, source: &SourceFile) {
@@ -1973,6 +2163,6 @@ fn print_parse_diagnostics(input: &str, source: &SourceFile) {
 
 fn print_help() {
     println!(
-        "closkell commands:\n  check <file> [--types]\n  build <file> [-o out.js] [--sourcemap] [--app] [--root id] [--css path] [--vendor-runtime]\n  expand <file>\n  fmt <file>\n  inspect <file>\n  test <file>\n  dev --watch <file> [--out out.js] [--sourcemap] [--app] [--root id] [--css path] [--vendor-runtime] [--poll-ms ms] [--once]"
+        "closkell commands:\n  check <file> [--types] [--json] [--stdin]\n  build <file> [-o out.js] [--sourcemap] [--app] [--root id] [--css path] [--vendor-runtime]\n  expand <file>\n  fmt <file> [--stdin]\n  inspect <file>\n  test <file>\n  dev --watch <file> [--out out.js] [--sourcemap] [--app] [--root id] [--css path] [--vendor-runtime] [--poll-ms ms] [--once]"
     );
 }

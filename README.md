@@ -3,7 +3,7 @@
 Greenfield Rust compiler workspace for a pure functional Lisp targeting HRWeb.
 
 The current repo intentionally does not preserve old Closkell semantics. The
-first proof target is rebuilding `C:/Users/crab/HRWeb` with:
+first proof target is rebuilding the HRWeb app with:
 
 - strict expression-oriented evaluation
 - hygienic macro expansion before type checking
@@ -24,11 +24,15 @@ first proof target is rebuilding `C:/Users/crab/HRWeb` with:
 - `runtime-js`: runtime helpers consumed by generated JS
 - `packages/vite-plugin-closkell`: Vite plugin that lets apps import `.clsk`
   modules directly
+- `packages/vscode-closkell`: VS Code extension with syntax highlighting,
+  formatter, and diagnostics support for `.clsk` files
 
 ## CLI
 
 ```powershell
 cargo run -p cli -- check hrweb/src/app.clsk
+cargo run -p cli -- check hrweb/src/app.clsk --json
+cargo run -p cli -- check hrweb/src/app.clsk --json --stdin
 cargo run -p cli -- check hrweb/src/app.clsk --types
 cargo run -p cli -- build hrweb/src/app.clsk --out dist/app.mjs --sourcemap
 cargo run -p cli -- test fixtures/hrweb/hrweb_test_suite.clsk
@@ -40,7 +44,16 @@ cargo test
 ```
 
 `check <file>` is quiet on success and prints diagnostics on failure. Add
-`--types` to dump inferred forms and the lowered template count.
+`--types` to dump inferred forms and the lowered template count. Add `--json`
+to emit machine-readable diagnostics for editor integrations. Add `--stdin` to
+read the root module source from stdin while still resolving imports relative to
+the file path.
+
+The VS Code extension calls `closkell fmt` for formatting and
+`closkell check --json --stdin` for diagnostics, piping editor buffers through
+stdin instead of writing temporary files beside source files. If a separate
+formatting engine is introduced later, it should sit behind `closkell fmt` so
+CLI, editor, and CI formatting stay aligned.
 
 `test <file>` compiles a module to temporary ESM and runs its exported `tests`
 vector under Node. Each test record uses `:name`, `:actual`, and `:expected`.
