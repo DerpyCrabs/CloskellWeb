@@ -1,7 +1,5 @@
 /node_modules/
 /dist/
-/.closkell/
-/.tmp/
 /test-results/
 /playwright-report/
 /src/generated/

@@ -52,7 +52,7 @@
         "closkell.executablePath": {
           "type": "string",
           "default": "",
-          "description": "Path to the closkell executable. When empty, the extension tries target/debug, target/release, cargo run -p cli, then PATH."
+          "description": "Path to the closkell executable. When empty, the extension tries a fresh target/release binary, a fresh target/debug binary, cargo run -p cli, then PATH."
         },
         "closkell.cargoCommand": {
           "type": "string",

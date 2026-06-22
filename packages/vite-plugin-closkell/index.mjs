@@ -114,7 +114,7 @@ async function collectClskFiles(root) {
   for (const entry of entries) {
     const file = path.join(root, entry.name);
     if (entry.isDirectory()) {
-      if (entry.name === ".closkell" || entry.name === "generated" || entry.name === "node_modules") continue;
+      if (entry.name === "generated" || entry.name === "node_modules") continue;
       files.push(...(await collectClskFiles(file)));
     } else if (entry.isFile() && entry.name.endsWith(".clsk")) {
       files.push(file);
@@ -127,6 +127,53 @@ async function newestClskMtimeMs(root) {
   const files = await collectClskFiles(root);
   const mtimes = await Promise.all(files.map(statMtimeMs));
   return Math.max(0, ...mtimes);
+}
+
+async function newestRustBuildInputMtimeMs(root) {
+  const files = [
+    path.join(root, "Cargo.lock"),
+    path.join(root, "Cargo.toml")
+  ];
+  const crates = path.join(root, "crates");
+  let entries = [];
+  try {
+    entries = await fs.readdir(crates, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const crateRoot = path.join(crates, entry.name);
+    files.push(path.join(crateRoot, "Cargo.toml"));
+    files.push(path.join(crateRoot, "build.rs"));
+    files.push(
+      ...(await collectFiles(path.join(crateRoot, "src"), (file) => file.endsWith(".rs")))
+    );
+  }
+  const mtimes = await Promise.all(files.map(statMtimeMs));
+  return Math.max(0, ...mtimes);
+}
+
+async function collectFiles(root, include) {
+  let entries;
+  try {
+    entries = await fs.readdir(root, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") return [];
+    throw error;
+  }
+
+  const files = [];
+  for (const entry of entries) {
+    const file = path.join(root, entry.name);
+    if (entry.isDirectory()) {
+      if (entry.name === "target" || entry.name === "node_modules") continue;
+      files.push(...(await collectFiles(file, include)));
+    } else if (entry.isFile() && include(file)) {
+      files.push(file);
+    }
+  }
+  return files;
 }
 
 function runCommand(command, args, cwd) {
@@ -164,15 +211,16 @@ export function closkell(options = {}) {
   const entryConfigured = Object.prototype.hasOwnProperty.call(options, "entry");
   const {
     entry = "src/app.clsk",
-    out = ".closkell/generated/main.mjs",
-    outDir = ".closkell/generated",
+    out = null,
+    outDir = null,
     sourceRoot: sourceRootOption = null,
     manifestPath = "../Cargo.toml",
     packageName = "cli",
+    binary = null,
     rootId = "root",
     css = "src/styles.css",
     app = true,
-    sourceMap = true,
+    sourceMap = false,
     vendorRuntime = true,
     inspect = true,
     inspectPath = "/__closkell/inspect"
@@ -180,6 +228,8 @@ export function closkell(options = {}) {
 
   let config;
   let sourceRoot;
+  let manifestRoot;
+  let compilerCommand = null;
   let entryPath = null;
   let outPath;
   let generatedRoot;
@@ -187,6 +237,12 @@ export function closkell(options = {}) {
 
   function resolveFromRoot(value) {
     return path.resolve(config.root, value);
+  }
+
+  function resolveCacheDir() {
+    return path.isAbsolute(config.cacheDir)
+      ? config.cacheDir
+      : path.resolve(config.root, config.cacheDir);
   }
 
   function resolveClskId(source, importer) {
@@ -235,7 +291,66 @@ export function closkell(options = {}) {
 
   async function outputIsFresh(output) {
     if (!existsSync(output)) return false;
-    return (await statMtimeMs(output)) >= (await newestClskMtimeMs(sourceRoot));
+    const outputMtime = await statMtimeMs(output);
+    if (outputMtime < (await newestClskMtimeMs(sourceRoot))) return false;
+    if (sourceMap && !existsSync(sourceMapPath(output))) return false;
+    if (!sourceMap) {
+      const tail = await readFileTail(output, 256);
+      if (tail.includes("sourceMappingURL=")) return false;
+    }
+    return true;
+  }
+
+  function sourceMapPath(output) {
+    return `${output}.map`;
+  }
+
+  async function readFileTail(file, bytes) {
+    let handle;
+    try {
+      handle = await fs.open(file, "r");
+      const stat = await handle.stat();
+      const length = Math.min(bytes, stat.size);
+      const buffer = Buffer.alloc(length);
+      await handle.read(buffer, 0, length, stat.size - length);
+      return buffer.toString("utf8");
+    } catch (error) {
+      if (error?.code === "ENOENT") return "";
+      throw error;
+    } finally {
+      await handle?.close();
+    }
+  }
+
+  async function resolveCompilerCommand() {
+    if (compilerCommand) return compilerCommand;
+    if (binary) {
+      compilerCommand = { command: binary, args: [] };
+      return compilerCommand;
+    }
+
+    const envBinary = process.env.CLOSKELL_BIN;
+    if (envBinary) {
+      compilerCommand = { command: envBinary, args: [] };
+      return compilerCommand;
+    }
+
+    const exe = process.platform === "win32" ? ".exe" : "";
+    const workspaceRoot = manifestRoot;
+    const rustMtime = await newestRustBuildInputMtimeMs(workspaceRoot);
+    for (const profile of ["release", "debug"]) {
+      const candidate = path.join(workspaceRoot, "target", profile, `closkell${exe}`);
+      if (existsSync(candidate) && (await statMtimeMs(candidate)) >= rustMtime) {
+        compilerCommand = { command: candidate, args: [] };
+        return compilerCommand;
+      }
+    }
+
+    compilerCommand = {
+      command: "cargo",
+      args: ["run", "-q", "--manifest-path", resolveFromRoot(manifestPath), "-p", packageName, "--"]
+    };
+    return compilerCommand;
   }
 
   async function compile(source, { force = false } = {}) {
@@ -249,13 +364,9 @@ export function closkell(options = {}) {
         return output;
       }
 
+      const compiler = await resolveCompilerCommand();
       const args = [
-        "run",
-        "--manifest-path",
-        resolveFromRoot(manifestPath),
-        "-p",
-        packageName,
-        "--",
+        ...compiler.args,
         "build",
         resolved,
         "--out",
@@ -271,7 +382,7 @@ export function closkell(options = {}) {
       }
 
       config.logger.info(`closkell: ${toPosixPath(path.relative(config.root, resolved))}`);
-      await runCommand("cargo", args, config.root);
+      await runCommand(compiler.command, args, config.root);
       return output;
     })().finally(() => {
       inFlight.delete(key);
@@ -283,17 +394,9 @@ export function closkell(options = {}) {
 
   async function inspectSource(source) {
     const resolved = path.resolve(source);
-    const args = [
-      "run",
-      "--manifest-path",
-      resolveFromRoot(manifestPath),
-      "-p",
-      packageName,
-      "--",
-      "inspect",
-      resolved
-    ];
-    const { stdout } = await runCommand("cargo", args, config.root);
+    const compiler = await resolveCompilerCommand();
+    const args = [...compiler.args, "inspect", resolved];
+    const { stdout } = await runCommand(compiler.command, args, config.root);
     return stdout;
   }
 
@@ -313,7 +416,6 @@ export function closkell(options = {}) {
       if (existsSync(vendored)) return vendored;
     }
 
-    const manifestRoot = path.dirname(resolveFromRoot(manifestPath));
     const workspaceRuntime = path.join(manifestRoot, "runtime-js", "src", "index.js");
     if (existsSync(workspaceRuntime)) return workspaceRuntime;
 
@@ -362,9 +464,10 @@ export function closkell(options = {}) {
 
     async configResolved(resolvedConfig) {
       config = resolvedConfig;
+      manifestRoot = path.dirname(resolveFromRoot(manifestPath));
       entryPath = entry ? resolveFromRoot(entry) : null;
-      outPath = resolveFromRoot(out);
-      generatedRoot = resolveFromRoot(outDir);
+      generatedRoot = outDir ? resolveFromRoot(outDir) : path.join(resolveCacheDir(), "closkell");
+      outPath = out ? resolveFromRoot(out) : path.join(generatedRoot, "main.mjs");
       sourceRoot = sourceRootOption
         ? resolveFromRoot(sourceRootOption)
         : entryPath
@@ -383,7 +486,7 @@ export function closkell(options = {}) {
 
     async buildStart() {
       if (shouldCompileEntryOnStart()) {
-        await compile(entryPath, { force: true });
+        await compile(entryPath);
       }
     },
 

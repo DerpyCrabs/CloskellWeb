@@ -290,8 +290,8 @@ declarations, annotations, and lowered template slots.
 Command log schema includes concrete command records reached through imported
 `Cmd` helpers, so entry reports expose browser effects hidden behind modules
 such as HRWeb's chart drawing helpers.
-By default the plugin lets Vite import `/src/app.clsk` directly, emits ignored
-ESM into `.closkell/generated/`, treats `css: "src/styles.css"` as a Vite-root
+By default the plugin lets Vite import `/src/app.clsk` directly, emits cache ESM
+under Vite's `node_modules/.vite/closkell/` cache, treats `css: "src/styles.css"` as a Vite-root
 path, and can also be used from plain JavaScript imports such as
 `import { summary } from "./math.clsk"` without a separate generated source
 directory. The plugin also excludes the vendored `@closkell/runtime` package

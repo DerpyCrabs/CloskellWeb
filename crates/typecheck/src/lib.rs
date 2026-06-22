@@ -195,7 +195,8 @@ pub fn check_source_with_module_imports(
             continue;
         }
 
-        let ty = if let Some(name) = definition_name(form) {
+        let form_name = definition_name(form);
+        let ty = if let Some(name) = form_name {
             defined_names.insert(name.to_string());
             if let Some(annotation) = annotations_by_name.get(name) {
                 if let Some(expected) = inferencer.type_syntax_to_type(
@@ -1313,7 +1314,9 @@ impl Inferencer {
             }
             let mut arm_env = env.clone();
             let pattern_ty = self.infer_pattern(pattern, scrutinee_ty.clone(), &mut arm_env);
-            self.unify(scrutinee_ty.clone(), pattern_ty, pattern.span);
+            if !(union_variants.is_some() && matches!(pattern_ty, Type::Union(_))) {
+                self.unify(scrutinee_ty.clone(), pattern_ty, pattern.span);
+            }
             let body_ty = self.infer_expr(body, &mut arm_env);
             result_ty = Some(match result_ty {
                 Some(existing) => self.join_types(existing, body_ty, body.span),
@@ -1584,12 +1587,16 @@ impl Inferencer {
             pattern_fields.push((name, value));
         }
 
+        let pattern_tag = pattern_record_kind_literal(&pattern_fields);
         let mut matched_fields: BTreeMap<String, Type> = BTreeMap::new();
         let mut matched_any = false;
         for variant in &variants {
             let Type::Record(fields) = self.resolve(variant.clone()) else {
                 continue;
             };
+            if pattern_tag.is_some_and(|tag| record_fields_kind_literal(&fields) != Some(tag)) {
+                continue;
+            }
             if !self.record_pattern_matches_fields(&pattern_fields, &fields) {
                 continue;
             }
@@ -1625,6 +1632,22 @@ impl Inferencer {
     }
 
     fn union_variants_matching_pattern(&mut self, pattern: &Expr, variants: &[Type]) -> Vec<usize> {
+        if let Some(tag) = pattern_kind_literal(pattern) {
+            return variants
+                .iter()
+                .enumerate()
+                .filter_map(|(index, variant)| {
+                    if tagged_record_literal(variant) == Some(tag)
+                        && self.pattern_matches_type(pattern, variant.clone())
+                    {
+                        Some(index)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+        }
+
         variants
             .iter()
             .enumerate()
@@ -3533,6 +3556,9 @@ impl Inferencer {
 
         let left = self.shallow_resolve(left);
         let right = self.shallow_resolve(right);
+        if left == right {
+            return left;
+        }
 
         match (left, right) {
             (Type::Var(id), ty) | (ty, Type::Var(id)) => self.bind(id, ty, span),
@@ -3689,6 +3715,9 @@ impl Inferencer {
     fn join_types(&mut self, left: Type, right: Type, span: Span) -> Type {
         let left = self.resolve(left);
         let right = self.resolve(right);
+        if left == right {
+            return left;
+        }
 
         match (left, right) {
             (Type::Tuple(left), Type::Tuple(right)) if left.len() == right.len() => Type::Tuple(
@@ -3776,10 +3805,16 @@ impl Inferencer {
         fields: &BTreeMap<String, Type>,
         span: Span,
     ) -> bool {
+        let tag = record_fields_kind_literal(fields);
         variants
             .iter()
             .any(|variant| match self.resolve(variant.clone()) {
                 Type::Record(variant_fields) => fields.iter().all(|(field, field_ty)| {
+                    if tag
+                        .is_some_and(|tag| record_fields_kind_literal(&variant_fields) != Some(tag))
+                    {
+                        return false;
+                    }
                     let Some(variant_field_ty) = variant_fields.get(field).cloned() else {
                         return false;
                     };
@@ -4715,14 +4750,25 @@ impl Inferencer {
     fn command_message_matches(&mut self, expected: Type, actual: Type, span: Span) -> bool {
         let expected = self.resolve(expected);
         let actual = self.resolve(actual);
+        if expected == actual {
+            return true;
+        }
         match (expected, actual) {
             (Type::Var(_), _) | (_, Type::Var(_)) => true,
             (expected, Type::Union(variants)) => variants
                 .into_iter()
                 .all(|variant| self.command_message_matches(expected.clone(), variant, span)),
-            (Type::Union(variants), actual) => variants
-                .into_iter()
-                .any(|variant| self.command_message_matches(variant, actual.clone(), span)),
+            (Type::Union(variants), actual) => {
+                if let Some(tag) = type_kind_literal(&actual) {
+                    return variants.into_iter().any(|variant| {
+                        tagged_record_literal(&variant) == Some(tag)
+                            && self.command_message_matches(variant, actual.clone(), span)
+                    });
+                }
+                variants
+                    .into_iter()
+                    .any(|variant| self.command_message_matches(variant, actual.clone(), span))
+            }
             (Type::Record(expected), Type::Record(actual)) => {
                 expected.into_iter().all(|(field, expected_ty)| {
                     actual.get(&field).cloned().is_some_and(|actual_ty| {
@@ -5944,6 +5990,45 @@ fn keyword_literal_name(ty: &Type) -> Option<&str> {
 fn tagged_record_literal(ty: &Type) -> Option<&str> {
     match ty {
         Type::Record(fields) => fields.get("kind").and_then(keyword_literal_name),
+        _ => None,
+    }
+}
+
+fn type_kind_literal(ty: &Type) -> Option<&str> {
+    match ty {
+        Type::Keyword(Some(name)) => Some(name),
+        Type::Record(fields) => record_fields_kind_literal(fields),
+        _ => None,
+    }
+}
+
+fn record_fields_kind_literal(fields: &BTreeMap<String, Type>) -> Option<&str> {
+    fields.get("kind").and_then(keyword_literal_name)
+}
+
+fn pattern_kind_literal(pattern: &Expr) -> Option<&str> {
+    match &pattern.kind {
+        ExprKind::Keyword(name) => Some(name),
+        ExprKind::Map(entries) => entries.iter().find_map(|(key, value)| {
+            (record_key_name(key).as_deref() == Some("kind"))
+                .then(|| keyword_expr_literal(value))?
+        }),
+        ExprKind::List(items) if items.first().is_some_and(|head| matches_symbol(head, "as")) => {
+            (items.len() == 3).then(|| pattern_kind_literal(&items[1]))?
+        }
+        _ => None,
+    }
+}
+
+fn pattern_record_kind_literal<'a>(pattern_fields: &[(String, &'a Expr)]) -> Option<&'a str> {
+    pattern_fields
+        .iter()
+        .find_map(|(field, value)| (field == "kind").then(|| keyword_expr_literal(value))?)
+}
+
+fn keyword_expr_literal(expr: &Expr) -> Option<&str> {
+    match &expr.kind {
+        ExprKind::Keyword(name) => Some(name),
         _ => None,
     }
 }

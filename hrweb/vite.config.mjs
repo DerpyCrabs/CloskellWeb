@@ -10,7 +10,7 @@ export default defineConfig({
       rootId: "root",
       css: "src/styles.css",
       vendorRuntime: true,
-      sourceMap: true
+      sourceMap: false
     })
   ],
   server: {
@@ -22,7 +22,7 @@ export default defineConfig({
     port: 4174
   },
   build: {
-    sourcemap: true,
+    sourcemap: false,
     target: "es2022"
   }
 });

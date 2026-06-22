@@ -939,6 +939,8 @@ fn build_file(
         .map_err(|err| format!("failed to write {}: {}", output.display(), err))?;
     if options.source_maps {
         write_source_map(path, &input, output, &emitted.source_mappings)?;
+    } else {
+        remove_file_if_exists(&source_map_path(output))?;
     }
     if let Some(app) = &options.app {
         if app.vendor_runtime {

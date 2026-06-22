@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "check:closkell": "cargo run --manifest-path ../Cargo.toml -p cli -- check src/app.clsk",
+    "check:closkell": "node ../packages/closkell-runner.cjs check src/app.clsk",
     "dev": "vite --host 127.0.0.1",
     "build": "vite build",
     "preview": "vite preview --host 127.0.0.1",

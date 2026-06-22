@@ -152,7 +152,7 @@ try {{
     throw new Error(`inspect endpoint did not report the command schema: ${{JSON.stringify(report.commandLogSchema)}}`);
   }}
 
-  const generated = path.join(root, ".closkell", "generated", "main.mjs");
+  const generated = path.join(server.config.cacheDir, "closkell", "main.mjs");
   const runtime = path.join(root, "node_modules", "@closkell", "runtime", "src", "index.js");
   if (!existsSync(generated)) throw new Error("Vite plugin did not emit the generated app module");
   if (!existsSync(`${{generated}}.map`)) throw new Error("Vite plugin did not emit a source map");
@@ -261,7 +261,7 @@ try {{
     throw new Error(`unexpected Closkell module exports: ${{JSON.stringify({{ answer: mod.answer, next: mod.next, label: mod.label }})}}`);
   }}
 
-  const generated = path.join(root, ".closkell", "generated", "math.mjs");
+  const generated = path.join(server.config.cacheDir, "closkell", "math.mjs");
   if (!existsSync(generated)) throw new Error("plain JS import did not emit the generated Closkell module");
   if (!existsSync(`${{generated}}.map`)) throw new Error("plain JS import did not emit a source map");
 }} finally {{
@@ -322,10 +322,7 @@ fn vite_plugin_builds_direct_clsk_entry_with_tailwind() {
         return;
     }
 
-    let temp_dir = hrweb_dir.join(".tmp").join(format!(
-        "closkell-vite-plugin-tailwind-{}",
-        std::process::id()
-    ));
+    let temp_dir = temp_dir("closkell-vite-plugin-tailwind");
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(temp_dir.join("src")).expect("temp Vite src dir should be created");
     fs::write(temp_dir.join("package.json"), "{\"type\":\"module\"}\n")
@@ -337,7 +334,15 @@ fn vite_plugin_builds_direct_clsk_entry_with_tailwind() {
     .expect("index.html should be written");
     fs::write(
         temp_dir.join("src").join("styles.css"),
-        "@import \"tailwindcss\";\n\n@theme {\n  --font-sans: Inter, ui-sans-serif, system-ui, sans-serif;\n}\n",
+        format!(
+            "@import \"{}\";\n\n@theme {{\n  --font-sans: Inter, ui-sans-serif, system-ui, sans-serif;\n}}\n",
+            posix_path(
+                &hrweb_dir
+                    .join("node_modules")
+                    .join("tailwindcss")
+                    .join("index.css")
+            )
+        ),
     )
     .expect("styles.css should be written");
     fs::write(
@@ -437,6 +442,10 @@ fn temp_dir(name: &str) -> PathBuf {
 
 fn node_available() -> bool {
     Command::new("node").arg("--version").output().is_ok()
+}
+
+fn posix_path(path: &Path) -> String {
+    path.display().to_string().replace('\\', "/")
 }
 
 fn json_string_for_test(value: &str) -> String {

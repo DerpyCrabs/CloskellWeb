@@ -336,11 +336,77 @@ function findCompilerWorkspace(document) {
 
 function findBuiltCompiler(root) {
   const executable = process.platform === "win32" ? "closkell.exe" : "closkell";
+  const newestInput = newestCompilerInputMtimeMs(root);
   const candidates = [
-    path.join(root, "target", "debug", executable),
     path.join(root, "target", "release", executable),
+    path.join(root, "target", "debug", executable),
   ];
-  return candidates.find((candidate) => fs.existsSync(candidate)) || null;
+  return (
+    candidates.find(
+      (candidate) => fs.existsSync(candidate) && statMtimeMs(candidate) >= newestInput
+    ) || null
+  );
+}
+
+function newestCompilerInputMtimeMs(root) {
+  return Math.max(0, ...compilerInputFiles(root).map(statMtimeMs));
+}
+
+function compilerInputFiles(root) {
+  const files = [path.join(root, "Cargo.toml"), path.join(root, "Cargo.lock")];
+  const crates = path.join(root, "crates");
+  let entries = [];
+  try {
+    entries = fs.readdirSync(crates, { withFileTypes: true });
+  } catch (error) {
+    if (error.code !== "ENOENT") {
+      throw error;
+    }
+  }
+
+  for (const entry of entries) {
+    if (!entry.isDirectory()) {
+      continue;
+    }
+    const crateRoot = path.join(crates, entry.name);
+    files.push(path.join(crateRoot, "Cargo.toml"));
+    files.push(path.join(crateRoot, "build.rs"));
+    collectFiles(path.join(crateRoot, "src"), (file) => file.endsWith(".rs"), files);
+  }
+  return files;
+}
+
+function collectFiles(root, include, files) {
+  let entries = [];
+  try {
+    entries = fs.readdirSync(root, { withFileTypes: true });
+  } catch (error) {
+    if (error.code !== "ENOENT") {
+      throw error;
+    }
+    return files;
+  }
+
+  for (const entry of entries) {
+    const file = path.join(root, entry.name);
+    if (entry.isDirectory()) {
+      collectFiles(file, include, files);
+    } else if (entry.isFile() && include(file)) {
+      files.push(file);
+    }
+  }
+  return files;
+}
+
+function statMtimeMs(file) {
+  try {
+    return fs.statSync(file).mtimeMs;
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return 0;
+    }
+    throw error;
+  }
 }
 
 function parseDiagnosticJson(stdout) {

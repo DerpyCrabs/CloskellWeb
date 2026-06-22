@@ -9,7 +9,7 @@ Adds `.clsk` language support for Closkell:
 The extension looks for the compiler in this order:
 
 1. `closkell.executablePath`, when configured.
-2. `target/debug/closkell` or `target/release/closkell` in a Closkell workspace.
+2. Fresh `target/release/closkell` or `target/debug/closkell` in a Closkell workspace.
 3. `cargo run -q -p cli --` from a Closkell workspace.
 4. `closkell` on `PATH`.
 
