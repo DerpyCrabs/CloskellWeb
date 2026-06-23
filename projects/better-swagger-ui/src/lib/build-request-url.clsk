@@ -1,0 +1,56 @@
+(import "./param-serialization.clsk" [appendQueryParam serializeHeaderParamValue serializePathParamValue])
+
+(defn hasText? [value]
+  (and (string? value) (not (= (trim value) ""))))
+
+(defn resolveServerUrl [serverUrl specUrl]
+  (let [resolved (url-resolve serverUrl specUrl)]
+    (if (some? resolved) resolved serverUrl)))
+
+(defn trimTrailingSlash [value]
+  (if (ends-with? value "/")
+      (string-slice value 0 (- (count value) 1))
+      value))
+
+(defn valueFor [values name]
+  (let [value (object-get values name)]
+    (if (string? value) value "")))
+
+(defn encodedPair [entry]
+  (str (encode-uri-component entry.name) "=" (encode-uri-component entry.value)))
+
+(defn appendQueryString [url entries]
+  (if (= (count entries) 0)
+      url
+      (str url "?" (join (map entries encodedPair) "&"))))
+
+(defn applyUrlParam [state param values]
+  (let [raw (valueFor values param.name)]
+    (if (= (get param :in) "path")
+        (let [serialized (serializePathParamValue param raw)]
+          (if (and (some? serialized) (hasText? serialized))
+              (assoc state :path (path-fill-param state.path param.name serialized))
+              state))
+        (if (= (get param :in) "query")
+            (assoc state :query (appendQueryParam state.query param raw))
+            state))))
+
+(defn buildUrl [serverUrl specUrl path defs values]
+  (let [built (reduce defs
+                      {:path path :query []}
+                      (fn [state param] (applyUrlParam state param values)))
+        base (trimTrailingSlash (resolveServerUrl serverUrl specUrl))
+        url (str base built.path)]
+    (appendQueryString url built.query)))
+
+(defn applyHeaderParam [headers param values]
+  (let [raw (valueFor values param.name)
+        serialized (serializeHeaderParamValue param raw)]
+    (if (and (= (get param :in) "header")
+             (some? serialized)
+             (hasText? serialized))
+        (object-assoc headers param.name serialized)
+        headers)))
+
+(defn buildRequestHeaders [defs values baseHeaders]
+  (reduce defs baseHeaders (fn [headers param] (applyHeaderParam headers param values))))

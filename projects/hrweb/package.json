@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "check:closkell": "node ../packages/closkell-runner.cjs check src/app.clsk",
+    "check:closkell": "node ../../packages/closkell-runner.cjs check src/app.clsk",
     "dev": "vite --host 127.0.0.1",
     "build": "vite build",
     "preview": "vite preview --host 127.0.0.1",
@@ -14,7 +14,7 @@
   },
   "dependencies": {},
   "devDependencies": {
-    "@closkell/vite-plugin": "file:../packages/vite-plugin-closkell",
+    "@closkell/vite-plugin": "file:../../packages/vite-plugin-closkell",
     "@tailwindcss/vite": "4.3.0",
     "@playwright/test": "^1.55.0",
     "tailwindcss": "4.3.0",

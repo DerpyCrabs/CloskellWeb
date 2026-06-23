@@ -9,6 +9,7 @@ export default defineConfig({
       entry: "src/app.clsk",
       rootId: "root",
       css: "src/styles.css",
+      manifestPath: "../../Cargo.toml",
       vendorRuntime: true,
       sourceMap: false
     })

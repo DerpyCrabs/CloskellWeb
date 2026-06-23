@@ -1,0 +1,167 @@
+(import "./schema.clsk" [resolveRef resolveSchema schemaTypeLabel])
+(import "./param-serialization.clsk" [appendQueryParam parseParamInputValue])
+
+(def uuidPattern "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
+
+(defn reference? [value]
+  (and (some? value) (some? (get value "$ref"))))
+
+(defn schemaKind [schema]
+  (if (not (some? schema))
+      "string"
+      (if (and (vector? (get schema :enum)) (> (count (get schema :enum)) 0))
+          "enum"
+          (match (get schema :type)
+            "boolean" "boolean"
+            "integer" "integer"
+            "number" "number"
+            "array" "array"
+            "object" "object"
+            _ (if (object? (get schema :properties)) "object" "string")))))
+
+(defn enumStrings [values]
+  (if (and (vector? values) (> (count values) 0))
+      (map values (fn [value] (str value)))
+      nil))
+
+(defn exampleAsString [value]
+  (if (not (some? value))
+      nil
+      (if (vector? value)
+          (join (map value (fn [item] (str item))) ", ")
+          (if (object? value) (json-stringify value) (str value)))))
+
+(defn arrayItemMeta [spec schema]
+  (if (or (not (some? schema)) (not (= (get schema :type) "array")) (not (some? (get schema :items))))
+      {:arrayItemKind "string"}
+      (let [itemSchema (resolveSchema spec (get schema :items))]
+        (if (not (some? itemSchema))
+            {:arrayItemKind "string"}
+            {:arrayItemKind (schemaKind itemSchema)
+             :arrayItemEnum (enumStrings (get itemSchema :enum))}))))
+
+(defn firstPresentString [values]
+  (let [match (find values (fn [value] (some? value)))]
+    match))
+
+(defn buildMeta [spec param]
+  (let [schema (get param :schema)
+        resolved (if (some? schema) (resolveSchema spec schema) nil)
+        kind (schemaKind resolved)
+        arrayItems (if (= kind "array") (arrayItemMeta spec resolved) {})
+        defaultValue (firstPresentString [(exampleAsString (get resolved :default))
+                                          (if (and (some? schema) (not (reference? schema)))
+                                              (exampleAsString (get schema :default))
+                                              nil)
+                                          (exampleAsString (get param :example))
+                                          (exampleAsString (get resolved :example))])]
+    (merge {:name param.name
+            :in param.in
+            :required (if (bool? param.required) param.required false)
+            :description (if (string? param.description) param.description (get resolved :description))
+            :schemaType (if (some? schema) (schemaTypeLabel spec schema) "string")
+            :kind kind
+            :style param.style
+            :explode param.explode
+            :enumValues (enumStrings (get resolved :enum))
+            :format (get resolved :format)
+            :minimum (get resolved :minimum)
+            :maximum (get resolved :maximum)
+            :minLength (get resolved :minLength)
+            :maxLength (get resolved :maxLength)
+            :pattern (get resolved :pattern)
+            :defaultValue defaultValue
+            :example (exampleAsString (if (some? (get param :example)) (get param :example) (get resolved :example)))}
+           arrayItems)))
+
+(defn resolveParameterObject [spec param]
+  (if (not (reference? param))
+      param
+      (let [ref (get param "$ref")]
+        (if (starts-with? ref "#/")
+            (let [resolved (resolveRef spec ref)]
+              (if (reference? resolved) nil resolved))
+            nil))))
+
+(defn supportedParam? [param]
+  (or (= (get param :in) "path")
+      (= (get param :in) "query")
+      (= (get param :in) "header")))
+
+(defn resolveParameterMeta [spec item]
+  (let [params (get item.operation :parameters)]
+    (map (filter (map (if (vector? params) params [])
+                      (fn [param] (resolveParameterObject spec param)))
+                 (fn [param] (and (some? param) (supportedParam? param))))
+         (fn [param] (buildMeta spec param)))))
+
+(defn emptyParamValues [defs]
+  (reduce defs
+          {}
+          (fn [values param]
+            (object-assoc values param.name (if (string? param.defaultValue) param.defaultValue "")))))
+
+(defn validateStringValue [meta value]
+  nil)
+
+(defn validateNumberBounds [meta parsed]
+  nil)
+
+(defn validateScalar [meta value]
+  (match (get meta :kind)
+    "boolean" (if (or (= value "true") (= value "false")) nil "Must be true or false")
+    "integer" (if (not (regex-test? value "^-?\\d+$" ""))
+                  "Must be an integer"
+                  nil)
+    "number" (if (not (regex-test? value "^-?\\d+(\\.\\d+)?$" ""))
+                 "Must be a number"
+                 nil)
+    "enum" nil
+    "string" (validateStringValue meta value)
+    _ nil))
+
+(defn validateObjectValue [value]
+  (let [result (json-parse-result value)
+        parsed (unwrap-or result nil)]
+    (if (and (ok? result) (object? parsed) (not (vector? parsed)))
+        nil
+        "Must be a JSON object")))
+
+(defn itemMeta [meta]
+  (merge meta
+         {:kind (if (and (vector? meta.arrayItemEnum) (> (count meta.arrayItemEnum) 0))
+                    "enum"
+                    (if (string? meta.arrayItemKind) meta.arrayItemKind "string"))
+          :enumValues meta.arrayItemEnum
+          :required true}))
+
+(defn validateArrayValue [meta value]
+  (let [parsed (parseParamInputValue meta value)
+        items (if (vector? parsed) (map parsed (fn [item] (str item))) [])]
+    (if (= (count items) 0)
+        (if meta.required "Required" nil)
+        (let [invalid (find items (fn [item] (some? (validateScalar (itemMeta meta) item))))]
+          (if (some? invalid)
+              (str "Invalid array item \"" invalid "\": " (validateScalar (itemMeta meta) invalid))
+              nil)))))
+
+(defn validateParamValue [meta value]
+  (let [trimmed (trim value)]
+    (if (and meta.required (= trimmed ""))
+        "Required"
+        (if (= trimmed "")
+            nil
+            (if (= meta.kind "object")
+                (validateObjectValue trimmed)
+                (if (= meta.kind "array")
+                    (validateArrayValue meta trimmed)
+                    (validateScalar meta trimmed)))))))
+
+(defn validateAllParams [defs values]
+  (reduce defs
+          {}
+          (fn [errors param]
+            (let [error (validateParamValue param (let [value (object-get values param.name)] (if (string? value) value "")))]
+              (if (some? error)
+                  (object-assoc errors param.name error)
+                  errors)))))

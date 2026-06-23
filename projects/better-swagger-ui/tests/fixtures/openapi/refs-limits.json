@@ -1,0 +1,47 @@
+{
+  "openapi": "3.0.3",
+  "info": { "title": "Refs Limits API", "version": "1.0.0" },
+  "servers": [{ "url": "/fixtures/mock-api" }],
+  "components": {
+    "schemas": {
+      "Item": {
+        "type": "object",
+        "properties": { "id": { "type": "integer" } }
+      }
+    },
+    "requestBodies": {
+      "ItemBody": {
+        "required": true,
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/Item" }
+          }
+        }
+      }
+    },
+    "responses": {
+      "ItemResponse": {
+        "description": "Item",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/Item" }
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "ApiKey": { "type": "apiKey", "in": "header", "name": "X-Key" }
+    }
+  },
+  "paths": {
+    "/items": {
+      "post": {
+        "summary": "Create with ref body",
+        "requestBody": { "$ref": "#/components/requestBodies/ItemBody" },
+        "responses": {
+          "200": { "$ref": "#/components/responses/ItemResponse" }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,47 @@
+{
+  "openapi": "3.0.3",
+  "info": { "title": "Multi Tag API", "version": "2.0.0", "description": "API with **multiple** tags." },
+  "servers": [{ "url": "/fixtures/mock-api" }],
+  "tags": [
+    { "name": "alpha", "description": "Alpha operations" },
+    { "name": "beta", "description": "Beta operations" },
+    { "name": "gamma", "description": "Gamma operations" }
+  ],
+  "components": {
+    "securitySchemes": {
+      "ApiKeyAuth": { "type": "apiKey", "in": "header", "name": "X-API-Key" }
+    }
+  },
+  "security": [{ "ApiKeyAuth": [] }],
+  "paths": {
+    "/alpha/a": {
+      "get": {
+        "tags": ["alpha"],
+        "summary": "Alpha A",
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "type": "object" } } } } }
+      }
+    },
+    "/alpha/b": {
+      "post": {
+        "tags": ["alpha"],
+        "summary": "Alpha B",
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "type": "object" } } } } }
+      }
+    },
+    "/beta/x": {
+      "get": {
+        "tags": ["beta"],
+        "summary": "Beta X",
+        "security": [],
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "type": "object" } } } } }
+      }
+    },
+    "/gamma/y": {
+      "put": {
+        "tags": ["gamma"],
+        "summary": "Gamma Y",
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "type": "object" } } } } }
+      }
+    }
+  }
+}

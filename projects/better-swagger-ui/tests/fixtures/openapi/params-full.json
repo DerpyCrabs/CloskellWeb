@@ -1,0 +1,78 @@
+{
+  "openapi": "3.0.3",
+  "info": { "title": "Params API", "version": "1.0.0" },
+  "servers": [{ "url": "/fixtures/mock-api" }],
+  "components": {
+    "parameters": {
+      "RefStatus": {
+        "name": "status",
+        "in": "query",
+        "schema": { "type": "string", "enum": ["active", "inactive"] }
+      }
+    }
+  },
+  "paths": {
+    "/users/{id}": {
+      "get": {
+        "summary": "Get user",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string", "format": "uuid" },
+            "example": "550e8400-e29b-41d4-a716-446655440000"
+          },
+          {
+            "name": "include",
+            "in": "query",
+            "schema": { "type": "array", "items": { "type": "string", "enum": ["profile", "settings"] } },
+            "example": "profile,settings"
+          },
+          {
+            "name": "active",
+            "in": "query",
+            "schema": { "type": "boolean" },
+            "example": true
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": { "type": "integer", "minimum": 1, "maximum": 100 },
+            "example": 10
+          },
+          {
+            "name": "email",
+            "in": "query",
+            "schema": { "type": "string", "format": "email", "minLength": 5 },
+            "example": "user@example.com"
+          },
+          {
+            "name": "code",
+            "in": "query",
+            "schema": { "type": "string", "pattern": "^[A-Z]{3}$" },
+            "example": "ABC"
+          },
+          {
+            "name": "X-Request-Id",
+            "in": "header",
+            "schema": { "type": "string" },
+            "example": "req-123"
+          },
+          { "$ref": "#/components/parameters/RefStatus" },
+          {
+            "name": "session",
+            "in": "cookie",
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": { "application/json": { "schema": { "type": "object" } } }
+          }
+        }
+      }
+    }
+  }
+}

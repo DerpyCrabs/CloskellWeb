@@ -1,0 +1,237 @@
+(import "yaml" [(parse as parseYaml)])
+
+(def theme-storage-key "better-swagger-theme")
+
+(defn hasOpenApiShape? [value]
+  (and (object? value)
+       (or (string? value.openapi) (string? value.swagger))
+       (object? value.paths)))
+
+(defn isLikelySpecUrl? [url]
+  (let [path (lower-case (url-pathname url))]
+    (or (ends-with? path ".json")
+        (ends-with? path ".yaml")
+        (ends-with? path ".yml")
+        (regex-test? url "\\.(json|ya?ml)(\\?|#|$)" "i"))))
+
+(defn validHttpUrl? [value]
+  (let [trimmed (trim value)]
+    (and (regex-test? trimmed "^https?://" "i")
+         (some? (url-resolve trimmed (browser-current-url))))))
+
+(defn looksLikeSpecContent [text]
+  (let [trimmed (trim text)]
+    (if (= trimmed "")
+        false
+        (or (starts-with? trimmed "{")
+            (regex-test? trimmed "^(openapi|swagger)\\s*:" "m")))))
+
+(defn parseSpecText [text]
+  (let [trimmed (trim text)]
+    (if (= trimmed "")
+        (fail "Spec content is empty")
+        (if (starts-with? trimmed "{")
+            (let [parsed (json-parse-result trimmed)]
+              (if (get parsed :ok)
+                  (unwrap-or parsed {})
+                  (fail "Invalid JSON spec")))
+            (parseYaml trimmed)))))
+
+(defn parseOpenApiText [text]
+  (let [parsed (parseSpecText text)]
+    (if (hasOpenApiShape? parsed)
+        parsed
+        (fail "Response is not an OpenAPI document"))))
+
+(defn defaultDefinitions [specUrl]
+  [{:name "default" :url specUrl}])
+
+(defn formatLoadError [error]
+  (str "Failed to load spec: " error))
+
+(defn parseSpecDocument [specUrl text]
+  (let [spec (parseOpenApiText text)]
+    {:ok true :spec spec :specUrl specUrl}))
+
+(defn absoluteUrl [value]
+  (let [resolved (url-resolve value (browser-current-url))]
+    (if (some? resolved) resolved value)))
+
+(defn absoluteUrlFrom [value base]
+  (let [resolved (url-resolve value base)]
+    (if (some? resolved) resolved value)))
+
+(defn swaggerUiBasePath [pathname]
+  (regex-capture pathname "^(.*?)/swagger-ui/?" "i"))
+
+(defn isSwaggerUiPage? [pathname]
+  (regex-test? pathname "/swagger-ui/?" "i"))
+
+(defn configUrlForSwaggerUiPage [sourceUrl]
+  (str (url-origin sourceUrl) (swaggerUiBasePath (url-pathname sourceUrl)) "/v3/api-docs/swagger-config"))
+
+(defn initOAuthUrlForSwaggerUiPage [sourceUrl]
+  (str (url-origin sourceUrl) (swaggerUiBasePath (url-pathname sourceUrl)) "/swagger-ui/swagger-initializer.js"))
+
+(defn parseInitOAuth [text]
+  (let [found (regex-capture text "initOAuth\\s*\\(\\s*(\\{[\\s\\S]*?\\})\\s*\\)" "")]
+    (if (= found "")
+        {}
+        (let [parsed (json-parse-result found)]
+          (if (get parsed :ok) (unwrap-or parsed {}) {})))))
+
+(defn parseSingleSpecUrl [text baseUrl]
+  (if (regex-test? text "urls\\s*:\\s*\\[" "")
+      ""
+      (let [found (regex-capture text "url\\s*:\\s*[\"']([^\"']+)[\"']" "")]
+        (if (= found "") "" (absoluteUrlFrom found baseUrl)))))
+
+(defn parseConfigUrl [text baseUrl]
+  (let [found (regex-capture text "configUrl\\s*:\\s*[\"']([^\"']+)[\"']" "")]
+    (if (= found "") "" (absoluteUrlFrom found baseUrl))))
+
+(defn analyzeSourceResponse [sourceInput text definitionName]
+  (let [sourceUrl (absoluteUrl sourceInput)
+        querySpecUrl (url-search-param sourceUrl "url")
+        queryConfigUrl (url-search-param sourceUrl "configUrl")
+        pathname (url-pathname sourceUrl)]
+    (if (not (= querySpecUrl ""))
+        (let [specUrl (absoluteUrlFrom querySpecUrl sourceUrl)]
+          {:kind "spec-url"
+           :sourceUrl sourceUrl
+           :specUrl specUrl
+           :definitions (defaultDefinitions specUrl)
+           :selectedDefinition "default"})
+        (if (not (= queryConfigUrl ""))
+            {:kind "config-url" :sourceUrl sourceUrl :configUrl (absoluteUrlFrom queryConfigUrl sourceUrl)}
+            (if (or (looksLikeSpecContent text) (isLikelySpecUrl? sourceUrl))
+                {:kind "spec"
+                 :sourceUrl sourceUrl
+                 :specUrl sourceUrl
+                 :definitions (defaultDefinitions sourceUrl)
+                 :selectedDefinition "default"
+                 :spec (parseOpenApiText text)}
+                (let [specUrl (parseSingleSpecUrl text sourceUrl)
+                      configUrl (parseConfigUrl text sourceUrl)]
+                  (if (not (= specUrl ""))
+                      {:kind "spec-url"
+                       :sourceUrl sourceUrl
+                       :specUrl specUrl
+                       :definitions (defaultDefinitions specUrl)
+                       :selectedDefinition "default"}
+                      (if (isSwaggerUiPage? pathname)
+                          {:kind "config-url" :sourceUrl sourceUrl :configUrl (configUrlForSwaggerUiPage sourceUrl)}
+                          (if (not (= configUrl ""))
+                              {:kind "config-url" :sourceUrl sourceUrl :configUrl configUrl}
+                              {:kind "error"
+                               :error "Could not find OpenAPI spec. Try pasting the direct spec URL (e.g. /v3/api-docs) if the API allows cross-origin access."})))))))))
+
+(defn normalizeDefinition [entry index baseUrl]
+  {:name (if (and (string? entry.name) (not (= (trim entry.name) "")))
+            (trim entry.name)
+            (if (= index 0) "default" (str "definition-" index)))
+   :url (absoluteUrlFrom entry.url baseUrl)})
+
+(defn normalizeDefinitions [entries baseUrl]
+  (map-indexed entries (fn [entry index] (normalizeDefinition entry index baseUrl))))
+
+(defn pickDefinition [definitions name]
+  (let [match (find definitions (fn [entry] (= entry.name name)))]
+    (if (some? match) match (first definitions))))
+
+(defn parseSwaggerConfigResponse [configUrl text definitionName]
+  (let [config (json-parse text)
+        urls config.urls
+        definitions (if (and (vector? urls) (> (count urls) 0))
+                        (normalizeDefinitions urls configUrl)
+                        (if (string? config.url)
+                            (defaultDefinitions (absoluteUrlFrom config.url configUrl))
+                            []))]
+    (if (= (count definitions) 0)
+        {:kind "error" :error "Could not find OpenAPI spec in swagger-config response"}
+        (let [selected (pickDefinition definitions definitionName)]
+          {:kind "spec-url"
+           :specUrl selected.url
+           :definitions definitions
+           :selectedDefinition selected.name}))))
+
+(defn definitionUrlByName [definitions name]
+  (let [selected (pickDefinition definitions name)]
+    selected.url))
+
+(defn initialUrlInput []
+  (url-search-param (browser-current-url) "url"))
+
+(defn initialDefinitionParam []
+  (url-search-param (browser-current-url) "definition"))
+
+(defn initialOpParam []
+  (url-search-param (browser-current-url) "op"))
+
+(defn initialTheme []
+  (browser-theme-initial theme-storage-key))
+
+(defn toggleTheme [current]
+  (browser-theme-toggle current theme-storage-key))
+
+(defn loadStoredAuthEntries [sourceUrl]
+  (auth-storage-load sourceUrl))
+
+(defn persistAuthEntries [sourceUrl entries]
+  (auth-storage-persist sourceUrl entries))
+
+(defn resolveTokenExpiry [response token]
+  (resolve-token-expiry (get response :expires_in) token))
+
+(defn setOpQueryParam [value]
+  (history-replace-search-param "op" value))
+
+(defn setDefinitionQueryParam [value]
+  (history-replace-search-param "definition" value))
+
+(defn setUrlQueryParam [url name value]
+  (url-set-search-param url name value))
+
+(defn writeRoute [url op definition]
+  (history-write-route url op definition))
+
+(defn setDeepObjectQueryParam [url name value]
+  (url-set-deep-object-param url name value))
+
+(defn resolveApiUrl [serverUrl path]
+  (let [resolvedPath (path-fill-params path "550e8400-e29b-41d4-a716-446655440000")
+        base serverUrl
+        suffix (if (starts-with? resolvedPath "/") resolvedPath (str "/" resolvedPath))
+        resolved (url-resolve (str base suffix) (browser-current-url))]
+    (if (some? resolved) resolved (str base suffix))))
+
+(defn resolvedSpecUrl [specUrl]
+  (let [resolved (url-resolve specUrl (browser-current-url))]
+    (if (some? resolved) resolved (browser-current-url))))
+
+(defn clipboardText [event]
+  (clipboard-text event))
+
+(defn copyText [text]
+  (clipboard-write text))
+
+(defn setCookie [name value]
+  (browser-set-cookie name value))
+
+(defn selectedRequestBodyFile []
+  (selected-file-by-test-id "request-body-file"))
+
+(defn hasSelectedRequestBodyFile? []
+  (has-selected-file "request-body-file"))
+
+(defn hasSelectedMultipartFile? [name]
+  (has-selected-file (str "request-body-multipart-" name)))
+
+(defn buildMultipartFormBody [fields values]
+  (multipart-form-body fields values))
+
+(defn buildUrlEncodedFormBody [fields values]
+  (urlencoded-form-body fields values))
+
+(defn validUuid [value]
+  (regex-test? value "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" "i"))

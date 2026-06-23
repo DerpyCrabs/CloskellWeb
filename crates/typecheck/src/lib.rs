@@ -447,6 +447,7 @@ impl Inferencer {
                 "not" => return self.infer_unary_bool(name, args, env),
                 "and" | "or" => return self.infer_bool_call(name, args, env),
                 "env-dev?" => return self.infer_zero_arg_bool(name, args),
+                "fail" => return self.infer_fail(name, args, env),
                 "ok" => return self.infer_ok(name, args, env),
                 "err" => return self.infer_err(name, args, env),
                 "ok?" | "err?" => return self.infer_result_predicate(name, args, env),
@@ -467,8 +468,9 @@ impl Inferencer {
                 "empty?" => return self.infer_empty(name, args, env),
                 "some?" => return self.infer_some(name, args, env),
                 "nil?" | "number?" | "string?" | "bool?" | "keyword?" | "list?" | "vector?"
-                | "set?" | "map?" => return self.infer_predicate(name, args, env),
+                | "set?" | "map?" | "object?" => return self.infer_predicate(name, args, env),
                 "get" => return self.infer_get(name, args, env),
+                "object-get" => return self.infer_object_get(name, args, env),
                 "first" | "second" => return self.infer_ordered_access(name, args, env),
                 "nth" => return self.infer_nth(name, args, env),
                 "last" => return self.infer_last(name, args, env),
@@ -491,6 +493,11 @@ impl Inferencer {
                 "reduce" => return self.infer_reduce(name, args, env),
                 "reduce-indexed" => return self.infer_reduce_indexed(name, args, env),
                 "trim" | "lower-case" => return self.infer_unary_string(name, args, env),
+                "split" => return self.infer_split(name, args, env),
+                "join" => return self.infer_join(name, args, env),
+                "starts-with?" | "ends-with?" => {
+                    return self.infer_binary_string_predicate(name, args, env);
+                }
                 "to-radix" => return self.infer_to_radix(name, args, env),
                 "string-slice" => return self.infer_string_slice(name, args, env),
                 "pad-start" => return self.infer_pad_start(name, args, env),
@@ -500,6 +507,121 @@ impl Inferencer {
                 "locale-compare" => return self.infer_locale_compare(name, args, env),
                 "json-stringify" => return self.infer_json_stringify(name, args, env),
                 "json-parse" => return self.infer_json_parse(name, args, env),
+                "json-parse-result" => return self.infer_json_parse_result(name, args, env),
+                "object-entries" => return self.infer_object_entries(name, args, env),
+                "object-keys" => return self.infer_object_keys(name, args, env),
+                "object-values" => return self.infer_object_values(name, args, env),
+                "object-assoc" => return self.infer_object_assoc(name, args, env),
+                "object-dissoc" => return self.infer_object_dissoc(name, args, env),
+                "encode-uri-component"
+                | "decode-uri-component"
+                | "base64-encode"
+                | "base64-decode" => return self.infer_unary_string(name, args, env),
+                "url-resolve" => return self.infer_url_resolve(name, args, env),
+                "url-without-hash" | "url-origin" | "url-hostname" | "url-pathname" => {
+                    return self.infer_url_part(name, args, env);
+                }
+                "browser-current-url" => return self.infer_zero_arg_string(name, args),
+                "url-search-param" => return self.infer_fixed_string_args(name, args, env, 2, Type::String),
+                "url-set-search-param" | "url-set-deep-object-param" => {
+                    return self.infer_fixed_string_args(name, args, env, 3, Type::String);
+                }
+                "history-replace-search-param" | "browser-set-cookie" => {
+                    return self.infer_fixed_string_args(name, args, env, 2, Type::Nil);
+                }
+                "history-write-route" => {
+                    if args.len() != 3 {
+                        self.diagnostics.push(Diagnostic::error(
+                            args.first().map_or(Span::default(), |arg| arg.span),
+                            format!("{} expects 3 arguments, got {}", name, args.len()),
+                        ));
+                    }
+                    for arg in args {
+                        self.infer_expr(arg, env);
+                    }
+                    return Type::Nil;
+                }
+                "browser-theme-initial" => {
+                    return self.infer_fixed_string_args(name, args, env, 1, Type::String);
+                }
+                "browser-theme-toggle" => {
+                    return self.infer_fixed_string_args(name, args, env, 2, Type::String);
+                }
+                "auth-storage-load" => {
+                    let result = self.fresh();
+                    return self.infer_fixed_string_args(name, args, env, 1, result);
+                }
+                "auth-storage-persist" => {
+                    if args.len() != 2 {
+                        self.diagnostics.push(Diagnostic::error(
+                            args.first().map_or(Span::default(), |arg| arg.span),
+                            format!("{} expects 2 arguments, got {}", name, args.len()),
+                        ));
+                    }
+                    for arg in args {
+                        self.infer_expr(arg, env);
+                    }
+                    return Type::Nil;
+                }
+                "resolve-token-expiry" => {
+                    if args.len() != 2 {
+                        self.diagnostics.push(Diagnostic::error(
+                            args.first().map_or(Span::default(), |arg| arg.span),
+                            format!("{} expects 2 arguments, got {}", name, args.len()),
+                        ));
+                    }
+                    for arg in args {
+                        self.infer_expr(arg, env);
+                    }
+                    return Type::Option(Box::new(Type::Number));
+                }
+                "clipboard-text" => return self.infer_clipboard_text(name, args, env),
+                "clipboard-write" => {
+                    return self.infer_fixed_string_args(name, args, env, 1, Type::Nil);
+                }
+                "path-fill-params" => {
+                    return self.infer_fixed_string_args(name, args, env, 2, Type::String);
+                }
+                "path-fill-param" => {
+                    return self.infer_fixed_string_args(name, args, env, 3, Type::String);
+                }
+                "selected-file-or-blob" => {
+                    let result = self.fresh();
+                    return self.infer_fixed_string_args(name, args, env, 4, result);
+                }
+                "selected-file-by-test-id" => {
+                    let result = self.fresh();
+                    return self.infer_fixed_string_args(name, args, env, 1, result);
+                }
+                "has-selected-file" => {
+                    return self.infer_fixed_string_args(name, args, env, 1, Type::Bool);
+                }
+                "multipart-form-body" => {
+                    if args.len() != 2 {
+                        self.diagnostics.push(Diagnostic::error(
+                            args.first().map_or(Span::default(), |arg| arg.span),
+                            format!("{} expects 2 arguments, got {}", name, args.len()),
+                        ));
+                    }
+                    for arg in args {
+                        self.infer_expr(arg, env);
+                    }
+                    return self.fresh();
+                }
+                "urlencoded-form-body" => {
+                    if args.len() != 2 {
+                        self.diagnostics.push(Diagnostic::error(
+                            args.first().map_or(Span::default(), |arg| arg.span),
+                            format!("{} expects 2 arguments, got {}", name, args.len()),
+                        ));
+                    }
+                    for arg in args {
+                        self.infer_expr(arg, env);
+                    }
+                    return Type::String;
+                }
+                "regex-capture" => return self.infer_regex_capture(name, args, env),
+                "install-virtual-json-viewer" => return self.infer_zero_arg_nil(name, args),
                 "str" => {
                     for arg in args {
                         self.infer_expr(arg, env);
@@ -2170,6 +2292,22 @@ impl Inferencer {
         self.resolve(ok_ty)
     }
 
+    fn infer_fail(&mut self, name: &str, args: &[Expr], env: &mut HashMap<String, Type>) -> Type {
+        if args.len() != 1 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                1,
+                args.len(),
+            );
+            return self.fresh();
+        }
+
+        let message_ty = self.infer_expr(&args[0], env);
+        self.unify(message_ty, Type::String, args[0].span);
+        self.fresh()
+    }
+
     fn infer_hash_map(
         &mut self,
         name: &str,
@@ -2370,6 +2508,157 @@ impl Inferencer {
         (self.resolve(key_ty), self.resolve(value_ty))
     }
 
+    fn infer_object_entries(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 1 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                1,
+                args.len(),
+            );
+            let fields = BTreeMap::from([
+                ("key".to_string(), Type::String),
+                ("value".to_string(), self.fresh()),
+            ]);
+            return Type::Vector(Box::new(Type::Record(fields)));
+        }
+
+        let value_ty = self.infer_object_projection_input(&args[0], env);
+        let fields = BTreeMap::from([
+            ("key".to_string(), Type::String),
+            ("value".to_string(), value_ty),
+        ]);
+        Type::Vector(Box::new(Type::Record(fields)))
+    }
+
+    fn infer_object_keys(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 1 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                1,
+                args.len(),
+            );
+            return Type::Vector(Box::new(Type::String));
+        }
+
+        self.infer_object_projection_input(&args[0], env);
+        Type::Vector(Box::new(Type::String))
+    }
+
+    fn infer_object_values(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 1 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                1,
+                args.len(),
+            );
+            return Type::Vector(Box::new(self.fresh()));
+        }
+
+        Type::Vector(Box::new(self.infer_object_projection_input(&args[0], env)))
+    }
+
+    fn infer_object_projection_input(
+        &mut self,
+        expr: &Expr,
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        let collection_ty = self.infer_expr(expr, env);
+        let value_ty = self.fresh();
+        match self.shallow_resolve(collection_ty) {
+            Type::Record(fields) => {
+                let mut merged: Option<Type> = None;
+                for field_ty in fields.into_values() {
+                    merged = Some(match merged {
+                        Some(current) => {
+                            self.unify(current.clone(), field_ty, expr.span);
+                            current
+                        }
+                        None => field_ty,
+                    });
+                }
+                self.resolve(merged.unwrap_or(value_ty))
+            }
+            Type::Map(key_ty, map_value_ty) => {
+                self.unify(*key_ty, Type::String, expr.span);
+                self.resolve(*map_value_ty)
+            }
+            Type::Var(_) => value_ty,
+            _ => value_ty,
+        }
+    }
+
+    fn infer_object_assoc(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() < 3 || args[1..].len() % 2 != 0 {
+            self.diagnostics.push(Diagnostic::error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                format!("{} expects an object followed by key/value pairs", name),
+            ));
+            for arg in args {
+                self.infer_expr(arg, env);
+            }
+            return self.fresh();
+        }
+
+        self.infer_expr(&args[0], env);
+        for pair in args[1..].chunks(2) {
+            let [key, value] = pair else {
+                continue;
+            };
+            let key_ty = self.infer_expr(key, env);
+            self.unify(key_ty, Type::String, key.span);
+            self.infer_expr(value, env);
+        }
+        self.fresh()
+    }
+
+    fn infer_object_dissoc(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() < 2 {
+            self.diagnostics.push(Diagnostic::error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                format!("{} expects an object followed by one or more keys", name),
+            ));
+            for arg in args {
+                self.infer_expr(arg, env);
+            }
+            return self.fresh();
+        }
+
+        self.infer_expr(&args[0], env);
+        for key in &args[1..] {
+            let key_ty = self.infer_expr(key, env);
+            self.unify(key_ty, Type::String, key.span);
+        }
+        self.fresh()
+    }
+
     fn infer_assoc(&mut self, name: &str, args: &[Expr], env: &mut HashMap<String, Type>) -> Type {
         if args.len() < 3 || args[1..].len() % 2 != 0 {
             self.diagnostics.push(Diagnostic::error(
@@ -2501,6 +2790,140 @@ impl Inferencer {
             self.unify(ty, Type::String, arg.span);
         }
         Type::String
+    }
+
+    fn infer_zero_arg_string(&mut self, name: &str, args: &[Expr]) -> Type {
+        if !args.is_empty() {
+            self.arity_error(Span::default(), name, 0, args.len());
+        }
+        Type::String
+    }
+
+    fn infer_zero_arg_nil(&mut self, name: &str, args: &[Expr]) -> Type {
+        if !args.is_empty() {
+            self.arity_error(Span::default(), name, 0, args.len());
+        }
+        Type::Nil
+    }
+
+    fn infer_fixed_string_args(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+        arity: usize,
+        return_type: Type,
+    ) -> Type {
+        if args.len() != arity {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                arity,
+                args.len(),
+            );
+            return return_type;
+        }
+        for arg in args {
+            let ty = self.infer_expr(arg, env);
+            self.unify(ty, Type::String, arg.span);
+        }
+        return_type
+    }
+
+    fn infer_clipboard_text(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 1 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                1,
+                args.len(),
+            );
+            return Type::String;
+        }
+        self.infer_expr(&args[0], env);
+        Type::String
+    }
+
+    fn infer_regex_capture(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if !(2..=3).contains(&args.len()) {
+            self.diagnostics.push(Diagnostic::error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                format!("{} expects 2 or 3 arguments, found {}", name, args.len()),
+            ));
+            return Type::String;
+        }
+        for arg in args {
+            let ty = self.infer_expr(arg, env);
+            self.unify(ty, Type::String, arg.span);
+        }
+        Type::String
+    }
+
+    fn infer_split(&mut self, name: &str, args: &[Expr], env: &mut HashMap<String, Type>) -> Type {
+        if args.len() != 2 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                2,
+                args.len(),
+            );
+            return Type::Vector(Box::new(Type::String));
+        }
+        for arg in args {
+            let ty = self.infer_expr(arg, env);
+            self.unify(ty, Type::String, arg.span);
+        }
+        Type::Vector(Box::new(Type::String))
+    }
+
+    fn infer_join(&mut self, name: &str, args: &[Expr], env: &mut HashMap<String, Type>) -> Type {
+        if args.len() != 2 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                2,
+                args.len(),
+            );
+            return Type::String;
+        }
+
+        let items_ty = self.infer_expr(&args[0], env);
+        self.unify(items_ty, Type::Vector(Box::new(Type::String)), args[0].span);
+        let separator_ty = self.infer_expr(&args[1], env);
+        self.unify(separator_ty, Type::String, args[1].span);
+        Type::String
+    }
+
+    fn infer_binary_string_predicate(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 2 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                2,
+                args.len(),
+            );
+            return Type::Bool;
+        }
+        for arg in args {
+            let ty = self.infer_expr(arg, env);
+            self.unify(ty, Type::String, arg.span);
+        }
+        Type::Bool
     }
 
     fn infer_includes(
@@ -2738,6 +3161,71 @@ impl Inferencer {
         self.fresh()
     }
 
+    fn infer_json_parse_result(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 1 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                1,
+                args.len(),
+            );
+            return Type::Result(Box::new(self.fresh()), Box::new(Type::String));
+        }
+
+        let ty = self.infer_expr(&args[0], env);
+        self.unify(ty, Type::String, args[0].span);
+        Type::Result(Box::new(self.fresh()), Box::new(Type::String))
+    }
+
+    fn infer_url_resolve(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 2 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                2,
+                args.len(),
+            );
+            return Type::Option(Box::new(Type::String));
+        }
+
+        for arg in args {
+            let ty = self.infer_expr(arg, env);
+            self.unify(ty, Type::String, arg.span);
+        }
+        Type::Option(Box::new(Type::String))
+    }
+
+    fn infer_url_part(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 1 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                1,
+                args.len(),
+            );
+            return Type::Option(Box::new(Type::String));
+        }
+
+        let ty = self.infer_expr(&args[0], env);
+        self.unify(ty, Type::String, args[0].span);
+        Type::Option(Box::new(Type::String))
+    }
+
     fn infer_count(&mut self, name: &str, args: &[Expr], env: &mut HashMap<String, Type>) -> Type {
         if args.len() != 1 {
             self.arity_error(
@@ -2829,6 +3317,28 @@ impl Inferencer {
         }
         self.infer_expr(&args[0], env);
         self.infer_expr(&args[1], env);
+        self.fresh()
+    }
+
+    fn infer_object_get(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 2 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                2,
+                args.len(),
+            );
+            return self.fresh();
+        }
+
+        self.infer_expr(&args[0], env);
+        let key_ty = self.infer_expr(&args[1], env);
+        self.unify(key_ty, Type::String, args[1].span);
         self.fresh()
     }
 
@@ -5646,16 +6156,47 @@ fn parse_import_form(expr: &Expr) -> Option<Result<Vec<String>, Diagnostic>> {
 
     let mut imported = Vec::new();
     for name in names {
-        let ExprKind::Symbol(symbol) = &name.kind else {
-            return Some(Err(Diagnostic::error(
-                name.span,
-                "imported name must be a symbol",
-            )));
-        };
-        imported.push(symbol.clone());
+        match parse_import_name(name) {
+            Ok(symbol) => imported.push(symbol),
+            Err(diagnostic) => return Some(Err(diagnostic)),
+        }
     }
 
     Some(Ok(imported))
+}
+
+fn parse_import_name(expr: &Expr) -> Result<String, Diagnostic> {
+    match &expr.kind {
+        ExprKind::Symbol(symbol) => Ok(symbol.clone()),
+        ExprKind::List(items)
+            if items.len() == 2
+                && matches!(&items[0].kind, ExprKind::Symbol(name) if name == "default") =>
+        {
+            let ExprKind::Symbol(local) = &items[1].kind else {
+                return Err(Diagnostic::error(
+                    items[1].span,
+                    "default import local name must be a symbol",
+                ));
+            };
+            Ok(local.clone())
+        }
+        ExprKind::List(items)
+            if items.len() == 3
+                && matches!(&items[1].kind, ExprKind::Symbol(name) if name == "as") =>
+        {
+            let ExprKind::Symbol(local) = &items[2].kind else {
+                return Err(Diagnostic::error(
+                    items[2].span,
+                    "aliased import local name must be a symbol",
+                ));
+            };
+            Ok(local.clone())
+        }
+        _ => Err(Diagnostic::error(
+            expr.span,
+            "imported name must be a symbol, (default local), or (name as local)",
+        )),
+    }
 }
 
 fn format_type_inner(ty: &Type) -> String {
@@ -7698,6 +8239,18 @@ mod tests {
         assert_eq!(result.forms[2].ty, "(Vector Number)");
         assert_eq!(result.forms[3].ty, "(Vector Number)");
         assert_eq!(result.forms[4].ty, "(Fn [(Map Number Number)] Number)");
+    }
+
+    #[test]
+    fn infers_dynamic_object_get() {
+        let result = check(
+            "(def method \"get\")\n\
+             (def operation (object-get {:get {:id \"listPets\"}} method))",
+        );
+
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert_eq!(result.forms[0].ty, "String");
+        assert!(result.forms[1].ty.starts_with("t"));
     }
 
     #[test]

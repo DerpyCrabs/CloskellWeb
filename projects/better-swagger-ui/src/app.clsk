@@ -1,0 +1,1750 @@
+(import "./lib/operations.clsk" [collectOperations methodColor methodExpandedBg methodHeaderBg tagDescriptions])
+(import "./lib/schema.clsk" [formatRequestBodySchemaForCopy formatResponseSchemaForCopy getRequestBodySchema getResponseSchemas hasCopyableSchema])
+(import "./lib/auth.clsk" [applyAuthHeaders applyAuthUrl authEntriesCount hasAuthSchemes? parseSecuritySchemes])
+(import "./lib/browser.clsk" [analyzeSourceResponse buildMultipartFormBody buildUrlEncodedFormBody clipboardText copyText definitionUrlByName hasSelectedMultipartFile? hasSelectedRequestBodyFile? initialDefinitionParam initialOpParam initialTheme initialUrlInput initOAuthUrlForSwaggerUiPage loadStoredAuthEntries looksLikeSpecContent parseInitOAuth parseSpecDocument parseSwaggerConfigResponse persistAuthEntries resolveApiUrl resolvedSpecUrl resolveTokenExpiry selectedRequestBodyFile setCookie setDeepObjectQueryParam setDefinitionQueryParam setOpQueryParam setUrlQueryParam toggleTheme validHttpUrl? validUuid writeRoute])
+(import "./lib/param-schema.clsk" [resolveParameterMeta validateAllParams validateParamValue])
+(import "./lib/build-request-url.clsk" [buildRequestHeaders buildUrl])
+(import "./lib/request-body.clsk" [defaultRequestBodyText hasTryItOutRequestBody? primaryTryItOutMedia requestBodyMode resolveBodyFormFields])
+(import "marked" [(parse as markedParse)])
+(import "dompurify" [(default domPurify)])
+
+(def virtualJsonViewerInstalled
+  (install-virtual-json-viewer))
+
+(def initialState
+  {:input ""
+   :loading? false
+   :error nil
+   :spec nil
+   :expandedOp nil
+   :expandedTags (set)
+   :authDialog? false
+   :authorized? false
+   :pendingAuthOp nil
+   :tryActiveOp nil
+   :executingOp nil
+   :definitions []
+   :selectedDefinition ""
+   :sourceUrl ""
+   :specUrl ""
+   :pendingDefinition ""
+   :pendingDefinitions []
+   :pendingSelectedDefinition ""
+   :pendingSourceUrl ""
+   :pendingSpecUrl ""
+   :oauthInit {}
+   :routeOp nil
+   :theme "dark"
+   :responses {}
+   :paramValues {}
+   :bodyValues {}
+   :formError nil
+   :authEntries {}
+   :authFormValues {}
+   :authLoadingScheme nil
+   :authError nil})
+
+(defn commandNone []
+  {:kind :none})
+
+(defn loadSourceCommand [source definitionName]
+  {:kind :http/request
+   :url source
+   :response :text
+   :toMessage (fn [response] {:kind :source-loaded :source source :value response})
+   :onError :spec-failed})
+
+(defn loadConfigCommand [configUrl]
+  {:kind :http/request
+   :url configUrl
+   :response :text
+   :toMessage (fn [response] {:kind :config-loaded :url configUrl :value response})
+   :onError :spec-failed})
+
+(defn loadSpecDocumentCommand [specUrl]
+  {:kind :http/request
+   :url specUrl
+   :response :text
+   :toMessage (fn [response] {:kind :spec-document-loaded :url specUrl :value response})
+   :onError :spec-failed})
+
+(defn loadOauthInitCommand [sourceUrl]
+  (if (validHttpUrl? sourceUrl)
+      {:kind :http/request
+       :url (initOAuthUrlForSwaggerUiPage sourceUrl)
+       :response :text
+       :toMessage (fn [response] {:kind :oauth-init-loaded :value response})
+       :onError :oauth-init-failed}
+      (commandNone)))
+
+(defn readSpecFileCommand []
+  {:kind :file/read-selected
+   :ref "spec-file-input"
+   :format :text
+   :toMessage (fn [text] {:kind :pasted-spec :label "uploaded.yaml" :value text})
+   :onError :spec-failed})
+
+(defn openSpecFileCommand []
+  {:kind :dom-ref/click
+   :ref "spec-file-input"})
+
+(defn downloadSpecCommand [spec]
+  {:kind :file/download
+   :name "openapi.json"
+   :content (json-stringify spec 2)
+   :mime "application/json"
+   :msg {:kind :noop}})
+
+(defn init []
+  (let [source (initialUrlInput)
+        definition (initialDefinitionParam)
+        op (initialOpParam)
+        theme (initialTheme)]
+    [(merge initialState {:input source
+                          :pendingDefinition definition
+                          :routeOp (if (= op "") nil op)
+                          :theme theme})
+     (if (= source "")
+         (commandNone)
+         (loadSourceCommand source definition))]))
+
+(defn validSpec? [spec]
+  (and (some? spec)
+       (object? (get spec :paths))
+       (or (string? (get spec :openapi))
+           (string? (get spec :swagger)))))
+
+(defn specTitle [spec]
+  (let [title (get (get spec :info) :title)]
+    (if (string? title) title "Untitled API")))
+
+(defn specVersion [spec]
+  (let [version (get (get spec :info) :version)]
+    (if (string? version)
+        (str "v" version)
+        "")))
+
+(defn specDescription [spec]
+  (let [description (get (get spec :info) :description)]
+    (if (string? description) description "")))
+
+(defn primaryServerUrl [spec]
+  (let [servers (get spec :servers)
+        firstServer (if (vector? servers) (first servers) nil)
+        url (get firstServer :url)]
+    (if (string? url) url "")))
+
+(defn hasText? [value]
+  (and (string? value) (> (count (trim value)) 0)))
+
+(defn markdownHtml [content]
+  (if (hasText? content)
+      ((get domPurify :sanitize) (markedParse content {:async false}))
+      ""))
+
+(defn authHeaders [state]
+  (applyAuthHeaders {"Accept" "application/json"} state.authEntries))
+
+(defn paramKey [opId name]
+  (str opId "::" name))
+
+(defn bodyKey [opId]
+  (str opId "::body"))
+
+(defn bodyFieldKey [name]
+  (str "body:" name))
+
+(defn paramValueByName [state opId name fallback]
+  (let [stored (object-get state.paramValues (paramKey opId name))]
+    (if (some? stored) stored fallback)))
+
+(defn paramDefaultValue [meta]
+  (if (string? meta.defaultValue) meta.defaultValue ""))
+
+(defn paramValue [state item meta]
+  (paramValueByName state item.id meta.name (paramDefaultValue meta)))
+
+(defn paramValuesForItem [state item defs]
+  (reduce defs
+          {}
+          (fn [values meta]
+            (object-assoc values meta.name (paramValue state item meta)))))
+
+(defn bodyFieldValue [state item name]
+  (paramValueByName state item.id (bodyFieldKey name) ""))
+
+(defn requestBodyInfoFor [state item]
+  (getRequestBodySchema state.spec (get item.operation :requestBody)))
+
+(defn primaryBodyMediaFor [state item]
+  (primaryTryItOutMedia (requestBodyInfoFor state item)))
+
+(defn requestBodyModeFor [state item]
+  (requestBodyMode (primaryBodyMediaFor state item)))
+
+(defn requestBodyFormFields [state item mode media]
+  (if (= mode "multipart")
+      (resolveBodyFormFields media true)
+      (if (= mode "urlencoded")
+          (resolveBodyFormFields media false)
+          [])))
+
+(defn bodyFieldValuesFor [state item fields]
+  (reduce fields
+          {}
+          (fn [values field]
+            (object-assoc values field.name (bodyFieldValue state item field.name)))))
+
+(defn operationRequestUrl [state item]
+  (let [defs (resolveParameterMeta state.spec item)
+        values (paramValuesForItem state item defs)
+        url (buildUrl (primaryServerUrl state.spec) state.specUrl item.path defs values)]
+    (applyAuthUrl url state.authEntries)))
+
+(defn executeHeaders [state item]
+  (let [defs (resolveParameterMeta state.spec item)
+        values (paramValuesForItem state item defs)]
+    (buildRequestHeaders defs values (authHeaders state))))
+
+(defn requestBodyDefault [state item]
+  (let [media (primaryBodyMediaFor state item)
+        mode (requestBodyMode media)]
+    (defaultRequestBodyText media mode)))
+
+(defn requestBodyValue [state item]
+  (let [stored (object-get state.bodyValues (bodyKey item.id))]
+    (if (some? stored) stored (requestBodyDefault state item))))
+
+(defn requestContentType [media mode]
+  (if (= mode "json")
+      "application/json"
+      (if (= mode "text")
+          "text/plain"
+          (if (= mode "file")
+              (if (string? media.contentType) media.contentType "application/octet-stream")
+              (if (= mode "urlencoded")
+                  "application/x-www-form-urlencoded"
+                  "")))))
+
+(defn requestBodyPayload [state item mode fields values]
+  (if (= mode "file")
+      (selectedRequestBodyFile)
+      (if (= mode "multipart")
+          (buildMultipartFormBody fields values)
+          (if (= mode "urlencoded")
+              (buildUrlEncodedFormBody fields values)
+              (requestBodyValue state item)))))
+
+(defn sendsRequestBody? [item mode]
+  (and (some? mode)
+       (not (= item.method "get"))
+       (not (= item.method "head"))))
+
+(defn hasRequestBodyPayload? [mode body]
+  (if (= mode "file")
+      (some? body)
+      true))
+
+(defn headersForBody [state item media mode]
+  (let [headers (executeHeaders state item)
+        contentType (requestContentType media mode)]
+    (if (hasText? contentType)
+        (object-assoc headers "content-type" contentType)
+        headers)))
+
+(defn executeRequestRecord [state item]
+  (let [media (primaryBodyMediaFor state item)
+        mode (requestBodyMode media)
+        fields (requestBodyFormFields state item mode media)
+        values (bodyFieldValuesFor state item fields)
+        body (requestBodyPayload state item mode fields values)
+        base {:url (operationRequestUrl state item)
+              :method item.method
+              :headers (executeHeaders state item)}]
+    (if (and (sendsRequestBody? item mode) (hasRequestBodyPayload? mode body))
+        (merge base {:headers (headersForBody state item media mode)
+                     :body body})
+        base)))
+
+(defn executeCommand [state item]
+  {:kind :http/request
+   :request (executeRequestRecord state item)
+   :response :text
+   :toMessage (fn [response] {:kind :request-finished :id item.id :value response})
+   :onError :request-failed})
+
+(defn invalidExecuteMessage [state item]
+  (let [defs (resolveParameterMeta state.spec item)
+        values (paramValuesForItem state item defs)
+        paramErrors (validateAllParams defs values)]
+    (if (> (count (object-keys paramErrors)) 0)
+        "Fix parameter validation errors before executing"
+        (let [info (requestBodyInfoFor state item)
+              media (primaryTryItOutMedia info)
+              mode (requestBodyMode media)
+              fields (requestBodyFormFields state item mode media)
+              values (bodyFieldValuesFor state item fields)
+              missingForm? (any? fields
+                                 (fn [field]
+                                   (and field.required
+                                        (if (= field.kind "file")
+                                            (not (hasSelectedMultipartFile? field.name))
+                                            (not (hasText? (object-get values field.name)))))))]
+          (if (and (sendsRequestBody? item mode)
+                   (or (and (= mode "json") (err? (json-parse-result (requestBodyValue state item))))
+                       (and (= mode "text") info.required (not (hasText? (requestBodyValue state item))))
+                       (and (= mode "file") info.required (not (hasSelectedRequestBodyFile?)))
+                       (and (or (= mode "multipart") (= mode "urlencoded")) missingForm?)))
+              "Fix request body validation errors before executing"
+              nil)))))
+
+(defn authSchemes [state]
+  (parseSecuritySchemes state.spec state.oauthInit))
+
+(defn authFieldKey [scheme field]
+  (str scheme.id "::" field))
+
+(defn authFieldValue [state scheme field fallback]
+  (let [stored (object-get state.authFormValues (authFieldKey scheme field))]
+    (if (some? stored) stored fallback)))
+
+(defn clientCredentialsLocation [state scheme]
+  (authFieldValue state scheme "clientCredentialsLocation" "header"))
+
+(defn authFormId [scheme]
+  (if (= scheme.kind "oauth2-password")
+      (str "oauth-password-" scheme.id)
+      (if (= scheme.kind "oauth2-client-credentials")
+          (str "oauth-client-" scheme.id)
+          (if (= scheme.kind "apiKey")
+              (str "api-key-" scheme.id)
+              (if (= scheme.kind "http-bearer")
+                  (str "bearer-" scheme.id)
+                  (if (= scheme.kind "http-basic")
+                      (str "basic-" scheme.id)
+                      (str "auth-form-" scheme.id)))))))
+
+(defn schemeAuthorized? [state scheme]
+  (some? (object-get state.authEntries scheme.id)))
+
+(defn afterAuthorizedState [state entries]
+  (let [_ (persistAuthEntries state.sourceUrl entries)]
+    (merge state {:authDialog? false
+                :authorized? (> (authEntriesCount entries) 0)
+                :authEntries entries
+                :expandedOp (if (some? state.pendingAuthOp) state.pendingAuthOp state.expandedOp)
+                :tryActiveOp (if (some? state.pendingAuthOp) state.pendingAuthOp state.tryActiveOp)
+                :pendingAuthOp nil
+                :authLoadingScheme nil
+                :authError nil})))
+
+(defn simpleAuthEntry [state scheme]
+  (if (= scheme.kind "apiKey")
+      {:schemeId scheme.id
+       :type "apiKey"
+       :token (authFieldValue state scheme "value" "")
+       :apiKeyName scheme.name
+       :apiKeyIn scheme.in}
+      (if (= scheme.kind "http-bearer")
+          {:schemeId scheme.id
+           :type "bearer"
+           :token (authFieldValue state scheme "token" "")}
+          {:schemeId scheme.id
+           :type "basic"
+           :token ""
+           :username (authFieldValue state scheme "username" "")
+           :password (authFieldValue state scheme "password" "")})))
+
+(defn oauthClientId [state scheme]
+  (authFieldValue state scheme "clientId" scheme.clientId))
+
+(defn oauthClientSecret [state scheme]
+  (authFieldValue state scheme "clientSecret" scheme.clientSecret))
+
+(defn oauthHeaders [state scheme]
+  (let [base {"content-type" "application/x-www-form-urlencoded" "Accept" "application/json"}]
+    (if (= (clientCredentialsLocation state scheme) "header")
+        (object-assoc base "Authorization" (str "Basic " (base64-encode (str (oauthClientId state scheme) ":" (oauthClientSecret state scheme)))))
+        base)))
+
+(defn oauthPasswordBody [state scheme]
+  (let [base (str "grant_type=password"
+                  "&username=" (encode-uri-component (authFieldValue state scheme "username" ""))
+                  "&password=" (encode-uri-component (authFieldValue state scheme "password" ""))
+                  "&client_id=" (encode-uri-component (oauthClientId state scheme)))]
+    (if (= (clientCredentialsLocation state scheme) "header")
+        base
+        (str base "&client_secret=" (encode-uri-component (oauthClientSecret state scheme))))))
+
+(defn oauthClientCredentialsBody [state scheme]
+  (let [base "grant_type=client_credentials"]
+    (if (= (clientCredentialsLocation state scheme) "header")
+        (str base "&client_id=" (encode-uri-component (oauthClientId state scheme)))
+        (str base
+             "&client_id=" (encode-uri-component (oauthClientId state scheme))
+             "&client_secret=" (encode-uri-component (oauthClientSecret state scheme))))))
+
+(defn oauthTokenCommand [state scheme]
+  {:kind :http/request
+   :url scheme.tokenUrl
+   :method "POST"
+   :headers (oauthHeaders state scheme)
+   :body (if (= scheme.kind "oauth2-password")
+             (oauthPasswordBody state scheme)
+             (oauthClientCredentialsBody state scheme))
+   :response :json
+   :toMessage (fn [response] {:kind :oauth-token-loaded :schemeId scheme.id :value response})
+   :onError :auth-failed})
+
+(defn clearAuthState [state]
+  (merge state {:authorized? false
+                :authEntries {}
+                :authFormValues {}
+                :authLoadingScheme nil
+                :authError nil}))
+
+(defn defaultDefinitionList [url]
+  [{:name "default" :url url}])
+
+(defn chooseText [value fallback]
+  (if (hasText? value) value fallback))
+
+(defn lucideClass [name extraClass]
+  (if (= extraClass "")
+      (str "lucide lucide-icon lucide-" name)
+      (str "lucide lucide-icon lucide-" name " " extraClass)))
+
+(defn iconUpload [size extraClass]
+  #html <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke-linecap="round" stroke-linejoin="round" width={size} height={size} stroke="currentColor" stroke-width="2" class={(lucideClass "upload" extraClass)}><path d="M12 3v12" key="1x0j5s"></path><path d="m17 8-5-5-5 5" key="7q97r8"></path><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" key="ih7n3h"></path></svg>)
+
+(defn iconDownload [size extraClass]
+  #html <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke-linecap="round" stroke-linejoin="round" width={size} height={size} stroke="currentColor" stroke-width="2" class={(lucideClass "download" extraClass)}><path d="M12 15V3" key="m9g1x1"></path><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" key="ih7n3h"></path><path d="m7 10 5 5 5-5" key="brsn70"></path></svg>)
+
+(defn iconLink2 [size extraClass]
+  #html <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke-linecap="round" stroke-linejoin="round" width={size} height={size} stroke="currentColor" stroke-width="2" class={(lucideClass "link-2" extraClass)}><path d="M9 17H7A5 5 0 0 1 7 7h2" key="8i5ue5"></path><path d="M15 7h2a5 5 0 1 1 0 10h-2" key="1b9ql8"></path><line x1="8" x2="16" y1="12" y2="12" key="1jonct"></line></svg>)
+
+(defn iconSun [size extraClass]
+  #html <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke-linecap="round" stroke-linejoin="round" width={size} height={size} stroke="currentColor" stroke-width="2" class={(lucideClass "sun" extraClass)}><circle cx="12" cy="12" r="4" key="4exip2"></circle><path d="M12 2v2" key="tus03m"></path><path d="M12 20v2" key="1lh1kg"></path><path d="m4.93 4.93 1.41 1.41" key="149t6j"></path><path d="m17.66 17.66 1.41 1.41" key="ptbguv"></path><path d="M2 12h2" key="1t8f8n"></path><path d="M20 12h2" key="1q8mjw"></path><path d="m6.34 17.66-1.41 1.41" key="1m8zz5"></path><path d="m19.07 4.93-1.41 1.41" key="1shlcs"></path></svg>)
+
+(defn iconMoon [size extraClass]
+  #html <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke-linecap="round" stroke-linejoin="round" width={size} height={size} stroke="currentColor" stroke-width="2" class={(lucideClass "moon" extraClass)}><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z" key="a7tn18"></path></svg>)
+
+(defn iconLock [size extraClass]
+  #html <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke-linecap="round" stroke-linejoin="round" width={size} height={size} stroke="currentColor" stroke-width="2" class={(lucideClass "lock" extraClass)}><rect width="18" height="11" x="3" y="11" rx="2" ry="2" key="1w4ew1"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4" key="fwvmzm"></path></svg>)
+
+(defn iconCopy [size extraClass]
+  #html <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke-linecap="round" stroke-linejoin="round" width={size} height={size} stroke="currentColor" stroke-width="2" class={(lucideClass "copy" extraClass)}><rect width="14" height="14" x="8" y="8" rx="2" ry="2" key="17jyea"></rect><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" key="zix9uf"></path></svg>)
+
+(defn iconPlay [size extraClass]
+  #html <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke-linecap="round" stroke-linejoin="round" width={size} height={size} stroke="currentColor" stroke-width="2" class={(lucideClass "play" extraClass)}><polygon points="6 3 20 12 6 21 6 3" key="1oa8hb"></polygon></svg>)
+
+(defn iconChevronRight [size extraClass]
+  #html <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke-linecap="round" stroke-linejoin="round" width={size} height={size} stroke="currentColor" stroke-width="2" class={(lucideClass "chevron-right" extraClass)}><path d="m9 18 6-6-6-6" key="mthhwq"></path></svg>)
+
+(defn iconChevronDown [size extraClass]
+  #html <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke-linecap="round" stroke-linejoin="round" width={size} height={size} stroke="currentColor" stroke-width="2" class={(lucideClass "chevron-down" extraClass)}><path d="m6 9 6 6 6-6" key="qrunsl"></path></svg>)
+
+(defn iconChevronUp [size extraClass]
+  #html <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke-linecap="round" stroke-linejoin="round" width={size} height={size} stroke="currentColor" stroke-width="2" class={(lucideClass "chevron-up" extraClass)}><path d="m18 15-6-6-6 6" key="153udz"></path></svg>)
+
+(defn iconX [size extraClass]
+  #html <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke-linecap="round" stroke-linejoin="round" width={size} height={size} stroke="currentColor" stroke-width="2" class={(lucideClass "x" extraClass)}><path d="M18 6 6 18" key="1bl5f8"></path><path d="m6 6 12 12" key="d8bk6v"></path></svg>)
+
+(defn iconLoaderCircle [size extraClass]
+  #html <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke-linecap="round" stroke-linejoin="round" width={size} height={size} stroke="currentColor" stroke-width="2" class={(lucideClass "loader-circle" extraClass)}><path d="M21 12a9 9 0 1 1-6.219-8.56" key="13zald"></path></svg>)
+
+(defn iconAlertCircle [size extraClass]
+  #html <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke-linecap="round" stroke-linejoin="round" width={size} height={size} stroke="currentColor" stroke-width="2" class={(lucideClass "circle-alert" extraClass)}><circle cx="12" cy="12" r="10" key="1mglay"></circle><line x1="12" x2="12" y1="8" y2="12" key="1pkeuh"></line><line x1="12" x2="12.01" y1="16" y2="16" key="4dfq90"></line></svg>)
+
+(defn definitionsOrDefault [definitions specUrl]
+  (if (> (count definitions) 0)
+      definitions
+      (defaultDefinitionList specUrl)))
+
+(defn allTagSet [spec]
+  (reduce (map-keys (collectOperations spec))
+          (set)
+          (fn [tags tag] (conj tags tag))))
+
+(defn completedSpecState [state spec specUrl sourceUrl definitions selectedDefinition]
+  (let [routeOp state.routeOp
+        expandedTags (if (some? routeOp) (allTagSet spec) (set))
+        routeDefinition (if (and (> (count definitions) 1) (hasText? selectedDefinition)) selectedDefinition nil)
+        _ (if (validHttpUrl? sourceUrl) (writeRoute sourceUrl routeOp routeDefinition) nil)]
+    (merge state {:loading? false
+                  :error nil
+                  :spec spec
+                  :sourceUrl sourceUrl
+                  :specUrl specUrl
+                  :oauthInit {}
+                  :definitions definitions
+                  :selectedDefinition selectedDefinition
+                  :expandedOp routeOp
+                  :expandedTags expandedTags
+                  :tryActiveOp routeOp
+                  :executingOp nil
+                  :responses {}
+                  :paramValues {}
+                  :bodyValues {}
+                  :formError nil
+                  :authEntries (loadStoredAuthEntries sourceUrl)
+                  :authFormValues {}
+                  :authLoadingScheme nil
+                  :authError nil
+                  :pendingDefinition ""
+                  :pendingDefinitions []
+                  :pendingSelectedDefinition ""
+                  :pendingSourceUrl ""
+                  :pendingSpecUrl ""
+                  :routeOp nil})))
+
+(defn completedSpecTuple [state spec specUrl sourceUrl definitions selectedDefinition]
+  [(completedSpecState state spec specUrl sourceUrl definitions selectedDefinition)
+   (loadOauthInitCommand sourceUrl)])
+
+(defn failedLoadTuple [state error]
+  [(merge state {:loading? false :error error}) (commandNone)])
+
+(defn followLoadDecision [state decision]
+  (let [kind (get decision :kind)]
+    (if (= kind "spec")
+        (completedSpecTuple state
+                            decision.spec
+                            decision.specUrl
+                            decision.sourceUrl
+                            (definitionsOrDefault decision.definitions decision.specUrl)
+                            (chooseText decision.selectedDefinition "default"))
+        (if (= kind "spec-url")
+            [(merge state {:pendingDefinitions (definitionsOrDefault decision.definitions decision.specUrl)
+                           :pendingSelectedDefinition (chooseText decision.selectedDefinition "default")
+                           :pendingSourceUrl (chooseText decision.sourceUrl state.pendingSourceUrl)
+                           :pendingSpecUrl decision.specUrl})
+             (loadSpecDocumentCommand decision.specUrl)]
+            (if (= kind "config-url")
+                [(merge state {:pendingSourceUrl (chooseText decision.sourceUrl state.pendingSourceUrl)})
+                 (loadConfigCommand decision.configUrl)]
+                (failedLoadTuple state decision.error))))))
+
+(defn finishSpecDocument [state decision]
+  (if (get decision :ok)
+      (completedSpecTuple state
+                          decision.spec
+                          decision.specUrl
+                          (chooseText state.pendingSourceUrl decision.specUrl)
+                          (definitionsOrDefault state.pendingDefinitions decision.specUrl)
+                          (chooseText state.pendingSelectedDefinition "default"))
+      (failedLoadTuple state decision.error)))
+
+(defn pastedSpecLabel [value]
+  (if (starts-with? (trim value) "{")
+      "pasted-spec.json"
+      "pasted-spec.yaml"))
+
+(defn update [state msg]
+  (match msg
+    {:kind :url-input :value value}
+      [(merge state {:input value :error nil}) (commandNone)]
+    {:kind :url-paste :value value}
+      (if (validHttpUrl? value)
+          [(merge state {:input (trim value)
+                         :loading? true
+                         :error nil
+                         :pendingDefinition ""
+                         :pendingDefinitions []
+                         :pendingSelectedDefinition ""
+                         :pendingSourceUrl (trim value)
+                         :pendingSpecUrl ""})
+           (loadSourceCommand (trim value) "")]
+          (if (looksLikeSpecContent value)
+          (let [label (pastedSpecLabel value)
+                decision (parseSpecDocument label value)]
+            (if (get decision :ok)
+                [(completedSpecState (merge state {:input label
+                                                   :pendingDefinitions (defaultDefinitionList label)
+                                                   :pendingSelectedDefinition "default"
+                                                   :pendingSourceUrl label})
+                                     decision.spec
+                                     decision.specUrl
+                                     label
+                                     (defaultDefinitionList label)
+                                     "default")
+                 (commandNone)]
+                [(merge state {:loading? false :error decision.error}) (commandNone)]))
+          [(merge state {:input value :error nil}) (commandNone)]))
+    {:kind :load}
+      (if (not (validHttpUrl? (trim state.input)))
+          [state (commandNone)]
+          [(merge state {:loading? true
+                         :error nil
+                         :pendingDefinition ""
+                         :pendingDefinitions []
+                         :pendingSelectedDefinition ""
+                         :pendingSourceUrl (trim state.input)
+                         :pendingSpecUrl ""})
+           (loadSourceCommand (trim state.input) "")])
+    {:kind :source-loaded :source source :value response}
+      (if (get response :ok)
+          (let [decision (analyzeSourceResponse source (get response :body) state.pendingDefinition)
+                kind (get decision :kind)]
+            (if (= kind "spec")
+                [(completedSpecState state
+                                     decision.spec
+                                     decision.specUrl
+                                     decision.sourceUrl
+                                     (definitionsOrDefault decision.definitions decision.specUrl)
+                                     (chooseText decision.selectedDefinition "default"))
+                 (loadOauthInitCommand decision.sourceUrl)]
+                (if (= kind "spec-url")
+                    [(merge state {:pendingDefinitions (definitionsOrDefault decision.definitions decision.specUrl)
+                                   :pendingSelectedDefinition (chooseText decision.selectedDefinition "default")
+                                   :pendingSourceUrl (chooseText decision.sourceUrl state.pendingSourceUrl)
+                                   :pendingSpecUrl decision.specUrl})
+                     (loadSpecDocumentCommand decision.specUrl)]
+                    (if (= kind "config-url")
+                        [(merge state {:pendingSourceUrl (chooseText decision.sourceUrl state.pendingSourceUrl)})
+                         (loadConfigCommand decision.configUrl)]
+                        [(merge state {:loading? false :error decision.error}) (commandNone)]))))
+          [(merge state {:loading? false :error "Failed to load spec"}) (commandNone)])
+    {:kind :config-loaded :url url :value response}
+      (if (get response :ok)
+          (let [decision (parseSwaggerConfigResponse url (get response :body) state.pendingDefinition)
+                kind (get decision :kind)]
+            (if (= kind "spec-url")
+                [(merge state {:pendingDefinitions (definitionsOrDefault decision.definitions decision.specUrl)
+                               :pendingSelectedDefinition (chooseText decision.selectedDefinition "default")
+                               :pendingSpecUrl decision.specUrl})
+                 (loadSpecDocumentCommand decision.specUrl)]
+                [(merge state {:loading? false :error decision.error}) (commandNone)]))
+          [(merge state {:loading? false :error "Failed to load spec"}) (commandNone)])
+    {:kind :spec-document-loaded :url url :value response}
+      (if (get response :ok)
+          (let [decision (parseSpecDocument url (get response :body))]
+            (if (get decision :ok)
+                [(completedSpecState state
+                                     decision.spec
+                                     decision.specUrl
+                                     (chooseText state.pendingSourceUrl decision.specUrl)
+                                     (definitionsOrDefault state.pendingDefinitions decision.specUrl)
+                                     (chooseText state.pendingSelectedDefinition "default"))
+                 (loadOauthInitCommand (chooseText state.pendingSourceUrl decision.specUrl))]
+                [(merge state {:loading? false :error decision.error}) (commandNone)]))
+          [(merge state {:loading? false :error "Failed to load spec"}) (commandNone)])
+    {:kind :pasted-spec :label label :value value}
+      (let [decision (parseSpecDocument label value)]
+        (if (get decision :ok)
+            [(completedSpecState (merge state {:input label
+                                               :pendingDefinitions (defaultDefinitionList label)
+                                               :pendingSelectedDefinition "default"
+                                               :pendingSourceUrl label})
+                                 decision.spec
+                                 decision.specUrl
+                                 label
+                                 (defaultDefinitionList label)
+                                 "default")
+             (commandNone)]
+            [(merge state {:loading? false :error decision.error}) (commandNone)]))
+    {:kind :spec-file-selected}
+      [(merge state {:loading? true :error nil}) (readSpecFileCommand)]
+    {:kind :open-spec-file}
+      [state (openSpecFileCommand)]
+    {:kind :download-schema}
+      [state (downloadSpecCommand state.spec)]
+    {:kind :definition-change :name name}
+      (let [specUrl (definitionUrlByName state.definitions name)
+            routeDefinition (if (and (> (count state.definitions) 1) (hasText? name)) name nil)
+            _ (writeRoute state.sourceUrl nil routeDefinition)]
+        [(merge state {:loading? true
+                       :error nil
+                       :pendingDefinitions state.definitions
+                       :pendingSelectedDefinition name
+                       :pendingSourceUrl (chooseText state.sourceUrl state.input)
+                       :pendingSpecUrl specUrl})
+         (loadSpecDocumentCommand specUrl)])
+    {:kind :toggle-theme}
+      (let [theme (toggleTheme state.theme)]
+        [(merge state {:theme theme}) (commandNone)])
+    {:kind :spec-loaded :value response}
+      (let [body (get response :body)]
+        (if (and (get response :ok) (validSpec? body))
+            [(merge state {:loading? false
+                           :error nil
+                           :spec body
+                           :expandedOp nil
+                           :expandedTags (set)
+                           :tryActiveOp nil
+                           :executingOp nil
+                           :responses {}
+                           :paramValues {}
+                           :bodyValues {}
+                           :formError nil}) (commandNone)]
+            [(merge state {:loading? false :error "Response is not an OpenAPI document"}) (commandNone)]))
+    {:kind :spec-failed :error error}
+      [(merge state {:loading? false :error (str "Failed to load spec: " error)}) (commandNone)]
+    {:kind :oauth-init-loaded :value response}
+      (if (get response :ok)
+          [(merge state {:oauthInit (parseInitOAuth (get response :body))}) (commandNone)]
+          [state (commandNone)])
+    {:kind :oauth-init-failed :error error}
+      [state (commandNone)]
+    {:kind :toggle-tag :tag tag}
+      [(merge state {:expandedTags (if (contains? state.expandedTags tag)
+                                      (disj state.expandedTags tag)
+                                      (conj state.expandedTags tag))}) (commandNone)]
+    {:kind :toggle-operation :id id}
+      (let [next (if (= state.expandedOp id) nil id)
+            _ (setOpQueryParam next)]
+        [(merge state {:expandedOp next}) (commandNone)])
+    {:kind :open-auth :id id}
+      [(merge state {:authDialog? true :pendingAuthOp id}) (commandNone)]
+    {:kind :close-auth}
+      [(merge state {:authDialog? false :pendingAuthOp nil}) (commandNone)]
+    {:kind :auth-input :scheme scheme :field field :value value}
+      [(merge state {:authFormValues (object-assoc state.authFormValues (authFieldKey scheme field) value)
+                     :authError nil}) (commandNone)]
+    {:kind :authorize-scheme :scheme scheme}
+      (if (or (= scheme.kind "oauth2-password") (= scheme.kind "oauth2-client-credentials"))
+          [(merge state {:authLoadingScheme scheme.id :authError nil}) (oauthTokenCommand state scheme)]
+          (let [entry (simpleAuthEntry state scheme)
+                entries (object-assoc state.authEntries scheme.id entry)
+                _ (if (and (= entry.type "apiKey") (= entry.apiKeyIn "cookie")) (setCookie entry.apiKeyName entry.token) nil)]
+            [(afterAuthorizedState state entries) (commandNone)]))
+    {:kind :oauth-token-loaded :schemeId schemeId :value response}
+      (if (and (get response :ok) (hasText? (get (get response :body) :access_token)))
+          (let [token (get (get response :body) :access_token)
+                entries (object-assoc state.authEntries schemeId {:schemeId schemeId
+                                                                  :type "bearer"
+                                                                  :token token
+                                                                  :expiresAt (resolveTokenExpiry (get response :body) token)})]
+            [(afterAuthorizedState state entries) (commandNone)])
+          [(merge state {:authLoadingScheme nil :authError "Authorization failed"}) (commandNone)])
+    {:kind :auth-failed :error error}
+      [(merge state {:authLoadingScheme nil :authError (str error)}) (commandNone)]
+    {:kind :logout-scheme :scheme scheme}
+      (let [entries (object-dissoc state.authEntries scheme.id)
+            _ (persistAuthEntries state.sourceUrl entries)]
+        [(merge state {:authEntries entries
+                       :authorized? (> (authEntriesCount entries) 0)
+                       :authError nil}) (commandNone)])
+    {:kind :logout}
+      (let [_ (persistAuthEntries state.sourceUrl {})]
+        [(merge (clearAuthState state) {:authDialog? true}) (commandNone)])
+    {:kind :open-try :id id}
+      (let [_ (setOpQueryParam id)]
+        [(merge state {:expandedOp id :tryActiveOp id :formError nil}) (commandNone)])
+    {:kind :cancel-try}
+      [(merge state {:tryActiveOp nil :formError nil}) (commandNone)]
+    {:kind :param-input :opId opId :name name :value value}
+      [(merge state {:paramValues (object-assoc state.paramValues (paramKey opId name) value)
+                     :formError nil}) (commandNone)]
+    {:kind :body-input :opId opId :value value}
+      [(merge state {:bodyValues (object-assoc state.bodyValues (bodyKey opId) value)
+                     :formError nil}) (commandNone)]
+    {:kind :validate-param :opId opId :name name}
+      (let [value (paramValueByName state opId name "")]
+        (if (and (= name "id") (not (validUuid value)))
+            [(merge state {:formError "Enter a valid UUID"}) (commandNone)]
+            [state (commandNone)]))
+    {:kind :execute :item item}
+      (let [message (invalidExecuteMessage state item)]
+        (if (some? message)
+            [(merge state {:formError message}) (commandNone)]
+            [(merge state {:executingOp item.id
+                           :formError nil
+                           :responses (object-assoc state.responses item.id {:status "Loading" :body ""})})
+             (executeCommand state item)]))
+    {:kind :request-finished :id id :value response}
+      [(merge state {:responses (object-assoc state.responses id response)
+                     :executingOp nil}) (commandNone)]
+    {:kind :request-failed :error error}
+      [(merge state {:responses (object-assoc state.responses state.executingOp {:status "Error" :body error})
+                     :executingOp nil}) (commandNone)]
+    {:kind :download-response :name name :content content :mime mime}
+      [state {:kind :file/download
+              :name name
+              :content content
+              :mime mime
+              :msg {:kind :noop}}]
+    {:kind :noop}
+      [state (commandNone)]
+    _ [state (commandNone)]))
+
+(defn operationSummary [operation]
+  (let [summary (get operation :summary)]
+    (if (string? summary) summary "")))
+
+(defn copyTextButton [testId label text visible? extraClass]
+  #html <button type="button"
+                class={(if visible?
+                            (str "inline-flex items-center rounded border border-zinc-400 p-1 text-zinc-700 hover:bg-white disabled:opacity-40 dark:border-dm-border dark:text-dm-text dark:hover:bg-dm-surface-hover " extraClass)
+                            "hidden")}
+                title={label}
+                aria-label={label}
+                data-testid={testId}
+                disabled={(not (hasText? text))}
+                on:click={(do (copyText text) {:kind :noop})}>{(iconCopy "12" "")}</button>)
+
+(defn tagDescription [descriptions tag]
+  (let [description (map-get descriptions tag)]
+    (if (string? description) description "")))
+
+(defn schemaDescription [value]
+  (if (string? value) value "-"))
+
+(defn schemaEnumLabel [property]
+  (let [values (get property :enum)]
+    (if (and (vector? values) (> (count values) 0))
+        (str "enum: " (join (map values (fn [value] (str value))) ", "))
+        "")))
+
+(defn schemaRowDescription [property]
+  (let [enumLabel (schemaEnumLabel property)
+        description (get property :description)]
+    (if (hasText? enumLabel)
+        (if (string? description) (str description " - " enumLabel) enumLabel)
+        (schemaDescription description))))
+
+(defn schemaModel [properties plain?]
+  #html <div class={(if (> (count properties) 0)
+                       (if plain?
+                           "overflow-x-auto"
+                           "overflow-x-auto rounded border border-zinc-300 bg-white dark:border-dm-border dark:bg-dm-surface")
+                       "hidden")}>
+          <div class="grid grid-cols-[minmax(8rem,26%)_minmax(6rem,18%)_1fr] gap-x-3 px-2 py-1 text-[11px] font-semibold text-zinc-700 dark:text-dm-muted">
+            <span>Name</span>
+            <span>Type</span>
+            <span>Description</span>
+          </div>
+          {(for [property properties :key property.name]
+             #html <div class={(if plain?
+                                   "grid grid-cols-[minmax(8rem,26%)_minmax(6rem,18%)_1fr] gap-x-3 border-t border-zinc-200 py-1 text-[13px] dark:border-dm-border"
+                                   "grid grid-cols-[minmax(8rem,26%)_minmax(6rem,18%)_1fr] gap-x-3 border-t border-zinc-300 py-1 text-[13px] dark:border-dm-border")}>
+                     <span class="px-2 font-semibold text-zinc-900 dark:text-dm-text">
+                       {property.name}
+                       {(if property.required
+                           #html <span class="text-rose-600 dark:text-rose-400"> *</span>
+                           #html <span class="hidden"></span>)}
+                     </span>
+                     <span class="px-2 font-mono text-[11px] font-medium text-zinc-800 dark:text-dm-muted">{property.type}</span>
+                     <span class="px-2 text-zinc-700 dark:text-dm-muted">{(schemaRowDescription property)}</span>
+                   </div>)}
+        </div>)
+
+(defn virtualJsonViewer [value maxHeight version]
+  #html <virtual-json-viewer data-json={(if (string? value) value (json-stringify value))}
+                             data-version={version}
+                             max-height={maxHeight}></virtual-json-viewer>)
+
+(defn schemaSection [media plain?]
+  #html <div class="space-y-1.5">
+          <div class="flex flex-wrap items-center gap-2 text-xs">
+            <span class="rounded bg-zinc-200 px-1.5 py-0.5 font-mono text-zinc-800 dark:bg-dm-surface dark:text-dm-text dark:ring-1 dark:ring-dm-border">{media.contentType}</span>
+            {(if (some? media.schemaName)
+                #html <span class="font-mono text-sky-700 dark:text-[#60a5fa]">{media.schemaName}</span>
+                #html <span class="hidden"></span>)}
+          </div>
+          {(if (> (count media.properties) 0)
+              #html <div>{(schemaModel media.properties plain?)}</div>
+              (if (some? media.example)
+                  #html <div>{(virtualJsonViewer media.example "16rem" (str media.contentType ":" media.schemaName))}</div>
+                  #html <p class="text-xs text-zinc-600 dark:text-dm-muted">No content</p>))}
+        </div>)
+
+(def requestBodyTextInputClass
+  "w-full max-w-sm rounded-md border border-zinc-400 bg-white px-2 py-1 text-[13px] text-zinc-900 outline-none focus:border-sky-500 focus:ring-2 focus:ring-sky-500/30 dark:border-dm-border dark:bg-dm-input dark:text-dm-text")
+
+(def requestBodyFileInputClass
+  "block max-w-lg text-[13px] text-zinc-800 file:mr-3 file:rounded-md file:border file:border-zinc-300 file:bg-white file:px-3 file:py-1 file:text-xs file:font-semibold file:text-zinc-800 hover:file:bg-zinc-50 dark:text-dm-text dark:file:border-dm-border dark:file:bg-dm-surface dark:file:text-dm-text dark:hover:file:bg-dm-surface-hover")
+
+(defn requestBodyFormFieldInput [state item field multipart?]
+  #html <div class="space-y-0.5">
+          <label class="block text-[11px] font-medium text-zinc-950 dark:text-dm-text">
+            {field.name}
+            {(if field.required
+                #html <span class="text-rose-600 dark:text-rose-400"> *</span>
+                #html <span class="hidden"></span>)}
+          </label>
+          {(if (hasText? field.description)
+              #html <p class="text-[11px] text-zinc-600 dark:text-dm-muted">{field.description}</p>
+              #html <span class="hidden"></span>)}
+          {(if (and multipart? (= field.kind "file"))
+              #html <input type="file"
+                           data-testid={(str "request-body-multipart-" field.name)}
+                           class={requestBodyFileInputClass}></input>
+              #html <input type="text"
+                           data-testid={(str "request-body-field-" field.name)}
+                           class={requestBodyTextInputClass}
+                           value={(bodyFieldValue state item field.name)}
+                           on:input={{:kind :param-input :opId item.id :name (bodyFieldKey field.name) :value event.currentTarget.value}}></input>)}
+        </div>)
+
+(defn requestBodyInput [state item operation]
+  (let [info (getRequestBodySchema state.spec (get operation :requestBody))
+        media (primaryTryItOutMedia info)
+        mode (requestBodyMode media)
+        fields (requestBodyFormFields state item mode media)]
+    #html <div class={(if (some? mode) "grid gap-2" "hidden")}>
+            {(if (= mode "file")
+                #html <input type="file"
+                             data-testid="request-body-file"
+                             class={requestBodyFileInputClass}></input>
+                #html <span class="hidden"></span>)}
+            {(if (= mode "multipart")
+                #html <div class="space-y-2">
+                        {(for [field fields :key field.name]
+                           #html <div>{(requestBodyFormFieldInput state item field true)}</div>)}
+                      </div>
+                #html <span class="hidden"></span>)}
+            {(if (= mode "urlencoded")
+                #html <div class="space-y-2">
+                        {(for [field fields :key field.name]
+                           #html <div>{(requestBodyFormFieldInput state item field false)}</div>)}
+                      </div>
+                #html <span class="hidden"></span>)}
+            {(if (or (= mode "json") (= mode "text"))
+                #html <textarea class="min-h-32 w-full max-w-lg rounded-md border border-zinc-300 bg-white px-2 py-1 font-mono text-[13px] text-zinc-900 outline-none focus:border-sky-500 focus:ring-2 focus:ring-sky-500/30 dark:border-dm-border dark:bg-dm-input dark:text-dm-text"
+                                value={(requestBodyValue state item)}
+                                on:input={{:kind :body-input :opId item.id :value event.currentTarget.value}}></textarea>
+                #html <span class="hidden"></span>)}
+          </div>))
+
+(defn requestBodyPanel [state item operation tryActive?]
+  (let [info (getRequestBodySchema state.spec (get operation :requestBody))
+        copyTextValue (if (some? info) (formatRequestBodySchemaForCopy info) "")]
+    #html <section class={(if (some? info) "mt-2 space-y-1.5 pt-1" "hidden")}>
+            <div class="flex flex-wrap items-center gap-2">
+              <h4 class="text-xs font-bold tracking-wide text-zinc-900 uppercase dark:text-dm-text">Request body</h4>
+              {(if (and (some? info) info.required)
+                  #html <span class="text-[11px] text-rose-600 dark:text-rose-400">required</span>
+                  #html <span class="hidden"></span>)}
+            </div>
+            {(if (and (some? info) (string? info.description))
+                #html <p class="text-xs text-zinc-600 dark:text-dm-muted">{info.description}</p>
+                #html <p class="hidden"></p>)}
+            <div class="flex gap-1 border-b border-zinc-200 dark:border-b-dm-border">
+              <button type="button"
+                      data-testid="request-body-tab-example"
+                      class={(if tryActive?
+                                  "border-b-2 border-zinc-900 px-3 py-1.5 text-xs font-semibold text-zinc-900 dark:border-white dark:text-white"
+                                  "border-b-2 border-transparent px-3 py-1.5 text-xs font-semibold text-zinc-600 hover:text-zinc-800 dark:text-dm-muted dark:hover:text-dm-text")}>Example Value</button>
+              <button type="button"
+                      data-testid="request-body-tab-model"
+                      class={(if tryActive?
+                                  "border-b-2 border-transparent px-3 py-1.5 text-xs font-semibold text-zinc-600 hover:text-zinc-800 dark:text-dm-muted dark:hover:text-dm-text"
+                                  "border-b-2 border-zinc-900 px-3 py-1.5 text-xs font-semibold text-zinc-900 dark:border-white dark:text-white")}>Model</button>
+            </div>
+            <div class="rounded-md bg-white/80 p-2 dark:bg-dm-surface">
+              {(if tryActive?
+                  #html <div>{(requestBodyInput state item operation)}</div>
+                  #html <div class="flex items-start gap-2">
+                          <div class="min-w-0 flex-1 space-y-2">
+                            {(for [media (if (some? info) info.media []) :key media.contentType]
+                               #html <div>{(schemaSection media false)}</div>)}
+                          </div>
+                          <div>{(copyTextButton "copy-request-body-schema" "Copy schema" copyTextValue (and (some? info) (hasCopyableSchema info)) "shrink-0")}</div>
+                        </div>)}
+            </div>
+          </section>))
+
+(defn isErrorResponseStatus? [status]
+  (or (starts-with? status "4") (starts-with? status "5")))
+
+(defn statusBadgeClass [status]
+  (if (starts-with? status "2")
+      "bg-emerald-600/15 text-emerald-800 dark:bg-[rgba(46,204,113,0.15)] dark:text-[#4ade80]"
+      (if (isErrorResponseStatus? status)
+          "bg-rose-600/15 text-rose-800 dark:bg-[rgba(231,76,60,0.15)] dark:text-[#f87171]"
+          "bg-zinc-200 text-zinc-800 dark:bg-dm-surface dark:text-dm-muted")))
+
+(defn responseHeader [response]
+  #html <div class="flex flex-wrap items-center gap-2"><span class={(str "rounded px-1.5 py-0.5 text-xs font-semibold " (statusBadgeClass response.status))}>{response.status}</span>{(if (string? response.description) #html <span class="text-xs text-zinc-600 dark:text-dm-muted">{response.description}</span> #html <span class="hidden"></span>)}</div>)
+
+(defn responseSchemaBody [response]
+  (let [copyTextValue (formatResponseSchemaForCopy response)]
+    #html <div class="pt-2">
+            {(if (> (count response.media) 0)
+                #html <div class="rounded-md bg-white/80 p-2 dark:bg-dm-surface">
+                        <div class="flex items-start gap-2">
+                          <div class="min-w-0 flex-1 space-y-2">
+                            {(for [media response.media :key media.contentType]
+                               #html <div>{(schemaSection media true)}</div>)}
+                          </div>
+                          <div>{(copyTextButton (str "copy-response-schema-" response.status) "Copy schema" copyTextValue (hasCopyableSchema response) "shrink-0")}</div>
+                        </div>
+                      </div>
+                #html <p class="text-xs text-zinc-600 dark:text-dm-muted">No content</p>)}
+          </div>))
+
+(defn responseBlock [response]
+  #html <div>
+          {(if (isErrorResponseStatus? response.status)
+              #html <details class="group -mx-1 rounded-md px-1 transition-colors hover:bg-zinc-100/90 dark:hover:bg-dm-surface-hover"><summary class="cursor-pointer list-none rounded-md py-1.5 [&::-webkit-details-marker]:hidden"><div class="flex items-center gap-2">{(iconChevronRight "16" "shrink-0 text-zinc-500 transition-transform group-open:rotate-90 dark:text-dm-muted")}{(responseHeader response)}</div></summary><div class="pb-1 pl-6">{(responseSchemaBody response)}</div></details>
+              #html <div class="space-y-1">
+                      {(responseHeader response)}
+                      {(responseSchemaBody response)}
+                    </div>)}
+        </div>)
+
+(defn responsesSchemaView [state operation]
+  (let [responses (getResponseSchemas state.spec (get operation :responses))]
+    #html <section class={(if (> (count responses) 0) "mt-2 space-y-2 pt-1" "hidden")}>
+            <h4 class="text-xs font-bold tracking-wide text-zinc-900 uppercase dark:text-dm-text">Responses</h4>
+            {(for [response responses :key response.status]
+               #html <div>{(responseBlock response)}</div>)}
+          </section>))
+
+(defn optionStrings [values]
+  (if (vector? values)
+      (map values (fn [value] (str value)))
+      []))
+
+(defn parameterOptions [meta]
+  (if (and (vector? meta.enumValues) (> (count meta.enumValues) 0))
+      (optionStrings meta.enumValues)
+      (if (= meta.kind "boolean")
+          ["true" "false"]
+          [])))
+
+(defn parameterTypeLabel [meta]
+  (if (string? meta.schemaType) meta.schemaType "string"))
+
+(defn parameterPlaceholder [meta]
+  (if (string? meta.example)
+      meta.example
+      (if (= meta.kind "array")
+          (if (and (vector? meta.arrayItemEnum) (> (count meta.arrayItemEnum) 0))
+              (join (optionStrings meta.arrayItemEnum) ", ")
+              "value1, value2")
+          (if (= meta.kind "object")
+              "{\"key\":\"value\"}"
+              meta.name))))
+
+(defn parameterInputType [meta]
+  (if (= meta.kind "integer")
+      "number"
+      (if (= meta.kind "number")
+          "number"
+          (if (= meta.format "date")
+              "date"
+              (if (= meta.format "date-time") "datetime-local" "text")))))
+
+(defn parameterInput [state item meta]
+  (let [name (get meta :name)
+        visible? (string? name)
+        value (if visible? (paramValue state item meta) "")
+        placeholder (if visible? (parameterPlaceholder meta) "")
+        options (parameterOptions meta)]
+    #html <div>
+            {(if (and visible? (= meta.kind "object"))
+                #html <textarea rows="3"
+                                class="w-full max-w-sm rounded-md border border-zinc-400 bg-white px-2 py-1 text-[13px] text-zinc-900 placeholder:text-zinc-500 outline-none focus:border-sky-500 focus:ring-2 focus:ring-sky-500/30 dark:border-dm-border dark:bg-dm-input dark:text-dm-text dark:placeholder:text-dm-muted dark:focus:border-sky-500 dark:focus:ring-sky-500/40"
+                                placeholder={placeholder}
+                                value={value}
+                                on:input={{:kind :param-input :opId item.id :name name :value event.currentTarget.value}}
+                                on:blur={{:kind :validate-param :opId item.id :name name}}></textarea>
+                (if (> (count options) 0)
+                    #html <select class="w-full max-w-sm rounded-md border border-zinc-400 bg-white px-2 py-1 text-[13px] text-zinc-900 outline-none focus:border-sky-500 focus:ring-2 focus:ring-sky-500/30 dark:border-dm-border dark:bg-dm-input dark:text-dm-text dark:focus:border-sky-500 dark:focus:ring-sky-500/40"
+                                  value={value}
+                                  on:change={{:kind :param-input :opId item.id :name name :value event.currentTarget.value}}
+                                  on:blur={{:kind :validate-param :opId item.id :name name}}>
+                            <option value="">{(if meta.required "Select…" "—")}</option>
+                            {(for [option options :key option]
+                               #html <option value={option}>{option}</option>)}
+                          </select>
+                    #html <input type={(parameterInputType meta)}
+                                 class={(if visible?
+                                            "w-full max-w-sm rounded-md border border-zinc-400 bg-white px-2 py-1 text-[13px] text-zinc-900 placeholder:text-zinc-500 outline-none focus:border-sky-500 focus:ring-2 focus:ring-sky-500/30 dark:border-dm-border dark:bg-dm-input dark:text-dm-text dark:placeholder:text-dm-muted dark:focus:border-sky-500 dark:focus:ring-sky-500/40"
+                                            "hidden")}
+                                 placeholder={placeholder}
+                                 value={value}
+                                 on:input={{:kind :param-input :opId item.id :name name :value event.currentTarget.value}}
+                                 on:blur={{:kind :validate-param :opId item.id :name name}}></input>))}
+          </div>))
+
+(defn parameterInputs [state item operation tryActive?]
+  (let [params (resolveParameterMeta state.spec item)]
+    #html <div class={(if (> (count params) 0) "overflow-x-auto rounded-md bg-white/70 dark:bg-dm-surface" "hidden")}>
+            <table class="w-full border-collapse text-[13px]">
+              <thead>
+                <tr class="text-left text-zinc-700 dark:text-dm-muted">
+                  <th class="w-[26%] px-2 py-1.5 text-xs font-semibold">Name</th>
+                  <th class="px-2 py-1.5 text-xs font-semibold">Description</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(for [param params :key (str item.id ":" (get param :name))]
+                   #html <tr class="border-t border-zinc-200/80 align-top dark:border-t-dm-border">
+                           <td class="px-2 py-2 pr-3">
+                             <div class="font-bold text-zinc-950 dark:text-dm-text">
+                               {param.name}
+                               {(if param.required
+                                   #html <span class="text-rose-600 dark:text-rose-400"> *</span>
+                                   #html <span class="hidden"></span>)}
+                             </div>
+                             <div class="mt-px font-mono text-[11px] text-zinc-600 dark:text-dm-muted">{(parameterTypeLabel param)}</div>
+                             <div class="mt-px text-[10px] text-zinc-600 dark:text-dm-muted">{param.in}</div>
+                           </td>
+                           <td class="px-2 py-2">
+                             {(if tryActive?
+                                 (if (hasText? param.description)
+                                     #html <p class="mb-1 text-[11px] leading-tight text-zinc-600 dark:text-dm-muted">{param.description}</p>
+                                     #html <span class="hidden"></span>)
+                                 #html <p class="text-zinc-700 dark:text-dm-muted">{(schemaDescription param.description)}</p>)}
+                             {(if tryActive?
+                                 #html <div>{(parameterInput state item param)}</div>
+                                 #html <div class="hidden"></div>)}
+                           </td>
+                         </tr>)}
+              </tbody>
+            </table>
+          </div>))
+
+(defn responseStatusText [response]
+  (let [status (get response :status)]
+    (if (number? status)
+        (let [statusText (get response :statusText)]
+          (if (hasText? statusText) (str status " " statusText) (str status)))
+        (if (string? status) status ""))))
+
+(defn responseOk? [response]
+  (let [status (get response :status)]
+    (and (number? status) (>= status 200) (< status 300))))
+
+(defn responseHeaderValue [response name]
+  (let [headers (get response :headers)
+        value (object-get headers name)]
+    (if (string? value) value "")))
+
+(defn responseContentType [response]
+  (responseHeaderValue response "content-type"))
+
+(defn responseContentDisposition [response]
+  (responseHeaderValue response "content-disposition"))
+
+(defn responseBaseMime [response]
+  (lower-case (trim (first (split (responseContentType response) ";")))))
+
+(defn responseJson? [response]
+  (let [mime (responseBaseMime response)]
+    (or (includes? mime "json") (ends-with? mime "+json"))))
+
+(defn responseBodyText [response]
+  (let [body (get response :body)]
+    (if (some? response)
+        (if (string? body) body (json-stringify body))
+        "")))
+
+(defn responseDisplayText [response]
+  (let [raw (responseBodyText response)
+        parsed (json-parse-result raw)]
+    (if (and (responseJson? response) (ok? parsed))
+        (json-stringify (unwrap-or parsed raw) 2)
+        raw)))
+
+(defn responseCopyText [response]
+  (responseDisplayText response))
+
+(defn responseDurationText [response]
+  (let [duration (get response :durationMs)]
+    (if (number? duration) (str duration " ms") "")))
+
+(defn attachmentDisposition? [response]
+  (includes? (lower-case (responseContentDisposition response)) "attachment"))
+
+(defn responseFile? [response]
+  (let [mime (responseBaseMime response)]
+    (or (attachmentDisposition? response)
+        (= mime "application/octet-stream")
+        (includes? mime "csv")
+        (starts-with? mime "image/")
+        (starts-with? mime "audio/")
+        (starts-with? mime "video/")
+        (= mime "application/pdf")
+        (includes? mime "zip")
+        (includes? mime "excel")
+        (includes? mime "spreadsheet")
+        (includes? mime "msword")
+        (includes? mime "officedocument"))))
+
+(defn extensionFromContentType [contentType]
+  (let [mime (lower-case contentType)]
+    (if (includes? mime "csv")
+        "csv"
+        (if (= mime "application/pdf")
+            "pdf"
+            (if (includes? mime "json")
+                "json"
+                (if (includes? mime "xml")
+                    "xml"
+                    (if (starts-with? mime "image/")
+                        (second (split mime "/"))
+                        (if (includes? mime "zip")
+                            "zip"
+                            (if (or (includes? mime "excel") (includes? mime "spreadsheet"))
+                                "xlsx"
+                                (if (or (includes? mime "word") (includes? mime "msword"))
+                                    "docx"
+                                    "bin"))))))))))
+
+(defn fileNameFromDisposition [header]
+  (let [quoted (regex-capture header "filename\\s*=\\s*\"([^\"]*)\"" "i")
+        plain (regex-capture header "filename\\s*=\\s*([^;\\n]+)" "i")]
+    (if (hasText? quoted)
+        quoted
+        (trim plain))))
+
+(defn responseFileNameFromUrl [response]
+  (let [requestUrl (get response :url)
+        pathName (if (string? requestUrl) (url-pathname requestUrl) "")
+        parts (filter (split pathName "/") hasText?)
+        lastPart (if (> (count parts) 0) (last parts) "")
+        extension (extensionFromContentType (responseBaseMime response))]
+    (if (= lastPart "")
+        ""
+        (if (includes? lastPart ".")
+            lastPart
+            (if (= lastPart "csv")
+                (if (> (count parts) 1) (str (nth parts (- (count parts) 2)) ".csv") "download.csv")
+                (if (not (= extension "bin")) (str lastPart "." extension) ""))))))
+
+(defn responseDownloadName [item response]
+  (let [fromDisposition (fileNameFromDisposition (responseContentDisposition response))
+        fromUrl (responseFileNameFromUrl response)
+        mime (responseBaseMime response)]
+    (if (hasText? fromDisposition)
+        fromDisposition
+        (if (hasText? fromUrl)
+            fromUrl
+            (str "download." (extensionFromContentType mime))))))
+
+(defn responseViewerKey [response]
+  (str (responseStatusText response) ":" (responseDurationText response) ":" (responseContentType response) ":" (count (responseBodyText response))))
+
+(defn responsePanel [item response]
+  #html <section class={(if (some? response)
+                            "mt-2 space-y-1.5 rounded-md bg-white/80 p-2 dark:bg-dm-surface"
+                            "hidden")}>
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <div class="text-xs font-bold tracking-wide text-zinc-900 uppercase dark:text-dm-text">Response</div>
+            <div class="flex items-center gap-2">
+              {(if (responseFile? response)
+                  #html <button type="button"
+                                data-testid="download-response"
+                                title="Download"
+                                aria-label="Download"
+                                class="inline-flex items-center rounded border border-zinc-400 p-1 text-zinc-700 hover:bg-white dark:border-dm-border dark:text-dm-text dark:hover:bg-dm-surface-hover"
+                                on:click={{:kind :download-response
+                                           :name (responseDownloadName item response)
+                                           :content (responseCopyText response)
+                                           :mime (responseContentType response)}}>{(iconDownload "12" "")}</button>
+                  #html <span class="hidden"></span>)}
+              {(copyTextButton "copy-response" "Copy" (responseCopyText response) (or (not (responseFile? response)) (hasText? (responseCopyText response))) "")}
+            </div>
+          </div>
+          <div class="flex flex-wrap items-center gap-3 text-sm">
+            <span class={(if (responseOk? response)
+                             "rounded bg-emerald-600/20 px-2 py-0.5 font-medium text-emerald-700 dark:text-emerald-400"
+                             "rounded bg-rose-600/20 px-2 py-0.5 font-medium text-rose-700 dark:text-rose-400")}
+                  data-testid="response-status">{(responseStatusText response)}</span>
+            {(if (hasText? (responseDurationText response))
+                #html <span class="text-zinc-600 dark:text-dm-muted">{(responseDurationText response)}</span>
+                #html <span class="hidden"></span>)}
+            {(if (hasText? (responseContentType response))
+                #html <span class="font-mono text-xs text-zinc-600 dark:text-dm-muted">{(responseContentType response)}</span>
+                #html <span class="hidden"></span>)}
+          </div>
+          {(if (responseFile? response)
+              #html <div class="rounded-lg bg-zinc-50 px-3 py-2 text-sm dark:bg-dm-surface" data-testid="response-body">
+                      <p class="text-zinc-700 dark:text-dm-text">File response
+                        <span class="ml-1 font-mono text-zinc-600 dark:text-dm-muted">({(responseDownloadName item response)})</span>
+                      </p>
+                      {(if (starts-with? (responseBaseMime response) "image/")
+                          #html <img alt={(responseDownloadName item response)}
+                                     class="mt-2 max-h-64 max-w-full rounded border border-zinc-200 dark:border-dm-border"></img>
+                          #html <span class="hidden"></span>)}
+                    </div>
+              #html <div data-testid="response-body">{(virtualJsonViewer (responseDisplayText response) "32rem" (responseViewerKey response))}</div>)}
+        </section>)
+
+(defn operationPanel [state item]
+  (let [expanded? (or (= state.expandedOp item.id) (= state.tryActiveOp item.id))
+        tryActive? (= state.tryActiveOp item.id)
+        operation item.operation
+        response (object-get state.responses item.id)]
+    #html <article class="scroll-mt-24 mb-[10px] overflow-hidden rounded border border-zinc-200 dark:border-dm-border"
+                   data-testid={(str "operation-" item.id)}>
+            <div class={(str "flex w-full items-stretch transition " (methodHeaderBg item.method expanded?) (if expanded? " border-b border-zinc-300/70 shadow-[inset_0_-1px_0_rgba(0,0,0,0.05)] dark:border-dm-border dark:shadow-none" ""))}
+                 data-op-header>
+              <button type="button"
+                      class="flex min-w-0 flex-1 flex-nowrap items-center gap-2.5 px-3 py-2 text-left sm:gap-3"
+                      on:click={{:kind :toggle-operation :id item.id}}>
+                <span class={(str "inline-flex w-[4.75rem] shrink-0 items-center justify-center rounded px-2 py-0.5 text-[11px] font-bold uppercase ring-1 ring-inset " (methodColor item.method))}>{item.method}</span>
+                <span class="shrink-0 whitespace-nowrap font-mono text-sm text-zinc-800 dark:text-dm-text">{item.path}</span>
+                <span class="min-w-0 flex-1 truncate text-sm text-zinc-600 dark:text-dm-muted">{(operationSummary operation)}</span>
+                <span class="ml-auto shrink-0 text-zinc-400 dark:text-dm-muted">
+                  {(if expanded? (iconChevronUp "18" "") (iconChevronDown "18" ""))}
+                </span>
+              </button>
+              {(if (hasAuthSchemes? state.spec state.oauthInit)
+                  #html <button type="button"
+                                class="shrink-0 px-2.5 text-zinc-400 transition hover:text-zinc-700 dark:text-dm-muted dark:hover:text-dm-text"
+                                title="Authorize"
+                                aria-label="Authorize"
+                                data-testid="operation-authorize-lock"
+                                on:click={{:kind :open-auth :id item.id}}>{(iconLock "15" "")}</button>
+                  #html <button type="button" class="hidden" data-testid="operation-authorize-lock"></button>)}
+            </div>
+            {(if expanded?
+                #html <div class={(str "px-3 py-3 " (methodExpandedBg item.method))}>
+                        {(if (and (hasText? (get operation :description)) (hasText? (operationSummary operation)))
+                            #html <div class="mb-2 text-sm"><div class="prose prose-sm max-w-none prose-p:my-2 prose-headings:my-2 dark:prose-invert" innerHTML={(markdownHtml (get operation :description))}></div></div>
+                            #html <div class="hidden"></div>)}
+                        <div class="mb-1 flex items-center justify-between">
+                          <span class="text-xs font-bold tracking-wide text-zinc-900 uppercase dark:text-dm-text">Parameters</span>
+                          {(if tryActive?
+                              #html <button type="button"
+                                            class="rounded-md border border-zinc-300 bg-transparent px-3 py-1 text-xs font-medium text-zinc-700 hover:bg-white/80 dark:border-dm-border dark:text-dm-muted dark:hover:bg-dm-surface-hover"
+                                            data-testid="cancel-try-it-out"
+                                            on:click={{:kind :cancel-try}}>Cancel</button>
+                              #html <button type="button"
+                                            class="rounded-md border border-zinc-300 bg-white px-3 py-1 text-xs font-semibold text-zinc-800 hover:bg-zinc-50 dark:border-dm-border dark:bg-dm-surface dark:text-dm-text dark:hover:bg-dm-surface-hover"
+                                            data-testid="try-it-out"
+                                            on:click={{:kind :open-try :id item.id}}>Try it out</button>)}
+                        </div>
+                        {(if (> (count (resolveParameterMeta state.spec item)) 0)
+                            #html <div>{(parameterInputs state item operation tryActive?)}</div>
+                            (if (hasTryItOutRequestBody? (requestBodyInfoFor state item))
+                                #html <span class="hidden"></span>
+                                #html <p class="py-1 text-xs text-zinc-600 dark:text-dm-muted">No parameters</p>))}
+                        <div>{(requestBodyPanel state item operation tryActive?)}</div>
+                        {(if tryActive?
+                            #html <div class="mt-2">
+                                    <button type="button"
+                                            class="inline-flex items-center gap-2 rounded-md bg-emerald-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-emerald-500 dark:bg-emerald-600 dark:hover:bg-emerald-500"
+                                            data-testid="execute"
+                                            on:click={{:kind :execute :item item}}>{(iconPlay "16" "")}Execute</button>
+                                  </div>
+                            #html <div class="hidden"></div>)}
+                        {(if (some? state.formError)
+                            #html <p class="mt-2 rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700 dark:border-rose-900/50 dark:bg-rose-950/30 dark:text-rose-300">{state.formError}</p>
+                            #html <div class="hidden"></div>)}
+                        <div>{(responsePanel item response)}</div>
+                        <div>{(responsesSchemaView state operation)}</div>
+                      </div>
+                #html <div class="hidden"></div>)}
+          </article>))
+
+(defn tagSection [state descriptions entry]
+  (let [expanded? (contains? state.expandedTags entry.key)]
+    #html <section class="border-b border-zinc-200 dark:border-dm-border"
+                   data-testid={(str "tag-section-" entry.key)}>
+            <button type="button"
+                    class="flex w-full items-center gap-3 px-2 py-3 text-left hover:bg-zinc-50 dark:bg-dm-surface dark:hover:bg-dm-surface-hover"
+                    on:click={{:kind :toggle-tag :tag entry.key}}>
+              <span class="text-lg font-medium text-zinc-900 dark:text-dm-text">{entry.key}</span>
+              {(if (hasText? (tagDescription descriptions entry.key))
+                  #html <span class="flex-1 truncate text-sm text-zinc-500 dark:text-dm-muted">{(tagDescription descriptions entry.key)}</span>
+                  #html <span class="hidden"></span>)}
+              <span class="ml-auto shrink-0 text-zinc-400 dark:text-dm-muted">
+                {(if expanded? (iconChevronUp "20" "") (iconChevronDown "20" ""))}
+              </span>
+            </button>
+            {(if expanded?
+                #html <div class="space-y-0 border-t border-zinc-200 p-2 dark:border-t-dm-border">
+                        {(for [item entry.value :key item.id]
+                           #html <div>{(operationPanel state item)}</div>)}
+                      </div>
+                #html <div class="hidden"></div>)}
+          </section>))
+
+(def authFieldInputClass
+  "w-full rounded-md border border-zinc-400 bg-white px-3 py-2 text-sm text-zinc-900 placeholder:text-zinc-500 outline-none focus:border-sky-500 focus:ring-2 focus:ring-sky-500/30 dark:border-zinc-600 dark:bg-zinc-950 dark:text-zinc-100 dark:placeholder:text-zinc-500")
+
+(def authFieldLabelClass
+  "text-sm font-medium text-zinc-800 dark:text-zinc-200")
+
+(def authMetaTextClass
+  "text-[11px] leading-snug text-zinc-500 dark:text-zinc-500")
+
+(def authSectionHeadingClass
+  "text-[11px] font-semibold tracking-wide text-zinc-600 uppercase dark:text-zinc-400")
+
+(def authPrimaryButtonClass
+  "inline-flex items-center justify-center gap-2 rounded-md bg-emerald-600 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-500 disabled:opacity-60 dark:bg-emerald-600 dark:hover:bg-emerald-500")
+
+(def authSecondaryButtonClass
+  "rounded-md border border-zinc-400 bg-white px-4 py-2 text-sm font-medium text-zinc-700 hover:bg-zinc-50 dark:border-zinc-600 dark:bg-transparent dark:text-zinc-300 dark:hover:bg-zinc-800")
+
+(def authLogoutButtonClass
+  "inline-flex items-center justify-center rounded-md border border-rose-300 bg-white px-4 py-2 text-sm font-semibold text-rose-700 hover:bg-rose-50 dark:border-rose-800 dark:bg-transparent dark:text-rose-400 dark:hover:bg-rose-950/40")
+
+(defn authorizedBadge []
+  #html <p class="text-xs font-medium text-emerald-700 dark:text-emerald-400">Authorized</p>)
+
+(defn authErrorText [state]
+  (if (some? state.authError)
+      #html <p class="text-xs text-rose-600 dark:text-rose-400">{state.authError}</p>
+      #html <p class="hidden"></p>))
+
+(defn apiKeySchemeForm [state scheme]
+  #html <div class="space-y-4 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900/60">
+          <div class="space-y-1">
+            <h3 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">{scheme.id} (apiKey, {scheme.in}: {scheme.name})</h3>
+          </div>
+          {(if (schemeAuthorized? state scheme)
+              (authorizedBadge)
+              #html <form id={(authFormId scheme)}
+                          on:submit={(do (event.preventDefault) {:kind :authorize-scheme :scheme scheme})}>
+                      <label class="block space-y-1.5">
+                        <span class={authFieldLabelClass}>{scheme.name}</span>
+                        <input type="text"
+                               value={(authFieldValue state scheme "value" "")}
+                               placeholder={scheme.name}
+                               class={authFieldInputClass}
+                               on:input={{:kind :auth-input :scheme scheme :field "value" :value event.currentTarget.value}}></input>
+                      </label>
+                    </form>)}
+        </div>)
+
+(defn bearerSchemeForm [state scheme]
+  #html <div class="space-y-4 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900/60">
+          <h3 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">{scheme.id} (HTTP Bearer)</h3>
+          {(if (schemeAuthorized? state scheme)
+              (authorizedBadge)
+              #html <form id={(authFormId scheme)}
+                          on:submit={(do (event.preventDefault) {:kind :authorize-scheme :scheme scheme})}>
+                      <label class="block space-y-1.5">
+                        <span class={authFieldLabelClass}>Bearer token</span>
+                        <input type="text"
+                               value={(authFieldValue state scheme "token" "")}
+                               placeholder="Bearer token"
+                               class={authFieldInputClass}
+                               on:input={{:kind :auth-input :scheme scheme :field "token" :value event.currentTarget.value}}></input>
+                      </label>
+                    </form>)}
+        </div>)
+
+(defn basicSchemeForm [state scheme]
+  #html <div class="space-y-4 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900/60">
+          <h3 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">{scheme.id} (HTTP Basic)</h3>
+          {(if (schemeAuthorized? state scheme)
+              (authorizedBadge)
+              #html <form id={(authFormId scheme)}
+                          class="space-y-4"
+                          autocomplete="on"
+                          on:submit={(do (event.preventDefault) {:kind :authorize-scheme :scheme scheme})}>
+                      <label class="block space-y-1.5">
+                        <span class={authFieldLabelClass}>Username</span>
+                        <input type="text"
+                               name="basic_username"
+                               autocomplete="username"
+                               value={(authFieldValue state scheme "username" "")}
+                               class={authFieldInputClass}
+                               on:input={{:kind :auth-input :scheme scheme :field "username" :value event.currentTarget.value}}></input>
+                      </label>
+                      <label class="block space-y-1.5">
+                        <span class={authFieldLabelClass}>Password</span>
+                        <input type="password"
+                               name="basic_password"
+                               autocomplete="current-password"
+                               value={(authFieldValue state scheme "password" "")}
+                               class={authFieldInputClass}
+                               on:input={{:kind :auth-input :scheme scheme :field "password" :value event.currentTarget.value}}></input>
+                      </label>
+                    </form>)}
+        </div>)
+
+(defn oauthClientFields [state scheme divider?]
+  #html <div class="space-y-3">
+          {(if divider?
+              #html <div class="border-t border-zinc-200 pt-4 dark:border-zinc-700"></div>
+              #html <div class="hidden"></div>)}
+          <h4 class={authSectionHeadingClass}>Client Application</h4>
+          <div class="space-y-3">
+            <label class="block space-y-1.5">
+              <span class={authFieldLabelClass}>Client ID</span>
+              {(if divider?
+                  #html <input type="text"
+                               name="client_id"
+                               autocomplete="off"
+                               value={(oauthClientId state scheme)}
+                               class={(str authFieldInputClass " font-mono")}
+                               on:input={{:kind :auth-input :scheme scheme :field "clientId" :value event.currentTarget.value}}></input>
+                  #html <input type="text"
+                               autocomplete="off"
+                               value={(oauthClientId state scheme)}
+                               class={(str authFieldInputClass " font-mono")}
+                               on:input={{:kind :auth-input :scheme scheme :field "clientId" :value event.currentTarget.value}}></input>)}
+            </label>
+            <label class="block space-y-1.5">
+              <span class={authFieldLabelClass}>Client secret</span>
+              <input type="text"
+                     name="client_secret"
+                     autocomplete="off"
+                     data-lpignore="true"
+                     data-1p-ignore="true"
+                     data-form-type="other"
+                     value={(oauthClientSecret state scheme)}
+                     class={(str authFieldInputClass " font-mono [-webkit-text-security:disc]")}
+                     on:input={{:kind :auth-input :scheme scheme :field "clientSecret" :value event.currentTarget.value}}></input>
+            </label>
+            <label class="block space-y-1.5">
+              <span class={authFieldLabelClass}>Client credentials location</span>
+              <select value={(clientCredentialsLocation state scheme)}
+                      autocomplete="off"
+                      class={authFieldInputClass}
+                      on:change={{:kind :auth-input :scheme scheme :field "clientCredentialsLocation" :value event.currentTarget.value}}>
+                <option value="body">Request body</option>
+                <option value="header">Authorization header</option>
+              </select>
+            </label>
+          </div>
+        </div>)
+
+(defn oauthPasswordSchemeForm [state scheme]
+  #html <div class="space-y-4 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900/60">
+          <div class="space-y-1">
+            <h3 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">{scheme.id} (OAuth2, password)</h3>
+            <p class={authMetaTextClass}>Token URL: <span class="font-mono">{scheme.tokenUrl}</span></p>
+            <p class={authMetaTextClass}>Flow: password</p>
+          </div>
+          {(if (schemeAuthorized? state scheme)
+              (authorizedBadge)
+              #html <form id={(authFormId scheme)}
+                          class="space-y-4"
+                          autocomplete="on"
+                          on:submit={(do (event.preventDefault) {:kind :authorize-scheme :scheme scheme})}>
+                      <div class="space-y-3">
+                        <h4 class={authSectionHeadingClass}>User Credentials</h4>
+                        <div class="space-y-3">
+                          <label class="block space-y-1.5">
+                            <span class={authFieldLabelClass}>Username</span>
+                            <input type="text"
+                                   name="username"
+                                   autocomplete="username"
+                                   value={(authFieldValue state scheme "username" "")}
+                                   class={authFieldInputClass}
+                                   on:input={{:kind :auth-input :scheme scheme :field "username" :value event.currentTarget.value}}></input>
+                          </label>
+                          <label class="block space-y-1.5">
+                            <span class={authFieldLabelClass}>Password</span>
+                            <input type="password"
+                                   name="password"
+                                   autocomplete="current-password"
+                                   value={(authFieldValue state scheme "password" "")}
+                                   class={authFieldInputClass}
+                                   on:input={{:kind :auth-input :scheme scheme :field "password" :value event.currentTarget.value}}></input>
+                          </label>
+                        </div>
+                      </div>
+                      {(oauthClientFields state scheme true)}
+                      {(authErrorText state)}
+                    </form>)}
+        </div>)
+
+(defn oauthClientCredentialsSchemeForm [state scheme]
+  #html <div class="space-y-4 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900/60">
+          <div class="space-y-1">
+            <h3 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">{scheme.id} (OAuth2, client credentials)</h3>
+            <p class={authMetaTextClass}>Token URL: <span class="font-mono">{scheme.tokenUrl}</span></p>
+          </div>
+          {(if (schemeAuthorized? state scheme)
+              (authorizedBadge)
+              #html <form id={(authFormId scheme)}
+                          class="space-y-4"
+                          on:submit={(do (event.preventDefault) {:kind :authorize-scheme :scheme scheme})}>
+                      {(oauthClientFields state scheme false)}
+                      {(authErrorText state)}
+                    </form>)}
+        </div>)
+
+(defn schemeForm [state scheme]
+  (if (= scheme.kind "oauth2-password")
+      (oauthPasswordSchemeForm state scheme)
+      (if (= scheme.kind "oauth2-client-credentials")
+          (oauthClientCredentialsSchemeForm state scheme)
+          (if (= scheme.kind "apiKey")
+              (apiKeySchemeForm state scheme)
+              (if (= scheme.kind "http-bearer")
+                  (bearerSchemeForm state scheme)
+                  (if (= scheme.kind "http-basic")
+                      (basicSchemeForm state scheme)
+                      #html <div class="hidden"></div>))))))
+
+(defn authFooterButton [state scheme]
+  (if (schemeAuthorized? state scheme)
+      #html <button type="button"
+                    data-testid={(str scheme.id "-authorize-logout")}
+                    class={authLogoutButtonClass}
+                    on:click={{:kind :logout-scheme :scheme scheme}}>Logout</button>
+      (if (= state.authLoadingScheme scheme.id)
+          #html <button type="submit"
+                        form={(authFormId scheme)}
+                        data-testid={(str scheme.id "-authorize")}
+                        disabled={true}
+                        class={authPrimaryButtonClass}>{(iconLoaderCircle "14" "animate-spin")}Authorizing…</button>
+          #html <button type="submit"
+                        form={(authFormId scheme)}
+                        data-testid={(str scheme.id "-authorize")}
+                        disabled={false}
+                        class={authPrimaryButtonClass}>Authorize</button>)))
+
+(defn authorizeDialog [state]
+  (let [schemes (authSchemes state)]
+    #html <div class={(if state.authDialog? "fixed inset-0 z-[100] flex items-start justify-center bg-black/40 p-4 pt-16" "hidden")}
+               data-testid="authorize-dialog">
+            <div role="dialog"
+                 aria-modal="true"
+                 class="flex max-h-[80vh] w-full max-w-lg flex-col overflow-hidden rounded-lg border border-zinc-200 bg-white shadow-xl dark:border-zinc-700 dark:bg-zinc-900">
+              <div class="flex items-center justify-between border-b border-zinc-200 px-4 py-3 dark:border-zinc-700">
+                <h2 class="text-lg font-semibold text-zinc-900 dark:text-zinc-100">Available authorizations</h2>
+                <button type="button"
+                        aria-label="Close"
+                        class="rounded p-1 text-zinc-500 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800"
+                        on:click={{:kind :close-auth}}>{(iconX "18" "")}</button>
+              </div>
+              <div class="space-y-4 overflow-auto p-4">
+                  {(for [scheme schemes :key (str scheme.id ":" (schemeAuthorized? state scheme))]
+                   #html <div>{(schemeForm state scheme)}</div>)}
+              </div>
+              <div class="flex items-center justify-between gap-3 border-t border-zinc-200 px-4 py-3 dark:border-zinc-700">
+                <button type="button"
+                        class={authSecondaryButtonClass}
+                        on:click={{:kind :close-auth}}>Close</button>
+                <div class="flex flex-wrap items-center justify-end gap-2">
+                  {(for [scheme schemes :key (str scheme.id ":" (schemeAuthorized? state scheme) ":" (= state.authLoadingScheme scheme.id))]
+                     #html <div>{(authFooterButton state scheme)}</div>)}
+                </div>
+              </div>
+            </div>
+          </div>))
+
+(defn documentView [state spec]
+  (let [grouped (collectOperations spec)
+        descriptions (tagDescriptions spec)]
+    #html <main class="mx-auto max-w-5xl px-4 py-4">
+            <section class="mb-6 border-b border-zinc-200 pb-6 dark:border-dm-border">
+              <div class="flex flex-wrap items-start justify-between gap-3">
+                <div class="min-w-0 flex-1">
+                  <h2 class="text-2xl font-semibold text-zinc-900 dark:text-dm-text" data-testid="api-title">{(specTitle spec)}</h2>
+                  {(if (hasText? (specVersion spec))
+                      #html <p class="mt-1 text-sm text-zinc-500 dark:text-dm-muted">{(specVersion spec)}</p>
+                      #html <p class="hidden"></p>)}
+                </div>
+                <div class="flex shrink-0 flex-wrap items-center gap-2">
+                  <button type="button"
+                          data-testid="download-schema"
+                          title="Download OpenAPI schema"
+                          aria-label="Download OpenAPI schema"
+                          class="inline-flex items-center rounded-md border border-zinc-300 p-1.5 text-zinc-700 transition hover:bg-zinc-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900"
+                          on:click={{:kind :download-schema}}>{(iconDownload "14" "")}</button>
+                  <a href={(resolvedSpecUrl state.specUrl)}
+                     target="_blank"
+                     rel="noopener noreferrer"
+                     data-testid="open-schema"
+                     title="Open schema URL"
+                     aria-label="Open schema URL"
+                     class="inline-flex items-center rounded-md border border-zinc-300 p-1.5 text-zinc-700 transition hover:bg-zinc-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900">{(iconLink2 "14" "")}</a>
+                </div>
+              </div>
+              {(if (hasText? (specDescription spec))
+                  #html <div class="mt-4 text-sm"><div class="prose prose-sm max-w-none prose-p:my-2 prose-headings:my-2 dark:prose-invert" innerHTML={(markdownHtml (specDescription spec))}></div></div>
+                  #html <div class="hidden"></div>)}
+              {(if (hasText? (primaryServerUrl spec))
+                  #html <p class="mt-3 font-mono text-sm text-zinc-500 dark:text-dm-muted">{(primaryServerUrl spec)}</p>
+                  #html <p class="hidden"></p>)}
+            </section>
+            <div>
+              {(for [entry (map-entries grouped) :key entry.key]
+                 #html <div>{(tagSection state descriptions entry)}</div>)}
+            </div>
+          </main>))
+
+(defn definitionSelect [state]
+  (if (> (count state.definitions) 1)
+      #html <div class="relative shrink-0">
+              <select class="min-w-[11.5rem] max-w-[14rem] appearance-none rounded-md border border-emerald-600 bg-white py-1.5 pr-8 pl-3 text-sm text-zinc-900 outline-none focus:ring-2 focus:ring-emerald-500/40 dark:border-emerald-600 dark:bg-zinc-900 dark:text-zinc-100"
+                      data-testid="definition-select"
+                      aria-label="Select a definition"
+                      title="Select a definition"
+                      value={state.selectedDefinition}
+                      on:change={{:kind :definition-change :name event.currentTarget.value}}>
+                {(for [definition state.definitions :key definition.name]
+                   #html <option value={definition.name}>{definition.name}</option>)}
+              </select>
+              {(iconChevronDown "14" "pointer-events-none absolute top-1/2 right-2.5 -translate-y-1/2 text-zinc-500 dark:text-zinc-400")}
+            </div>
+      #html <div class="hidden"></div>))
+
+(defn themeButtonLabel [state]
+  (if (= state.theme "dark") "Switch to light theme" "Switch to dark theme"))
+
+(defn view [state]
+  #html <div class="min-h-screen">
+          <header class="sticky top-0 z-40 border-b border-zinc-200 bg-white/90 backdrop-blur dark:border-dm-border dark:bg-dm-base/95">
+            <div class="mx-auto flex max-w-5xl items-center gap-2 px-3 py-2 sm:gap-3 sm:px-4">
+              <span class="hidden shrink-0 text-sm font-semibold text-zinc-900 dark:text-dm-text sm:inline">Better Swagger UI</span>
+              <form class="flex min-w-0 flex-1 items-center gap-2.5 sm:gap-3"
+                    data-testid="load-form"
+                    on:submit={(do (event.preventDefault) {:kind :load})}>
+                <div class="relative min-w-0 flex-1">
+                  <input class="w-full rounded-md border border-zinc-300 bg-white py-1.5 pl-3 pr-16 text-sm text-zinc-900 outline-none placeholder:text-zinc-400 focus:ring-2 focus:ring-sky-500/40 dark:border-dm-border dark:bg-dm-input dark:text-dm-text dark:placeholder:text-dm-muted dark:focus:border-sky-500 dark:focus:ring-sky-500/40"
+                         data-testid="url-input"
+                         value={state.input}
+                         placeholder="Swagger UI URL or paste YAML/JSON"
+                         on:input={{:kind :url-input :value event.currentTarget.value}}
+                         on:paste={(let [pasted (clipboardText event)]
+                                     (if (or (validHttpUrl? pasted) (looksLikeSpecContent pasted))
+                                         (do (event.preventDefault) {:kind :url-paste :value pasted})
+                                         {:kind :noop}))}></input>
+                  {(if state.loading?
+                      #html <span class="pointer-events-none absolute inset-y-0 right-9 inline-flex items-center px-2 text-zinc-400 dark:text-dm-muted" data-testid="spec-loading" aria-label="Loading spec">{(iconLoaderCircle "16" "animate-spin")}</span>
+                      #html <span class="hidden"></span>)}
+                  <button type="button"
+                          data-testid="spec-upload-button"
+                          title="Upload OpenAPI YAML or JSON"
+                          aria-label="Upload OpenAPI YAML or JSON"
+                          class="absolute inset-y-0 right-0 inline-flex items-center justify-center rounded-r-md px-2.5 text-zinc-500 hover:text-zinc-700 dark:text-dm-muted dark:hover:text-dm-text"
+                          on:click={{:kind :open-spec-file}}>{(iconUpload "16" "")}</button>
+                </div>
+                <input type="file"
+                       class="hidden"
+                       ref="spec-file-input"
+                       data-testid="spec-file-input"
+                       accept=".yaml,.yml,.json,application/json,application/yaml,text/yaml"
+                       on:change={{:kind :spec-file-selected}}></input>
+                {(definitionSelect state)}
+                <button type="submit" class="hidden"></button>
+              </form>
+              <div class="flex shrink-0 items-center gap-1.5">
+                {(if (and (some? state.spec) (hasAuthSchemes? state.spec state.oauthInit))
+                    #html <button type="button"
+                                  class={(if (> (authEntriesCount state.authEntries) 0)
+                                             "inline-flex shrink-0 items-center rounded-md border border-emerald-600 font-medium text-emerald-700 transition gap-1 px-2 py-1.5 text-xs dark:text-emerald-400"
+                                             "inline-flex shrink-0 items-center rounded-md border border-zinc-300 font-medium text-zinc-700 transition gap-1 px-2 py-1.5 text-xs dark:border-zinc-700 dark:text-zinc-200")}
+                                  data-testid="authorize-button"
+                                  title={(if (> (authEntriesCount state.authEntries) 0) "Authorized" "Authorize")}
+                                  aria-label={(if (> (authEntriesCount state.authEntries) 0) "Authorized" "Authorize")}
+                                  on:click={{:kind :open-auth :id nil}}>{(iconLock "14" "")}<span class="hidden md:inline">{(if (> (authEntriesCount state.authEntries) 0) "Authorized" "Authorize")}</span>{(if (> (authEntriesCount state.authEntries) 0) #html <span class="rounded-full bg-emerald-600/15 px-1 text-[10px] leading-none md:text-xs">{(authEntriesCount state.authEntries)}</span> #html <span class="hidden"></span>)}</button>
+                    #html <button type="button" class="hidden" data-testid="authorize-button"></button>)}
+                <button type="button"
+                        class="inline-flex shrink-0 items-center justify-center rounded-md border border-zinc-300 bg-zinc-100 p-1.5 text-zinc-700 transition hover:bg-zinc-200 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700"
+                        data-testid="theme-toggle"
+                        title={(themeButtonLabel state)}
+                        aria-label={(themeButtonLabel state)}
+                        on:click={{:kind :toggle-theme}}>{(if (= state.theme "dark") (iconSun "16" "") (iconMoon "16" ""))}</button>
+              </div>
+            </div>
+          </header>
+          {(if (some? state.error)
+              #html <div class="mx-auto flex max-w-5xl items-start gap-2 px-4 py-3 text-sm text-rose-700 dark:text-rose-300">{(iconAlertCircle "16" "mt-0.5 shrink-0")}<p>{state.error}</p></div>
+              #html <div class="hidden"></div>)}
+          {(if (and state.loading? (not (some? state.spec)))
+              #html <div class="flex items-center justify-center gap-2 px-4 py-10 text-sm text-zinc-500 dark:text-dm-muted" data-testid="spec-loading-message">{(iconLoaderCircle "16" "animate-spin shrink-0")}<span>Loading spec from URL…</span></div>
+              #html <div class="hidden"></div>)}
+          {(if (some? state.spec)
+              #html <div>{(documentView state state.spec)}</div>
+              (if (and (not state.loading?) (not (some? state.error)))
+                  #html <p class="px-4 py-10 text-center text-sm text-zinc-500">Paste a Swagger UI URL, upload an OpenAPI file, or paste YAML/JSON spec content above.</p>
+                  #html <p class="hidden"></p>))}
+          <div>{(authorizeDialog state)}</div>
+        </div>)

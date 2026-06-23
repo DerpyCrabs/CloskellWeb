@@ -11,7 +11,7 @@ fn vite_plugin_serves_clsk_modules_as_transformed_js() {
         return;
     }
 
-    let hrweb_dir = workspace_root().join("hrweb");
+    let hrweb_dir = workspace_root().join("projects").join("hrweb");
     if !hrweb_dir.join("node_modules").join("vite").is_dir()
         || !hrweb_dir
             .join("node_modules")
@@ -196,7 +196,7 @@ fn vite_plugin_resolves_clsk_imports_from_plain_js() {
         return;
     }
 
-    let hrweb_dir = workspace_root().join("hrweb");
+    let hrweb_dir = workspace_root().join("projects").join("hrweb");
     if !hrweb_dir.join("node_modules").join("vite").is_dir()
         || !hrweb_dir
             .join("node_modules")
@@ -303,7 +303,7 @@ fn vite_plugin_builds_direct_clsk_entry_with_tailwind() {
         return;
     }
 
-    let hrweb_dir = workspace_root().join("hrweb");
+    let hrweb_dir = workspace_root().join("projects").join("hrweb");
     if !hrweb_dir.join("node_modules").join("vite").is_dir()
         || !hrweb_dir
             .join("node_modules")

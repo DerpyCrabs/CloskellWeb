@@ -1,0 +1,96 @@
+(defn reference? [value]
+  (and (some? value) (some? (get value "$ref"))))
+
+(defn resolveRefParts [current parts]
+  (if (= (count parts) 0)
+      current
+      (if (object? current)
+          (resolveRefParts (get current (first parts)) (slice parts 1 (count parts)))
+          nil)))
+
+(defn resolveSecurityScheme [spec scheme]
+  (if (reference? scheme)
+      (let [ref (get scheme "$ref")]
+        (if (starts-with? ref "#/")
+            (let [resolved (resolveRefParts spec (split (string-slice ref 2) "/"))]
+              (if (and (object? resolved) (not (reference? resolved))) resolved nil))
+            nil))
+      scheme))
+
+(defn oauthInitValue [oauthInit name]
+  (let [value (object-get oauthInit name)]
+    (if (string? value) value "")))
+
+(defn parseSecuritySchemeEntry [spec oauthInit entry]
+  (let [id entry.key
+        resolved (resolveSecurityScheme spec entry.value)
+        resolvedType (get resolved :type)
+        clientId (oauthInitValue oauthInit "clientId")
+        clientSecret (oauthInitValue oauthInit "clientSecret")]
+    (if (not (object? resolved))
+        nil
+        (if (= resolvedType "oauth2")
+            (let [flows (get resolved :flows)
+                  password (get flows :password)
+                  clientCredentials (get flows :clientCredentials)]
+              (if (and (object? password) (string? (get password :tokenUrl)))
+                  {:kind "oauth2-password"
+                   :id id
+                   :tokenUrl (get password :tokenUrl)
+                   :scopes (if (object? (get password :scopes)) (get password :scopes) {})
+                   :clientId clientId
+                   :clientSecret clientSecret}
+                  (if (and (object? clientCredentials) (string? (get clientCredentials :tokenUrl)))
+                      {:kind "oauth2-client-credentials"
+                       :id id
+                       :tokenUrl (get clientCredentials :tokenUrl)
+                       :scopes (if (object? (get clientCredentials :scopes)) (get clientCredentials :scopes) {})
+                       :clientId clientId
+                       :clientSecret clientSecret}
+                      nil)))
+            (if (= resolvedType "apiKey")
+                (if (or (= (get resolved :in) "header") (= (get resolved :in) "query") (= (get resolved :in) "cookie"))
+                    {:kind "apiKey" :id id :name (get resolved :name) :in (get resolved :in)}
+                    nil)
+                (if (= resolvedType "http")
+                    (let [scheme (lower-case (get resolved :scheme))]
+                      (if (= scheme "bearer")
+                          {:kind "http-bearer" :id id}
+                          (if (= scheme "basic")
+                              {:kind "http-basic" :id id}
+                              nil)))
+                    nil))))))
+
+(defn parseSecuritySchemes [spec oauthInit]
+  (let [raw (get (get spec :components) :securitySchemes)]
+    (if (object? raw)
+        (filter (map (object-entries raw)
+                     (fn [entry] (parseSecuritySchemeEntry spec oauthInit entry)))
+                (fn [scheme] (some? scheme)))
+        [])))
+
+(defn hasAuthSchemes? [spec oauthInit]
+  (> (count (parseSecuritySchemes spec oauthInit)) 0))
+
+(defn authEntriesCount [entries]
+  (count (object-keys entries)))
+
+(defn applyAuthHeaders [headers entries]
+  (reduce (object-values entries)
+          headers
+          (fn [next entry]
+            (if (= entry.type "bearer")
+                (object-assoc next "Authorization" (str "Bearer " entry.token))
+                (if (= entry.type "basic")
+                    (object-assoc next "Authorization" (str "Basic " (base64-encode (str entry.username ":" entry.password))))
+                    (if (and (= entry.type "apiKey") (= entry.apiKeyIn "header"))
+                        (object-assoc next entry.apiKeyName entry.token)
+                        next))))))
+
+(defn applyAuthUrl [url entries]
+  (reduce (object-values entries)
+          url
+          (fn [next entry]
+            (if (and (= entry.type "apiKey") (= entry.apiKeyIn "query"))
+                (url-set-search-param next entry.apiKeyName entry.token)
+                next))))

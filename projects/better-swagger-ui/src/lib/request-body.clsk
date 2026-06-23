@@ -1,0 +1,75 @@
+(defn binarySchema? [schema]
+  (and (some? schema)
+       (= schema.type "string")
+       (= schema.format "binary")))
+
+(defn mediaContentType [media]
+  (if (string? media.contentType) media.contentType ""))
+
+(defn primaryTryItOutMedia [info]
+  (if (not (some? info))
+      nil
+      (let [json (find info.media (fn [item] (includes? (mediaContentType item) "json")))
+            plain (find info.media (fn [item] (= (mediaContentType item) "text/plain")))
+            multipart (find info.media (fn [item] (= (mediaContentType item) "multipart/form-data")))
+            urlencoded (find info.media (fn [item] (= (mediaContentType item) "application/x-www-form-urlencoded")))
+            octet (find info.media (fn [item] (= (mediaContentType item) "application/octet-stream")))]
+        (if (some? json)
+            json
+            (if (some? plain)
+                plain
+                (if (some? multipart)
+                    multipart
+                    (if (some? urlencoded)
+                        urlencoded
+                        (if (some? octet)
+                            octet
+                            (if (> (count info.media) 0) (first info.media) nil)))))))))
+
+(defn requestBodyMode [media]
+  (if (not (some? media))
+      nil
+      (let [contentType (lower-case (mediaContentType media))]
+        (if (includes? contentType "json")
+            "json"
+            (if (= contentType "text/plain")
+                "text"
+                (if (and (= contentType "application/octet-stream") (binarySchema? media.schema))
+                    "file"
+                    (if (= contentType "multipart/form-data")
+                        "multipart"
+                        (if (= contentType "application/x-www-form-urlencoded")
+                            "urlencoded"
+                            (if (binarySchema? media.schema) "file" "text")))))))))
+
+(defn exampleAsJsonText [example]
+  (if (string? example)
+      example
+      (json-stringify example 2)))
+
+(defn defaultRequestBodyText [media mode]
+  (if (or (not (some? media)) (not (some? mode)))
+      "{}"
+      (if (= mode "json")
+          (if (some? media.example) (exampleAsJsonText media.example) "{}")
+          (if (= mode "text")
+              (if (some? media.example)
+                  (if (string? media.example) media.example (str media.example))
+                  "")
+              ""))))
+
+(defn hasTryItOutRequestBody? [info]
+  (and (some? info) (some? (requestBodyMode (primaryTryItOutMedia info)))))
+
+(defn formFieldKind [allowFiles property]
+  (if (and allowFiles (= property.type "string") (= property.format "binary"))
+      "file"
+      "text"))
+
+(defn resolveBodyFormFields [media allowFiles]
+  (map (if (vector? media.properties) media.properties [])
+       (fn [property]
+         {:name property.name
+          :required property.required
+          :kind (formFieldKind allowFiles property)
+          :description property.description})))

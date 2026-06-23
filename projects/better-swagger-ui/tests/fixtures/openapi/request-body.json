@@ -1,0 +1,57 @@
+{
+  "openapi": "3.0.3",
+  "info": { "title": "Request Body API", "version": "1.0.0" },
+  "servers": [{ "url": "/fixtures/mock-api" }],
+  "paths": {
+    "/items": {
+      "post": {
+        "summary": "Create item",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["name"],
+                "properties": {
+                  "name": { "type": "string" },
+                  "tags": { "type": "array", "items": { "type": "string" } },
+                  "meta": {
+                    "type": "object",
+                    "properties": { "count": { "type": "integer" } }
+                  }
+                }
+              },
+              "example": { "name": "Widget", "tags": ["a", "b"], "meta": { "count": 1 } }
+            },
+            "text/plain": {
+              "schema": { "type": "string" }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": { "application/json": { "schema": { "type": "object" } } }
+          }
+        }
+      },
+      "patch": {
+        "summary": "Patch item",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": { "type": "object", "properties": { "name": { "type": "string" } } }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": { "application/json": { "schema": { "type": "object" } } }
+          }
+        }
+      }
+    }
+  }
+}

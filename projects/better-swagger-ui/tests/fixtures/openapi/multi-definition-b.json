@@ -1,0 +1,13 @@
+{
+  "openapi": "3.0.3",
+  "info": { "title": "Definition B", "version": "2.0.0" },
+  "servers": [{ "url": "/fixtures/mock-api" }],
+  "paths": {
+    "/b": {
+      "get": {
+        "summary": "Endpoint B",
+        "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "type": "object" } } } } }
+      }
+    }
+  }
+}

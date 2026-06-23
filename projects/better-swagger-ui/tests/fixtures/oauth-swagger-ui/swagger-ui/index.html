@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<html>
+  <head><title>Swagger UI OAuth</title></head>
+  <body>
+    <div id="swagger-ui"></div>
+    <script>
+      window.ui = SwaggerUIBundle({
+        url: "/fixtures/openapi/oauth-only.json",
+        dom_id: "#swagger-ui",
+      })
+    </script>
+    <script src="./swagger-initializer.js"></script>
+  </body>
+</html>

@@ -1,0 +1,193 @@
+(defn reference? [value]
+  (and (some? value) (some? (get value "$ref"))))
+
+(defn refName [ref]
+  (last (split ref "/")))
+
+(defn resolveRefParts [current parts]
+  (if (= (count parts) 0)
+      current
+      (if (object? current)
+          (resolveRefParts (get current (first parts)) (slice parts 1 (count parts)))
+          nil)))
+
+(defn resolveRef [spec ref]
+  (if (starts-with? ref "#/")
+      (resolveRefParts spec (split (string-slice ref 2) "/"))
+      nil))
+
+(defn mergeRequired [left right]
+  (reduce (if (vector? right) right [])
+          (if (vector? left) left [])
+          (fn [items name]
+            (if (includes? items name) items (conj items name)))))
+
+(defn mergeSchema [base schema]
+  (merge base
+         {:properties (merge (if (object? base.properties) base.properties {})
+                             (if (object? schema.properties) schema.properties {}))
+          :required (mergeRequired base.required schema.required)
+          :description (if (string? base.description) base.description schema.description)}))
+
+(defn resolveSchema [spec schema]
+  (if (not (some? schema))
+      nil
+      (if (reference? schema)
+          (resolveSchema spec (resolveRef spec (get schema "$ref")))
+          (if (and (vector? (get schema :allOf)) (> (count (get schema :allOf)) 0))
+              (reduce (get schema :allOf)
+                      {:type "object" :properties {} :required []}
+                      (fn [merged part]
+                        (let [resolved (resolveSchema spec part)]
+                          (if (some? resolved)
+                              (mergeSchema merged resolved)
+                              merged))))
+              schema))))
+
+(defn schemaTypeLabel [spec schema]
+  (if (not (some? schema))
+      "unknown"
+      (if (reference? schema)
+          (refName (get schema "$ref"))
+          (let [resolved (resolveSchema spec schema)]
+            (if (not (some? resolved))
+                "unknown"
+                (if (= (get resolved :type) "array")
+                    (let [items (get resolved :items)]
+                      (if (not (some? items))
+                          "array"
+                          (if (reference? items)
+                              (str "array[" (refName (get items "$ref")) "]")
+                              (str "array[" (schemaTypeLabel spec items) "]"))))
+                    (if (and (vector? (get resolved :enum)) (> (count (get resolved :enum)) 0))
+                        "enum"
+                        (if (string? (get resolved :type)) (get resolved :type) "object"))))))))
+
+(defn propertyDescription [propertySchema nested]
+  (if (reference? propertySchema)
+      (get nested :description)
+      (get propertySchema :description)))
+
+(defn propertyEnum [propertySchema nested]
+  (if (reference? propertySchema)
+      (get nested :enum)
+      (get propertySchema :enum)))
+
+(defn schemaProperties [spec schema]
+  (let [resolved (resolveSchema spec schema)
+        properties (if (object? (get resolved :properties)) (get resolved :properties) nil)
+        required (if (vector? (get resolved :required)) (get resolved :required) [])]
+    (if (some? properties)
+        (map (object-entries properties)
+             (fn [entry]
+               (let [nested (resolveSchema spec entry.value)]
+                 {:name entry.key
+                  :required (includes? required entry.key)
+                  :type (if (reference? entry.value)
+                            (refName (get entry.value "$ref"))
+                            (schemaTypeLabel spec entry.value))
+                  :format (if (string? (get nested :format)) (get nested :format) (get entry.value :format))
+                  :description (propertyDescription entry.value nested)
+                  :enum (propertyEnum entry.value nested)})))
+        [])))
+
+(defn schemaToExample [spec schema]
+  (if (not (some? schema))
+      ""
+      (if (reference? schema)
+          (schemaToExample spec (resolveRef spec (get schema "$ref")))
+          (if (some? (get schema :example))
+              (json-stringify (get schema :example) 2)
+              (if (some? (get schema :default))
+                  (json-stringify (get schema :default) 2)
+                  (let [resolved (resolveSchema spec schema)]
+                    (if (and (vector? (get resolved :enum)) (> (count (get resolved :enum)) 0))
+                        (json-stringify (first (get resolved :enum)) 2)
+                        (if (object? (get resolved :properties))
+                            (json-stringify
+                              (reduce (object-entries (get resolved :properties))
+                                      {}
+                                      (fn [result entry]
+                                        (object-assoc result entry.key (schemaToExample spec entry.value))))
+                              2)
+                            (if (= (get resolved :type) "object")
+                                "{}"
+                                (if (= (get resolved :type) "array") "[]" "\"\""))))))))))
+
+(defn buildMediaSchemaInfo [spec entry]
+  (let [media entry.value
+        rawSchema (get media :schema)
+        schema (if (some? rawSchema) (resolveSchema spec rawSchema) nil)
+        example (if (some? (get media :example))
+                    (get media :example)
+                    (if (some? rawSchema) (schemaToExample spec rawSchema) nil))]
+    {:contentType entry.key
+     :schema schema
+     :schemaName (if (and (some? rawSchema) (reference? rawSchema)) (refName (get rawSchema "$ref")) nil)
+     :example example
+     :properties (if (some? rawSchema) (schemaProperties spec rawSchema) [])}))
+
+(defn getRequestBodySchema [spec requestBody]
+  (if (or (not (some? requestBody)) (reference? requestBody) (not (object? (get requestBody :content))))
+      nil
+      (let [media (map (object-entries (get requestBody :content))
+                       (fn [entry] (buildMediaSchemaInfo spec entry)))]
+        (if (= (count media) 0)
+            nil
+            {:required (if (bool? (get requestBody :required)) (get requestBody :required) false)
+             :description (get requestBody :description)
+             :media media}))))
+
+(defn statusRank [status]
+  (if (= status "default") 9999 (to-number status)))
+
+(defn responseOrder [left right]
+  (- (statusRank left.key) (statusRank right.key)))
+
+(defn responseInfo [spec entry]
+  (let [response entry.value]
+    (if (reference? response)
+        {:status entry.key :description nil :media []}
+        {:status entry.key
+         :description (get response :description)
+         :media (if (object? (get response :content))
+                    (map (object-entries (get response :content))
+                         (fn [mediaEntry] (buildMediaSchemaInfo spec mediaEntry)))
+                    [])})))
+
+(defn getResponseSchemas [spec responses]
+  (if (object? responses)
+      (map (sort-with (object-entries responses) responseOrder)
+           (fn [entry] (responseInfo spec entry)))
+      []))
+
+(defn primaryJsonMedia [info]
+  (let [jsonMedia (find info.media (fn [media] (includes? media.contentType "json")))]
+    (if (some? jsonMedia)
+        jsonMedia
+        (if (> (count info.media) 0) (first info.media) nil))))
+
+(defn mediaSchemas [info]
+  (filter (map info.media (fn [media] media.schema)) (fn [schema] (some? schema))))
+
+(defn formatSchemaListForCopy [schemas]
+  (if (= (count schemas) 0)
+      ""
+      (if (= (count schemas) 1)
+          (json-stringify (first schemas) 2)
+          (json-stringify schemas 2))))
+
+(defn formatRequestBodySchemaForCopy [info]
+  (let [primary (primaryJsonMedia info)]
+    (if (and (some? primary) (some? (get primary :schema)))
+        (json-stringify (get primary :schema) 2)
+        (formatSchemaListForCopy (mediaSchemas info)))))
+
+(defn formatResponseSchemaForCopy [response]
+  (let [primary (primaryJsonMedia response)]
+    (if (and (some? primary) (some? (get primary :schema)))
+        (json-stringify (get primary :schema) 2)
+        (formatSchemaListForCopy (mediaSchemas response)))))
+
+(defn hasCopyableSchema [info]
+  (any? info.media (fn [media] (some? media.schema))))

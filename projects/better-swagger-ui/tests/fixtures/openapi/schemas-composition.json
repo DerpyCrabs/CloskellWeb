@@ -1,0 +1,75 @@
+{
+  "openapi": "3.0.3",
+  "info": { "title": "Schemas API", "version": "1.0.0" },
+  "servers": [{ "url": "/fixtures/mock-api" }],
+  "components": {
+    "schemas": {
+      "Pet": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string" },
+          "status": { "type": "string", "enum": ["available", "pending", "sold"] },
+          "owner": { "$ref": "#/components/schemas/Owner" }
+        }
+      },
+      "Owner": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "integer" },
+          "email": { "type": "string", "format": "email" }
+        }
+      },
+      "Named": {
+        "type": "object",
+        "properties": { "name": { "type": "string" } }
+      },
+      "Timestamped": {
+        "type": "object",
+        "properties": { "createdAt": { "type": "string", "format": "date-time" } }
+      },
+      "NamedPet": {
+        "allOf": [
+          { "$ref": "#/components/schemas/Named" },
+          { "$ref": "#/components/schemas/Timestamped" },
+          { "type": "object", "properties": { "species": { "type": "string" } } }
+        ]
+      }
+    }
+  },
+  "paths": {
+    "/pets/{id}": {
+      "get": {
+        "summary": "Get pet",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "integer" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Pet",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Pet" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/named-pets": {
+      "get": {
+        "summary": "Named pets",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/NamedPet" }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

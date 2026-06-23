@@ -318,6 +318,7 @@ export function setAttr(instance, slot, node, name, value) {
   const previous = instance.values[slot];
   if (previous === value) return;
   instance.values[slot] = value;
+  const isSvg = node.namespaceURI === "http://www.w3.org/2000/svg";
 
   if (name === "style" && isStyleObject(value)) {
     applyStyleObject(node, value, previous);
@@ -339,13 +340,13 @@ export function setAttr(instance, slot, node, name, value) {
       return;
     }
     node.removeAttribute(name);
-    if (name in node) node[name] = false;
+    if (!isSvg && name in node) setDomProperty(node, name, false);
     return;
   }
 
   if (value === true) {
     node.setAttribute(name, "");
-    if (name in node) node[name] = true;
+    if (!isSvg && name in node) setDomProperty(node, name, true);
     return;
   }
 
@@ -354,7 +355,15 @@ export function setAttr(instance, slot, node, name, value) {
     if (node.style) node.style.cssText = String(value);
     return;
   }
-  if (name in node) node[name] = value;
+  if (!isSvg && name in node) setDomProperty(node, name, value);
+}
+
+function setDomProperty(node, name, value) {
+  try {
+    node[name] = value;
+  } catch {
+    // Some reflected attributes expose read-only DOM properties, for example button.form.
+  }
 }
 
 function isStructuredClassValue(value) {
@@ -548,6 +557,7 @@ export function setKeyedList(instance, slot, marker, items, keyForItem, renderIt
   const nextByKey = new Map();
   const nextDuplicateKeys = new Map();
   const seenKeys = new Map();
+  const orderedEntries = [];
 
   let index = 0;
   for (const item of items || []) {
@@ -576,8 +586,17 @@ export function setKeyedList(instance, slot, marker, items, keyForItem, renderIt
     }
 
     nextByKey.set(key, entry);
-    parent.insertBefore(entry.component.root, marker);
+    orderedEntries.push(entry);
     index += 1;
+  }
+
+  let cursor = marker;
+  for (let i = orderedEntries.length - 1; i >= 0; i -= 1) {
+    const root = orderedEntries[i].component.root;
+    if (root.parentNode !== parent || root.nextSibling !== cursor) {
+      parent.insertBefore(root, cursor);
+    }
+    cursor = root;
   }
 
   for (const [key, entry] of current.byKey) {
@@ -672,25 +691,60 @@ export function setComponent(instance, slot, marker, render, args, dispatch, upd
   if (!parent) return;
 
   const current = instance.componentSlots[slot] || {};
+  const rendered = typeof render === "function" ? render() : render;
+  const renderedKey = componentRenderKey(rendered);
   let fresh = false;
   if (!current.component) {
-    current.component = typeof render === "function" ? render() : render;
+    current.component = rendered;
+    current.renderKey = renderedKey;
     fresh = true;
+  } else if (
+    rendered
+    && rendered !== current.component
+    && renderedKey
+    && current.renderKey
+    && renderedKey !== current.renderKey
+  ) {
+    if (current.component.root?.parentNode) {
+      current.component.root.parentNode.removeChild(current.component.root);
+    }
+    disposeComponent(current.component);
+    current.component = rendered;
+    current.renderKey = renderedKey;
+    current.args = [];
+    fresh = true;
+  } else if (rendered && rendered !== current.component) {
+    disposeComponent(rendered);
   }
 
   if (current.component) {
     const nextArgs = Array.isArray(args) ? args : [];
+    const params = componentParams(current.component);
     const componentContext = fresh
       ? forceUpdateContext(updateContext)
-      : componentUpdateContext(updateContext, current.component.definition?.params, current.args, nextArgs);
-    current.component.update(...nextArgs, dispatch, componentContext);
-    current.args = nextArgs;
+      : componentUpdateContext(updateContext, params, current.args, nextArgs);
+    if (params.length) {
+      current.component.update(...nextArgs, dispatch, componentContext);
+      current.args = nextArgs;
+    } else {
+      current.component.update(dispatch, componentContext);
+      current.args = [];
+    }
     if (current.component.root.parentNode !== parent) {
       parent.insertBefore(current.component.root, marker);
     }
   }
 
   instance.componentSlots[slot] = current;
+}
+
+function componentRenderKey(component) {
+  return component?.definition?.name || null;
+}
+
+function componentParams(component) {
+  const params = component?.definition?.params;
+  return Array.isArray(params) ? params : [];
 }
 
 function disposeComponent(component) {
@@ -1160,10 +1214,19 @@ export function createCommandHandlers(env = {}) {
 
       try {
         const { url, options } = httpRequestFetchArgs(command);
+        const started = nowMs();
         const response = await fetchImpl(url, options);
         const responseFormat = commandValueName(command.response || command.format || "json");
         const body = responseFormat === "text" ? await response.text() : await response.json();
-        return commandMessage(command, { status: response.status, ok: response.ok, body });
+        return commandMessage(command, {
+          status: response.status,
+          statusText: response.statusText,
+          ok: response.ok,
+          body,
+          headers: headersToObject(response.headers),
+          url: response.url || url,
+          durationMs: Math.max(0, Math.round(nowMs() - started))
+        });
       } catch (error) {
         return commandErrorMessage(command, error);
       }
@@ -1648,6 +1711,19 @@ function commandValueName(value) {
     return Symbol.keyFor(value) || value.description || "";
   }
   return String(value || "");
+}
+
+function nowMs() {
+  return globalThis.performance?.now?.() ?? Date.now();
+}
+
+function headersToObject(headers) {
+  const result = {};
+  if (!headers?.forEach) return result;
+  headers.forEach((value, key) => {
+    result[String(key).toLowerCase()] = String(value);
+  });
+  return result;
 }
 
 function simulationHeartRateBpm(random, explicitStart, min, max, jitter, previous) {

@@ -1,0 +1,42 @@
+{
+  "openapi": "3.0.3",
+  "info": { "title": "Param Serialization API", "version": "1.0.0" },
+  "servers": [{ "url": "/fixtures/mock-api" }],
+  "paths": {
+    "/search": {
+      "get": {
+        "summary": "Search with serialized params",
+        "parameters": [
+          {
+            "name": "tags",
+            "in": "query",
+            "style": "form",
+            "explode": false,
+            "schema": { "type": "array", "items": { "type": "string" } },
+            "example": "a,b,c"
+          },
+          {
+            "name": "filter",
+            "in": "query",
+            "style": "deepObject",
+            "explode": true,
+            "schema": {
+              "type": "object",
+              "properties": {
+                "role": { "type": "string" },
+                "status": { "type": "string" }
+              }
+            },
+            "example": { "role": "admin", "status": "active" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": { "application/json": { "schema": { "type": "object" } } }
+          }
+        }
+      }
+    }
+  }
+}

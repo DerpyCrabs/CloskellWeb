@@ -1,0 +1,32 @@
+{
+  "openapi": "3.0.3",
+  "info": { "title": "OAuth Only API", "version": "1.0.0" },
+  "servers": [{ "url": "/fixtures/mock-api" }],
+  "components": {
+    "securitySchemes": {
+      "oauth2": {
+        "type": "oauth2",
+        "flows": {
+          "password": {
+            "tokenUrl": "/fixtures/mock-api/oauth/token",
+            "scopes": { "read": "Read access" }
+          }
+        }
+      }
+    }
+  },
+  "security": [{ "oauth2": [] }],
+  "paths": {
+    "/secure": {
+      "get": {
+        "summary": "Secure endpoint",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": { "application/json": { "schema": { "type": "object" } } }
+          }
+        }
+      }
+    }
+  }
+}

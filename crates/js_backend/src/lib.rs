@@ -21,7 +21,13 @@ pub struct SourceMapping {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ImportSpec {
     path: String,
-    names: Vec<String>,
+    names: Vec<ImportName>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ImportName {
+    Named { imported: String, local: String },
+    Default { local: String },
 }
 
 pub fn emit_module(source: &SourceFile) -> EmitResult {
@@ -180,19 +186,66 @@ fn parse_import_form(expr: &Expr) -> Option<Result<ImportSpec, Diagnostic>> {
 
     let mut imported = Vec::new();
     for name in names {
-        let ExprKind::Symbol(symbol) = &name.kind else {
-            return Some(Err(Diagnostic::error(
-                name.span,
-                "imported name must be a symbol",
-            )));
-        };
-        imported.push(symbol.clone());
+        match parse_import_name(name) {
+            Ok(parsed) => imported.push(parsed),
+            Err(diagnostic) => return Some(Err(diagnostic)),
+        }
     }
 
     Some(Ok(ImportSpec {
         path: path.clone(),
         names: imported,
     }))
+}
+
+fn parse_import_name(expr: &Expr) -> Result<ImportName, Diagnostic> {
+    match &expr.kind {
+        ExprKind::Symbol(symbol) => Ok(ImportName::Named {
+            imported: symbol.clone(),
+            local: symbol.clone(),
+        }),
+        ExprKind::List(items)
+            if items.len() == 2
+                && matches!(&items[0].kind, ExprKind::Symbol(name) if name == "default") =>
+        {
+            let ExprKind::Symbol(local) = &items[1].kind else {
+                return Err(Diagnostic::error(
+                    items[1].span,
+                    "default import local name must be a symbol",
+                ));
+            };
+            Ok(ImportName::Default {
+                local: local.clone(),
+            })
+        }
+        ExprKind::List(items)
+            if items.len() == 3
+                && matches!(&items[1].kind, ExprKind::Symbol(name) if name == "as") =>
+        {
+            let ExprKind::Symbol(imported) = &items[0].kind else {
+                return Err(Diagnostic::error(
+                    items[0].span,
+                    "aliased import name must be a symbol",
+                ));
+            };
+            let ExprKind::Symbol(local) = &items[2].kind else {
+                return Err(Diagnostic::error(
+                    items[2].span,
+                    "aliased import local name must be a symbol",
+                ));
+            };
+            Ok(ImportName::Named {
+                imported: imported.clone(),
+                local: local.clone(),
+            })
+        }
+        _ => {
+            Err(Diagnostic::error(
+                expr.span,
+                "imported name must be a symbol, (default local), or (name as local)",
+            ))
+        }
+    }
 }
 
 fn is_type_form(expr: &Expr) -> bool {
@@ -204,21 +257,41 @@ fn is_ann_form(expr: &Expr) -> bool {
 }
 
 fn emit_import(spec: &ImportSpec) -> Option<String> {
+    let default_name = spec.names.iter().find_map(|name| match name {
+        ImportName::Default { local } if is_runtime_import_name(local) => {
+            Some(sanitize_identifier(local))
+        }
+        _ => None,
+    });
     let names = spec
         .names
         .iter()
-        .filter(|name| is_runtime_import_name(name))
-        .map(|name| sanitize_identifier(name))
+        .filter_map(|name| match name {
+            ImportName::Named { imported, local } if is_runtime_import_name(local) => {
+                let imported = sanitize_identifier(imported);
+                let local = sanitize_identifier(local);
+                if imported == local {
+                    Some(imported)
+                } else {
+                    Some(format!("{} as {}", imported, local))
+                }
+            }
+            _ => None,
+        })
         .collect::<Vec<_>>()
         .join(", ");
-    if names.is_empty() {
+    if names.is_empty() && default_name.is_none() {
         return None;
     }
-    Some(format!(
-        "import {{ {} }} from \"{}\";",
-        names,
-        escape_js(&js_import_path(&spec.path))
-    ))
+    let path = escape_js(&js_import_path(&spec.path));
+    match (default_name, names.is_empty()) {
+        (Some(default_name), true) => Some(format!("import {} from \"{}\";", default_name, path)),
+        (Some(default_name), false) => {
+            Some(format!("import {}, {{ {} }} from \"{}\";", default_name, names, path))
+        }
+        (None, false) => Some(format!("import {{ {} }} from \"{}\";", names, path)),
+        (None, true) => None,
+    }
 }
 
 pub fn is_runtime_import_name(name: &str) -> bool {
@@ -336,10 +409,12 @@ impl Emitter {
                 "string?" => return self.emit_type_predicate("string", args),
                 "bool?" => return self.emit_type_predicate("boolean", args),
                 "keyword?" => return self.emit_type_predicate("symbol", args),
+                "object?" => return self.emit_object_predicate(args),
                 "list?" => return self.emit_vector_predicate(args),
                 "vector?" => return self.emit_vector_predicate(args),
                 "set?" => return self.emit_set_predicate(args),
                 "get" => return self.emit_get(args),
+                "object-get" => return self.emit_object_get(args),
                 "first" => return self.emit_vector_index(args, 0),
                 "second" => return self.emit_vector_index(args, 1),
                 "nth" => return self.emit_nth(args),
@@ -366,6 +441,10 @@ impl Emitter {
                 "reduce-indexed" => return self.emit_reduce(args, true),
                 "trim" => return self.emit_string_method("trim", args),
                 "lower-case" => return self.emit_string_method("toLowerCase", args),
+                "split" => return self.emit_split(args),
+                "join" => return self.emit_join(args),
+                "starts-with?" => return self.emit_string_predicate_method("startsWith", args),
+                "ends-with?" => return self.emit_string_predicate_method("endsWith", args),
                 "to-radix" => return self.emit_to_radix(args),
                 "string-slice" => return self.emit_string_slice(args),
                 "pad-start" => return self.emit_pad_start(args),
@@ -375,6 +454,49 @@ impl Emitter {
                 "locale-compare" => return self.emit_locale_compare(args),
                 "json-stringify" => return self.emit_json_stringify(args),
                 "json-parse" => return self.emit_json_parse(args),
+                "json-parse-result" => return self.emit_json_parse_result(args),
+                "object-entries" => return self.emit_object_entries(args),
+                "object-keys" => return self.emit_object_projection(args, "keys"),
+                "object-values" => return self.emit_object_projection(args, "values"),
+                "object-assoc" => return self.emit_object_assoc(args),
+                "object-dissoc" => return self.emit_object_dissoc(args),
+                "encode-uri-component" => {
+                    return self.emit_global_string_call("encodeURIComponent", args);
+                }
+                "decode-uri-component" => {
+                    return self.emit_global_string_call("decodeURIComponent", args);
+                }
+                "url-resolve" => return self.emit_url_resolve(args),
+                "url-without-hash" => return self.emit_url_part(args, "href", true),
+                "url-origin" => return self.emit_url_part(args, "origin", false),
+                "url-hostname" => return self.emit_url_part(args, "hostname", false),
+                "url-pathname" => return self.emit_url_part(args, "pathname", false),
+                "browser-current-url" => return self.emit_zero_arg_expr(args, "globalThis.location?.href ?? \"\""),
+                "url-search-param" => return self.emit_url_search_param(args),
+                "url-set-search-param" => return self.emit_url_set_search_param(args),
+                "url-set-deep-object-param" => return self.emit_url_set_deep_object_param(args),
+                "history-replace-search-param" => return self.emit_history_replace_search_param(args),
+                "history-write-route" => return self.emit_history_write_route(args),
+                "browser-theme-initial" => return self.emit_browser_theme_initial(args),
+                "browser-theme-toggle" => return self.emit_browser_theme_toggle(args),
+                "auth-storage-load" => return self.emit_auth_storage_load(args),
+                "auth-storage-persist" => return self.emit_auth_storage_persist(args),
+                "resolve-token-expiry" => return self.emit_resolve_token_expiry(args),
+                "clipboard-text" => return self.emit_clipboard_text(args),
+                "clipboard-write" => return self.emit_clipboard_write(args),
+                "browser-set-cookie" => return self.emit_browser_set_cookie(args),
+                "path-fill-params" => return self.emit_path_fill_params(args),
+                "path-fill-param" => return self.emit_path_fill_param(args),
+                "selected-file-or-blob" => return self.emit_selected_file_or_blob(args),
+                "selected-file-by-test-id" => return self.emit_selected_file_by_test_id(args),
+                "has-selected-file" => return self.emit_has_selected_file(args),
+                "multipart-form-body" => return self.emit_multipart_form_body(args),
+                "urlencoded-form-body" => return self.emit_urlencoded_form_body(args),
+                "regex-capture" => return self.emit_regex_capture(args),
+                "install-virtual-json-viewer" => return self.emit_install_virtual_json_viewer(args),
+                "base64-encode" => return self.emit_base64(true, args),
+                "base64-decode" => return self.emit_base64(false, args),
+                "fail" => return self.emit_fail(args),
                 "env-dev?" => return self.emit_env_dev(args),
                 "not" => return self.emit_prefix("!", args),
                 "and" => return self.emit_infix("&&", args),
@@ -1060,6 +1182,16 @@ impl Emitter {
         format!("{} instanceof Map", self.emit_expr(&args[0]))
     }
 
+    fn emit_object_predicate(&mut self, args: &[Expr]) -> String {
+        if args.len() != 1 {
+            return "undefined".to_string();
+        }
+        format!(
+            "((__value) => __value != null && typeof __value === \"object\" && !Array.isArray(__value) && !(__value instanceof Map) && !(__value instanceof Set))({})",
+            self.emit_expr(&args[0])
+        )
+    }
+
     fn emit_get(&mut self, args: &[Expr]) -> String {
         if args.len() != 2 {
             return "undefined".to_string();
@@ -1071,6 +1203,18 @@ impl Emitter {
             }
             _ => format!("({}?.[{}] ?? null)", base, self.emit_expr(&args[1])),
         }
+    }
+
+    fn emit_object_get(&mut self, args: &[Expr]) -> String {
+        if args.len() != 2 {
+            return "undefined".to_string();
+        }
+
+        format!(
+            "((__value, __key) => __value instanceof Map ? (__value.has(__key) ? __value.get(__key) : null) : (__value?.[__key] ?? null))({}, {})",
+            self.emit_expr(&args[0]),
+            self.emit_expr(&args[1])
+        )
     }
 
     fn emit_hash_map(&mut self, args: &[Expr]) -> String {
@@ -1164,6 +1308,71 @@ impl Emitter {
         format!(
             "((__map) => __map instanceof Map ? Array.from(__map.{}()) : [])({})",
             method,
+            self.emit_expr(&args[0])
+        )
+    }
+
+    fn emit_object_entries(&mut self, args: &[Expr]) -> String {
+        if args.len() != 1 {
+            return "undefined".to_string();
+        }
+
+        format!(
+            "((__value) => __value instanceof Map ? Array.from(__value.entries(), ([__key, __value]) => ({{ key: __key, value: __value }})) : (__value != null && typeof __value === \"object\" ? Object.entries(__value).map(([__key, __value]) => ({{ key: __key, value: __value }})) : []))({})",
+            self.emit_expr(&args[0])
+        )
+    }
+
+    fn emit_object_projection(&mut self, args: &[Expr], method: &str) -> String {
+        if args.len() != 1 {
+            return "undefined".to_string();
+        }
+
+        format!(
+            "((__value) => __value instanceof Map ? Array.from(__value.{}()) : (__value != null && typeof __value === \"object\" ? Object.{}(__value) : []))({})",
+            method,
+            method,
+            self.emit_expr(&args[0])
+        )
+    }
+
+    fn emit_object_assoc(&mut self, args: &[Expr]) -> String {
+        if args.len() < 3 || args[1..].len() % 2 != 0 {
+            return "undefined".to_string();
+        }
+
+        let statements = args[1..]
+            .chunks(2)
+            .filter_map(|pair| match pair {
+                [key, value] => Some(format!(
+                    "__next[{}] = {};",
+                    self.emit_expr(key),
+                    self.emit_expr(value)
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!(
+            "((__object) => {{ const __next = {{ ...(__object ?? {{}}) }}; {} return __next; }})({})",
+            statements,
+            self.emit_expr(&args[0])
+        )
+    }
+
+    fn emit_object_dissoc(&mut self, args: &[Expr]) -> String {
+        if args.len() < 2 {
+            return "undefined".to_string();
+        }
+
+        let statements = args[1..]
+            .iter()
+            .map(|key| format!("delete __next[{}];", self.emit_expr(key)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!(
+            "((__object) => {{ const __next = {{ ...(__object ?? {{}}) }}; {} return __next; }})({})",
+            statements,
             self.emit_expr(&args[0])
         )
     }
@@ -1433,6 +1642,40 @@ impl Emitter {
         )
     }
 
+    fn emit_split(&mut self, args: &[Expr]) -> String {
+        if args.len() != 2 {
+            return "undefined".to_string();
+        }
+        format!(
+            "{}.split({})",
+            parenthesize_member_base(self.emit_expr(&args[0])),
+            self.emit_expr(&args[1])
+        )
+    }
+
+    fn emit_join(&mut self, args: &[Expr]) -> String {
+        if args.len() != 2 {
+            return "undefined".to_string();
+        }
+        format!(
+            "{}.join({})",
+            parenthesize_member_base(self.emit_expr(&args[0])),
+            self.emit_expr(&args[1])
+        )
+    }
+
+    fn emit_string_predicate_method(&mut self, method: &str, args: &[Expr]) -> String {
+        if args.len() != 2 {
+            return "undefined".to_string();
+        }
+        format!(
+            "{}.{}({})",
+            parenthesize_member_base(self.emit_expr(&args[0])),
+            method,
+            self.emit_expr(&args[1])
+        )
+    }
+
     fn emit_to_radix(&mut self, args: &[Expr]) -> String {
         if args.len() != 2 {
             return "undefined".to_string();
@@ -1573,6 +1816,464 @@ impl Emitter {
         }
 
         format!("JSON.parse({})", self.emit_expr(&args[0]))
+    }
+
+    fn emit_json_parse_result(&mut self, args: &[Expr]) -> String {
+        if args.len() != 1 {
+            return "undefined".to_string();
+        }
+
+        format!(
+            "((__text) => {{ try {{ return {{ ok: true, value: JSON.parse(__text) }}; }} catch (__error) {{ return {{ ok: false, error: __error?.message ?? String(__error) }}; }} }})({})",
+            self.emit_expr(&args[0])
+        )
+    }
+
+    fn emit_global_string_call(&mut self, callee: &str, args: &[Expr]) -> String {
+        if args.len() != 1 {
+            return "undefined".to_string();
+        }
+        format!("{}({})", callee, self.emit_expr(&args[0]))
+    }
+
+    fn emit_zero_arg_expr(&mut self, args: &[Expr], expr: &str) -> String {
+        if !args.is_empty() {
+            return "undefined".to_string();
+        }
+        expr.to_string()
+    }
+
+    fn emit_url_resolve(&mut self, args: &[Expr]) -> String {
+        if args.len() != 2 {
+            return "undefined".to_string();
+        }
+
+        format!(
+            "((__value, __base) => {{ try {{ return new URL(__value, __base).href; }} catch {{ return null; }} }})({}, {})",
+            self.emit_expr(&args[0]),
+            self.emit_expr(&args[1])
+        )
+    }
+
+    fn emit_url_part(&mut self, args: &[Expr], part: &str, strip_hash: bool) -> String {
+        if args.len() != 1 {
+            return "undefined".to_string();
+        }
+
+        let hash_statement = if strip_hash {
+            "__url.hash = \"\"; "
+        } else {
+            ""
+        };
+        format!(
+            "((__value) => {{ try {{ const __url = new URL(__value); {}return __url.{}; }} catch {{ return null; }} }})({})",
+            hash_statement,
+            part,
+            self.emit_expr(&args[0])
+        )
+    }
+
+    fn emit_url_search_param(&mut self, args: &[Expr]) -> String {
+        if args.len() != 2 {
+            return "undefined".to_string();
+        }
+        format!(
+            "((__url, __name) => {{ try {{ return new URL(__url, globalThis.location?.href ?? undefined).searchParams.get(__name) ?? \"\"; }} catch {{ return \"\"; }} }})({}, {})",
+            self.emit_expr(&args[0]),
+            self.emit_expr(&args[1])
+        )
+    }
+
+    fn emit_url_set_search_param(&mut self, args: &[Expr]) -> String {
+        if args.len() != 3 {
+            return "undefined".to_string();
+        }
+        format!(
+            "((__url, __name, __value) => {{ try {{ const __next = new URL(__url, globalThis.location?.href ?? undefined); __next.searchParams.set(__name, String(__value)); return __next.href; }} catch {{ return String(__url); }} }})({}, {}, {})",
+            self.emit_expr(&args[0]),
+            self.emit_expr(&args[1]),
+            self.emit_expr(&args[2])
+        )
+    }
+
+    fn emit_url_set_deep_object_param(&mut self, args: &[Expr]) -> String {
+        if args.len() != 3 {
+            return "undefined".to_string();
+        }
+        format!(
+            "((__url, __name, __jsonText) => {{ try {{ const __next = new URL(__url, globalThis.location?.href ?? undefined); const __parsed = JSON.parse(String(__jsonText || \"{{}}\")); if (!__parsed || typeof __parsed !== \"object\" || Array.isArray(__parsed)) return __next.href; for (const [__key, __value] of Object.entries(__parsed)) {{ if (__value !== undefined && __value !== null && String(__value) !== \"\") __next.searchParams.set(`${{__name}}[${{__key}}]`, String(__value)); }} return __next.href; }} catch {{ try {{ return new URL(__url, globalThis.location?.href ?? undefined).href; }} catch {{ return String(__url); }} }} }})({}, {}, {})",
+            self.emit_expr(&args[0]),
+            self.emit_expr(&args[1]),
+            self.emit_expr(&args[2])
+        )
+    }
+
+    fn emit_history_replace_search_param(&mut self, args: &[Expr]) -> String {
+        if args.len() != 2 {
+            return "undefined".to_string();
+        }
+        format!(
+            "((__name, __value) => {{ try {{ const __next = new URL(globalThis.location?.href ?? \"http://localhost/\"); if (__value === null || __value === undefined || String(__value) === \"\") __next.searchParams.delete(__name); else __next.searchParams.set(__name, String(__value)); globalThis.history?.replaceState?.(null, \"\", `${{__next.pathname}}${{__next.search}}${{__next.hash}}`); }} catch {{}} return null; }})({}, {})",
+            self.emit_expr(&args[0]),
+            self.emit_expr(&args[1])
+        )
+    }
+
+    fn emit_history_write_route(&mut self, args: &[Expr]) -> String {
+        if args.len() != 3 {
+            return "undefined".to_string();
+        }
+        format!(
+            r#"((__url, __op, __definition) => {{
+  try {{
+    const __params = new URLSearchParams();
+    if (__url !== null && __url !== undefined && String(__url) !== "") __params.set("url", String(__url));
+    if (__definition !== null && __definition !== undefined && String(__definition) !== "") __params.set("definition", String(__definition));
+    if (__op !== null && __op !== undefined && String(__op) !== "") __params.set("op", String(__op));
+    const __query = __params.toString();
+    const __next = __query ? `${{globalThis.location?.pathname ?? "/"}}?${{__query}}` : (globalThis.location?.pathname ?? "/");
+    if (__next !== `${{globalThis.location?.pathname ?? "/"}}${{globalThis.location?.search ?? ""}}`) globalThis.history?.replaceState?.(null, "", __next);
+  }} catch {{}}
+  return null;
+}})({}, {}, {})"#,
+            self.emit_expr(&args[0]),
+            self.emit_expr(&args[1]),
+            self.emit_expr(&args[2])
+        )
+    }
+
+    fn emit_browser_theme_initial(&mut self, args: &[Expr]) -> String {
+        if args.len() != 1 {
+            return "undefined".to_string();
+        }
+        format!(
+            "((__key) => {{ const __stored = globalThis.sessionStorage?.getItem(__key) ?? globalThis.localStorage?.getItem(__key); const __theme = __stored === \"light\" ? \"light\" : \"dark\"; globalThis.document?.documentElement?.classList?.toggle(\"dark\", __theme === \"dark\"); try {{ globalThis.sessionStorage?.setItem(__key, __theme); globalThis.localStorage?.setItem(__key, __theme); }} catch {{}} return __theme; }})({})",
+            self.emit_expr(&args[0])
+        )
+    }
+
+    fn emit_browser_theme_toggle(&mut self, args: &[Expr]) -> String {
+        if args.len() != 2 {
+            return "undefined".to_string();
+        }
+        format!(
+            "((__current, __key) => {{ const __theme = __current === \"dark\" ? \"light\" : \"dark\"; globalThis.document?.documentElement?.classList?.toggle(\"dark\", __theme === \"dark\"); try {{ globalThis.sessionStorage?.setItem(__key, __theme); globalThis.localStorage?.setItem(__key, __theme); }} catch {{}} return __theme; }})({}, {})",
+            self.emit_expr(&args[0]),
+            self.emit_expr(&args[1])
+        )
+    }
+
+    fn emit_auth_storage_load(&mut self, args: &[Expr]) -> String {
+        if args.len() != 1 {
+            return "undefined".to_string();
+        }
+        format!(
+            r#"((__sourceUrl) => {{
+  const __key = `better-swagger-auth:${{String(__sourceUrl)}}`;
+  const __raw = globalThis.localStorage?.getItem(__key) ?? globalThis.sessionStorage?.getItem(__key);
+  if (!__raw) return {{}};
+  try {{
+    const __parsed = JSON.parse(__raw);
+    const __now = Date.now();
+    const __valid = (Array.isArray(__parsed) ? __parsed : []).filter((__entry) => !__entry?.expiresAt || __entry.expiresAt > __now);
+    const __entries = Object.fromEntries(__valid.map((__entry) => [__entry.schemeId, __entry]));
+    if (__valid.length !== (Array.isArray(__parsed) ? __parsed.length : 0) || globalThis.sessionStorage?.getItem(__key)) {{
+      globalThis.localStorage?.setItem(__key, JSON.stringify(Object.values(__entries)));
+      globalThis.sessionStorage?.removeItem(__key);
+    }}
+    return __entries;
+  }} catch {{
+    return {{}};
+  }}
+}})({})"#,
+            self.emit_expr(&args[0])
+        )
+    }
+
+    fn emit_auth_storage_persist(&mut self, args: &[Expr]) -> String {
+        if args.len() != 2 {
+            return "undefined".to_string();
+        }
+        format!(
+            r#"((__sourceUrl, __entries) => {{
+  const __key = `better-swagger-auth:${{String(__sourceUrl)}}`;
+  try {{
+    globalThis.localStorage?.setItem(__key, JSON.stringify(Object.values(__entries ?? {{}})));
+  }} catch {{}}
+  return null;
+}})({}, {})"#,
+            self.emit_expr(&args[0]),
+            self.emit_expr(&args[1])
+        )
+    }
+
+    fn emit_resolve_token_expiry(&mut self, args: &[Expr]) -> String {
+        if args.len() != 2 {
+            return "undefined".to_string();
+        }
+        format!(
+            r#"((__expiresIn, __accessToken) => {{
+  const __fromResponse = Number(__expiresIn) > 0 ? Date.now() + Number(__expiresIn) * 1000 : null;
+  let __fromJwt = null;
+  try {{
+    const __payload = String(__accessToken).split(".")[1];
+    if (__payload) {{
+      const __normalized = __payload.replace(/-/g, "+").replace(/_/g, "/");
+      const __decoded = JSON.parse(globalThis.atob(__normalized));
+      if (typeof __decoded?.exp === "number") __fromJwt = __decoded.exp * 1000;
+    }}
+  }} catch {{}}
+  if (__fromResponse && __fromJwt) return Math.min(__fromResponse, __fromJwt);
+  return __fromResponse ?? __fromJwt;
+}})({}, {})"#,
+            self.emit_expr(&args[0]),
+            self.emit_expr(&args[1])
+        )
+    }
+
+    fn emit_clipboard_text(&mut self, args: &[Expr]) -> String {
+        if args.len() != 1 {
+            return "undefined".to_string();
+        }
+        format!(
+            "({}?.clipboardData?.getData?.(\"text/plain\") ?? {})",
+            self.emit_expr(&args[0]),
+            "\"\""
+        )
+    }
+
+    fn emit_clipboard_write(&mut self, args: &[Expr]) -> String {
+        if args.len() != 1 {
+            return "undefined".to_string();
+        }
+        format!(
+            "((__text) => {{ void globalThis.navigator?.clipboard?.writeText?.(String(__text)); return null; }})({})",
+            self.emit_expr(&args[0])
+        )
+    }
+
+    fn emit_browser_set_cookie(&mut self, args: &[Expr]) -> String {
+        if args.len() != 2 {
+            return "undefined".to_string();
+        }
+        format!(
+            "((__name, __value) => {{ if (globalThis.document) globalThis.document.cookie = `${{encodeURIComponent(__name)}}=${{encodeURIComponent(__value)}}; path=/`; return null; }})({}, {})",
+            self.emit_expr(&args[0]),
+            self.emit_expr(&args[1])
+        )
+    }
+
+    fn emit_path_fill_params(&mut self, args: &[Expr]) -> String {
+        if args.len() != 2 {
+            return "undefined".to_string();
+        }
+        format!(
+            "String({}).replace(/\\{{[^}}]+\\}}/g, encodeURIComponent(String({})))",
+            self.emit_expr(&args[0]),
+            self.emit_expr(&args[1])
+        )
+    }
+
+    fn emit_path_fill_param(&mut self, args: &[Expr]) -> String {
+        if args.len() != 3 {
+            return "undefined".to_string();
+        }
+        format!(
+            "((__path, __name, __value) => String(__path).replace(new RegExp(`\\\\{{${{String(__name).replace(/[.*+?^${{}}()|[\\]\\\\]/g, \"\\\\$&\")}}\\\\}}`, \"g\"), encodeURIComponent(String(__value))))({}, {}, {})",
+            self.emit_expr(&args[0]),
+            self.emit_expr(&args[1]),
+            self.emit_expr(&args[2])
+        )
+    }
+
+    fn emit_selected_file_or_blob(&mut self, args: &[Expr]) -> String {
+        if args.len() != 4 {
+            return "undefined".to_string();
+        }
+        format!(
+            "((__testId, __content, __name, __type) => {{ const __input = globalThis.document?.querySelector?.(`[data-testid=\"${{__testId}}\"]`); const __selected = __input?.files?.[0]; if (__selected) return __selected; if (typeof File === \"function\") return new File([String(__content)], String(__name), {{ type: String(__type) }}); return new Blob([String(__content)], {{ type: String(__type) }}); }})({}, {}, {}, {})",
+            self.emit_expr(&args[0]),
+            self.emit_expr(&args[1]),
+            self.emit_expr(&args[2]),
+            self.emit_expr(&args[3])
+        )
+    }
+
+    fn emit_selected_file_by_test_id(&mut self, args: &[Expr]) -> String {
+        if args.len() != 1 {
+            return "undefined".to_string();
+        }
+        format!(
+            r#"((__testId) => {{ const __safe = String(__testId).replace(/\\/g, "\\\\").replace(/"/g, "\\\""); return globalThis.document?.querySelector?.(`[data-testid="${{__safe}}"]`)?.files?.[0] ?? null; }})({})"#,
+            self.emit_expr(&args[0])
+        )
+    }
+
+    fn emit_has_selected_file(&mut self, args: &[Expr]) -> String {
+        if args.len() != 1 {
+            return "undefined".to_string();
+        }
+        format!(
+            r#"((__testId) => {{ const __safe = String(__testId).replace(/\\/g, "\\\\").replace(/"/g, "\\\""); return Boolean(globalThis.document?.querySelector?.(`[data-testid="${{__safe}}"]`)?.files?.[0]); }})({})"#,
+            self.emit_expr(&args[0])
+        )
+    }
+
+    fn emit_multipart_form_body(&mut self, args: &[Expr]) -> String {
+        if args.len() != 2 {
+            return "undefined".to_string();
+        }
+        format!(
+            r#"((__fields, __values) => {{ const __form = new FormData(); const __attr = (__value) => String(__value).replace(/\\/g, "\\\\").replace(/"/g, "\\\""); const __byTestId = (__id) => globalThis.document?.querySelector?.(`[data-testid="${{__attr(__id)}}"]`); for (const __field of Array.isArray(__fields) ? __fields : []) {{ const __name = String(__field?.name ?? ""); if (!__name) continue; if (__field?.kind === "file") {{ const __file = __byTestId(`request-body-multipart-${{__name}}`)?.files?.[0]; if (__file) __form.append(__name, __file, __file.name); }} else {{ const __value = (__values && Object.prototype.hasOwnProperty.call(__values, __name)) ? __values[__name] : (__byTestId(`request-body-field-${{__name}}`)?.value ?? ""); const __text = String(__value ?? "").trim(); if (__text) __form.append(__name, __text); }} }} return __form; }})({}, {})"#,
+            self.emit_expr(&args[0]),
+            self.emit_expr(&args[1])
+        )
+    }
+
+    fn emit_urlencoded_form_body(&mut self, args: &[Expr]) -> String {
+        if args.len() != 2 {
+            return "undefined".to_string();
+        }
+        format!(
+            r#"((__fields, __values) => {{ const __params = new URLSearchParams(); for (const __field of Array.isArray(__fields) ? __fields : []) {{ if (__field?.kind === "file") continue; const __name = String(__field?.name ?? ""); if (!__name) continue; const __text = String((__values && Object.prototype.hasOwnProperty.call(__values, __name)) ? __values[__name] : "").trim(); if (__text) __params.append(__name, __text); }} return __params.toString(); }})({}, {})"#,
+            self.emit_expr(&args[0]),
+            self.emit_expr(&args[1])
+        )
+    }
+
+    fn emit_regex_capture(&mut self, args: &[Expr]) -> String {
+        if !(2..=3).contains(&args.len()) {
+            return "undefined".to_string();
+        }
+        let flags = args
+            .get(2)
+            .map(|flags| self.emit_expr(flags))
+            .unwrap_or_else(|| "\"\"".to_string());
+        format!(
+            "((__text, __pattern, __flags) => {{ try {{ return new RegExp(__pattern, __flags).exec(String(__text))?.[1] ?? \"\"; }} catch {{ return \"\"; }} }})({}, {}, {})",
+            self.emit_expr(&args[0]),
+            self.emit_expr(&args[1]),
+            flags
+        )
+    }
+
+    fn emit_install_virtual_json_viewer(&mut self, args: &[Expr]) -> String {
+        if !args.is_empty() {
+            return "undefined".to_string();
+        }
+        r#"(() => {
+  if (globalThis.customElements?.get?.("virtual-json-viewer")) return null;
+  const LINE_HEIGHT = 20;
+  const OVERSCAN = 15;
+  const escapeHtml = (__text) => String(__text)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+  const prettyText = (__raw) => {
+    const __trimmed = String(__raw ?? "").trim();
+    if (!__trimmed) return "";
+    try { return JSON.stringify(JSON.parse(__trimmed), null, 2); }
+    catch { return String(__raw ?? ""); }
+  };
+  const highlightLine = (__line) => {
+    const __tokens = [];
+    const __pattern = /("(?:\\.|[^"\\])*")(\s*:)?|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|\btrue\b|\bfalse\b|\bnull\b/g;
+    let __last = 0;
+    for (const __match of String(__line).matchAll(__pattern)) {
+      __tokens.push(escapeHtml(String(__line).slice(__last, __match.index)));
+      const __token = __match[0];
+      const __escaped = escapeHtml(__token);
+      if (__match[1] && __match[2]) __tokens.push(`<span class="hljs-attr">${escapeHtml(__match[1])}</span>${escapeHtml(__match[2])}`);
+      else if (__match[1]) __tokens.push(`<span class="hljs-string">${__escaped}</span>`);
+      else if (/^-?\d/.test(__token)) __tokens.push(`<span class="hljs-number">${__escaped}</span>`);
+      else __tokens.push(`<span class="hljs-literal">${__escaped}</span>`);
+      __last = (__match.index ?? 0) + __token.length;
+    }
+    __tokens.push(escapeHtml(String(__line).slice(__last)));
+    return __tokens.join("");
+  };
+  class VirtualJsonViewer extends HTMLElement {
+    constructor() {
+      super();
+      this.__lines = [""];
+      this.__scroll = null;
+      this.__spacer = null;
+      this.__rows = null;
+      this.__onScroll = () => this.__updateRows();
+    }
+    static get observedAttributes() { return ["data-json", "data-version", "max-height", "highlight"]; }
+    connectedCallback() { this.__renderShell(); this.__rebuild(); }
+    disconnectedCallback() { this.__scroll?.removeEventListener("scroll", this.__onScroll); }
+    attributeChangedCallback() { if (this.isConnected) this.__rebuild(); }
+    __bindScroll() {
+      if (!this.__scroll) return;
+      this.__scroll.removeEventListener("scroll", this.__onScroll);
+      this.__scroll.addEventListener("scroll", this.__onScroll, { passive: true });
+    }
+    __renderShell() {
+      if (this.__scroll) return;
+      this.classList.add("block");
+      this.innerHTML = `<div class="virtual-json-scroll overflow-auto rounded-lg border border-zinc-200 bg-zinc-50 font-mono text-[13px] dark:border-zinc-800 dark:bg-zinc-900/80"><div class="virtual-json-spacer relative w-full"><div class="virtual-json-rows absolute inset-x-0 top-0"></div></div></div>`;
+      this.__scroll = this.querySelector(".virtual-json-scroll");
+      this.__spacer = this.querySelector(".virtual-json-spacer");
+      this.__rows = this.querySelector(".virtual-json-rows");
+      this.__scroll.style.maxHeight = this.getAttribute("max-height") || "24rem";
+      this.__bindScroll();
+    }
+    __rebuild() {
+      this.__renderShell();
+      this.__bindScroll();
+      this.__scroll.style.maxHeight = this.getAttribute("max-height") || "24rem";
+      this.__scroll.scrollTop = 0;
+      const __text = prettyText(this.getAttribute("data-json") ?? "");
+      const __highlight = this.getAttribute("highlight") !== "false";
+      this.__lines = (__text ? __text.split("\n") : [""]).map((__line) => __highlight ? highlightLine(__line) : escapeHtml(__line));
+      this.__spacer.style.height = `${this.__lines.length * LINE_HEIGHT}px`;
+      this.__updateRows();
+    }
+    __updateRows() {
+      if (!this.__scroll || !this.__rows) return;
+      const __height = this.__scroll.clientHeight || 384;
+      const __first = Math.max(0, Math.floor(this.__scroll.scrollTop / LINE_HEIGHT) - OVERSCAN);
+      const __count = Math.ceil(__height / LINE_HEIGHT) + OVERSCAN * 2;
+      const __last = Math.min(this.__lines.length, __first + __count);
+      let __html = "";
+      for (let __index = __first; __index < __last; __index += 1) {
+        __html += `<div class="absolute left-0 top-0 flex w-full px-3 leading-5 whitespace-pre" style="height:${LINE_HEIGHT}px;transform:translateY(${__index * LINE_HEIGHT}px)"><span class="mr-3 w-8 shrink-0 text-right text-zinc-400 select-none dark:text-zinc-600">${__index + 1}</span><span>${this.__lines[__index] ?? ""}</span></div>`;
+      }
+      this.__rows.innerHTML = __html;
+    }
+  }
+  globalThis.customElements?.define?.("virtual-json-viewer", VirtualJsonViewer);
+  return null;
+})()"#.to_string()
+    }
+
+    fn emit_base64(&mut self, encode: bool, args: &[Expr]) -> String {
+        if args.len() != 1 {
+            return "undefined".to_string();
+        }
+
+        let body = if encode {
+            "if (typeof btoa === \"function\") return btoa(__value); return Buffer.from(__value, \"utf8\").toString(\"base64\");"
+        } else {
+            "if (typeof atob === \"function\") return atob(__value); return Buffer.from(__value, \"base64\").toString(\"utf8\");"
+        };
+        format!(
+            "((__value) => {{ try {{ {} }} catch {{ return \"\"; }} }})({})",
+            body,
+            self.emit_expr(&args[0])
+        )
+    }
+
+    fn emit_fail(&mut self, args: &[Expr]) -> String {
+        if args.len() != 1 {
+            return "undefined".to_string();
+        }
+        format!(
+            "(() => {{ throw new Error({}); }})()",
+            self.emit_expr(&args[0])
+        )
     }
 
     fn emit_assoc(&mut self, expr: &Expr, args: &[Expr]) -> String {
@@ -2159,6 +2860,7 @@ impl Emitter {
             owner: self,
             template_id,
             read_aliases,
+            svg_depth: 0,
             nodes: Vec::new(),
             slots: Vec::new(),
             create_lines: Vec::new(),
@@ -2184,6 +2886,7 @@ struct TemplateEmitter<'a> {
     owner: &'a mut Emitter,
     template_id: usize,
     read_aliases: &'a ReadAliases,
+    svg_depth: usize,
     nodes: Vec<String>,
     slots: Vec<TemplateSlot>,
     create_lines: Vec<String>,
@@ -2273,11 +2976,21 @@ impl TemplateEmitter<'_> {
     fn emit_element(&mut self, element: &HtmlElement) -> String {
         let var = self.next_node_var();
         let node_id = self.node_id_for_var(&var);
-        self.create_lines.push(format!(
-            "const {} = document.createElement(\"{}\");",
-            var,
-            escape_js(&element.tag)
-        ));
+        let is_svg_element = element.tag.eq_ignore_ascii_case("svg");
+        let in_svg_tree = self.svg_depth > 0 || is_svg_element;
+        if in_svg_tree {
+            self.create_lines.push(format!(
+                "const {} = document.createElementNS(\"http://www.w3.org/2000/svg\", \"{}\");",
+                var,
+                escape_js(&element.tag)
+            ));
+        } else {
+            self.create_lines.push(format!(
+                "const {} = document.createElement(\"{}\");",
+                var,
+                escape_js(&element.tag)
+            ));
+        }
 
         for attr in &element.attrs {
             if attr.name == "ref" {
@@ -2321,10 +3034,16 @@ impl TemplateEmitter<'_> {
             }
         }
 
+        if in_svg_tree {
+            self.svg_depth += 1;
+        }
         for child in &element.children {
             let child_var = self.emit_node(child);
             self.create_lines
                 .push(format!("{}.appendChild({});", var, child_var));
+        }
+        if in_svg_tree {
+            self.svg_depth -= 1;
         }
         var
     }
@@ -2807,12 +3526,25 @@ fn let_template_parts(expr: &Expr) -> Option<(&[Expr], &HtmlNode)> {
     Some((bindings, node))
 }
 
-fn is_template_component_expr(expr: &Expr) -> bool {
-    matches!(&expr.kind, ExprKind::HtmlTemplate(_)) || let_template_parts(expr).is_some()
+fn is_template_component_expr(expr: &Expr, components: &BTreeSet<String>) -> bool {
+    match &expr.kind {
+        ExprKind::HtmlTemplate(_) => true,
+        ExprKind::List(items) => {
+            if let_template_parts(expr).is_some() {
+                return true;
+            }
+            if items.len() == 4 && matches_symbol(&items[0], "if") {
+                return is_template_component_expr(&items[2], components)
+                    && is_template_component_expr(&items[3], components);
+            }
+            ComponentSpec::parse(expr, components).is_some()
+        }
+        _ => false,
+    }
 }
 
 fn collect_template_defns(source: &SourceFile) -> BTreeSet<String> {
-    source
+    let defs = source
         .forms
         .iter()
         .filter_map(|form| {
@@ -2828,13 +3560,27 @@ fn collect_template_defns(source: &SourceFile) -> BTreeSet<String> {
             let Some(body) = items.last() else {
                 return None;
             };
-            if !is_template_component_expr(body) {
-                return None;
-            }
-
-            Some(name.clone())
+            Some((name.clone(), body))
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+    let mut components = BTreeSet::new();
+    loop {
+        let mut changed = false;
+        for (name, body) in &defs {
+            if components.contains(name) {
+                continue;
+            }
+            if is_template_component_expr(body, &components) {
+                changed |= components.insert(name.clone());
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    components
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -3788,6 +4534,27 @@ mod tests {
     }
 
     #[test]
+    fn emits_svg_templates_with_svg_namespace() {
+        let source = syntax::parse_source(
+            "(defn icon [] #html <span><svg viewBox=\"0 0 24 24\"><path d=\"M12 3v18\"></path></svg></span>)",
+        );
+        let emitted = emit_module(&source);
+
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        assert!(emitted.code.contains("document.createElement(\"span\")"));
+        assert!(
+            emitted
+                .code
+                .contains("document.createElementNS(\"http://www.w3.org/2000/svg\", \"svg\")")
+        );
+        assert!(
+            emitted
+                .code
+                .contains("document.createElementNS(\"http://www.w3.org/2000/svg\", \"path\")")
+        );
+    }
+
+    #[test]
     fn emits_indexed_keyed_template_loops() {
         let source = syntax::parse_source(
             "(defn view [state]\n  #html <section>{(for [zone state.zones index :key zone.id] #html <button data-index={index} on:click={{:kind :select :rank (+ index 1)}}>{(str index zone.name)}</button>)}</section>)",
@@ -4100,7 +4867,37 @@ mod tests {
         assert!(
             emitted
                 .code
-                .contains("update(next_summary, dispatch, updateContext)")
+            .contains("update(next_summary, dispatch, updateContext)")
+        );
+    }
+
+    #[test]
+    fn emits_conditional_component_returning_defns_as_components() {
+        let source = syntax::parse_source(
+            "(defn password-card [scheme] #html <article>{scheme.id}<span>Password</span></article>)\n\
+             (defn api-key-card [scheme] #html <article>{scheme.id}<span>API key</span></article>)\n\
+             (defn scheme-card [scheme]\n\
+               (if (= scheme.kind \"password\")\n\
+                   (password-card scheme)\n\
+                   (api-key-card scheme)))\n\
+             (defn view [state]\n\
+               #html <section>{(for [scheme state.schemes :key scheme.id]\n\
+                                #html <div>{(scheme-card scheme)}</div>)}</section>)",
+        );
+        let emitted = emit_module(&source);
+
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        assert!(
+            emitted.code.contains("{ component: \"scheme-card\" }"),
+            "conditional component-returning defn should be lowered as a component slot:\n{}",
+            emitted.code
+        );
+        assert!(
+            emitted
+                .code
+                .contains("kind: { component: \"scheme-card\" }, reads: [\"scheme.id\", \"scheme.kind\"]"),
+            "component metadata should include conditional branch reads:\n{}",
+            emitted.code
         );
     }
 
@@ -4533,6 +5330,22 @@ mod tests {
         ));
         assert!(emitted.code.contains("Array.from(__map.keys())"));
         assert!(emitted.code.contains("Array.from(__map.values())"));
+    }
+
+    #[test]
+    fn emits_dynamic_object_get() {
+        let source = syntax::parse_source(
+            "(def method \"get\")\n\
+             (def operation (object-get {:get {:id \"listPets\"}} method))",
+        );
+        let emitted = emit_module(&source);
+
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        assert!(
+            emitted
+                .code
+                .contains("__value instanceof Map ? (__value.has(__key) ? __value.get(__key) : null) : (__value?.[__key] ?? null)")
+        );
     }
 
     #[test]

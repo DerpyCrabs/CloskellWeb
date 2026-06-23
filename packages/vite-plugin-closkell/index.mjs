@@ -293,6 +293,7 @@ export function closkell(options = {}) {
     if (!existsSync(output)) return false;
     const outputMtime = await statMtimeMs(output);
     if (outputMtime < (await newestClskMtimeMs(sourceRoot))) return false;
+    if (outputMtime < (await newestRustBuildInputMtimeMs(manifestRoot))) return false;
     if (sourceMap && !existsSync(sourceMapPath(output))) return false;
     if (!sourceMap) {
       const tail = await readFileTail(output, 256);
@@ -303,6 +304,14 @@ export function closkell(options = {}) {
 
   function sourceMapPath(output) {
     return `${output}.map`;
+  }
+
+  function vendoredRuntimeSourcePath() {
+    return path.join(config.root, "node_modules", "@closkell", "runtime", "src", "index.js");
+  }
+
+  function entryNeedsVendoredRuntime(source) {
+    return vendorRuntime && app && entryPath && samePath(source, entryPath);
   }
 
   async function readFileTail(file, bytes) {
@@ -360,7 +369,11 @@ export function closkell(options = {}) {
     if (inFlight.has(key)) return inFlight.get(key);
 
     const task = (async () => {
-      if (!force && (await outputIsFresh(output))) {
+      if (
+        !force &&
+        (await outputIsFresh(output)) &&
+        (!entryNeedsVendoredRuntime(resolved) || existsSync(vendoredRuntimeSourcePath()))
+      ) {
         return output;
       }
 
@@ -401,14 +414,7 @@ export function closkell(options = {}) {
   }
 
   async function runtimeSourcePath({ allowCompile = false } = {}) {
-    const vendored = path.join(
-      config.root,
-      "node_modules",
-      "@closkell",
-      "runtime",
-      "src",
-      "index.js"
-    );
+    const vendored = vendoredRuntimeSourcePath();
     if (existsSync(vendored)) return vendored;
 
     if (allowCompile && vendorRuntime && entryPath && existsSync(entryPath)) {

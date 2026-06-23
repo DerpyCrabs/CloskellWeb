@@ -1,0 +1,117 @@
+(def httpMethods ["get" "post" "put" "patch" "delete" "head" "options"])
+
+(def dmHeaderSurface "dark:bg-dm-surface dark:hover:bg-dm-surface-hover")
+
+(defn operationItem [method path operation]
+  {:id (str method ":" path)
+   :method method
+   :path path
+   :operation operation})
+
+(defn operationTags [operation]
+  (let [tags (get operation :tags)]
+    (if (and (vector? tags) (> (count tags) 0))
+        tags
+        ["default"])))
+
+(defn addTaggedOperation [byTag tag item]
+  (let [existing (map-get byTag tag)
+        items (if (some? existing) existing [])]
+    (map-assoc byTag tag (conj items item))))
+
+(defn addOperation [byTag item]
+  (reduce (operationTags item.operation)
+          byTag
+          (fn [next tag] (addTaggedOperation next tag item))))
+
+(defn addPathOperations [byTag pathEntry]
+  (reduce httpMethods
+          byTag
+          (fn [next method]
+            (let [operation (object-get pathEntry.value method)]
+              (if (some? operation)
+                  (addOperation next (operationItem method pathEntry.key operation))
+                  next)))))
+
+(defn operationOrder [a b]
+  (let [pathOrder (locale-compare a.path b.path)]
+    (if (= pathOrder 0)
+        (locale-compare a.method b.method)
+        pathOrder)))
+
+(defn sortedOperationEntries [byTag]
+  (sort-with (map-entries byTag)
+             (fn [a b] (locale-compare a.key b.key))))
+
+(defn collectOperations [spec]
+  (let [paths (get spec :paths)
+        byTag (reduce (object-entries paths)
+                      (hash-map)
+                      addPathOperations)]
+    (reduce (sortedOperationEntries byTag)
+            (hash-map)
+            (fn [next entry]
+              (map-assoc next entry.key (sort-with entry.value operationOrder))))))
+
+(defn methodColor [method]
+  (match (lower-case method)
+    "get" "bg-emerald-600/20 text-emerald-700 ring-emerald-600/40 dark:bg-[rgba(46,204,113,0.15)] dark:text-[#4ade80] dark:ring-[rgba(46,204,113,0.25)]"
+    "post" "bg-sky-600/20 text-sky-700 ring-sky-600/40 dark:bg-[rgba(52,152,219,0.15)] dark:text-[#60a5fa] dark:ring-[rgba(52,152,219,0.25)]"
+    "put" "bg-amber-600/20 text-amber-800 ring-amber-600/40 dark:bg-[rgba(245,158,11,0.15)] dark:text-[#fbbf24] dark:ring-[rgba(245,158,11,0.25)]"
+    "patch" "bg-orange-600/20 text-orange-800 ring-orange-600/40 dark:bg-[rgba(251,146,60,0.15)] dark:text-[#fb923c] dark:ring-[rgba(251,146,60,0.25)]"
+    "delete" "bg-rose-600/20 text-rose-700 ring-rose-600/40 dark:bg-[rgba(231,76,60,0.15)] dark:text-[#f87171] dark:ring-[rgba(231,76,60,0.25)]"
+    _ "bg-zinc-600/20 text-zinc-700 ring-zinc-600/40 dark:bg-[rgba(255,255,255,0.08)] dark:text-dm-muted dark:ring-dm-border"))
+
+(defn methodExpandedBg [method]
+  (match (lower-case method)
+    "get" "bg-emerald-50 dark:bg-[rgba(46,204,113,0.05)]"
+    "post" "bg-sky-50 dark:bg-[rgba(52,152,219,0.05)]"
+    "put" "bg-amber-50 dark:bg-[rgba(245,158,11,0.05)]"
+    "patch" "bg-orange-50 dark:bg-[rgba(251,146,60,0.05)]"
+    "delete" "bg-rose-50 dark:bg-[rgba(231,76,60,0.05)]"
+    _ "bg-zinc-50 dark:bg-dm-base"))
+
+(defn methodHeaderBg [method expanded]
+  (match (lower-case method)
+    "get" (if expanded
+              (str "bg-emerald-100 hover:bg-emerald-100/90 " dmHeaderSurface)
+              (str "bg-emerald-50 hover:bg-emerald-100/80 " dmHeaderSurface))
+    "post" (if expanded
+               (str "bg-sky-100 hover:bg-sky-100/90 " dmHeaderSurface)
+               (str "bg-sky-50 hover:bg-sky-100/80 " dmHeaderSurface))
+    "put" (if expanded
+              (str "bg-amber-100 hover:bg-amber-100/90 " dmHeaderSurface)
+              (str "bg-amber-50 hover:bg-amber-100/80 " dmHeaderSurface))
+    "patch" (if expanded
+                (str "bg-orange-100 hover:bg-orange-100/90 " dmHeaderSurface)
+                (str "bg-orange-50 hover:bg-orange-100/80 " dmHeaderSurface))
+    "delete" (if expanded
+                 (str "bg-rose-100 hover:bg-rose-100/90 " dmHeaderSurface)
+                 (str "bg-rose-50 hover:bg-rose-100/80 " dmHeaderSurface))
+    _ (if expanded
+          (str "bg-zinc-100 hover:bg-zinc-100/90 " dmHeaderSurface)
+          (str "bg-zinc-50 hover:bg-zinc-100/80 " dmHeaderSurface))))
+
+(defn tagDescriptions [spec]
+  (reduce (if (vector? (get spec :tags)) spec.tags [])
+          (hash-map)
+          (fn [next tag]
+            (if (some? (get tag :description))
+                (map-assoc next tag.name tag.description)
+                next))))
+
+(defn itemHasId? [operationId item]
+  (= item.id operationId))
+
+(defn tagContainsOperation? [operationId entry]
+  (any? entry.value (fn [item] (itemHasId? operationId item))))
+
+(defn findOperationTag [grouped operationId]
+  (let [entry (find (map-entries grouped)
+                    (fn [candidate] (tagContainsOperation? operationId candidate)))]
+    (if (some? entry)
+        entry.key
+        nil)))
+
+(defn operationExists [grouped operationId]
+  (some? (findOperationTag grouped operationId)))

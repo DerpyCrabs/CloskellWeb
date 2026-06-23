@@ -62,6 +62,9 @@ fn run(args: Vec<String>) -> Result<(), String> {
             let mut modules = HashMap::new();
             let mut checking = HashSet::new();
             for import in &imports {
+                if !is_closkell_import_path(&import.path) {
+                    continue;
+                }
                 let import_source = resolve_import_source(&path, &import.path)?;
                 check_file(&import_source, &mut modules, &mut checking, false)?;
             }
@@ -703,6 +706,9 @@ fn collect_source_paths(source: &Path, paths: &mut BTreeSet<PathBuf>) -> Result<
         return Ok(());
     }
     for import in parse_imports(&input, &parsed)? {
+        if !is_closkell_import_path(&import.path) {
+            continue;
+        }
         let import_source = resolve_import_source(&canonical, &import.path)?;
         collect_source_paths(&import_source, paths)?;
     }
@@ -777,6 +783,9 @@ fn check_file_inner(
     let mut imported_macros = HashMap::new();
     let mut imported_command_shapes = HashMap::new();
     for import in &imports {
+        if !is_closkell_import_path(&import.path) {
+            continue;
+        }
         let import_source = resolve_import_source(path, &import.path)?;
         let imported = check_file_with_reporter(
             &import_source,
@@ -904,6 +913,9 @@ fn build_file(
     }
 
     for import in parse_imports(&input, &source)? {
+        if !is_closkell_import_path(&import.path) {
+            continue;
+        }
         let import_output = output_for_import(output, &import.path)?;
         if !import_has_runtime_names(path, &import, modules)? {
             remove_stale_type_only_output(path, &import.path, &import_output, visited)?;
@@ -955,6 +967,12 @@ fn import_has_runtime_names(
     import: &ImportSpec,
     modules: &HashMap<PathBuf, ModuleInfo>,
 ) -> Result<bool, String> {
+    if !is_closkell_import_path(&import.path) {
+        return Ok(import
+            .names
+            .iter()
+            .any(|name| js_backend::is_runtime_import_name(&name.name)));
+    }
     let import_source = resolve_import_source(source_path, &import.path)?;
     let canonical = fs::canonicalize(&import_source)
         .map_err(|err| format!("failed to resolve {}: {}", import_source.display(), err))?;
@@ -971,6 +989,9 @@ fn remove_stale_type_only_output(
     output: &Path,
     visited: &HashSet<PathBuf>,
 ) -> Result<(), String> {
+    if !is_closkell_import_path(import_path) {
+        return Ok(());
+    }
     let import_source = resolve_import_source(source_path, import_path)?;
     let canonical = fs::canonicalize(&import_source)
         .map_err(|err| format!("failed to resolve {}: {}", import_source.display(), err))?;
@@ -1303,22 +1324,59 @@ fn parse_import_form(expr: &Expr) -> Option<Result<ImportSpec, Diagnostic>> {
     }
     let mut imported = Vec::new();
     for name in names {
-        let ExprKind::Symbol(symbol) = &name.kind else {
-            return Some(Err(Diagnostic::error(
-                name.span,
-                "imported name must be a symbol",
-            )));
-        };
-        imported.push(ImportName {
-            name: symbol.clone(),
-            span: name.span,
-        });
+        match parse_import_name(name) {
+            Ok(parsed) => imported.push(parsed),
+            Err(diagnostic) => return Some(Err(diagnostic)),
+        }
     }
 
     Some(Ok(ImportSpec {
         path: path.clone(),
         names: imported,
     }))
+}
+
+fn parse_import_name(expr: &Expr) -> Result<ImportName, Diagnostic> {
+    match &expr.kind {
+        ExprKind::Symbol(symbol) => Ok(ImportName {
+            name: symbol.clone(),
+            span: expr.span,
+        }),
+        ExprKind::List(items)
+            if items.len() == 2
+                && matches!(&items[0].kind, ExprKind::Symbol(name) if name == "default") =>
+        {
+            let ExprKind::Symbol(local) = &items[1].kind else {
+                return Err(Diagnostic::error(
+                    items[1].span,
+                    "default import local name must be a symbol",
+                ));
+            };
+            Ok(ImportName {
+                name: local.clone(),
+                span: expr.span,
+            })
+        }
+        ExprKind::List(items)
+            if items.len() == 3
+                && matches!(&items[1].kind, ExprKind::Symbol(name) if name == "as") =>
+        {
+            let ExprKind::Symbol(local) = &items[2].kind else {
+                return Err(Diagnostic::error(
+                    items[2].span,
+                    "aliased import local name must be a symbol",
+                ));
+            };
+            Ok(ImportName {
+                name: local.clone(),
+                span: expr.span,
+            })
+        }
+        _ => Err(Diagnostic::error(
+            expr.span,
+            "imported name must be a symbol, (default local), or (name as local)",
+        )),
+    }
 }
 
 fn resolve_import_source(source_path: &Path, import_path: &str) -> Result<PathBuf, String> {
@@ -1330,7 +1388,7 @@ fn resolve_import_source(source_path: &Path, import_path: &str) -> Result<PathBu
         )
     }) {
         return Err(format!(
-            "only same-tree relative .clsk imports are supported: {}",
+            "only same-tree relative local imports are supported: {}",
             import_path
         ));
     }
@@ -1343,6 +1401,13 @@ fn resolve_import_source(source_path: &Path, import_path: &str) -> Result<PathBu
 
     let parent = source_path.parent().unwrap_or_else(|| Path::new("."));
     Ok(parent.join(relative))
+}
+
+fn is_closkell_import_path(import_path: &str) -> bool {
+    Path::new(import_path)
+        .extension()
+        .and_then(|value| value.to_str())
+        == Some("clsk")
 }
 
 fn output_for_import(output: &Path, import_path: &str) -> Result<PathBuf, String> {
@@ -1475,6 +1540,9 @@ fn imported_macros_from_imports(
 ) -> Result<HashMap<String, macro_expand::MacroDef>, String> {
     let mut macros = HashMap::new();
     for import in imports {
+        if !is_closkell_import_path(&import.path) {
+            continue;
+        }
         let import_source = resolve_import_source(path, &import.path)?;
         let canonical = fs::canonicalize(&import_source)
             .map_err(|err| format!("failed to resolve {}: {}", import_source.display(), err))?;
@@ -1497,6 +1565,9 @@ fn imported_command_shapes_from_imports(
 ) -> Result<Vec<CommandShape>, String> {
     let mut shapes = BTreeMap::new();
     for import in imports {
+        if !is_closkell_import_path(&import.path) {
+            continue;
+        }
         let import_source = resolve_import_source(path, &import.path)?;
         let canonical = fs::canonicalize(&import_source)
             .map_err(|err| format!("failed to resolve {}: {}", import_source.display(), err))?;

@@ -19,7 +19,7 @@ first proof target is rebuilding the HRWeb app with:
 - `typecheck`: initial local inference and shape checks
 - `effects`: command-effect catalog and validation boundary
 - `template_ir`: static DOM/update-slot lowering
-- `js_backend`: readable JS ESM emission
+- `js_backend`: JavaScript ESM emission
 - `cli`: `closkell` developer commands
 - `runtime-js`: runtime helpers consumed by generated JS
 - `packages/vite-plugin-closkell`: Vite plugin that lets apps import `.clsk`
@@ -30,16 +30,16 @@ first proof target is rebuilding the HRWeb app with:
 ## CLI
 
 ```powershell
-cargo run -p cli -- check hrweb/src/app.clsk
-cargo run -p cli -- check hrweb/src/app.clsk --json
-cargo run -p cli -- check hrweb/src/app.clsk --json --stdin
-cargo run -p cli -- check hrweb/src/app.clsk --types
-cargo run -p cli -- build hrweb/src/app.clsk --out dist/app.mjs --sourcemap
+cargo run -p cli -- check projects/hrweb/src/app.clsk
+cargo run -p cli -- check projects/hrweb/src/app.clsk --json
+cargo run -p cli -- check projects/hrweb/src/app.clsk --json --stdin
+cargo run -p cli -- check projects/hrweb/src/app.clsk --types
+cargo run -p cli -- build projects/hrweb/src/app.clsk --out dist/app.mjs --sourcemap
 cargo run -p cli -- test fixtures/hrweb/hrweb_test_suite.clsk
-cargo run -p cli -- dev --watch hrweb/src/app.clsk --out dist/app.mjs --sourcemap
+cargo run -p cli -- dev --watch projects/hrweb/src/app.clsk --out dist/app.mjs --sourcemap
 cargo run -p cli -- expand fixtures/hrweb/hrweb_macro_app.clsk
-cargo run -p cli -- fmt hrweb/src/app.clsk
-cargo run -p cli -- inspect hrweb/src/app.clsk
+cargo run -p cli -- fmt projects/hrweb/src/app.clsk
+cargo run -p cli -- inspect projects/hrweb/src/app.clsk
 cargo test
 ```
 
@@ -59,7 +59,7 @@ CLI, editor, and CI formatting stay aligned.
 vector under Node. Each test record uses `:name`, `:actual`, and `:expected`.
 
 HRWeb-specific compiler/runtime fixtures live in `fixtures/hrweb/`. They are
-test inputs, not app examples; the full runnable app is under `hrweb/`.
+test inputs, not app examples; the full runnable app is under `projects/hrweb/`.
 
 `build --sourcemap` and `dev --watch --sourcemap` write `.mjs.map` files for
 the entry and same-tree imported modules, including original `.clsk`

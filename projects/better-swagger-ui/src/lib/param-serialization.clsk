@@ -1,0 +1,125 @@
+(defn hasText? [value]
+  (and (string? value) (not (= (trim value) ""))))
+
+(defn defaultParamStyle [location]
+  (if (= location "query") "form" "simple"))
+
+(defn defaultParamExplode [style kind]
+  (and (= style "form") (or (= kind "array") (= kind "object"))))
+
+(defn resolvedStyle [meta]
+  (let [style (get meta :style)]
+    (if (string? style) style (defaultParamStyle (get meta :in)))))
+
+(defn resolvedExplode [meta style]
+  (let [explode (get meta :explode)]
+    (if (bool? explode) explode (defaultParamExplode style (get meta :kind)))))
+
+(defn serializePrimitive [value]
+  (str value))
+
+(defn objectEntries [value]
+  (filter (object-entries value)
+          (fn [entry]
+            (let [entryValue entry.value]
+              (and (some? entryValue)
+                   (not (= entryValue "")))))))
+
+(defn parseObjectInput [trimmed]
+  (let [result (json-parse-result trimmed)
+        value (unwrap-or result nil)]
+    (if (and (ok? result) (object? value) (not (vector? value)))
+        value
+        nil)))
+
+(defn arraySeparator [style]
+  (match style
+    "pipeDelimited" "|"
+    "spaceDelimited" " "
+    _ ","))
+
+(defn parseArrayInput [style trimmed]
+  (filter (map (split trimmed (arraySeparator style)) (fn [part] (trim part))) hasText?))
+
+(defn parseParamInputValue [meta raw]
+  (let [trimmed (trim raw)
+        style (resolvedStyle meta)]
+    (if (= trimmed "")
+        []
+        (parseArrayInput style trimmed))))
+
+(defn appendQueryValue [query name value]
+  (conj query {:name name :value (serializePrimitive value)}))
+
+(defn appendObjectPairs [query name entries]
+  (reduce entries
+          query
+          (fn [next entry]
+            (appendQueryValue next (str name "[" entry.key "]") entry.value))))
+
+(defn appendExplodedObject [query entries]
+  (reduce entries
+          query
+          (fn [next entry]
+            (appendQueryValue next entry.key entry.value))))
+
+(defn flattenedObjectValue [entries]
+  (join (reduce entries
+                []
+                (fn [items entry]
+                  (conj (conj items entry.key) (serializePrimitive entry.value))))
+        ","))
+
+(defn appendArrayParam [query name style explode value]
+  (if (= (count value) 0)
+      query
+      (if (and (= style "form") explode)
+          (reduce value query (fn [next item] (appendQueryValue next name item)))
+          (appendQueryValue query name (join (map value serializePrimitive) (arraySeparator style))))))
+
+(defn appendObjectParam [query name style explode value]
+  (let [entries (objectEntries value)]
+    (if (= (count entries) 0)
+        query
+        (if (= style "deepObject")
+            (appendObjectPairs query name entries)
+            (if (and (= style "form") explode)
+                (appendExplodedObject query entries)
+                (appendQueryValue query name (flattenedObjectValue entries)))))))
+
+(defn appendQueryParam [query meta raw]
+  (let [trimmed (trim raw)
+        style (resolvedStyle meta)
+        explode (resolvedExplode meta style)
+        name (get meta :name)]
+    (if (= trimmed "")
+        query
+        (if (= (get meta :kind) "array")
+            (appendArrayParam query name style explode (parseParamInputValue meta trimmed))
+            (if (= (get meta :kind) "object")
+                (let [objectValue (parseObjectInput trimmed)]
+                  (if (some? objectValue)
+                      (appendObjectParam query name style explode objectValue)
+                      query))
+                (appendQueryValue query name trimmed))))))
+
+(defn serializePathParamValue [meta raw]
+  (let [trimmed (trim raw)
+        style (resolvedStyle meta)
+        explode (resolvedExplode meta style)]
+    (if (= trimmed "")
+        nil
+        (if (= (get meta :kind) "array")
+            (join (map (parseParamInputValue meta trimmed) serializePrimitive) ",")
+            (if (= (get meta :kind) "object")
+                (let [objectValue (parseObjectInput trimmed)]
+                  (if (some? objectValue)
+                      (let [entries (objectEntries objectValue)]
+                        (if explode
+                            (join (map entries (fn [entry] (str entry.key "=" (serializePrimitive entry.value)))) ",")
+                            (flattenedObjectValue entries)))
+                      nil))
+                (serializePrimitive trimmed))))))
+
+(defn serializeHeaderParamValue [meta raw]
+  (serializePathParamValue meta raw))

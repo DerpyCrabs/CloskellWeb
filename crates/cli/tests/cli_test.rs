@@ -1070,7 +1070,13 @@ fn cli_inspect_includes_imported_match_command_helper_schema() {
 fn cli_inspect_reports_hrweb_wrapped_panes_and_source_reads() {
     let inspect = Command::new(env!("CARGO_BIN_EXE_closkell"))
         .arg("inspect")
-        .arg(workspace_root().join("hrweb").join("src").join("app.clsk"))
+        .arg(
+            workspace_root()
+                .join("projects")
+                .join("hrweb")
+                .join("src")
+                .join("app.clsk"),
+        )
         .output()
         .expect("closkell inspect should run");
 

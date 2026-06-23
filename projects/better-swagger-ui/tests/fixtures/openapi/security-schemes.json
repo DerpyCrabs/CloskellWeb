@@ -1,0 +1,78 @@
+{
+  "openapi": "3.0.3",
+  "info": { "title": "Security API", "version": "1.0.0" },
+  "servers": [{ "url": "/fixtures/mock-api" }],
+  "components": {
+    "securitySchemes": {
+      "ApiKeyAuth": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-API-Key"
+      },
+      "BearerAuth": {
+        "type": "http",
+        "scheme": "bearer"
+      },
+      "BasicAuth": {
+        "type": "http",
+        "scheme": "basic"
+      },
+      "QueryApiKey": {
+        "type": "apiKey",
+        "in": "query",
+        "name": "api_key"
+      },
+      "CookieApiKey": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "session"
+      },
+      "OAuthPassword": {
+        "type": "oauth2",
+        "flows": {
+          "password": {
+            "tokenUrl": "/fixtures/mock-api/oauth/token",
+            "scopes": { "read": "Read access" }
+          }
+        }
+      },
+      "OAuthClientCreds": {
+        "type": "oauth2",
+        "flows": {
+          "clientCredentials": {
+            "tokenUrl": "/fixtures/mock-api/oauth/token",
+            "scopes": { "write": "Write access" }
+          }
+        }
+      },
+      "RefScheme": { "$ref": "#/components/securitySchemes/ApiKeyAuth" }
+    }
+  },
+  "security": [{ "ApiKeyAuth": [] }],
+  "paths": {
+    "/secure": {
+      "get": {
+        "summary": "Secure endpoint",
+        "security": [{ "BearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": { "application/json": { "schema": { "type": "object" } } }
+          }
+        }
+      }
+    },
+    "/public": {
+      "get": {
+        "summary": "Public endpoint",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": { "application/json": { "schema": { "type": "object" } } }
+          }
+        }
+      }
+    }
+  }
+}

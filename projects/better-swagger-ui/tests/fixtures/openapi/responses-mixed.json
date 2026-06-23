@@ -1,0 +1,72 @@
+{
+  "openapi": "3.0.3",
+  "info": { "title": "Responses API", "version": "1.0.0" },
+  "servers": [{ "url": "/fixtures/mock-api" }],
+  "paths": {
+    "/json": {
+      "get": {
+        "summary": "JSON response",
+        "responses": {
+          "200": {
+            "description": "JSON",
+            "content": { "application/json": { "schema": { "type": "object" } } }
+          }
+        }
+      }
+    },
+    "/csv": {
+      "get": {
+        "summary": "CSV response",
+        "responses": {
+          "200": {
+            "description": "CSV",
+            "content": { "text/csv": { "schema": { "type": "string" } } }
+          }
+        }
+      }
+    },
+    "/file": {
+      "get": {
+        "summary": "Binary file",
+        "responses": {
+          "200": {
+            "description": "File",
+            "content": { "application/octet-stream": { "schema": { "type": "string", "format": "binary" } } }
+          }
+        }
+      }
+    },
+    "/image": {
+      "get": {
+        "summary": "Image response",
+        "responses": {
+          "200": {
+            "description": "PNG",
+            "content": { "image/png": { "schema": { "type": "string", "format": "binary" } } }
+          }
+        }
+      }
+    },
+    "/empty": {
+      "delete": {
+        "summary": "No content",
+        "responses": { "204": { "description": "No content" } }
+      }
+    },
+    "/error": {
+      "get": {
+        "summary": "Error response",
+        "responses": {
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/problem+json": {
+                "schema": { "type": "object", "properties": { "title": { "type": "string" } } }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

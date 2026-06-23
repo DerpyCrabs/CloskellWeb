@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html>
+  <head><title>Swagger UI Multi</title></head>
+  <body>
+    <div id="swagger-ui"></div>
+    <script>
+      window.ui = SwaggerUIBundle({
+        urls: [
+          { url: "/fixtures/openapi/multi-definition-a.json", name: "API A" },
+          { url: "/fixtures/openapi/multi-definition-b.json", name: "API B" },
+        ],
+        dom_id: "#swagger-ui",
+      })
+    </script>
+  </body>
+</html>

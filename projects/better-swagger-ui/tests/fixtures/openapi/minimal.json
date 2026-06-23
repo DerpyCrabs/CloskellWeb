@@ -1,0 +1,32 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Minimal API",
+    "version": "1.0.0",
+    "description": "A **minimal** test API."
+  },
+  "servers": [{ "url": "/fixtures/mock-api" }],
+  "tags": [{ "name": "pets", "description": "Pet operations" }],
+  "paths": {
+    "/pets": {
+      "get": {
+        "tags": ["pets"],
+        "summary": "List pets",
+        "operationId": "listPets",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": { "type": "string" }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

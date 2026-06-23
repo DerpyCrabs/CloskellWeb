@@ -16,13 +16,17 @@ fn perf_check_hrweb_app_stays_under_budget() {
     let Some(bin) = perf_bin() else {
         return;
     };
-    let app = workspace_root().join("hrweb").join("src").join("app.clsk");
+    let app = workspace_root()
+        .join("projects")
+        .join("hrweb")
+        .join("src")
+        .join("app.clsk");
     let samples = command_samples(3, || {
         let mut command = Command::new(&bin);
         command
             .arg("check")
             .arg(&app)
-            .current_dir(workspace_root().join("hrweb"));
+            .current_dir(workspace_root().join("projects").join("hrweb"));
         command
     });
     assert_under("closkell check hrweb", &samples, CHECK_HRWEB_BUDGET);
@@ -37,7 +41,7 @@ fn perf_npm_check_hrweb_script_stays_under_budget() {
         eprintln!("skipping npm check perf test because npm was not found");
         return;
     };
-    let hrweb = workspace_root().join("hrweb");
+    let hrweb = workspace_root().join("projects").join("hrweb");
     let samples = command_samples(3, || {
         let mut command = Command::new(&npm);
         command
@@ -57,7 +61,7 @@ fn perf_build_hrweb_app_stays_under_budget_and_omits_sourcemaps() {
         return;
     };
     let root = workspace_root();
-    let hrweb = root.join("hrweb");
+    let hrweb = root.join("projects").join("hrweb");
     let app = hrweb.join("src").join("app.clsk");
     let temp_dir = env::temp_dir().join(format!("closkell-perf-build-{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
@@ -96,7 +100,11 @@ fn perf_fmt_hrweb_app_stays_under_budget() {
     let Some(bin) = perf_bin() else {
         return;
     };
-    let app = workspace_root().join("hrweb").join("src").join("app.clsk");
+    let app = workspace_root()
+        .join("projects")
+        .join("hrweb")
+        .join("src")
+        .join("app.clsk");
     let samples = command_samples(5, || {
         let mut command = Command::new(&bin);
         command.arg("fmt").arg(&app);
@@ -111,7 +119,7 @@ fn perf_vite_plugin_warm_hrweb_build_stays_under_budget() {
         return;
     };
     let root = workspace_root();
-    let hrweb = root.join("hrweb");
+    let hrweb = root.join("projects").join("hrweb");
     if !vite_bin(&hrweb).is_file() {
         eprintln!("skipping Vite perf test because hrweb npm dependencies are not installed");
         return;

@@ -1,0 +1,56 @@
+(defn reference? [value]
+  (some? (get value "$ref")))
+
+(defn base-mime [contentType]
+  (lower-case (trim (first (split contentType ";")))))
+
+(defn contentTypePriority [contentType]
+  (let [mime (base-mime contentType)]
+    (if (includes? mime "octet-stream")
+        0
+        (if (includes? mime "csv")
+            1
+            (if (or (includes? mime "pdf")
+                    (includes? mime "zip")
+                    (includes? mime "excel")
+                    (starts-with? mime "image/")
+                    (starts-with? mime "video/")
+                    (starts-with? mime "audio/"))
+                1
+                (if (includes? mime "json")
+                    3
+                    2))))))
+
+(defn response-content-types [response]
+  (if (or (reference? response)
+          (not (object? (get response :content))))
+      []
+      (object-keys response.content)))
+
+(defn collectResponseContentTypes [operation]
+  (let [responses (object-values (get operation :responses))
+        types (reduce responses
+                      (set)
+                      (fn [seen response]
+                        (reduce (response-content-types response)
+                                seen
+                                (fn [next contentType] (conj next contentType)))))]
+    (sort-with (set-values types)
+               (fn [a b]
+                 (let [priority (- (contentTypePriority a) (contentTypePriority b))]
+                   (if (= priority 0)
+                       (locale-compare a b)
+                       priority))))))
+
+(defn buildAcceptHeader [operation]
+  (let [types (collectResponseContentTypes operation)]
+    (if (= (count types) 0)
+        "application/json, text/plain, */*"
+        (join (conj types "*/*") ", "))))
+
+(defn prefersBinaryResponse [operation]
+  (let [types (collectResponseContentTypes operation)]
+    (if (= (count types) 0)
+        false
+        (<= (contentTypePriority (first types)) 1))))
+
