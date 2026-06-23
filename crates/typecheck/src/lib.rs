@@ -13,6 +13,7 @@ pub struct CheckResult {
     pub forms: Vec<TypedForm>,
     pub type_declarations: Vec<TypeDeclaration>,
     pub type_annotations: Vec<TypeAnnotation>,
+    pub foreign_declarations: Vec<ForeignDeclaration>,
     pub bindings: Vec<ExportedBinding>,
     pub diagnostics: Vec<Diagnostic>,
 }
@@ -20,8 +21,10 @@ pub struct CheckResult {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TypeDeclaration {
     pub name: String,
+    pub params: Vec<String>,
     pub schema: String,
     syntax: TypeSyntax,
+    span: Span,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -45,8 +48,24 @@ pub struct TypeAnnotationReport {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForeignDeclaration {
+    pub mode: String,
+    pub name: String,
+    pub schema: String,
+    syntax: TypeSyntax,
+    span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForeignDeclarationReport {
+    pub declarations: Vec<ForeignDeclaration>,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImportedTypeDeclaration {
     name: String,
+    params: Vec<String>,
     syntax: TypeSyntax,
 }
 
@@ -68,6 +87,7 @@ impl TypeDeclaration {
     pub fn import_as(&self, name: impl Into<String>) -> ImportedTypeDeclaration {
         ImportedTypeDeclaration {
             name: name.into(),
+            params: self.params.clone(),
             syntax: self.syntax.clone(),
         }
     }
@@ -85,11 +105,19 @@ impl ExportedBinding {
     pub fn is_annotated(&self) -> bool {
         self.annotated
     }
+
+    pub fn schema(&self) -> String {
+        format_type_inner(&self.ty)
+    }
 }
 
 impl ImportedBinding {
     pub fn returns_cmd(&self) -> bool {
         type_returns_cmd(&self.ty)
+    }
+
+    pub fn returns_sub(&self) -> bool {
+        type_returns_sub(&self.ty)
     }
 }
 
@@ -102,7 +130,10 @@ enum Type {
     Nil,
     Keyword(Option<String>),
     Syntax,
+    Js,
     Html,
+    TrustedHtml,
+    Decoder(Box<Type>),
     Option(Box<Type>),
     List(Box<Type>),
     Vector(Box<Type>),
@@ -111,6 +142,9 @@ enum Type {
     Map(Box<Type>, Box<Type>),
     Result(Box<Type>, Box<Type>),
     Cmd(Box<Type>),
+    Task(Box<Type>, Box<Type>),
+    Sub(Box<Type>),
+    Event(Box<Type>),
     Union(Vec<Type>),
     Record(BTreeMap<String, Type>),
     Fn(Vec<Type>, Box<Type>),
@@ -120,8 +154,15 @@ enum Type {
 struct Inferencer {
     next_var: u32,
     subst: HashMap<u32, Type>,
+    type_aliases: HashMap<String, TypeAlias>,
     html_event_msg: Option<Type>,
     diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TypeAlias {
+    params: Vec<String>,
+    syntax: TypeSyntax,
 }
 
 pub fn check_source(source: &SourceFile) -> CheckResult {
@@ -143,16 +184,28 @@ pub fn check_source_with_module_imports(
     let mut bindings = Vec::new();
     let type_report = collect_type_declarations(source);
     let annotation_report = collect_type_annotations(source);
+    let foreign_report = collect_foreign_declarations(source);
     let mut type_aliases = imported_types
         .iter()
-        .map(|declaration| (declaration.name.clone(), declaration.syntax.clone()))
+        .map(|declaration| {
+            (
+                declaration.name.clone(),
+                TypeAlias {
+                    params: declaration.params.clone(),
+                    syntax: declaration.syntax.clone(),
+                },
+            )
+        })
         .collect::<HashMap<_, _>>();
-    type_aliases.extend(
-        type_report
-            .declarations
-            .iter()
-            .map(|declaration| (declaration.name.clone(), declaration.syntax.clone())),
-    );
+    type_aliases.extend(type_report.declarations.iter().map(|declaration| {
+        (
+            declaration.name.clone(),
+            TypeAlias {
+                params: declaration.params.clone(),
+                syntax: declaration.syntax.clone(),
+            },
+        )
+    }));
     let annotations_by_name = annotation_report
         .annotations
         .iter()
@@ -166,11 +219,26 @@ pub fn check_source_with_module_imports(
     inferencer
         .diagnostics
         .extend(annotation_report.diagnostics.iter().cloned());
+    inferencer
+        .diagnostics
+        .extend(foreign_report.diagnostics.iter().cloned());
+    inferencer.type_aliases = type_aliases.clone();
     inferencer.html_event_msg = annotations_by_name.get("update").and_then(|annotation| {
         update_message_type_syntax(&annotation.syntax).and_then(|syntax| {
             inferencer.type_syntax_to_type(syntax, &type_aliases, annotation.span)
         })
     });
+
+    for declaration in &type_report.declarations {
+        if declaration.params.is_empty() {
+            continue;
+        }
+        let substituted = substitute_type_syntax(
+            &declaration.syntax,
+            &type_parameter_validation_bindings(&declaration.params),
+        );
+        inferencer.type_syntax_to_type(&substituted, &type_aliases, declaration.span);
+    }
 
     for import in imports {
         let ty = inferencer.instantiate_imported_type(&import.ty);
@@ -180,9 +248,16 @@ pub fn check_source_with_module_imports(
     for form in &source.forms {
         if let Some(import) = parse_import_form(form) {
             match import {
-                Ok(names) => {
-                    for name in names {
-                        env.entry(name).or_insert_with(|| inferencer.fresh());
+                Ok(import) => {
+                    let is_js_import = !is_closkell_import_path(&import.path);
+                    for name in import.names {
+                        env.entry(name).or_insert_with(|| {
+                            if is_js_import {
+                                Type::Js
+                            } else {
+                                inferencer.fresh()
+                            }
+                        });
                     }
                 }
                 Err(diagnostic) => inferencer.diagnostics.push(diagnostic),
@@ -190,8 +265,20 @@ pub fn check_source_with_module_imports(
         }
     }
 
+    for declaration in &foreign_report.declarations {
+        if let Some(ty) =
+            inferencer.type_syntax_to_type(&declaration.syntax, &type_aliases, declaration.span)
+        {
+            env.insert(declaration.name.clone(), ty);
+        }
+    }
+
     for form in &source.forms {
-        if parse_import_form(form).is_some() || is_type_form(form) || is_ann_form(form) {
+        if parse_import_form(form).is_some()
+            || is_type_form(form)
+            || is_ann_form(form)
+            || is_foreign_form(form)
+        {
             continue;
         }
 
@@ -243,6 +330,7 @@ pub fn check_source_with_module_imports(
         forms,
         type_declarations: type_report.declarations,
         type_annotations: annotation_report.annotations,
+        foreign_declarations: foreign_report.declarations,
         bindings,
         diagnostics: inferencer.diagnostics,
     }
@@ -306,6 +394,35 @@ pub fn collect_type_annotations(source: &SourceFile) -> TypeAnnotationReport {
     }
 }
 
+pub fn collect_foreign_declarations(source: &SourceFile) -> ForeignDeclarationReport {
+    let mut declarations = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut names = BTreeSet::new();
+
+    for form in &source.forms {
+        let Some(parsed) = parse_foreign_declaration_form(form) else {
+            continue;
+        };
+        match parsed {
+            Ok(declaration) => {
+                if !names.insert(declaration.name.clone()) {
+                    diagnostics.push(Diagnostic::error(
+                        form.span,
+                        format!("duplicate foreign declaration `{}`", declaration.name),
+                    ));
+                }
+                declarations.push(declaration);
+            }
+            Err(diagnostic) => diagnostics.push(diagnostic),
+        }
+    }
+
+    ForeignDeclarationReport {
+        declarations,
+        diagnostics,
+    }
+}
+
 impl Inferencer {
     fn instantiate_imported_type(&mut self, ty: &Type) -> Type {
         let mut vars = HashMap::new();
@@ -330,6 +447,9 @@ impl Inferencer {
             Type::Option(inner) => {
                 Type::Option(Box::new(self.instantiate_imported_type_inner(inner, vars)))
             }
+            Type::Decoder(inner) => {
+                Type::Decoder(Box::new(self.instantiate_imported_type_inner(inner, vars)))
+            }
             Type::List(inner) => {
                 Type::List(Box::new(self.instantiate_imported_type_inner(inner, vars)))
             }
@@ -348,6 +468,14 @@ impl Inferencer {
                 Box::new(self.instantiate_imported_type_inner(err, vars)),
             ),
             Type::Cmd(msg) => Type::Cmd(Box::new(self.instantiate_imported_type_inner(msg, vars))),
+            Type::Task(err, ok) => Type::Task(
+                Box::new(self.instantiate_imported_type_inner(err, vars)),
+                Box::new(self.instantiate_imported_type_inner(ok, vars)),
+            ),
+            Type::Sub(msg) => Type::Sub(Box::new(self.instantiate_imported_type_inner(msg, vars))),
+            Type::Event(msg) => {
+                Type::Event(Box::new(self.instantiate_imported_type_inner(msg, vars)))
+            }
             Type::Tuple(items) => Type::Tuple(
                 items
                     .iter()
@@ -383,7 +511,9 @@ impl Inferencer {
             Type::Nil => Type::Nil,
             Type::Keyword(name) => Type::Keyword(name.clone()),
             Type::Syntax => Type::Syntax,
+            Type::Js => Type::Js,
             Type::Html => Type::Html,
+            Type::TrustedHtml => Type::TrustedHtml,
         }
     }
 
@@ -422,7 +552,60 @@ impl Inferencer {
                 "if" => return self.infer_if(span, args, env),
                 "match" => return self.infer_match(span, args, env),
                 "do" => return self.infer_do(args, env),
+                "unsafe-cast" => return self.infer_unsafe_cast(name, args, env),
+                "Event.prevent" | "Event.stop" | "Event.prevent-stop" => {
+                    return self.infer_event_control(name, args, env);
+                }
+                "Task.succeed" => return self.infer_task_succeed(name, args, env),
+                "Task.fail" => return self.infer_task_fail(name, args, env),
+                "Task.map" => return self.infer_task_map(name, args, env),
+                "Task.map-error" => return self.infer_task_map_error(name, args, env),
+                "Task.and-then" => return self.infer_task_and_then(name, args, env),
+                "Task.perform" => return self.infer_task_perform(name, args, env),
+                "Http.get-text" => return self.infer_http_get_text(name, args, env),
+                "Http.get-json" => return self.infer_http_get_json(name, args, env),
+                "scope-update" => return self.infer_scope_update(name, args, env),
+                "scope-subscriptions" => {
+                    return self.infer_scope_subscriptions(name, args, env);
+                }
+                "scope-view" => return self.infer_scope_view(name, args, env),
+                "Sub.batch" => return self.infer_sub_batch(name, args, env),
+                "Sub.timer/every" => return self.infer_sub_timer_every(name, args, env),
+                "Sub.media-query" => {
+                    return self.infer_sub_change(name, args, env, "sub/media-query");
+                }
+                "Sub.window/event" => return self.infer_sub_window_event(name, args, env),
+                "Sub.dom-ref/resize" => {
+                    return self.infer_sub_change(name, args, env, "sub/dom-ref/resize");
+                }
+                "describe" => return self.infer_test_group(name, args, env),
+                "test" => return self.infer_test_case(name, args, env),
+                "expect=" => return self.infer_expect_equal(name, args, env, false),
+                "expect-not=" => return self.infer_expect_equal(name, args, env, true),
+                "expect-ok" => return self.infer_expect_ok(name, args, env),
+                "expect-err" => return self.infer_expect_err(name, args, env),
+                "expect-some" => return self.infer_expect_some(name, args, env),
+                "expect-nil" => return self.infer_expect_nil(name, args, env),
+                "expect-match" => return self.infer_expect_match(name, args, env),
+                "expect-throws" => return self.infer_expect_throws(name, args, env),
+                "render-to-string" => return self.infer_render_to_string(name, args, env),
+                "render" => return self.infer_render_harness(name, args, env),
+                "rerender" => return self.infer_rerender_harness(name, args, env),
+                "dispose" => return self.infer_dispose_harness(name, args, env),
+                "find-all" => return self.infer_query_helper(name, args, env, true),
+                "text" | "html" => return self.infer_harness_string_query(name, args, env),
+                "attr" | "style" => return self.infer_harness_attr_query(name, args, env),
+                "class?" => return self.infer_harness_class_query(name, args, env),
+                "messages" | "commands" => return self.infer_harness_records(name, args, env),
+                "fire.event" => return self.infer_fire_event(name, args, env),
+                "fire.click" | "fire.keydown" | "fire.pointerdown" => {
+                    return self.infer_fire_selector_event(name, args, env);
+                }
+                "fire.input" | "fire.change" => {
+                    return self.infer_fire_value_event(name, args, env);
+                }
                 "type" => return Type::Nil,
+                "foreign" => return Type::Nil,
                 "+" | "-" | "*" | "/" | "max" | "min" => {
                     return self.infer_numeric_call(name, args, env);
                 }
@@ -444,6 +627,7 @@ impl Inferencer {
                 "=" | "<" | ">" | "<=" | ">=" => {
                     return self.infer_comparison_call(name, args, env);
                 }
+                "identical?" => return self.infer_identity_call(name, args, env),
                 "not" => return self.infer_unary_bool(name, args, env),
                 "and" | "or" => return self.infer_bool_call(name, args, env),
                 "env-dev?" => return self.infer_zero_arg_bool(name, args),
@@ -461,9 +645,11 @@ impl Inferencer {
                 "map-entries" => return self.infer_map_entries(name, args, env),
                 "map-keys" => return self.infer_map_keys(name, args, env),
                 "map-values" => return self.infer_map_values(name, args, env),
+                "get-in" => return self.infer_get_in(name, args, env),
                 "assoc" => return self.infer_assoc(name, args, env),
                 "merge" => return self.infer_merge(name, args, env),
                 "dissoc" => return self.infer_dissoc(name, args, env),
+                "update-in" => return self.infer_update_in(name, args, env),
                 "count" => return self.infer_count(name, args, env),
                 "empty?" => return self.infer_empty(name, args, env),
                 "some?" => return self.infer_some(name, args, env),
@@ -476,7 +662,7 @@ impl Inferencer {
                 "last" => return self.infer_last(name, args, env),
                 "cons" => return self.infer_cons(name, args, env),
                 "rest" => return self.infer_rest(name, args, env),
-                "find" => return self.infer_find(name, args, env),
+                "find" => return self.infer_find_overloaded(name, args, env),
                 "map" => return self.infer_map_transform(name, args, env, false),
                 "map-indexed" => return self.infer_map_transform(name, args, env, true),
                 "filter" => return self.infer_filter(name, args, env),
@@ -508,6 +694,21 @@ impl Inferencer {
                 "json-stringify" => return self.infer_json_stringify(name, args, env),
                 "json-parse" => return self.infer_json_parse(name, args, env),
                 "json-parse-result" => return self.infer_json_parse_result(name, args, env),
+                "decoder-string" => {
+                    return self.infer_zero_arg_decoder(name, args, Type::String);
+                }
+                "decoder-number" => {
+                    return self.infer_zero_arg_decoder(name, args, Type::Number);
+                }
+                "decoder-bool" => return self.infer_zero_arg_decoder(name, args, Type::Bool),
+                "decoder-keyword" => {
+                    return self.infer_zero_arg_decoder(name, args, Type::Keyword(None));
+                }
+                "decoder-literal" => return self.infer_decoder_literal(name, args, env),
+                "decoder-optional" => return self.infer_decoder_optional(name, args, env),
+                "decoder-vector" => return self.infer_decoder_vector(name, args, env),
+                "decoder-record" => return self.infer_decoder_record(name, args, env),
+                "decode" => return self.infer_decode(name, args, env),
                 "object-entries" => return self.infer_object_entries(name, args, env),
                 "object-keys" => return self.infer_object_keys(name, args, env),
                 "object-values" => return self.infer_object_values(name, args, env),
@@ -522,7 +723,9 @@ impl Inferencer {
                     return self.infer_url_part(name, args, env);
                 }
                 "browser-current-url" => return self.infer_zero_arg_string(name, args),
-                "url-search-param" => return self.infer_fixed_string_args(name, args, env, 2, Type::String),
+                "url-search-param" => {
+                    return self.infer_fixed_string_args(name, args, env, 2, Type::String);
+                }
                 "url-set-search-param" | "url-set-deep-object-param" => {
                     return self.infer_fixed_string_args(name, args, env, 3, Type::String);
                 }
@@ -640,6 +843,9 @@ impl Inferencer {
             .iter()
             .map(|arg| self.infer_expr(arg, env))
             .collect::<Vec<_>>();
+        if matches!(self.resolve(callee.clone()), Type::Js) {
+            return Type::Js;
+        }
         let ret = self.fresh();
         self.unify(
             callee,
@@ -680,6 +886,8 @@ impl Inferencer {
                                     self.require_html_class_attr(attr_ty, expr.span);
                                 } else if attr.name == "style" {
                                     self.require_html_style_attr(attr_ty, expr.span);
+                                } else if attr.name == "innerHTML" {
+                                    self.require_html_inner_html_attr(attr_ty, expr.span);
                                 } else if is_boolean_html_attr(&attr.name) {
                                     self.unify(attr_ty, Type::Bool, expr.span);
                                 }
@@ -717,6 +925,13 @@ impl Inferencer {
                 _ => {}
             },
             HtmlAttrValue::Static(static_value) => {
+                if name == "innerHTML" {
+                    self.diagnostics.push(Diagnostic::error(
+                        span,
+                        "innerHTML requires TrustedHtml; use innerHTML={...} with an explicit sanitizer or unsafe-cast boundary",
+                    ));
+                }
+
                 if name == "ref" && static_value.is_empty() {
                     self.diagnostics.push(Diagnostic::error(
                         span,
@@ -850,6 +1065,34 @@ impl Inferencer {
         }
     }
 
+    fn require_html_inner_html_attr(&mut self, ty: Type, span: Span) {
+        let resolved = self.resolve(ty);
+        if self.html_inner_html_attr_type_matches(resolved.clone(), span) {
+            return;
+        }
+
+        let found = self.format_type(&resolved);
+        self.diagnostics.push(Diagnostic::error(
+            span,
+            format!(
+                "innerHTML expects TrustedHtml from an explicit sanitizer or unsafe-cast boundary, found {}",
+                found
+            ),
+        ));
+    }
+
+    fn html_inner_html_attr_type_matches(&mut self, ty: Type, span: Span) -> bool {
+        match self.resolve(ty) {
+            Type::Var(id) => {
+                self.unify(Type::Var(id), Type::TrustedHtml, span);
+                true
+            }
+            Type::TrustedHtml | Type::Nil => true,
+            Type::Option(inner) => self.html_inner_html_attr_type_matches(*inner, span),
+            _ => false,
+        }
+    }
+
     fn require_html_style_attr(&mut self, ty: Type, span: Span) {
         let resolved = self.resolve(ty);
         if self.html_style_attr_type_matches(resolved.clone()) {
@@ -934,10 +1177,6 @@ impl Inferencer {
             ("currentTarget".to_string(), form_target.clone()),
             ("key".to_string(), Type::String),
             ("metaKey".to_string(), Type::Bool),
-            (
-                "preventDefault".to_string(),
-                Type::Fn(Vec::new(), Box::new(Type::Nil)),
-            ),
             ("shiftKey".to_string(), Type::Bool),
             ("target".to_string(), form_target),
         ]))
@@ -946,6 +1185,14 @@ impl Inferencer {
     fn infer_symbol(&mut self, span: Span, name: &str, env: &mut HashMap<String, Type>) -> Type {
         if let Some(ty) = env.get(name) {
             return ty.clone();
+        }
+
+        if name == "Sub.none" {
+            return Type::Sub(Box::new(self.fresh()));
+        }
+
+        if let Some(ty) = primitive_decoder_type(name) {
+            return ty;
         }
 
         if let Some((base, fields)) = split_path(name) {
@@ -1003,6 +1250,7 @@ impl Inferencer {
                         (field_ty, record)
                     }
                 }
+                Type::Js => (Type::Js, Type::Js),
                 other => {
                     let type_name = self.format_type(&other);
                     self.diagnostics.push(Diagnostic::error(
@@ -1029,6 +1277,7 @@ impl Inferencer {
                 let field_ty = self.union_field_type(&variants, field, span);
                 (field_ty, Type::Union(variants))
             }
+            Type::Js => (Type::Js, Type::Js),
             other => {
                 let type_name = self.format_type(&other);
                 self.diagnostics.push(Diagnostic::error(
@@ -1932,6 +2181,1106 @@ impl Inferencer {
         ty
     }
 
+    fn infer_test_group(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() < 2 {
+            self.diagnostics.push(Diagnostic::error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                format!("{} expects a name and at least one test", name),
+            ));
+        }
+        if let Some(label) = args.first() {
+            let label_ty = self.infer_expr(label, env);
+            self.unify(Type::String, label_ty, label.span);
+        }
+        for entry in args.iter().skip(1) {
+            self.infer_expr(entry, env);
+        }
+        Type::Js
+    }
+
+    fn infer_test_case(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() < 2 {
+            self.diagnostics.push(Diagnostic::error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                format!("{} expects a name and at least one assertion", name),
+            ));
+        }
+        if let Some(label) = args.first() {
+            let label_ty = self.infer_expr(label, env);
+            self.unify(Type::String, label_ty, label.span);
+        }
+        for assertion in args.iter().skip(1) {
+            self.infer_expr(assertion, env);
+        }
+        Type::Js
+    }
+
+    fn infer_expect_equal(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+        _negated: bool,
+    ) -> Type {
+        if args.len() != 2 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                2,
+                args.len(),
+            );
+            for arg in args {
+                self.infer_expr(arg, env);
+            }
+            return Type::Js;
+        }
+        let actual = self.infer_expr(&args[0], env);
+        let expected = self.infer_expr(&args[1], env);
+        if !matches!(self.resolve(actual.clone()), Type::Js)
+            && !matches!(self.resolve(expected.clone()), Type::Js)
+        {
+            self.unify(actual, expected, args[1].span);
+        }
+        Type::Js
+    }
+
+    fn infer_expect_ok(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 1 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                1,
+                args.len(),
+            );
+            for arg in args {
+                self.infer_expr(arg, env);
+            }
+            return Type::Js;
+        }
+        let actual = self.infer_expr(&args[0], env);
+        self.unify(Type::Bool, actual, args[0].span);
+        Type::Js
+    }
+
+    fn infer_expect_err(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 1 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                1,
+                args.len(),
+            );
+            for arg in args {
+                self.infer_expr(arg, env);
+            }
+            return Type::Js;
+        }
+        let actual = self.infer_expr(&args[0], env);
+        let ok = self.fresh();
+        let err = self.fresh();
+        self.unify(
+            Type::Result(Box::new(ok), Box::new(err)),
+            actual,
+            args[0].span,
+        );
+        Type::Js
+    }
+
+    fn infer_expect_some(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 1 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                1,
+                args.len(),
+            );
+            for arg in args {
+                self.infer_expr(arg, env);
+            }
+            return Type::Js;
+        }
+        self.infer_expr(&args[0], env);
+        Type::Js
+    }
+
+    fn infer_expect_nil(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 1 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                1,
+                args.len(),
+            );
+            for arg in args {
+                self.infer_expr(arg, env);
+            }
+            return Type::Js;
+        }
+        self.infer_expr(&args[0], env);
+        Type::Js
+    }
+
+    fn infer_expect_match(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 2 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                2,
+                args.len(),
+            );
+            for arg in args {
+                self.infer_expr(arg, env);
+            }
+            return Type::Js;
+        }
+        self.infer_expr(&args[0], env);
+        self.infer_expr(&args[1], env);
+        Type::Js
+    }
+
+    fn infer_expect_throws(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 1 && args.len() != 2 {
+            self.diagnostics.push(Diagnostic::error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                format!("{} expects a thunk and optional expected message", name),
+            ));
+            for arg in args {
+                self.infer_expr(arg, env);
+            }
+            return Type::Js;
+        }
+        let thunk = self.infer_expr(&args[0], env);
+        if !matches!(self.resolve(thunk.clone()), Type::Js) {
+            let ret = self.fresh();
+            self.unify(thunk, Type::Fn(Vec::new(), Box::new(ret)), args[0].span);
+        }
+        if let Some(expected) = args.get(1) {
+            let expected_ty = self.infer_expr(expected, env);
+            self.unify(Type::String, expected_ty, expected.span);
+        }
+        Type::Js
+    }
+
+    fn infer_render_harness(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 1 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                1,
+                args.len(),
+            );
+            for arg in args {
+                self.infer_expr(arg, env);
+            }
+            return Type::Js;
+        }
+        let component = self.infer_expr(&args[0], env);
+        self.unify(Type::Html, component, args[0].span);
+        Type::Js
+    }
+
+    fn infer_render_to_string(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        match args.len() {
+            1 => {
+                let component = self.infer_expr(&args[0], env);
+                self.unify(Type::Html, component, args[0].span);
+            }
+            2 => {
+                let view = self.infer_expr(&args[0], env);
+                let state = self.infer_expr(&args[1], env);
+                self.unify(
+                    view,
+                    Type::Fn(vec![state], Box::new(Type::Html)),
+                    args[0].span,
+                );
+            }
+            _ => {
+                self.diagnostics.push(Diagnostic::error(
+                    args.first().map_or(Span::default(), |arg| arg.span),
+                    format!("{} expects a component or view and state", name),
+                ));
+                for arg in args {
+                    self.infer_expr(arg, env);
+                }
+            }
+        }
+        Type::String
+    }
+
+    fn infer_rerender_harness(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 2 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                2,
+                args.len(),
+            );
+            for arg in args {
+                self.infer_expr(arg, env);
+            }
+            return Type::Js;
+        }
+        self.infer_expr(&args[0], env);
+        let component = self.infer_expr(&args[1], env);
+        self.unify(Type::Html, component, args[1].span);
+        Type::Js
+    }
+
+    fn infer_dispose_harness(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 1 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                1,
+                args.len(),
+            );
+        }
+        for arg in args {
+            self.infer_expr(arg, env);
+        }
+        Type::Nil
+    }
+
+    fn infer_query_helper(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+        all: bool,
+    ) -> Type {
+        if args.len() != 2 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                2,
+                args.len(),
+            );
+        }
+        self.infer_optional_harness_arg(args.first(), env);
+        self.infer_optional_string_arg(args.get(1), env);
+        if all {
+            Type::Vector(Box::new(Type::Js))
+        } else {
+            Type::Js
+        }
+    }
+
+    fn infer_harness_string_query(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 1 && args.len() != 2 {
+            self.diagnostics.push(Diagnostic::error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                format!("{} expects a harness and optional selector", name),
+            ));
+        }
+        self.infer_optional_harness_arg(args.first(), env);
+        if let Some(selector) = args.get(1) {
+            let selector_ty = self.infer_expr(selector, env);
+            self.unify(Type::String, selector_ty, selector.span);
+        }
+        Type::String
+    }
+
+    fn infer_harness_attr_query(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 3 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                3,
+                args.len(),
+            );
+        }
+        self.infer_optional_harness_arg(args.first(), env);
+        self.infer_optional_string_arg(args.get(1), env);
+        self.infer_optional_string_arg(args.get(2), env);
+        Type::String
+    }
+
+    fn infer_harness_class_query(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 3 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                3,
+                args.len(),
+            );
+        }
+        self.infer_optional_harness_arg(args.first(), env);
+        self.infer_optional_string_arg(args.get(1), env);
+        self.infer_optional_string_arg(args.get(2), env);
+        Type::Bool
+    }
+
+    fn infer_harness_records(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 1 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                1,
+                args.len(),
+            );
+        }
+        self.infer_optional_harness_arg(args.first(), env);
+        Type::Vector(Box::new(self.fresh()))
+    }
+
+    fn infer_fire_event(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 3 && args.len() != 4 {
+            self.diagnostics.push(Diagnostic::error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                format!(
+                    "{} expects harness, selector, event type, and optional event data",
+                    name
+                ),
+            ));
+        }
+        self.infer_optional_harness_arg(args.first(), env);
+        self.infer_optional_string_arg(args.get(1), env);
+        self.infer_optional_string_arg(args.get(2), env);
+        if let Some(init) = args.get(3) {
+            self.infer_expr(init, env);
+        }
+        Type::Js
+    }
+
+    fn infer_fire_selector_event(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 2 && args.len() != 3 {
+            self.diagnostics.push(Diagnostic::error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                format!(
+                    "{} expects harness, selector, and optional event data",
+                    name
+                ),
+            ));
+        }
+        self.infer_optional_harness_arg(args.first(), env);
+        self.infer_optional_string_arg(args.get(1), env);
+        if let Some(init) = args.get(2) {
+            self.infer_expr(init, env);
+        }
+        Type::Js
+    }
+
+    fn infer_fire_value_event(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 2 && args.len() != 3 {
+            self.diagnostics.push(Diagnostic::error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                format!(
+                    "{} expects harness, selector, and optional value or event data",
+                    name
+                ),
+            ));
+        }
+        self.infer_optional_harness_arg(args.first(), env);
+        self.infer_optional_string_arg(args.get(1), env);
+        if let Some(value) = args.get(2) {
+            self.infer_expr(value, env);
+        }
+        Type::Js
+    }
+
+    fn infer_optional_harness_arg(&mut self, arg: Option<&Expr>, env: &mut HashMap<String, Type>) {
+        if let Some(arg) = arg {
+            self.infer_expr(arg, env);
+        }
+    }
+
+    fn infer_optional_string_arg(&mut self, arg: Option<&Expr>, env: &mut HashMap<String, Type>) {
+        if let Some(arg) = arg {
+            let ty = self.infer_expr(arg, env);
+            self.unify(Type::String, ty, arg.span);
+        }
+    }
+
+    fn infer_unsafe_cast(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 2 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                2,
+                args.len(),
+            );
+            if let Some(value) = args.get(1) {
+                self.infer_expr(value, env);
+            }
+            return self.fresh();
+        }
+
+        self.infer_expr(&args[1], env);
+        let Ok(syntax) = parse_type_syntax(&args[0]) else {
+            self.diagnostics.push(Diagnostic::error(
+                args[0].span,
+                "unsafe-cast expects a type expression",
+            ));
+            return self.fresh();
+        };
+        let aliases = self.type_aliases.clone();
+        self.type_syntax_to_type(&syntax, &aliases, args[0].span)
+            .unwrap_or_else(|| self.fresh())
+    }
+
+    fn infer_event_control(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 1 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                1,
+                args.len(),
+            );
+            return Type::Event(Box::new(self.fresh()));
+        }
+
+        let msg = self.infer_expr(&args[0], env);
+        Type::Event(Box::new(msg))
+    }
+
+    fn infer_task_succeed(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 1 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                1,
+                args.len(),
+            );
+            return Type::Task(Box::new(self.fresh()), Box::new(self.fresh()));
+        }
+
+        let ok = self.infer_expr(&args[0], env);
+        Type::Task(Box::new(self.fresh()), Box::new(ok))
+    }
+
+    fn infer_task_fail(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 1 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                1,
+                args.len(),
+            );
+            return Type::Task(Box::new(self.fresh()), Box::new(self.fresh()));
+        }
+
+        let err = self.infer_expr(&args[0], env);
+        Type::Task(Box::new(err), Box::new(self.fresh()))
+    }
+
+    fn infer_task_map(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 2 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                2,
+                args.len(),
+            );
+            return Type::Task(Box::new(self.fresh()), Box::new(self.fresh()));
+        }
+
+        let err = self.fresh();
+        let ok = self.fresh();
+        let next_ok = self.fresh();
+        let task = self.infer_expr(&args[0], env);
+        self.unify(
+            task,
+            Type::Task(Box::new(err.clone()), Box::new(ok.clone())),
+            args[0].span,
+        );
+        let mapper = self.infer_expr(&args[1], env);
+        self.unify(
+            mapper,
+            Type::Fn(vec![ok], Box::new(next_ok.clone())),
+            args[1].span,
+        );
+        Type::Task(Box::new(self.resolve(err)), Box::new(self.resolve(next_ok)))
+    }
+
+    fn infer_task_map_error(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 2 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                2,
+                args.len(),
+            );
+            return Type::Task(Box::new(self.fresh()), Box::new(self.fresh()));
+        }
+
+        let err = self.fresh();
+        let ok = self.fresh();
+        let next_err = self.fresh();
+        let task = self.infer_expr(&args[0], env);
+        self.unify(
+            task,
+            Type::Task(Box::new(err.clone()), Box::new(ok.clone())),
+            args[0].span,
+        );
+        let mapper = self.infer_expr(&args[1], env);
+        self.unify(
+            mapper,
+            Type::Fn(vec![err], Box::new(next_err.clone())),
+            args[1].span,
+        );
+        Type::Task(Box::new(self.resolve(next_err)), Box::new(self.resolve(ok)))
+    }
+
+    fn infer_task_and_then(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 2 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                2,
+                args.len(),
+            );
+            return Type::Task(Box::new(self.fresh()), Box::new(self.fresh()));
+        }
+
+        let err = self.fresh();
+        let ok = self.fresh();
+        let next_ok = self.fresh();
+        let task = self.infer_expr(&args[0], env);
+        self.unify(
+            task,
+            Type::Task(Box::new(err.clone()), Box::new(ok.clone())),
+            args[0].span,
+        );
+        let next = self.infer_expr(&args[1], env);
+        self.unify(
+            next,
+            Type::Fn(
+                vec![ok],
+                Box::new(Type::Task(Box::new(err.clone()), Box::new(next_ok.clone()))),
+            ),
+            args[1].span,
+        );
+        Type::Task(Box::new(self.resolve(err)), Box::new(self.resolve(next_ok)))
+    }
+
+    fn infer_task_perform(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        match args.len() {
+            3 => self.infer_task_perform_value(args, env),
+            4 => self.infer_task_perform_call(args, env),
+            found => {
+                self.diagnostics.push(Diagnostic::error(
+                    args.first().map_or(Span::default(), |arg| arg.span),
+                    format!("{} expects 3 or 4 arguments, found {}", name, found),
+                ));
+                for arg in args {
+                    self.infer_expr(arg, env);
+                }
+                Type::Cmd(Box::new(self.fresh()))
+            }
+        }
+    }
+
+    fn infer_task_perform_value(&mut self, args: &[Expr], env: &mut HashMap<String, Type>) -> Type {
+        let err = self.fresh();
+        let ok = self.fresh();
+        let task = self.infer_expr(&args[0], env);
+        self.unify(
+            task,
+            Type::Task(Box::new(err.clone()), Box::new(ok.clone())),
+            args[0].span,
+        );
+        self.infer_task_perform_mappers(err, ok, &args[1], &args[2], env)
+    }
+
+    fn infer_task_perform_call(&mut self, args: &[Expr], env: &mut HashMap<String, Type>) -> Type {
+        let input = self.infer_expr(&args[1], env);
+        let err = self.fresh();
+        let ok = self.fresh();
+        let task_fn = self.infer_expr(&args[0], env);
+        self.unify(
+            task_fn,
+            Type::Fn(
+                vec![input],
+                Box::new(Type::Task(Box::new(err.clone()), Box::new(ok.clone()))),
+            ),
+            args[0].span,
+        );
+        self.infer_task_perform_mappers(err, ok, &args[2], &args[3], env)
+    }
+
+    fn infer_task_perform_mappers(
+        &mut self,
+        err: Type,
+        ok: Type,
+        ok_mapper_expr: &Expr,
+        err_mapper_expr: &Expr,
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        let ok_msg = self.fresh();
+        let err_msg = self.fresh();
+        let ok_mapper = self.infer_expr(ok_mapper_expr, env);
+        self.unify(
+            ok_mapper,
+            Type::Fn(vec![ok], Box::new(ok_msg.clone())),
+            ok_mapper_expr.span,
+        );
+        let err_mapper = self.infer_expr(err_mapper_expr, env);
+        self.unify(
+            err_mapper,
+            Type::Fn(vec![err], Box::new(err_msg.clone())),
+            err_mapper_expr.span,
+        );
+        let msg = self.join_types(ok_msg, err_msg, err_mapper_expr.span);
+        Type::Cmd(Box::new(self.resolve(msg)))
+    }
+
+    fn infer_http_get_text(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 1 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                1,
+                args.len(),
+            );
+            return Type::Task(Box::new(Type::String), Box::new(Type::String));
+        }
+
+        let url = self.infer_expr(&args[0], env);
+        self.unify(Type::String, url, args[0].span);
+        Type::Task(Box::new(Type::String), Box::new(Type::String))
+    }
+
+    fn infer_http_get_json(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 1 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                1,
+                args.len(),
+            );
+            return Type::Task(Box::new(Type::String), Box::new(Type::Js));
+        }
+
+        let url = self.infer_expr(&args[0], env);
+        self.unify(Type::String, url, args[0].span);
+        Type::Task(Box::new(Type::String), Box::new(Type::Js))
+    }
+
+    fn infer_scope_update(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 5 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                5,
+                args.len(),
+            );
+            return Type::Tuple(vec![self.fresh(), Type::Cmd(Box::new(self.fresh()))]);
+        }
+
+        let (parent_state, child_state) =
+            self.infer_scope_parent_child_state(&args[0], &args[1], env);
+        let child_msg = self.infer_expr(&args[2], env);
+        let update_ty = self.infer_expr(&args[3], env);
+        self.unify(
+            update_ty,
+            Type::Fn(
+                vec![child_state.clone(), child_msg.clone()],
+                Box::new(Type::Tuple(vec![
+                    child_state.clone(),
+                    Type::Cmd(Box::new(child_msg.clone())),
+                ])),
+            ),
+            args[3].span,
+        );
+
+        let parent_msg = self.scope_wrapper_message_type(&args[4], child_msg, env);
+        Type::Tuple(vec![parent_state, Type::Cmd(Box::new(parent_msg))])
+    }
+
+    fn infer_scope_subscriptions(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 3 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                3,
+                args.len(),
+            );
+            return Type::Sub(Box::new(self.fresh()));
+        }
+
+        let child_state = self.infer_expr(&args[0], env);
+        let child_msg = self.fresh();
+        let subscriptions_ty = self.infer_expr(&args[1], env);
+        self.unify(
+            subscriptions_ty,
+            Type::Fn(
+                vec![child_state],
+                Box::new(Type::Sub(Box::new(child_msg.clone()))),
+            ),
+            args[1].span,
+        );
+
+        let parent_msg = self.scope_wrapper_message_type(&args[2], child_msg, env);
+        Type::Sub(Box::new(parent_msg))
+    }
+
+    fn infer_scope_view(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 3 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                3,
+                args.len(),
+            );
+            return Type::Html;
+        }
+
+        self.infer_scope_tag(&args[0], env);
+        let child_state = self.infer_expr(&args[2], env);
+        let view_ty = self.infer_expr(&args[1], env);
+        self.unify(
+            view_ty,
+            Type::Fn(vec![child_state], Box::new(Type::Html)),
+            args[1].span,
+        );
+        Type::Html
+    }
+
+    fn infer_scope_parent_child_state(
+        &mut self,
+        parent_expr: &Expr,
+        field_expr: &Expr,
+        env: &mut HashMap<String, Type>,
+    ) -> (Type, Type) {
+        let parent_ty = self.infer_expr(parent_expr, env);
+        let Some(field) = self.scope_keyword_name(field_expr, env, "scope field") else {
+            let child_state = self.fresh();
+            return (parent_ty, child_state);
+        };
+
+        let (child_state, updated_parent) =
+            self.infer_field_read(parent_ty, &field, field_expr.span);
+        let resolved_parent = self.resolve(updated_parent);
+        if let ExprKind::Symbol(name) = &parent_expr.kind {
+            env.insert(name.clone(), resolved_parent.clone());
+        }
+        (resolved_parent, child_state)
+    }
+
+    fn scope_wrapper_message_type(
+        &mut self,
+        tag_expr: &Expr,
+        child_msg: Type,
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        let tag = self
+            .scope_keyword_name(tag_expr, env, "scope message tag")
+            .map(|tag| Type::Keyword(Some(tag)))
+            .unwrap_or(Type::Keyword(None));
+        Type::Record(BTreeMap::from([
+            ("kind".to_string(), tag),
+            ("msg".to_string(), child_msg),
+        ]))
+    }
+
+    fn infer_scope_tag(&mut self, tag_expr: &Expr, env: &mut HashMap<String, Type>) {
+        let _ = self.scope_keyword_name(tag_expr, env, "scope message tag");
+    }
+
+    fn scope_keyword_name(
+        &mut self,
+        expr: &Expr,
+        env: &mut HashMap<String, Type>,
+        _label: &str,
+    ) -> Option<String> {
+        let ty = self.infer_expr(expr, env);
+        self.unify(ty, Type::Keyword(None), expr.span);
+        match &expr.kind {
+            ExprKind::Keyword(name) => Some(name.clone()),
+            _ => None,
+        }
+    }
+
+    fn infer_sub_batch(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 1 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                1,
+                args.len(),
+            );
+            return Type::Sub(Box::new(self.fresh()));
+        }
+
+        let msg = self.fresh();
+        let batch_ty = self.infer_expr(&args[0], env);
+        match self.resolve(batch_ty) {
+            Type::Vector(item) => {
+                self.unify(Type::Sub(Box::new(msg.clone())), *item, args[0].span);
+            }
+            Type::Tuple(items) => {
+                for item in items {
+                    self.unify(Type::Sub(Box::new(msg.clone())), item, args[0].span);
+                }
+            }
+            Type::Var(_) => {}
+            other => {
+                let found = self.format_type(&other);
+                self.diagnostics.push(Diagnostic::error(
+                    args[0].span,
+                    format!(
+                        "Sub.batch expects a vector of subscriptions, found {}",
+                        found
+                    ),
+                ));
+            }
+        }
+        Type::Sub(Box::new(self.resolve(msg)))
+    }
+
+    fn infer_sub_timer_every(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 3 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                3,
+                args.len(),
+            );
+            return Type::Sub(Box::new(self.fresh()));
+        }
+
+        let id = self.infer_expr(&args[0], env);
+        self.unify(Type::String, id, args[0].span);
+        let ms = self.infer_expr(&args[1], env);
+        self.unify(Type::Number, ms, args[1].span);
+        let msg = self.infer_expr(&args[2], env);
+        Type::Sub(Box::new(msg))
+    }
+
+    fn infer_sub_change(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+        subscription_kind: &str,
+    ) -> Type {
+        if args.len() != 3 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                3,
+                args.len(),
+            );
+            return Type::Sub(Box::new(self.fresh()));
+        }
+
+        let id = self.infer_expr(&args[0], env);
+        self.unify(Type::String, id, args[0].span);
+        let target = self.infer_expr(&args[1], env);
+        self.unify(Type::String, target, args[1].span);
+        let tag = self.infer_expr(&args[2], env);
+        let msg = self.subscription_tag_message_type(
+            Some(subscription_kind),
+            "onChange",
+            tag,
+            args[2].span,
+        );
+        Type::Sub(Box::new(msg))
+    }
+
+    fn infer_sub_window_event(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 3 && args.len() != 4 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                3,
+                args.len(),
+            );
+            return Type::Sub(Box::new(self.fresh()));
+        }
+
+        let id = self.infer_expr(&args[0], env);
+        self.unify(Type::String, id, args[0].span);
+        let event_type = self.infer_expr(&args[1], env);
+        self.unify(Type::String, event_type, args[1].span);
+        let tag = self.infer_expr(&args[2], env);
+        if let Some(options) = args.get(3) {
+            self.infer_expr(options, env);
+        }
+        let msg = self.subscription_tag_message_type(
+            Some("sub/window/event"),
+            "onEvent",
+            tag,
+            args[2].span,
+        );
+        Type::Sub(Box::new(msg))
+    }
+
     fn infer_numeric_call(
         &mut self,
         name: &str,
@@ -2129,6 +3478,24 @@ impl Inferencer {
                 let ty = self.infer_expr(arg, env);
                 self.unify(ty, Type::Number, arg.span);
             }
+        }
+        Type::Bool
+    }
+
+    fn infer_identity_call(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() < 2 {
+            self.diagnostics.push(Diagnostic::error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                format!("{} expects at least two arguments", name),
+            ));
+        }
+        for arg in args {
+            self.infer_expr(arg, env);
         }
         Type::Bool
     }
@@ -2659,6 +4026,150 @@ impl Inferencer {
         self.fresh()
     }
 
+    fn infer_get_in(&mut self, name: &str, args: &[Expr], env: &mut HashMap<String, Type>) -> Type {
+        if args.len() != 2 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                2,
+                args.len(),
+            );
+            return self.fresh();
+        }
+
+        let base_ty = self.infer_expr(&args[0], env);
+        let Some(path) = self.static_record_path(name, &args[1]) else {
+            return self.fresh();
+        };
+        self.infer_static_path_read(base_ty, &path, args[1].span)
+    }
+
+    fn infer_update_in(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() < 3 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                3,
+                args.len(),
+            );
+            return self.fresh();
+        }
+
+        let base_ty = self.infer_expr(&args[0], env);
+        let Some(path) = self.static_record_path(name, &args[1]) else {
+            self.infer_expr(&args[2], env);
+            for arg in args.iter().skip(3) {
+                self.infer_expr(arg, env);
+            }
+            return base_ty;
+        };
+        let current_ty = self.infer_static_path_read(base_ty.clone(), &path, args[1].span);
+        let extra_arg_tys = args
+            .iter()
+            .skip(3)
+            .map(|arg| self.infer_expr(arg, env))
+            .collect::<Vec<_>>();
+        let next_ty = self.fresh();
+        let mut updater_args = Vec::with_capacity(1 + extra_arg_tys.len());
+        updater_args.push(current_ty);
+        updater_args.extend(extra_arg_tys);
+        let updater_ty = self.infer_expr(&args[2], env);
+        self.unify(
+            updater_ty,
+            Type::Fn(updater_args, Box::new(next_ty.clone())),
+            args[2].span,
+        );
+        let next_ty = self.resolve(next_ty);
+        self.record_with_static_path_update(base_ty, &path, next_ty, args[1].span)
+    }
+
+    fn static_record_path(&mut self, name: &str, path: &Expr) -> Option<Vec<String>> {
+        let ExprKind::Vector(items) = &path.kind else {
+            self.diagnostics.push(Diagnostic::error(
+                path.span,
+                format!(
+                    "{} path must be a static vector of keywords, strings, or symbols",
+                    name
+                ),
+            ));
+            return None;
+        };
+
+        let mut fields = Vec::new();
+        for item in items {
+            let Some(field) = record_key_name(item) else {
+                self.diagnostics.push(Diagnostic::error(
+                    item.span,
+                    format!(
+                        "{} path entries must be keywords, strings, or symbols",
+                        name
+                    ),
+                ));
+                return None;
+            };
+            fields.push(field);
+        }
+        Some(fields)
+    }
+
+    fn infer_static_path_read(&mut self, base_ty: Type, path: &[String], span: Span) -> Type {
+        let mut current_ty = base_ty;
+        for field in path {
+            let (field_ty, _) = self.infer_field_read(current_ty, field, span);
+            current_ty = field_ty;
+        }
+        current_ty
+    }
+
+    fn record_with_static_path_update(
+        &mut self,
+        base_ty: Type,
+        path: &[String],
+        next_ty: Type,
+        span: Span,
+    ) -> Type {
+        let Some((field, rest)) = path.split_first() else {
+            return next_ty;
+        };
+
+        match self.shallow_resolve(base_ty) {
+            Type::Var(id) => {
+                let nested_ty = self.fresh();
+                let updated_nested =
+                    self.record_with_static_path_update(nested_ty, rest, next_ty, span);
+                self.bind(
+                    id,
+                    Type::Record(BTreeMap::from([(field.clone(), updated_nested)])),
+                    span,
+                )
+            }
+            Type::Record(mut fields) => {
+                let current = fields.remove(field).unwrap_or_else(|| self.fresh());
+                let updated_nested =
+                    self.record_with_static_path_update(current, rest, next_ty, span);
+                fields.insert(field.clone(), updated_nested);
+                Type::Record(fields)
+            }
+            Type::Js => Type::Js,
+            other => {
+                let type_name = self.format_type(&other);
+                self.diagnostics.push(Diagnostic::error(
+                    span,
+                    format!(
+                        "update-in expects records along its path, found {}",
+                        type_name
+                    ),
+                ));
+                other
+            }
+        }
+    }
+
     fn infer_assoc(&mut self, name: &str, args: &[Expr], env: &mut HashMap<String, Type>) -> Type {
         if args.len() < 3 || args[1..].len() % 2 != 0 {
             self.diagnostics.push(Diagnostic::error(
@@ -3182,6 +4693,142 @@ impl Inferencer {
         Type::Result(Box::new(self.fresh()), Box::new(Type::String))
     }
 
+    fn infer_zero_arg_decoder(&mut self, name: &str, args: &[Expr], ty: Type) -> Type {
+        if !args.is_empty() {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                0,
+                args.len(),
+            );
+        }
+        Type::Decoder(Box::new(ty))
+    }
+
+    fn infer_decoder_literal(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 1 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                1,
+                args.len(),
+            );
+            return Type::Decoder(Box::new(self.fresh()));
+        }
+
+        let ty = self.infer_expr(&args[0], env);
+        Type::Decoder(Box::new(self.resolve(ty)))
+    }
+
+    fn infer_decoder_optional(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 1 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                1,
+                args.len(),
+            );
+            return Type::Decoder(Box::new(Type::Option(Box::new(self.fresh()))));
+        }
+
+        let inner = self.infer_decoder_inner_arg(&args[0], env);
+        Type::Decoder(Box::new(Type::Option(Box::new(inner))))
+    }
+
+    fn infer_decoder_vector(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 1 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                1,
+                args.len(),
+            );
+            return Type::Decoder(Box::new(Type::Vector(Box::new(self.fresh()))));
+        }
+
+        let inner = self.infer_decoder_inner_arg(&args[0], env);
+        Type::Decoder(Box::new(Type::Vector(Box::new(inner))))
+    }
+
+    fn infer_decoder_record(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 1 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                1,
+                args.len(),
+            );
+            return Type::Decoder(Box::new(Type::Record(BTreeMap::new())));
+        }
+
+        let ExprKind::Map(entries) = &args[0].kind else {
+            self.diagnostics.push(Diagnostic::error(
+                args[0].span,
+                "decoder-record expects a record literal of decoder fields",
+            ));
+            self.infer_expr(&args[0], env);
+            return Type::Decoder(Box::new(Type::Record(BTreeMap::new())));
+        };
+
+        let mut fields = BTreeMap::new();
+        for (key, decoder) in entries {
+            let Some(name) = record_key_name(key) else {
+                self.diagnostics.push(Diagnostic::error(
+                    key.span,
+                    "decoder-record field names must be keywords, strings, or symbols",
+                ));
+                self.infer_expr(decoder, env);
+                continue;
+            };
+            let field_ty = self.infer_decoder_inner_arg(decoder, env);
+            fields.insert(name, field_ty);
+        }
+        Type::Decoder(Box::new(Type::Record(fields)))
+    }
+
+    fn infer_decode(&mut self, name: &str, args: &[Expr], env: &mut HashMap<String, Type>) -> Type {
+        if args.len() != 2 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                2,
+                args.len(),
+            );
+            return Type::Result(Box::new(self.fresh()), Box::new(Type::String));
+        }
+
+        let inner = self.infer_decoder_inner_arg(&args[0], env);
+        self.infer_expr(&args[1], env);
+        Type::Result(Box::new(inner), Box::new(Type::String))
+    }
+
+    fn infer_decoder_inner_arg(&mut self, expr: &Expr, env: &mut HashMap<String, Type>) -> Type {
+        let inner = self.fresh();
+        let decoder = self.infer_expr(expr, env);
+        self.unify(decoder, Type::Decoder(Box::new(inner.clone())), expr.span);
+        self.resolve(inner)
+    }
+
     fn infer_url_resolve(
         &mut self,
         name: &str,
@@ -3315,8 +4962,11 @@ impl Inferencer {
             );
             return self.fresh();
         }
-        self.infer_expr(&args[0], env);
+        let base_ty = self.infer_expr(&args[0], env);
         self.infer_expr(&args[1], env);
+        if matches!(self.resolve(base_ty), Type::Js) {
+            return Type::Js;
+        }
         self.fresh()
     }
 
@@ -3336,9 +4986,12 @@ impl Inferencer {
             return self.fresh();
         }
 
-        self.infer_expr(&args[0], env);
+        let base_ty = self.infer_expr(&args[0], env);
         let key_ty = self.infer_expr(&args[1], env);
         self.unify(key_ty, Type::String, args[1].span);
+        if matches!(self.resolve(base_ty), Type::Js) {
+            return Type::Js;
+        }
         self.fresh()
     }
 
@@ -3455,6 +5108,18 @@ impl Inferencer {
             CollectionKind::List,
         );
         Type::List(Box::new(self.resolve(element_ty)))
+    }
+
+    fn infer_find_overloaded(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if matches!(args.get(1).map(|arg| &arg.kind), Some(ExprKind::String(_))) {
+            return self.infer_query_helper(name, args, env, false);
+        }
+        self.infer_find(name, args, env)
     }
 
     fn infer_find(&mut self, name: &str, args: &[Expr], env: &mut HashMap<String, Type>) -> Type {
@@ -4081,7 +5746,9 @@ impl Inferencer {
                 Type::Keyword(literal)
             }
             (Type::Syntax, Type::Syntax) => Type::Syntax,
+            (Type::Js, Type::Js) => Type::Js,
             (Type::Html, Type::Html) => Type::Html,
+            (Type::TrustedHtml, Type::TrustedHtml) => Type::TrustedHtml,
             (Type::Nil, Type::Option(inner)) | (Type::Option(inner), Type::Nil) => {
                 Type::Option(inner)
             }
@@ -4089,6 +5756,10 @@ impl Inferencer {
             (Type::Option(a), Type::Option(b)) => {
                 let inner = self.unify(*a, *b, span);
                 Type::Option(Box::new(inner))
+            }
+            (Type::Decoder(a), Type::Decoder(b)) => {
+                let inner = self.unify(*a, *b, span);
+                Type::Decoder(Box::new(inner))
             }
             (Type::Option(inner), ty) | (ty, Type::Option(inner)) => {
                 let inner = self.unify(*inner, ty, span);
@@ -4149,6 +5820,30 @@ impl Inferencer {
             }
             (Type::Cmd(msg), Type::Union(variants)) | (Type::Union(variants), Type::Cmd(msg)) => {
                 self.unify_cmd_union(*msg, variants, span)
+            }
+            (Type::Task(a_err, a_ok), Type::Task(b_err, b_ok)) => {
+                let err = self.unify(*a_err, *b_err, span);
+                let ok = self.unify(*a_ok, *b_ok, span);
+                Type::Task(Box::new(err), Box::new(ok))
+            }
+            (Type::Sub(a), Type::Sub(b)) => {
+                self.require_subscription_message_matches(
+                    (*a).clone(),
+                    (*b).clone(),
+                    span,
+                    ":subscriptions item",
+                );
+                Type::Sub(Box::new(self.resolve(*a)))
+            }
+            (Type::Sub(msg), Type::Record(fields)) | (Type::Record(fields), Type::Sub(msg)) => {
+                self.unify_sub_record(*msg, fields, span)
+            }
+            (Type::Sub(msg), Type::Union(variants)) | (Type::Union(variants), Type::Sub(msg)) => {
+                self.unify_sub_union(*msg, variants, span)
+            }
+            (Type::Event(a), Type::Event(b)) => {
+                let msg = self.unify(*a, *b, span);
+                Type::Event(Box::new(msg))
             }
             (Type::Union(a), Type::Union(b)) => {
                 if a.len() != b.len() {
@@ -4236,12 +5931,58 @@ impl Inferencer {
                     .map(|(left, right)| self.join_types(left, right, span))
                     .collect(),
             ),
+            (Type::Decoder(left), Type::Decoder(right)) => {
+                Type::Decoder(Box::new(self.join_types(*left, *right, span)))
+            }
             (Type::Cmd(left), Type::Cmd(right)) => {
                 Type::Cmd(Box::new(self.join_types(*left, *right, span)))
+            }
+            (Type::Cmd(left), Type::Record(right)) if is_batch_command_record_fields(&right) => {
+                let right_msg = self.infer_command_record_message_type(right, span);
+                Type::Cmd(Box::new(self.join_types(*left, right_msg, span)))
+            }
+            (Type::Record(left), Type::Cmd(right)) if is_batch_command_record_fields(&left) => {
+                let left_msg = self.infer_command_record_message_type(left, span);
+                Type::Cmd(Box::new(self.join_types(left_msg, *right, span)))
+            }
+            (Type::Task(left_err, left_ok), Type::Task(right_err, right_ok)) => Type::Task(
+                Box::new(self.join_types(*left_err, *right_err, span)),
+                Box::new(self.join_types(*left_ok, *right_ok, span)),
+            ),
+            (Type::Sub(left), Type::Sub(right)) => {
+                Type::Sub(Box::new(self.join_types(*left, *right, span)))
+            }
+            (Type::Event(left), Type::Event(right)) => {
+                Type::Event(Box::new(self.join_types(*left, *right, span)))
+            }
+            (Type::Event(left), right) | (right, Type::Event(left)) => {
+                Type::Event(Box::new(self.join_types(*left, right, span)))
             }
             (Type::Union(left), Type::Union(right)) => self.join_union_variants(left, right, span),
             (Type::Union(variants), ty) | (ty, Type::Union(variants)) => {
                 self.join_union_with_type(variants, ty, span)
+            }
+            (Type::Record(left), Type::Record(right))
+                if is_batch_command_record_fields(&left)
+                    && is_batch_command_record_fields(&right) =>
+            {
+                let left_msg = self.infer_command_record_message_type(left, span);
+                let right_msg = self.infer_command_record_message_type(right, span);
+                Type::Cmd(Box::new(self.join_types(left_msg, right_msg, span)))
+            }
+            (Type::Record(left), Type::Record(right))
+                if is_batch_command_record_fields(&left) && is_command_record_fields(&right) =>
+            {
+                let left_msg = self.infer_command_record_message_type(left, span);
+                let right_msg = self.infer_command_record_message_type(right, span);
+                Type::Cmd(Box::new(self.join_types(left_msg, right_msg, span)))
+            }
+            (Type::Record(left), Type::Record(right))
+                if is_command_record_fields(&left) && is_batch_command_record_fields(&right) =>
+            {
+                let left_msg = self.infer_command_record_message_type(left, span);
+                let right_msg = self.infer_command_record_message_type(right, span);
+                Type::Cmd(Box::new(self.join_types(left_msg, right_msg, span)))
             }
             (Type::Record(left), Type::Record(right))
                 if records_have_distinct_tags(&left, &right) =>
@@ -4344,19 +6085,30 @@ impl Inferencer {
             | (Type::Bool, Type::Bool)
             | (Type::Nil, Type::Nil)
             | (Type::Syntax, Type::Syntax)
-            | (Type::Html, Type::Html) => true,
+            | (Type::Js, Type::Js)
+            | (Type::Html, Type::Html)
+            | (Type::TrustedHtml, Type::TrustedHtml) => true,
             (Type::Keyword(expected), Type::Keyword(actual)) => {
                 keyword_type_accepts(&expected, &actual)
             }
             (Type::Option(left), Type::Option(right))
+            | (Type::Decoder(left), Type::Decoder(right))
             | (Type::List(left), Type::List(right))
             | (Type::Vector(left), Type::Vector(right))
             | (Type::Set(left), Type::Set(right))
-            | (Type::Cmd(left), Type::Cmd(right)) => self.union_field_matches(*left, *right, span),
+            | (Type::Cmd(left), Type::Cmd(right))
+            | (Type::Sub(left), Type::Sub(right))
+            | (Type::Event(left), Type::Event(right)) => {
+                self.union_field_matches(*left, *right, span)
+            }
             (Type::Map(left_key, left_value), Type::Map(right_key, right_value))
             | (Type::Result(left_key, left_value), Type::Result(right_key, right_value)) => {
                 self.union_field_matches(*left_key, *right_key, span)
                     && self.union_field_matches(*left_value, *right_value, span)
+            }
+            (Type::Task(left_err, left_ok), Type::Task(right_err, right_ok)) => {
+                self.union_field_matches(*left_err, *right_err, span)
+                    && self.union_field_matches(*left_ok, *right_ok, span)
             }
             (Type::Tuple(left), Type::Tuple(right)) => {
                 left.len() == right.len()
@@ -4459,13 +6211,86 @@ impl Inferencer {
         Type::Cmd(Box::new(msg))
     }
 
+    fn unify_sub_record(
+        &mut self,
+        msg: Type,
+        mut fields: BTreeMap<String, Type>,
+        span: Span,
+    ) -> Type {
+        let msg = self.resolve(msg);
+        let mut subscription_kind = None;
+        let mut known_subscription = false;
+        match fields.remove("kind") {
+            Some(kind_ty) => {
+                let kind_ty = self.resolve(kind_ty);
+                self.unify(kind_ty.clone(), Type::Keyword(None), span);
+                subscription_kind = keyword_literal_name(&kind_ty).map(str::to_string);
+                if let Some(kind) = subscription_kind.as_deref() {
+                    if !is_known_subscription_kind(kind) {
+                        self.diagnostics.push(Diagnostic::error(
+                            span,
+                            format!("unknown subscription kind :{}", kind),
+                        ));
+                    } else {
+                        known_subscription = true;
+                        self.validate_subscription_schema(kind, &fields, span);
+                    }
+                }
+                if subscription_kind.as_deref() == Some("batch") {
+                    self.validate_batch_subscriptions(&msg, &fields, span);
+                }
+            }
+            None => self.diagnostics.push(Diagnostic::error(
+                span,
+                "subscription value must include :kind to satisfy Sub annotation",
+            )),
+        }
+        if known_subscription {
+            self.validate_subscription_messages(subscription_kind.as_deref(), &msg, &fields, span);
+        }
+        Type::Sub(Box::new(msg))
+    }
+
+    fn unify_sub_union(&mut self, msg: Type, variants: Vec<Type>, span: Span) -> Type {
+        let msg = self.resolve(msg);
+        for variant in variants {
+            match self.resolve(variant) {
+                Type::Record(fields) => {
+                    self.unify_sub_record(msg.clone(), fields, span);
+                }
+                Type::Union(variants) => {
+                    self.unify_sub_union(msg.clone(), variants, span);
+                }
+                Type::Var(_) => {}
+                other => {
+                    let found = self.format_type(&other);
+                    self.diagnostics.push(Diagnostic::error(
+                        span,
+                        format!(
+                            "subscription union variant must be a subscription record, found {}",
+                            found
+                        ),
+                    ));
+                }
+            }
+        }
+        Type::Sub(Box::new(msg))
+    }
+
     fn validate_command_schema(
         &mut self,
         command_kind: &str,
         fields: &BTreeMap<String, Type>,
         span: Span,
     ) {
-        if matches!(command_kind, "none" | "batch") {
+        if command_kind == "task/perform" {
+            self.require_command_fields(
+                command_kind,
+                fields,
+                &["task", "onSuccess", "onError"],
+                span,
+            );
+        } else if matches!(command_kind, "none" | "batch") {
             self.reject_structural_command_continuations(command_kind, fields, span);
         } else if matches!(command_kind, "dom-ref/resize-watch" | "media-query/watch") {
             self.reject_change_command_success_continuations(command_kind, fields, span);
@@ -4618,6 +6443,80 @@ impl Inferencer {
             "storage/remove" => {
                 self.require_command_fields(command_kind, fields, &["key"], span);
                 self.require_command_field_type(command_kind, fields, "key", Type::String, span);
+            }
+            "browser/history-replace-search-param" => {
+                self.require_command_fields(command_kind, fields, &["name", "value"], span);
+                self.require_command_field_type(command_kind, fields, "name", Type::String, span);
+                self.require_command_field_type(
+                    command_kind,
+                    fields,
+                    "value",
+                    Type::Option(Box::new(Type::String)),
+                    span,
+                );
+            }
+            "browser/history-write-route" => {
+                self.require_command_fields(
+                    command_kind,
+                    fields,
+                    &["url", "op", "definition"],
+                    span,
+                );
+                self.require_command_field_type(command_kind, fields, "url", Type::String, span);
+                self.require_command_field_type(
+                    command_kind,
+                    fields,
+                    "op",
+                    Type::Option(Box::new(Type::String)),
+                    span,
+                );
+                self.require_command_field_type(
+                    command_kind,
+                    fields,
+                    "definition",
+                    Type::Option(Box::new(Type::String)),
+                    span,
+                );
+            }
+            "browser/theme-load" => {
+                self.require_command_fields(command_kind, fields, &["key"], span);
+                self.require_command_field_type(command_kind, fields, "key", Type::String, span);
+                self.require_success_command_field(command_kind, fields, span);
+            }
+            "browser/theme-apply" => {
+                self.require_command_fields(command_kind, fields, &["theme", "key"], span);
+                self.require_command_field_type(command_kind, fields, "theme", Type::String, span);
+                self.require_command_field_type(command_kind, fields, "key", Type::String, span);
+            }
+            "browser/clipboard-write" => {
+                self.require_command_fields(command_kind, fields, &["text"], span);
+                self.require_command_field_type(command_kind, fields, "text", Type::String, span);
+            }
+            "browser/set-cookie" => {
+                self.require_command_fields(command_kind, fields, &["name", "value"], span);
+                self.require_command_field_type(command_kind, fields, "name", Type::String, span);
+                self.require_command_field_type(command_kind, fields, "value", Type::String, span);
+            }
+            "auth-storage/load" => {
+                self.require_command_fields(command_kind, fields, &["sourceUrl"], span);
+                self.require_command_field_type(
+                    command_kind,
+                    fields,
+                    "sourceUrl",
+                    Type::String,
+                    span,
+                );
+                self.require_success_command_field(command_kind, fields, span);
+            }
+            "auth-storage/persist" => {
+                self.require_command_fields(command_kind, fields, &["sourceUrl", "entries"], span);
+                self.require_command_field_type(
+                    command_kind,
+                    fields,
+                    "sourceUrl",
+                    Type::String,
+                    span,
+                );
             }
             "random/number" => {
                 self.require_success_command_field(command_kind, fields, span);
@@ -4777,6 +6676,195 @@ impl Inferencer {
                 self.require_success_command_field(command_kind, fields, span);
             }
             "none" => {}
+            _ => {}
+        }
+    }
+
+    fn validate_subscription_schema(
+        &mut self,
+        subscription_kind: &str,
+        fields: &BTreeMap<String, Type>,
+        span: Span,
+    ) {
+        match subscription_kind {
+            "none" => {}
+            "batch" => {
+                if !fields.contains_key("subscriptions") && !fields.contains_key("subs") {
+                    self.diagnostics.push(Diagnostic::error(
+                        span,
+                        "batch subscription is missing a :subscriptions vector",
+                    ));
+                }
+            }
+            "sub/timer/every" => {
+                self.require_command_fields(subscription_kind, fields, &["id", "ms", "msg"], span);
+                self.require_command_field_type(
+                    subscription_kind,
+                    fields,
+                    "id",
+                    Type::String,
+                    span,
+                );
+                self.require_command_field_type(
+                    subscription_kind,
+                    fields,
+                    "ms",
+                    Type::Number,
+                    span,
+                );
+            }
+            "sub/dom-ref/resize" => {
+                self.require_command_fields(subscription_kind, fields, &["ref", "onChange"], span);
+                self.require_command_field_type(
+                    subscription_kind,
+                    fields,
+                    "id",
+                    Type::String,
+                    span,
+                );
+                self.require_command_field_type(
+                    subscription_kind,
+                    fields,
+                    "ref",
+                    Type::String,
+                    span,
+                );
+            }
+            "sub/window/event" => {
+                self.require_command_fields(subscription_kind, fields, &["type", "onEvent"], span);
+                self.require_command_field_type(
+                    subscription_kind,
+                    fields,
+                    "id",
+                    Type::String,
+                    span,
+                );
+                self.require_command_field_type(
+                    subscription_kind,
+                    fields,
+                    "type",
+                    Type::String,
+                    span,
+                );
+            }
+            "sub/media-query" => {
+                self.require_command_fields(
+                    subscription_kind,
+                    fields,
+                    &["query", "onChange"],
+                    span,
+                );
+                self.require_command_field_type(
+                    subscription_kind,
+                    fields,
+                    "id",
+                    Type::String,
+                    span,
+                );
+                self.require_command_field_type(
+                    subscription_kind,
+                    fields,
+                    "query",
+                    Type::String,
+                    span,
+                );
+            }
+            "sub/simulation/heart-rate" => {
+                self.require_command_fields(subscription_kind, fields, &["id", "onReading"], span);
+                self.require_command_field_type(
+                    subscription_kind,
+                    fields,
+                    "id",
+                    Type::String,
+                    span,
+                );
+                self.require_command_field_type(
+                    subscription_kind,
+                    fields,
+                    "ms",
+                    Type::Number,
+                    span,
+                );
+                self.require_command_field_type(
+                    subscription_kind,
+                    fields,
+                    "min",
+                    Type::Number,
+                    span,
+                );
+                self.require_command_field_type(
+                    subscription_kind,
+                    fields,
+                    "max",
+                    Type::Number,
+                    span,
+                );
+                self.require_command_field_type(
+                    subscription_kind,
+                    fields,
+                    "jitter",
+                    Type::Number,
+                    span,
+                );
+                self.require_command_field_type(
+                    subscription_kind,
+                    fields,
+                    "start",
+                    Type::Number,
+                    span,
+                );
+                self.require_command_field_type(
+                    subscription_kind,
+                    fields,
+                    "deviceName",
+                    Type::String,
+                    span,
+                );
+            }
+            "sub/bluetooth/connect-heart-rate" => {
+                self.require_command_fields(subscription_kind, fields, &["id", "onReading"], span);
+                self.require_command_field_type(
+                    subscription_kind,
+                    fields,
+                    "id",
+                    Type::String,
+                    span,
+                );
+                self.require_one_command_field(
+                    subscription_kind,
+                    fields,
+                    &["options", "filters", "acceptAllDevices"],
+                    span,
+                );
+                self.require_command_field_type(
+                    subscription_kind,
+                    fields,
+                    "options",
+                    Type::Record(BTreeMap::new()),
+                    span,
+                );
+                self.require_command_field_type(
+                    subscription_kind,
+                    fields,
+                    "filters",
+                    Type::Vector(Box::new(bluetooth_filter_type())),
+                    span,
+                );
+                self.require_command_field_type(
+                    subscription_kind,
+                    fields,
+                    "optionalServices",
+                    Type::Vector(Box::new(Type::String)),
+                    span,
+                );
+                self.require_command_field_type(
+                    subscription_kind,
+                    fields,
+                    "acceptAllDevices",
+                    Type::Bool,
+                    span,
+                );
+            }
             _ => {}
         }
     }
@@ -5109,6 +7197,42 @@ impl Inferencer {
         }
     }
 
+    fn validate_batch_subscriptions(
+        &mut self,
+        msg: &Type,
+        fields: &BTreeMap<String, Type>,
+        span: Span,
+    ) {
+        let Some(subscriptions_ty) = fields
+            .get("subscriptions")
+            .or_else(|| fields.get("subs"))
+            .cloned()
+        else {
+            return;
+        };
+        match self.resolve(subscriptions_ty) {
+            Type::Vector(subscription_ty) => {
+                self.unify(Type::Sub(Box::new(msg.clone())), *subscription_ty, span);
+            }
+            Type::Tuple(subscriptions) => {
+                for subscription_ty in subscriptions {
+                    self.unify(Type::Sub(Box::new(msg.clone())), subscription_ty, span);
+                }
+            }
+            Type::Var(_) => {}
+            other => {
+                let found = self.format_type(&other);
+                self.diagnostics.push(Diagnostic::error(
+                    span,
+                    format!(
+                        "batch :subscriptions must be a vector of subscription records, found {}",
+                        found
+                    ),
+                ));
+            }
+        }
+    }
+
     fn validate_command_messages(
         &mut self,
         command_kind: Option<&str>,
@@ -5116,6 +7240,11 @@ impl Inferencer {
         fields: &BTreeMap<String, Type>,
         span: Span,
     ) {
+        if command_kind == Some("task/perform") {
+            self.validate_task_perform_messages(msg, fields, span);
+            return;
+        }
+
         if let Some(message_ty) = fields.get("msg").cloned() {
             self.require_command_message_matches(msg.clone(), message_ty, span, ":msg");
         }
@@ -5140,6 +7269,254 @@ impl Inferencer {
                     field,
                     fields,
                 );
+            }
+        }
+    }
+
+    fn infer_command_message_type(&mut self, command_ty: Type, span: Span) -> Type {
+        match self.resolve(command_ty) {
+            Type::Cmd(msg) => self.resolve(*msg),
+            Type::Record(fields) if is_command_record_fields(&fields) => {
+                self.infer_command_record_message_type(fields, span)
+            }
+            Type::Union(variants) => {
+                let mut joined = None;
+                for variant in variants {
+                    let msg = self.infer_command_message_type(variant, span);
+                    joined = Some(match joined {
+                        Some(existing) => self.join_types(existing, msg, span),
+                        None => msg,
+                    });
+                }
+                joined.unwrap_or_else(|| self.fresh())
+            }
+            Type::Vector(command) => self.infer_command_message_type(*command, span),
+            Type::Tuple(commands) => {
+                let mut joined = None;
+                for command in commands {
+                    let msg = self.infer_command_message_type(command, span);
+                    joined = Some(match joined {
+                        Some(existing) => self.join_types(existing, msg, span),
+                        None => msg,
+                    });
+                }
+                joined.unwrap_or_else(|| self.fresh())
+            }
+            Type::Var(_) => self.fresh(),
+            _ => self.fresh(),
+        }
+    }
+
+    fn infer_command_record_message_type(
+        &mut self,
+        fields: BTreeMap<String, Type>,
+        span: Span,
+    ) -> Type {
+        let command_kind = fields
+            .get("kind")
+            .cloned()
+            .and_then(|kind| keyword_literal_name(&self.resolve(kind)).map(str::to_string));
+
+        if let Some(kind) = command_kind.as_deref() {
+            self.validate_command_schema(kind, &fields, span);
+        }
+
+        if command_kind.as_deref() == Some("batch") {
+            if let Some(commands_ty) = fields.get("commands").cloned() {
+                return self.infer_command_message_type(commands_ty, span);
+            }
+            return self.fresh();
+        }
+
+        let mut joined = None;
+        if let Some(message_ty) = fields.get("msg").cloned() {
+            joined = Some(message_ty);
+        }
+
+        if let Some(to_message_ty) = fields.get("toMessage").cloned() {
+            if let Type::Fn(args, ret) = self.resolve(to_message_ty) {
+                if let Some(value_ty) =
+                    self.command_success_value_type(command_kind.as_deref(), &fields)
+                {
+                    if let Some(arg) = args.first().cloned() {
+                        self.unify(arg, value_ty, span);
+                    }
+                }
+                joined = Some(match joined {
+                    Some(existing) => self.join_types(existing, *ret, span),
+                    None => *ret,
+                });
+            }
+        }
+
+        for field in COMMAND_MESSAGE_TAG_FIELDS {
+            let Some(tag_ty) = fields.get(*field).cloned() else {
+                continue;
+            };
+            if let Type::Keyword(Some(tag)) = self.resolve(tag_ty) {
+                let message_ty =
+                    self.command_message_tag_type(command_kind.as_deref(), field, &tag, &fields);
+                joined = Some(match joined {
+                    Some(existing) => self.join_types(existing, message_ty, span),
+                    None => message_ty,
+                });
+            }
+        }
+
+        joined.unwrap_or_else(|| self.fresh())
+    }
+
+    fn validate_task_perform_messages(
+        &mut self,
+        msg: &Type,
+        fields: &BTreeMap<String, Type>,
+        span: Span,
+    ) {
+        let err = self.fresh();
+        let ok = self.fresh();
+        if let Some(task_ty) = fields.get("task").cloned() {
+            self.unify(
+                task_ty,
+                Type::Task(Box::new(err.clone()), Box::new(ok.clone())),
+                span,
+            );
+        }
+
+        if let Some(on_success_ty) = fields.get("onSuccess").cloned() {
+            self.require_task_perform_mapper_matches(
+                msg.clone(),
+                ok,
+                on_success_ty,
+                span,
+                ":onSuccess",
+            );
+        }
+
+        if let Some(on_error_ty) = fields.get("onError").cloned() {
+            self.require_task_perform_mapper_matches(
+                msg.clone(),
+                err,
+                on_error_ty,
+                span,
+                ":onError",
+            );
+        }
+    }
+
+    fn require_task_perform_mapper_matches(
+        &mut self,
+        expected_msg: Type,
+        payload_ty: Type,
+        mapper_ty: Type,
+        span: Span,
+        label: &str,
+    ) {
+        match self.resolve(mapper_ty) {
+            Type::Var(_) => {}
+            Type::Fn(args, ret) => {
+                if args.len() != 1 {
+                    self.diagnostics.push(Diagnostic::error(
+                        span,
+                        format!("task/perform {} must accept exactly one argument", label),
+                    ));
+                    return;
+                }
+                self.unify(args[0].clone(), payload_ty, span);
+                self.require_command_message_matches(
+                    expected_msg,
+                    *ret,
+                    span,
+                    &format!("{} return", label),
+                );
+            }
+            other => {
+                let found = self.format_type(&other);
+                self.diagnostics.push(Diagnostic::error(
+                    span,
+                    format!("task/perform {} must be a function, found {}", label, found),
+                ));
+            }
+        }
+    }
+
+    fn validate_subscription_messages(
+        &mut self,
+        subscription_kind: Option<&str>,
+        msg: &Type,
+        fields: &BTreeMap<String, Type>,
+        span: Span,
+    ) {
+        if let Some(message_ty) = fields.get("msg").cloned() {
+            self.require_subscription_message_matches(msg.clone(), message_ty, span, ":msg");
+        }
+
+        for field in [
+            "onError",
+            "onChange",
+            "onEvent",
+            "onReading",
+            "onDisconnected",
+            "onSuccess",
+        ] {
+            if let Some(tag_ty) = fields.get(field).cloned() {
+                self.require_subscription_tag_matches(
+                    subscription_kind,
+                    msg.clone(),
+                    tag_ty,
+                    span,
+                    field,
+                    fields,
+                );
+            }
+        }
+    }
+
+    fn require_subscription_tag_matches(
+        &mut self,
+        subscription_kind: Option<&str>,
+        expected_msg: Type,
+        tag_ty: Type,
+        span: Span,
+        field: &str,
+        subscription_fields: &BTreeMap<String, Type>,
+    ) {
+        let label = match self.resolve(tag_ty.clone()) {
+            Type::Keyword(Some(tag)) => format!(":{} {}", field, format_keyword_literal(&tag)),
+            _ => format!(":{}", field),
+        };
+        let message_ty = self.subscription_tag_message_type(subscription_kind, field, tag_ty, span);
+        if let Type::Var(_) = self.resolve(message_ty.clone()) {
+            return;
+        }
+        let _ = subscription_fields;
+        self.require_subscription_message_matches(expected_msg, message_ty, span, &label);
+    }
+
+    fn subscription_tag_message_type(
+        &mut self,
+        subscription_kind: Option<&str>,
+        field: &str,
+        tag_ty: Type,
+        span: Span,
+    ) -> Type {
+        match self.resolve(tag_ty) {
+            Type::Var(_) | Type::Keyword(None) => self.fresh(),
+            Type::Keyword(Some(tag)) => self.command_message_tag_type(
+                subscription_command_kind(subscription_kind),
+                field,
+                &tag,
+                &BTreeMap::new(),
+            ),
+            other => {
+                let found = self.format_type(&other);
+                self.diagnostics.push(Diagnostic::error(
+                    span,
+                    format!(
+                        "subscription continuation :{} must be a keyword tag, found {}",
+                        field, found
+                    ),
+                ));
+                self.fresh()
             }
         }
     }
@@ -5235,6 +7612,28 @@ impl Inferencer {
         ));
     }
 
+    fn require_subscription_message_matches(
+        &mut self,
+        expected_msg: Type,
+        actual_msg: Type,
+        span: Span,
+        label: &str,
+    ) {
+        if self.command_message_matches(expected_msg.clone(), actual_msg.clone(), span) {
+            return;
+        }
+
+        let expected = format_type_with_literals(&self.resolve(expected_msg));
+        let actual = format_type_with_literals(&self.resolve(actual_msg));
+        self.diagnostics.push(Diagnostic::error(
+            span,
+            format!(
+                "subscription message {} has type {}, which is not part of Sub message type {}",
+                label, actual, expected
+            ),
+        ));
+    }
+
     fn require_html_event_message_matches(
         &mut self,
         expected_msg: Type,
@@ -5242,7 +7641,7 @@ impl Inferencer {
         span: Span,
         event_name: &str,
     ) {
-        if self.command_message_matches(expected_msg.clone(), actual_msg.clone(), span) {
+        if self.html_event_message_matches(expected_msg.clone(), actual_msg.clone(), span) {
             return;
         }
 
@@ -5255,6 +7654,15 @@ impl Inferencer {
                 event_name, actual, expected
             ),
         ));
+    }
+
+    fn html_event_message_matches(&mut self, expected: Type, actual: Type, span: Span) -> bool {
+        match self.resolve(actual) {
+            Type::Nil => true,
+            Type::Option(inner) => self.html_event_message_matches(expected, *inner, span),
+            Type::Event(inner) => self.html_event_message_matches(expected, *inner, span),
+            actual => self.command_message_matches(expected, actual, span),
+        }
     }
 
     fn command_message_matches(&mut self, expected: Type, actual: Type, span: Span) -> bool {
@@ -5289,11 +7697,17 @@ impl Inferencer {
             (Type::Keyword(expected), Type::Keyword(actual)) => {
                 keyword_type_accepts(&expected, &actual)
             }
+            (Type::Js, Type::Js)
+            | (Type::TrustedHtml, Type::TrustedHtml)
+            | (Type::Html, Type::Html) => true,
             (Type::Option(expected), Type::Option(actual))
+            | (Type::Decoder(expected), Type::Decoder(actual))
             | (Type::List(expected), Type::List(actual))
             | (Type::Vector(expected), Type::Vector(actual))
             | (Type::Set(expected), Type::Set(actual))
-            | (Type::Cmd(expected), Type::Cmd(actual)) => {
+            | (Type::Cmd(expected), Type::Cmd(actual))
+            | (Type::Sub(expected), Type::Sub(actual))
+            | (Type::Event(expected), Type::Event(actual)) => {
                 self.command_message_matches(*expected, *actual, span)
             }
             (Type::Map(expected_key, expected_value), Type::Map(actual_key, actual_value))
@@ -5303,6 +7717,10 @@ impl Inferencer {
             ) => {
                 self.command_message_matches(*expected_key, *actual_key, span)
                     && self.command_message_matches(*expected_value, *actual_value, span)
+            }
+            (Type::Task(expected_err, expected_ok), Type::Task(actual_err, actual_ok)) => {
+                self.command_message_matches(*expected_err, *actual_err, span)
+                    && self.command_message_matches(*expected_ok, *actual_ok, span)
             }
             (Type::Tuple(expected), Type::Tuple(actual)) => {
                 expected.len() == actual.len()
@@ -5402,6 +7820,8 @@ impl Inferencer {
             | Some("file/import")
             | Some("file/read-selected")
             | Some("bluetooth/request-device") => Some(self.fresh()),
+            Some("browser/theme-load") | Some("browser/theme-apply") => Some(Type::String),
+            Some("auth-storage/load") => Some(Type::Js),
             Some("storage/remove") => Some(Type::Record(BTreeMap::from([(
                 "key".to_string(),
                 Type::String,
@@ -5489,14 +7909,18 @@ impl Inferencer {
         match self.resolve(ty.clone()) {
             Type::Var(other) => id == other,
             Type::Option(inner)
+            | Type::Decoder(inner)
             | Type::List(inner)
             | Type::Vector(inner)
             | Type::Set(inner)
-            | Type::Cmd(inner) => self.occurs(id, &inner),
+            | Type::Cmd(inner)
+            | Type::Sub(inner)
+            | Type::Event(inner) => self.occurs(id, &inner),
             Type::Tuple(items) => items.iter().any(|item| self.occurs(id, item)),
             Type::Map(key, value) | Type::Result(key, value) => {
                 self.occurs(id, &key) || self.occurs(id, &value)
             }
+            Type::Task(err, ok) => self.occurs(id, &err) || self.occurs(id, &ok),
             Type::Union(variants) => variants.iter().any(|variant| self.occurs(id, variant)),
             Type::Record(fields) => fields.values().any(|field| self.occurs(id, field)),
             Type::Fn(args, ret) => {
@@ -5517,6 +7941,7 @@ impl Inferencer {
                 None => Type::Var(id),
             },
             Type::Option(inner) => Type::Option(Box::new(self.resolve(*inner))),
+            Type::Decoder(inner) => Type::Decoder(Box::new(self.resolve(*inner))),
             Type::List(inner) => Type::List(Box::new(self.resolve(*inner))),
             Type::Vector(inner) => Type::Vector(Box::new(self.resolve(*inner))),
             Type::Tuple(items) => Type::Tuple(
@@ -5533,6 +7958,11 @@ impl Inferencer {
                 Type::Result(Box::new(self.resolve(*ok)), Box::new(self.resolve(*err)))
             }
             Type::Cmd(msg) => Type::Cmd(Box::new(self.resolve(*msg))),
+            Type::Task(err, ok) => {
+                Type::Task(Box::new(self.resolve(*err)), Box::new(self.resolve(*ok)))
+            }
+            Type::Sub(msg) => Type::Sub(Box::new(self.resolve(*msg))),
+            Type::Event(msg) => Type::Event(Box::new(self.resolve(*msg))),
             Type::Union(variants) => Type::Union(
                 variants
                     .into_iter()
@@ -5582,7 +8012,7 @@ impl Inferencer {
     fn type_syntax_to_type(
         &mut self,
         syntax: &TypeSyntax,
-        aliases: &HashMap<String, TypeSyntax>,
+        aliases: &HashMap<String, TypeAlias>,
         span: Span,
     ) -> Option<Type> {
         let mut resolving = BTreeSet::new();
@@ -5592,7 +8022,7 @@ impl Inferencer {
     fn type_syntax_to_type_inner(
         &mut self,
         syntax: &TypeSyntax,
-        aliases: &HashMap<String, TypeSyntax>,
+        aliases: &HashMap<String, TypeAlias>,
         span: Span,
         resolving: &mut BTreeSet<String>,
     ) -> Option<Type> {
@@ -5604,7 +8034,9 @@ impl Inferencer {
                 "Nil" => Some(Type::Nil),
                 "Keyword" => Some(Type::Keyword(None)),
                 "Syntax" => Some(Type::Syntax),
+                "Js" => Some(Type::Js),
                 "Html" => Some(Type::Html),
+                "TrustedHtml" => Some(Type::TrustedHtml),
                 _ => {
                     let Some(alias) = aliases.get(name) else {
                         self.diagnostics.push(Diagnostic::error(
@@ -5613,6 +8045,17 @@ impl Inferencer {
                         ));
                         return None;
                     };
+                    if !alias.params.is_empty() {
+                        self.diagnostics.push(Diagnostic::error(
+                            span,
+                            format!(
+                                "{} expects {} type arguments, found 0",
+                                name,
+                                alias.params.len()
+                            ),
+                        ));
+                        return None;
+                    }
                     if !resolving.insert(name.clone()) {
                         self.diagnostics.push(Diagnostic::error(
                             span,
@@ -5620,7 +8063,8 @@ impl Inferencer {
                         ));
                         return None;
                     }
-                    let ty = self.type_syntax_to_type_inner(alias, aliases, span, resolving);
+                    let ty =
+                        self.type_syntax_to_type_inner(&alias.syntax, aliases, span, resolving);
                     resolving.remove(name);
                     ty
                 }
@@ -5649,6 +8093,9 @@ impl Inferencer {
                 Some(Type::Tuple(checked))
             }
             TypeSyntax::Apply { name, args } => match name.as_str() {
+                "Decoder" => self
+                    .type_syntax_to_type_inner(&args[0], aliases, span, resolving)
+                    .map(|inner| Type::Decoder(Box::new(inner))),
                 "Option" => self
                     .type_syntax_to_type_inner(&args[0], aliases, span, resolving)
                     .map(|inner| Type::Option(Box::new(inner))),
@@ -5676,7 +8123,52 @@ impl Inferencer {
                     let msg = self.type_syntax_to_type_inner(&args[0], aliases, span, resolving)?;
                     Some(Type::Cmd(Box::new(msg)))
                 }
+                "Sub" => {
+                    let msg = self.type_syntax_to_type_inner(&args[0], aliases, span, resolving)?;
+                    Some(Type::Sub(Box::new(msg)))
+                }
+                "Event" => {
+                    let msg = self.type_syntax_to_type_inner(&args[0], aliases, span, resolving)?;
+                    Some(Type::Event(Box::new(msg)))
+                }
+                "Task" => {
+                    let err = self.type_syntax_to_type_inner(&args[0], aliases, span, resolving)?;
+                    let ok = self.type_syntax_to_type_inner(&args[1], aliases, span, resolving)?;
+                    Some(Type::Task(Box::new(err), Box::new(ok)))
+                }
                 _ => {
+                    if let Some(alias) = aliases.get(name) {
+                        if alias.params.len() != args.len() {
+                            self.diagnostics.push(Diagnostic::error(
+                                span,
+                                format!(
+                                    "{} expects {} type arguments, found {}",
+                                    name,
+                                    alias.params.len(),
+                                    args.len()
+                                ),
+                            ));
+                            return None;
+                        }
+                        if !resolving.insert(name.clone()) {
+                            self.diagnostics.push(Diagnostic::error(
+                                span,
+                                format!("recursive type alias `{}` cannot be checked", name),
+                            ));
+                            return None;
+                        }
+                        let bindings = alias
+                            .params
+                            .iter()
+                            .cloned()
+                            .zip(args.iter().cloned())
+                            .collect::<HashMap<_, _>>();
+                        let substituted = substitute_type_syntax(&alias.syntax, &bindings);
+                        let ty =
+                            self.type_syntax_to_type_inner(&substituted, aliases, span, resolving);
+                        resolving.remove(name);
+                        return ty;
+                    }
                     self.diagnostics.push(Diagnostic::error(
                         span,
                         format!("unknown type constructor `{}` in annotation", name),
@@ -5846,6 +8338,10 @@ fn is_ann_form(expr: &Expr) -> bool {
     matches!(&expr.kind, ExprKind::List(items) if items.first().is_some_and(|head| matches_symbol(head, "ann")))
 }
 
+fn is_foreign_form(expr: &Expr) -> bool {
+    matches!(&expr.kind, ExprKind::List(items) if items.first().is_some_and(|head| matches_symbol(head, "foreign")))
+}
+
 fn definition_name(expr: &Expr) -> Option<&str> {
     let ExprKind::List(items) = &expr.kind else {
         return None;
@@ -5875,10 +8371,10 @@ fn parse_type_declaration_form(expr: &Expr) -> Option<Result<TypeDeclaration, Di
     {
         return None;
     }
-    if items.len() != 3 {
+    if items.len() < 3 {
         return Some(Err(Diagnostic::error(
             expr.span,
-            "type expects a name and a type expression",
+            "type expects a name, optional type parameters, and a type expression",
         )));
     }
 
@@ -5888,11 +8384,34 @@ fn parse_type_declaration_form(expr: &Expr) -> Option<Result<TypeDeclaration, Di
             "type name must be a symbol",
         )));
     };
-    Some(parse_type_syntax(&items[2]).map(|syntax| TypeDeclaration {
-        name: name.clone(),
-        schema: syntax.render(),
-        syntax,
-    }))
+    let mut params = Vec::new();
+    let mut seen = BTreeSet::new();
+    for param in &items[2..items.len() - 1] {
+        let ExprKind::Symbol(param_name) = &param.kind else {
+            return Some(Err(Diagnostic::error(
+                param.span,
+                "type parameters must be symbols",
+            )));
+        };
+        if !seen.insert(param_name.clone()) {
+            return Some(Err(Diagnostic::error(
+                param.span,
+                format!("duplicate type parameter `{}`", param_name),
+            )));
+        }
+        params.push(param_name.clone());
+    }
+    Some(
+        parse_type_syntax(items.last().expect("type expression should exist")).map(|syntax| {
+            TypeDeclaration {
+                name: name.clone(),
+                params,
+                schema: syntax.render(),
+                syntax,
+                span: expr.span,
+            }
+        }),
+    )
 }
 
 fn parse_type_annotation_form(expr: &Expr) -> Option<Result<TypeAnnotation, Diagnostic>> {
@@ -5924,6 +8443,54 @@ fn parse_type_annotation_form(expr: &Expr) -> Option<Result<TypeAnnotation, Diag
         syntax,
         span: expr.span,
     }))
+}
+
+fn parse_foreign_declaration_form(expr: &Expr) -> Option<Result<ForeignDeclaration, Diagnostic>> {
+    let ExprKind::List(items) = &expr.kind else {
+        return None;
+    };
+    if !items
+        .first()
+        .is_some_and(|head| matches_symbol(head, "foreign"))
+    {
+        return None;
+    }
+    if items.len() != 4 {
+        return Some(Err(Diagnostic::error(
+            expr.span,
+            "foreign expects a mode, name, and type expression",
+        )));
+    }
+
+    let ExprKind::Symbol(mode) = &items[1].kind else {
+        return Some(Err(Diagnostic::error(
+            items[1].span,
+            "foreign mode must be a symbol",
+        )));
+    };
+    if !matches!(mode.as_str(), "pure" | "task" | "command") {
+        return Some(Err(Diagnostic::error(
+            items[1].span,
+            "foreign mode must be pure, task, or command",
+        )));
+    }
+
+    let ExprKind::Symbol(name) = &items[2].kind else {
+        return Some(Err(Diagnostic::error(
+            items[2].span,
+            "foreign name must be a symbol",
+        )));
+    };
+
+    Some(
+        parse_type_syntax(&items[3]).map(|syntax| ForeignDeclaration {
+            mode: mode.clone(),
+            name: name.clone(),
+            schema: syntax.render(),
+            syntax,
+            span: expr.span,
+        }),
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -5992,6 +8559,58 @@ impl TypeSyntax {
     }
 }
 
+fn substitute_type_syntax(
+    syntax: &TypeSyntax,
+    bindings: &HashMap<String, TypeSyntax>,
+) -> TypeSyntax {
+    match syntax {
+        TypeSyntax::Named(name) => bindings
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| TypeSyntax::Named(name.clone())),
+        TypeSyntax::Keyword(name) => TypeSyntax::Keyword(name.clone()),
+        TypeSyntax::Record(fields) => TypeSyntax::Record(
+            fields
+                .iter()
+                .map(|(name, field)| (name.clone(), substitute_type_syntax(field, bindings)))
+                .collect(),
+        ),
+        TypeSyntax::Tuple(items) => TypeSyntax::Tuple(
+            items
+                .iter()
+                .map(|item| substitute_type_syntax(item, bindings))
+                .collect(),
+        ),
+        TypeSyntax::Apply { name, args } => TypeSyntax::Apply {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|arg| substitute_type_syntax(arg, bindings))
+                .collect(),
+        },
+        TypeSyntax::Fn { args, ret } => TypeSyntax::Fn {
+            args: args
+                .iter()
+                .map(|arg| substitute_type_syntax(arg, bindings))
+                .collect(),
+            ret: Box::new(substitute_type_syntax(ret, bindings)),
+        },
+        TypeSyntax::Union(variants) => TypeSyntax::Union(
+            variants
+                .iter()
+                .map(|variant| substitute_type_syntax(variant, bindings))
+                .collect(),
+        ),
+    }
+}
+
+fn type_parameter_validation_bindings(params: &[String]) -> HashMap<String, TypeSyntax> {
+    params
+        .iter()
+        .map(|param| (param.clone(), TypeSyntax::Named("Js".to_string())))
+        .collect()
+}
+
 fn parse_type_syntax(expr: &Expr) -> Result<TypeSyntax, Diagnostic> {
     match &expr.kind {
         ExprKind::Symbol(name) => Ok(TypeSyntax::Named(name.clone())),
@@ -6033,14 +8652,14 @@ fn parse_type_application(span: Span, items: &[Expr]) -> Result<TypeSyntax, Diag
     };
 
     match name.as_str() {
-        "Option" | "List" | "Vector" | "Set" | "Cmd" => {
+        "Decoder" | "Option" | "List" | "Vector" | "Set" | "Cmd" | "Sub" | "Event" => {
             require_type_arity(span, name, args, 1)?;
             Ok(TypeSyntax::Apply {
                 name: name.clone(),
                 args: vec![parse_type_syntax(&args[0])?],
             })
         }
-        "Map" | "Result" => {
+        "Map" | "Result" | "Task" => {
             require_type_arity(span, name, args, 2)?;
             Ok(TypeSyntax::Apply {
                 name: name.clone(),
@@ -6072,10 +8691,13 @@ fn parse_type_application(span: Span, items: &[Expr]) -> Result<TypeSyntax, Diag
                 .collect::<Result<Vec<_>, _>>()
                 .map(TypeSyntax::Union)
         }
-        _ => Err(Diagnostic::error(
-            head.span,
-            format!("unknown type constructor `{}`", name),
-        )),
+        _ => Ok(TypeSyntax::Apply {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(parse_type_syntax)
+                .collect::<Result<Vec<_>, _>>()?,
+        }),
     }
 }
 
@@ -6118,7 +8740,12 @@ fn require_type_arity(
     ))
 }
 
-fn parse_import_form(expr: &Expr) -> Option<Result<Vec<String>, Diagnostic>> {
+struct ImportSpec {
+    path: String,
+    names: Vec<String>,
+}
+
+fn parse_import_form(expr: &Expr) -> Option<Result<ImportSpec, Diagnostic>> {
     let ExprKind::List(items) = &expr.kind else {
         return None;
     };
@@ -6134,12 +8761,12 @@ fn parse_import_form(expr: &Expr) -> Option<Result<Vec<String>, Diagnostic>> {
             "import expects a path string and a vector of symbols",
         )));
     }
-    if !matches!(&items[1].kind, ExprKind::String(_)) {
+    let ExprKind::String(path) = &items[1].kind else {
         return Some(Err(Diagnostic::error(
             items[1].span,
             "import path must be a string",
         )));
-    }
+    };
 
     let ExprKind::Vector(names) = &items[2].kind else {
         return Some(Err(Diagnostic::error(
@@ -6162,7 +8789,10 @@ fn parse_import_form(expr: &Expr) -> Option<Result<Vec<String>, Diagnostic>> {
         }
     }
 
-    Some(Ok(imported))
+    Some(Ok(ImportSpec {
+        path: path.clone(),
+        names: imported,
+    }))
 }
 
 fn parse_import_name(expr: &Expr) -> Result<String, Diagnostic> {
@@ -6199,6 +8829,10 @@ fn parse_import_name(expr: &Expr) -> Result<String, Diagnostic> {
     }
 }
 
+fn is_closkell_import_path(path: &str) -> bool {
+    path.ends_with(".clsk")
+}
+
 fn format_type_inner(ty: &Type) -> String {
     format_type_inner_with_keywords(ty, false)
 }
@@ -6215,6 +8849,44 @@ fn type_returns_cmd(ty: &Type) -> bool {
     }
 }
 
+fn type_returns_sub(ty: &Type) -> bool {
+    match ty {
+        Type::Sub(_) => true,
+        Type::Fn(_, ret) => type_returns_sub(ret),
+        _ => false,
+    }
+}
+
+fn is_known_subscription_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "none"
+            | "batch"
+            | "sub/timer/every"
+            | "sub/dom-ref/resize"
+            | "sub/window/event"
+            | "sub/media-query"
+            | "sub/simulation/heart-rate"
+            | "sub/bluetooth/connect-heart-rate"
+    )
+}
+
+fn subscription_command_kind(kind: Option<&str>) -> Option<&'static str> {
+    match kind {
+        Some("sub/timer/every") => Some("timer/every"),
+        Some("sub/dom-ref/resize") => Some("dom-ref/resize-watch"),
+        Some("sub/window/event") => Some("window/event-watch"),
+        Some("sub/media-query") => Some("media-query/watch"),
+        Some("sub/simulation/heart-rate") => Some("simulation/heart-rate"),
+        Some("sub/bluetooth/connect-heart-rate") => Some("bluetooth/connect-heart-rate"),
+        _ => kind.and_then(|kind| match kind {
+            "none" => Some("none"),
+            "batch" => Some("batch"),
+            _ => None,
+        }),
+    }
+}
+
 fn format_type_inner_with_keywords(ty: &Type, show_keyword_literals: bool) -> String {
     match ty {
         Type::Var(id) => format!("t{}", id),
@@ -6225,7 +8897,15 @@ fn format_type_inner_with_keywords(ty: &Type, show_keyword_literals: bool) -> St
         Type::Keyword(Some(name)) if show_keyword_literals => format!(":{}", name),
         Type::Keyword(_) => "Keyword".to_string(),
         Type::Syntax => "Syntax".to_string(),
+        Type::Js => "Js".to_string(),
         Type::Html => "Html".to_string(),
+        Type::TrustedHtml => "TrustedHtml".to_string(),
+        Type::Decoder(inner) => {
+            format!(
+                "(Decoder {})",
+                format_type_inner_with_keywords(inner, show_keyword_literals)
+            )
+        }
         Type::Option(inner) => {
             format!(
                 "(Option {})",
@@ -6274,6 +8954,25 @@ fn format_type_inner_with_keywords(ty: &Type, show_keyword_literals: bool) -> St
         Type::Cmd(msg) => {
             format!(
                 "(Cmd {})",
+                format_type_inner_with_keywords(msg, show_keyword_literals)
+            )
+        }
+        Type::Task(err, ok) => {
+            format!(
+                "(Task {} {})",
+                format_type_inner_with_keywords(err, show_keyword_literals),
+                format_type_inner_with_keywords(ok, show_keyword_literals)
+            )
+        }
+        Type::Sub(msg) => {
+            format!(
+                "(Sub {})",
+                format_type_inner_with_keywords(msg, show_keyword_literals)
+            )
+        }
+        Type::Event(msg) => {
+            format!(
+                "(Event {})",
                 format_type_inner_with_keywords(msg, show_keyword_literals)
             )
         }
@@ -6327,6 +9026,16 @@ fn keyword_literal_matches(expected: &Option<String>, actual: &str) -> bool {
     }
 }
 
+fn primitive_decoder_type(name: &str) -> Option<Type> {
+    match name {
+        "decoder-string" => Some(Type::Decoder(Box::new(Type::String))),
+        "decoder-number" => Some(Type::Decoder(Box::new(Type::Number))),
+        "decoder-bool" => Some(Type::Decoder(Box::new(Type::Bool))),
+        "decoder-keyword" => Some(Type::Decoder(Box::new(Type::Keyword(None)))),
+        _ => None,
+    }
+}
+
 fn could_be_homogeneous(left: &Type, right: &Type) -> bool {
     match (left, right) {
         (Type::Record(left), Type::Record(right)) => left.keys().eq(right.keys()),
@@ -6334,6 +9043,7 @@ fn could_be_homogeneous(left: &Type, right: &Type) -> bool {
         (Type::Var(_), Type::Record(_)) | (Type::Record(_), Type::Var(_)) => false,
         (Type::Var(_), _) | (_, Type::Var(_)) => true,
         (Type::Option(left), Type::Option(right))
+        | (Type::Decoder(left), Type::Decoder(right))
         | (Type::List(left), Type::List(right))
         | (Type::Vector(left), Type::Vector(right))
         | (Type::Set(left), Type::Set(right)) => could_be_homogeneous(left, right),
@@ -6345,6 +9055,12 @@ fn could_be_homogeneous(left: &Type, right: &Type) -> bool {
             could_be_homogeneous(left_ok, right_ok) && could_be_homogeneous(left_err, right_err)
         }
         (Type::Cmd(left), Type::Cmd(right)) => could_be_homogeneous(left, right),
+        (Type::Task(left_err, left_ok), Type::Task(right_err, right_ok)) => {
+            could_be_homogeneous(left_err, right_err) && could_be_homogeneous(left_ok, right_ok)
+        }
+        (Type::Sub(left), Type::Sub(right)) | (Type::Event(left), Type::Event(right)) => {
+            could_be_homogeneous(left, right)
+        }
         (Type::Union(left), Type::Union(right)) => {
             left.len() == right.len()
                 && left
@@ -6500,9 +9216,18 @@ fn is_known_command_kind(kind: &str) -> bool {
             | "storage/get"
             | "storage/set"
             | "storage/remove"
+            | "browser/history-replace-search-param"
+            | "browser/history-write-route"
+            | "browser/theme-load"
+            | "browser/theme-apply"
+            | "browser/clipboard-write"
+            | "browser/set-cookie"
+            | "auth-storage/load"
+            | "auth-storage/persist"
             | "random/number"
             | "simulation/heart-rate"
             | "simulation/stop"
+            | "task/perform"
             | "file/download"
             | "file/import"
             | "file/read-selected"
@@ -6585,6 +9310,20 @@ fn records_have_distinct_tags(
         (Some(left), Some(right)) => left != right,
         _ => false,
     }
+}
+
+fn is_command_record_fields(fields: &BTreeMap<String, Type>) -> bool {
+    fields
+        .get("kind")
+        .and_then(keyword_literal_name)
+        .is_some_and(is_known_command_kind)
+}
+
+fn is_batch_command_record_fields(fields: &BTreeMap<String, Type>) -> bool {
+    fields
+        .get("kind")
+        .and_then(keyword_literal_name)
+        .is_some_and(|kind| kind == "batch")
 }
 
 fn format_keyword_literal(name: &str) -> String {
@@ -6768,6 +9507,79 @@ mod tests {
     }
 
     #[test]
+    fn infers_parametric_type_aliases() {
+        let result = check(
+            "(type RemoteData a\n\
+               (Union\n\
+                 {:kind :idle}\n\
+                 {:kind :ready :value a}\n\
+                 {:kind :failed :error String}))\n\
+             (type ApiResult ok err (Result ok err))\n\
+             (ann loaded (RemoteData {:id String}))\n\
+             (def loaded {:kind :ready :value {:id \"spec\"}})\n\
+             (ann parsed (ApiResult Number String))\n\
+             (def parsed (ok 42))",
+        );
+
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert_eq!(result.type_declarations[0].params, vec!["a"]);
+        assert_eq!(result.type_declarations[1].params, vec!["ok", "err"]);
+        assert_eq!(
+            result.forms[0].ty,
+            "(Union {:kind Keyword} {:kind Keyword :value {:id String}} {:error String :kind Keyword})"
+        );
+        assert_eq!(result.forms[1].ty, "(Result Number String)");
+    }
+
+    #[test]
+    fn imported_parametric_type_declarations_are_available_to_annotations() {
+        let api = check(
+            "(type Box a {:value a})\n\
+             (ann string-box (Box String))\n\
+             (def string-box {:value \"ready\"})",
+        );
+        assert!(api.diagnostics.is_empty(), "{:?}", api.diagnostics);
+        let box_ty = imported_type(&api, "Box");
+
+        let result = check_with_module_imports(
+            "(import \"./api.clsk\" [Box])\n\
+             (ann value (Box Number))\n\
+             (def value {:value 7})",
+            &[],
+            &[box_ty],
+        );
+
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert_eq!(result.forms[0].ty, "{:value Number}");
+    }
+
+    #[test]
+    fn reports_parametric_type_alias_arity_errors() {
+        let result = check(
+            "(type Box a {:value a})\n\
+             (ann bare Box)\n\
+             (def bare {:value 1})\n\
+             (ann too-many (Box String Number))\n\
+             (def too-many {:value \"x\"})",
+        );
+
+        assert!(
+            result.diagnostics.iter().any(|diagnostic| diagnostic
+                .message
+                .contains("Box expects 1 type arguments, found 0")),
+            "{:?}",
+            result.diagnostics
+        );
+        assert!(
+            result.diagnostics.iter().any(|diagnostic| diagnostic
+                .message
+                .contains("Box expects 1 type arguments, found 2")),
+            "{:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
     fn collects_exported_api_type_declarations() {
         let result = check(
             "(type HeartReading {:bpm Number :time Number})\n\
@@ -6888,6 +9700,18 @@ mod tests {
              (type UpdateResult [{:label String} (Cmd Msg)])\n\
              (ann update (Fn [{:label String} Msg] UpdateResult))\n\
              (defn update [state msg]\n  (match msg\n    {:kind :load}\n      [state {:kind :batch\n              :commands [{:kind :storage/get :key \"hrweb\" :onSuccess :loaded :onError :failed}\n                         {:kind :timer/after :id \"refresh\" :ms 1000 :msg {:kind :tick}}]}]\n    _ [state {:kind :none}]))",
+        );
+
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn infers_mixed_browser_command_batches() {
+        let result = check(
+            "(type Msg (Union {:kind :loaded :value String} {:kind :failed :error String} {:kind :theme-loaded :value String} {:kind :auth-loaded :value Js}))\n\
+             (type UpdateResult [{:label String} (Cmd Msg)])\n\
+             (ann update (Fn [{:label String} Msg] UpdateResult))\n\
+             (defn update [state msg]\n  [state {:kind :batch\n          :commands [{:kind :browser/history-write-route :url \"/docs\" :op nil :definition nil}\n                     {:kind :http/request\n                      :url \"/openapi.json\"\n                      :response :text\n                      :toMessage (fn [response] {:kind :loaded :value (get response :body)})\n                      :onError :failed}\n                     {:kind :browser/theme-load :key \"theme\" :onSuccess :theme-loaded}\n                     {:kind :auth-storage/load :sourceUrl \"/docs\" :onSuccess :auth-loaded}]}])",
         );
 
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
@@ -7448,6 +10272,40 @@ mod tests {
     }
 
     #[test]
+    fn infers_task_perform_command_messages() {
+        let result = check(
+            "(type Spec {:title String})\n\
+             (type Msg (Union {:kind :load} {:kind :loaded :value Spec} {:kind :failed :error String}))\n\
+             (ann decode-spec (Fn [String] (Task String Spec)))\n\
+             (defn decode-spec [text]\n  (Task.succeed {:title text}))\n\
+             (ann load-spec-task (Fn [String] (Task String Spec)))\n\
+             (defn load-spec-task [url]\n  (Task.and-then (Http.get-text url) decode-spec))\n\
+             (ann load-spec-command (Fn [String] (Cmd Msg)))\n\
+             (defn load-spec-command [url]\n  (Task.perform load-spec-task\n                url\n                (fn [spec] {:kind :loaded :value spec})\n                (fn [error] {:kind :failed :error error})))",
+        );
+
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn rejects_task_perform_messages_outside_cmd_message_type() {
+        let result = check(
+            "(type Msg (Union {:kind :loaded :value {:title String}}))\n\
+             (ann load-spec-command (Fn [String] (Cmd Msg)))\n\
+             (defn load-spec-command [url]\n  (Task.perform (Http.get-text url)\n                (fn [text] {:kind :loaded :value {:title text}})\n                (fn [error] {:kind :failed :error error})))",
+        );
+
+        assert!(
+            result.diagnostics.iter().any(|diagnostic| {
+                diagnostic.message.contains("command message")
+                    && diagnostic.message.contains(":failed")
+            }),
+            "{:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
     fn imported_command_helpers_keep_cmd_message_types() {
         let helper = check(
             "(type Rect {:x Number :y Number :width Number :height Number :top Number :right Number :bottom Number :left Number})\n\
@@ -7568,6 +10426,18 @@ mod tests {
 
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
         assert_eq!(result.forms[0].ty, "(Fn [t0] Html)");
+    }
+
+    #[test]
+    fn infers_render_to_string_for_view_functions() {
+        let result = check(
+            "(defn view [state]\n  #html <article>{state.title}</article>)\n\
+             (render-to-string view {:title \"Pulse\"})",
+        );
+
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert_eq!(result.forms[1].ty, "String");
+        assert!(result.forms[0].ty.ends_with("] Html)"));
     }
 
     #[test]
@@ -7779,13 +10649,90 @@ mod tests {
     }
 
     #[test]
-    fn infers_template_event_prevent_default_calls() {
+    fn infers_template_event_prevent_default_values() {
         let result = check(
-            "(defn view [state]\n  #html <button on:keydown={(if (= event.key \"ArrowLeft\") (do (event.preventDefault) {:kind :step :value -1}) {:kind :none})}>{state.label}</button>)",
+            "(defn view [state]\n  #html <button on:keydown={(if (= event.key \"ArrowLeft\") (Event.prevent {:kind :step :value -1}) {:kind :none})}>{state.label}</button>)",
         );
 
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
-        assert_eq!(result.forms[0].ty, "(Fn [{:label t2}] Html)");
+        assert_eq!(result.forms[0].ty, "(Fn [{:label t1}] Html)");
+    }
+
+    #[test]
+    fn infers_state_derived_subscriptions() {
+        let result = check(
+            "(type State {:running? Bool})\n\
+             (type Msg (Union {:kind :tick} {:kind :media-changed :id String :media String :matches Bool}))\n\
+             (ann subscriptions (Fn [State] (Sub Msg)))\n\
+             (defn subscriptions [state]\n  (Sub.batch [(if state.running?\n                   (Sub.timer/every \"clock\" 250 {:kind :tick})\n                   Sub.none)\n              (Sub.media-query \"mobile\" \"(max-width: 700px)\" :media-changed)]))",
+        );
+
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert_eq!(result.forms.len(), 1);
+        assert!(result.forms[0].ty.contains("(Sub (Union"));
+    }
+
+    #[test]
+    fn rejects_subscription_messages_outside_sub_message_type() {
+        let result = check(
+            "(type State {:running? Bool})\n\
+             (type Msg (Union {:kind :tick}))\n\
+             (ann subscriptions (Fn [State] (Sub Msg)))\n\
+             (defn subscriptions [state]\n  (Sub.media-query \"mobile\" \"(max-width: 700px)\" :media-changed))",
+        );
+
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("subscription message")),
+            "{:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn infers_scoped_update_subscriptions_and_view() {
+        let result = check(
+            "(type ChildState {:count Number})\n\
+             (type ChildMsg (Union {:kind :inc} {:kind :tick}))\n\
+             (type AppState {:log ChildState :route String})\n\
+             (type AppMsg (Union {:kind :log :msg ChildMsg} {:kind :route-changed :route String}))\n\
+             (type ChildResult [ChildState (Cmd ChildMsg)])\n\
+             (type AppResult [AppState (Cmd AppMsg)])\n\
+             (ann child-update (Fn [ChildState ChildMsg] ChildResult))\n\
+             (defn child-update [state msg]\n  [(assoc state :count (+ state.count 1)) {:kind :none}])\n\
+             (ann child-subscriptions (Fn [ChildState] (Sub ChildMsg)))\n\
+             (defn child-subscriptions [state]\n  (if (> state.count 0) (Sub.timer/every \"child\" 100 {:kind :tick}) Sub.none))\n\
+             (defn child-view [state]\n  #html <button>{state.count}</button>)\n\
+             (ann update (Fn [AppState AppMsg] AppResult))\n\
+             (defn update [state msg]\n  (match msg\n    {:kind :log :msg child-msg}\n      (scope-update state :log child-msg child-update :log)\n    _ [state {:kind :none}]))\n\
+             (ann subscriptions (Fn [AppState] (Sub AppMsg)))\n\
+             (defn subscriptions [state]\n  (scope-subscriptions state.log child-subscriptions :log))\n\
+             (defn view [state]\n  #html <main>{(scope-view :log child-view state.log)}</main>)",
+        );
+
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn infers_closkell_test_api_forms() {
+        let result = check(
+            "(import \"closkell/test\" [describe test expect= expect-not= expect-ok expect-err expect-some expect-match expect-throws])\n\
+             \n\
+             (describe \"math\"\n\
+               (test \"assertions\"\n\
+                 (expect= (+ 1 1) 2)\n\
+                 (expect-not= (+ 1 1) 3)\n\
+                 (expect-ok true)\n\
+                 (expect-err (err \"bad\"))\n\
+                 (expect-some (find [1 2 3] (fn [value] (= value 2))))\n\
+                 (expect-match {:kind :loaded :value 42 :meta {:source \"cache\"}}\n\
+                               {:kind :loaded :meta {:source \"cache\"}})\n\
+                 (expect-throws (fn [] (fail \"boom\")) \"boom\")))",
+        );
+
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
     }
 
     #[test]
@@ -8018,6 +10965,22 @@ mod tests {
 
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
         assert_eq!(result.forms[0].ty, "(Fn [(Vector {:bpm Number})] Number)");
+    }
+
+    #[test]
+    fn infers_value_equality_and_identity_predicates() {
+        let result = check(
+            "(def equal-records (= {:items [1 2] :tag :ok} {:tag :ok :items [1 2]}))\n\
+             (def equal-symbols (= :ready :ready))\n\
+             (def shared-identity (let [value {:items [1 2]}] (identical? value value)))\n\
+             (def distinct-identity (identical? {:items [1 2]} {:items [1 2]}))",
+        );
+
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert_eq!(result.forms[0].ty, "Bool");
+        assert_eq!(result.forms[1].ty, "Bool");
+        assert_eq!(result.forms[2].ty, "Bool");
+        assert_eq!(result.forms[3].ty, "Bool");
     }
 
     #[test]
@@ -8277,6 +11240,30 @@ mod tests {
     }
 
     #[test]
+    fn infers_schema_decoders_for_records() {
+        let result = check(
+            "(type Spec {:draft (Option Number) :tags (Vector String) :title String})\n\
+             (ann spec-decoder (Decoder Spec))\n\
+             (def spec-decoder\n\
+               (decoder-record {:title decoder-string\n\
+                                :tags (decoder-vector decoder-string)\n\
+                                :draft (decoder-optional decoder-number)}))\n\
+             (def decoded\n\
+               (decode spec-decoder (json-parse \"{\\\"title\\\":\\\"Pulse\\\",\\\"tags\\\":[\\\"zone\\\"]}\")))",
+        );
+
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert_eq!(
+            result.forms[0].ty,
+            "(Decoder {:draft (Option Number) :tags (Vector String) :title String})"
+        );
+        assert_eq!(
+            result.forms[1].ty,
+            "(Result {:draft (Option Number) :tags (Vector String) :title String} String)"
+        );
+    }
+
+    #[test]
     fn infers_option_and_result_match_patterns() {
         let result = check(
             "(type ImportResult (Result (Vector {:id String}) String))\n\
@@ -8343,7 +11330,11 @@ mod tests {
         let result = check(
             "(def updated-entry (assoc {:id \"warmup\" :hiddenAt nil} :hiddenAt 42 :exerciseType \"Strength\"))\n\
              (def imported (merge {:message \"Ready\" :selectedLogId nil} {:message \"Imported\" :selectedLogId \"warmup\"}))\n\
-             (def cleared (dissoc {:message \"Ready\" :visibleCount 2} :message))",
+             (def cleared (dissoc {:message \"Ready\" :visibleCount 2} :message))\n\
+             (def nested {:summary {:value 1 :label \"Warmup\"} :status \"Ready\"})\n\
+             (def bumped (update-in nested [:summary :value] (fn [value] (+ value 1))))\n\
+             (def relabeled (update-in bumped [:summary :label] (fn [label suffix] (str label suffix)) \"!\"))\n\
+             (def nested-value (get-in relabeled [:summary :value]))",
         );
 
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
@@ -8352,6 +11343,17 @@ mod tests {
         assert!(result.forms[1].ty.contains(":message String"));
         assert!(result.forms[1].ty.contains(":selectedLogId String"));
         assert_eq!(result.forms[2].ty, "{:visibleCount Number}");
+        assert!(
+            result.forms[4]
+                .ty
+                .contains(":summary {:label String :value Number}")
+        );
+        assert!(
+            result.forms[5]
+                .ty
+                .contains(":summary {:label String :value Number}")
+        );
+        assert_eq!(result.forms[6].ty, "Number");
     }
 
     #[test]

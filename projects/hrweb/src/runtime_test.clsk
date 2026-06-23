@@ -1,0 +1,77 @@
+(import "closkell/test" [describe test expect= expect-ok render fire text attr class? messages mount-app commands])
+(import "./domain.clsk" [initial-state])
+(import "./zones.clsk" [default-zone-state zone-label-for-bpm set-zone-boundary boundary-controls])
+(import "./log.clsk" [duration-label exercise-types hide-entry visible-log])
+(import "./app.clsk" [desktop-tab-strip monitor-card init update view])
+
+(def sample-entry-a
+  {:id "a"
+   :startedAt 1
+   :stoppedAt 61_000
+   :durationMs 60_000
+   :readings [{:bpm 120 :time 0}]
+   :targetZoneId 3
+   :zones default-zone-state.zones
+   :exerciseType "LISS"
+   :hiddenAt nil})
+
+(def sample-entry-b
+  {:id "b"
+   :startedAt 2
+   :stoppedAt 122_000
+   :durationMs 120_000
+   :readings [{:bpm 132 :time 0}]
+   :targetZoneId 3
+   :zones default-zone-state.zones
+   :exerciseType "Tempo"
+   :hiddenAt nil})
+
+(def connected-state
+  (merge initial-state
+         {:appStatus "Live"
+          :message "Recording"
+          :statusMode "good"
+          :connected? true
+          :latestBpm 128
+          :trend "Rising"
+          :dev? true
+          :zones default-zone-state.zones
+          :targetZoneId default-zone-state.targetZoneId}))
+
+(def app-handlers
+  {:storage/get (fn [cmd dispatch] nil)
+   :media-query/watch (fn [cmd dispatch] nil)
+   :dom-ref/resize-watch (fn [cmd dispatch] nil)
+   :canvas/draw (fn [cmd dispatch] nil)})
+
+(describe "hrweb pure functions"
+  (test "normalizes zones and log helpers"
+    (let [zones (set-zone-boundary default-zone-state.zones 1 145)
+          hidden (hide-entry [sample-entry-a sample-entry-b] "a" 200_000)]
+      (expect= (zone-label-for-bpm zones 146) "Zone 3")
+      (expect= (duration-label 65_000) "1:05")
+      (expect= (exercise-types [sample-entry-b sample-entry-a]) ["LISS" "Tempo"])
+      (expect= (count (boundary-controls zones)) 4)
+      (expect= (count (visible-log hidden)) 1))))
+
+(describe "hrweb components"
+  (test "renders monitor state"
+    (let [h (render (monitor-card connected-state))]
+      (expect= (text h "[data-testid='connection-status']") "Live")
+      (expect-ok (contains? (text h "[data-testid='latest-bpm']") "128"))
+      (expect= (attr h "[data-testid='stop-workout']" "data-testid") "stop-workout")))
+
+  (test "captures tab messages"
+    (let [h (render (desktop-tab-strip initial-state))
+          _ (fire.click h "button")]
+      (expect-ok (class? h "[data-active='true']" "bg-white"))
+      (expect= (messages h) [{:kind :select-tab :view "live"}]))))
+
+(describe "hrweb app harness"
+  (test "mounts the app and dispatches through update"
+    (let [app (mount-app {:init init :update update :view view}
+                         {:handlers app-handlers})
+          _ (app.dispatch {:kind :select-tab :view "log"})]
+      (expect= (attr app "[data-testid='hrweb-app']" "data-state") "idle")
+      (expect= (attr app "[data-testid='log-pane']" "data-testid") "log-pane")
+      (expect-ok (> (count (commands app)) 0)))))

@@ -91,16 +91,14 @@
                                          :value event.currentTarget.valueAsNumber}}
                               on:keydown={(if (or (= event.key "ArrowLeft")
                                                    (= event.key "ArrowDown"))
-                                               (do (event.preventDefault)
-                                                   {:kind :zone-boundary
-                                                    :index control.index
-                                                    :value (- control.max 1)})
+                                               (Event.prevent {:kind :zone-boundary
+                                                               :index control.index
+                                                               :value (- control.max 1)})
                                                (if (or (= event.key "ArrowRight")
                                                        (= event.key "ArrowUp"))
-                                                   (do (event.preventDefault)
-                                                       {:kind :zone-boundary
-                                                        :index control.index
-                                                        :value (+ control.max 1)})
+                                                   (Event.prevent {:kind :zone-boundary
+                                                                   :index control.index
+                                                                   :value (+ control.max 1)})
                                                    {:kind :none}))}></input>
                        <strong>{control.max}</strong>
                      </label>)}

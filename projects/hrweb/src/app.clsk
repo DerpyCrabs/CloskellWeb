@@ -1723,16 +1723,15 @@
                     data-holding={state.stopHold?}
                     disabled={(and (not (= state.exerciseState "running"))
                                    (not (= state.exerciseState "paused")))}
-                    on:pointerdown={(do (event.preventDefault)
-                                        {:kind :stop-hold-start})}
+                    on:pointerdown={(Event.prevent {:kind :stop-hold-start})}
                     on:pointerup={{:kind :stop-hold-cancel}}
                     on:pointerleave={{:kind :stop-hold-cancel}}
                     on:pointercancel={{:kind :stop-hold-cancel}}
-                    on:keydown={(do (if (hold-key? event.key)
-                                         (event.preventDefault)
-                                         nil)
-                                     {:kind :stop-hold-key-down
-                                      :key event.key})}
+                    on:keydown={(if (hold-key? event.key)
+                                    (Event.prevent {:kind :stop-hold-key-down
+                                                    :key event.key})
+                                    {:kind :stop-hold-key-down
+                                     :key event.key})}
                     on:keyup={{:kind :stop-hold-key-up
                                 :key event.key}}>
               <span class="absolute inset-y-0 left-0 bg-[#d9184b]/12"
@@ -1783,10 +1782,9 @@
                              aria-valuenow={control.max}
                              style={{:left (str control.leftPercent "%")
                                      :top "-4px"}}
-                             on:pointerdown={(do (event.preventDefault)
-                                                 {:kind :zone-boundary-drag-start
-                                                  :index control.index
-                                                  :clientX event.clientX})}
+                             on:pointerdown={(Event.prevent {:kind :zone-boundary-drag-start
+                                                             :index control.index
+                                                             :clientX event.clientX})}
                              on:keydown={{:kind :zone-boundary-key
                                           :index control.index
                                           :key event.key}}>
@@ -1886,11 +1884,11 @@
                   placeholder="Select or enter type"
                   on:input={{:kind :edit-type-draft
                              :text event.currentTarget.value}}
-                  on:keydown={(do (if (= event.key "Enter")
-                                       (event.preventDefault)
-                                       nil)
-                                   {:kind :type-draft-key
-                                    :key event.key})}></input>
+                  on:keydown={(if (= event.key "Enter")
+                                  (Event.prevent {:kind :type-draft-key
+                                                  :key event.key})
+                                  {:kind :type-draft-key
+                                   :key event.key})}></input>
             <button type="button"
                     class={(str primary-button-class " type-save !min-h-9 !shrink-0 !px-3 !text-[0.82rem]")}
                     on:click={{:kind :save-type}}>Save</button>
@@ -1912,11 +1910,11 @@
                    placeholder="Select or enter type"
                    on:input={{:kind :type-picker-draft
                               :text event.currentTarget.value}}
-                   on:keydown={(do (if (= event.key "Enter")
-                                        (event.preventDefault)
-                                        nil)
-                                    {:kind :type-picker-key
-                                     :key event.key})}></input>
+                   on:keydown={(if (= event.key "Enter")
+                                   (Event.prevent {:kind :type-picker-key
+                                                   :key event.key})
+                                   {:kind :type-picker-key
+                                    :key event.key})}></input>
             <button type="button"
                     class={(str primary-button-class " type-save !min-h-9 !shrink-0 !px-3 !text-[0.82rem]")}
                     data-testid="type-picker-save"
@@ -2005,16 +2003,15 @@
                         data-testid="delete-log"
                         data-holding={state.deleteHold?}
                         disabled={not has-selected-entry?}
-                        on:pointerdown={(do (event.preventDefault)
-                                            {:kind :delete-hold-start})}
+                        on:pointerdown={(Event.prevent {:kind :delete-hold-start})}
                         on:pointerup={{:kind :delete-hold-cancel}}
                         on:pointerleave={{:kind :delete-hold-cancel}}
                         on:pointercancel={{:kind :delete-hold-cancel}}
-                        on:keydown={(do (if (hold-key? event.key)
-                                           (event.preventDefault)
-                                           nil)
-                                       {:kind :delete-hold-key-down
-                                        :key event.key})}
+                        on:keydown={(if (hold-key? event.key)
+                                      (Event.prevent {:kind :delete-hold-key-down
+                                                      :key event.key})
+                                      {:kind :delete-hold-key-down
+                                       :key event.key})}
                         on:keyup={{:kind :delete-hold-key-up
                                     :key event.key}}>
                   <span class="absolute inset-y-0 left-0 bg-[#d9184b]/12"

@@ -67,8 +67,7 @@
                  data-frames={state.frames}
                  data-status={state.status}>
           <button type="button"
-                  on:pointerdown={(do (event.preventDefault)
-                                      {:kind :start-hold})}
+                  on:pointerdown={(Event.prevent {:kind :start-hold})}
                   on:pointerup={{:kind :cancel-hold}}
                   on:pointercancel={{:kind :cancel-hold}}>
             Hold to stop

@@ -48,6 +48,11 @@ pub fn core_command_types() -> Vec<CommandType> {
             message_type: "msg",
         },
         CommandType {
+            name: "Task",
+            payload_type: "TaskRequest",
+            message_type: "msg",
+        },
+        CommandType {
             name: "Random",
             payload_type: "RandomRequest",
             message_type: "msg",
@@ -105,6 +110,7 @@ pub fn validate_purity_with_imported_command_helpers(
         collect_forbidden_browser_access(form, &mut validator.diagnostics);
         validator.validate_init_form(form);
         validator.validate_update_form(form);
+        validator.validate_subscriptions_form(form);
     }
 
     EffectReport {
@@ -459,6 +465,22 @@ impl EffectValidator<'_> {
         }
     }
 
+    fn validate_subscriptions_form(&mut self, expr: &Expr) {
+        let ExprKind::List(items) = &expr.kind else {
+            return;
+        };
+        if items.len() < 4
+            || !matches_symbol(&items[0], "defn")
+            || !matches_symbol(&items[1], "subscriptions")
+        {
+            return;
+        }
+
+        if let Some(body) = items.last() {
+            self.validate_subscription_expr(body);
+        }
+    }
+
     fn validate_init_form(&mut self, expr: &Expr) {
         let ExprKind::List(items) = &expr.kind else {
             return;
@@ -526,6 +548,7 @@ impl EffectValidator<'_> {
                     self.validate_update_result(last);
                 }
             }
+            ExprKind::List(items) if matches_head(items, "scope-update") => {}
             ExprKind::List(items) if matches_head(items, "let") => {
                 self.with_let_command_scope(items, |validator, body| {
                     validator.validate_update_result(body);
@@ -565,6 +588,10 @@ impl EffectValidator<'_> {
             }
             ExprKind::List(items) => {
                 if let Some(name) = function_call_name(items) {
+                    if name == "Task.perform" {
+                        self.validate_task_perform_expr(expr, items);
+                        return;
+                    }
                     if self.command_helpers.contains_key(name) {
                         self.validate_command_helper(name, expr.span);
                         return;
@@ -582,6 +609,64 @@ impl EffectValidator<'_> {
             _ => self.diagnostics.push(Diagnostic::error(
                 expr.span,
                 "command position must be command data such as {:kind :none}",
+            )),
+        }
+    }
+
+    fn validate_subscription_expr(&mut self, expr: &Expr) {
+        match &expr.kind {
+            ExprKind::Map(entries) => validate_subscription_map(self, expr.span, entries),
+            ExprKind::Vector(items) => {
+                for item in items {
+                    self.validate_subscription_expr(item);
+                }
+            }
+            ExprKind::List(items) if matches_head(items, "if") && items.len() == 4 => {
+                self.validate_subscription_expr(&items[2]);
+                self.validate_subscription_expr(&items[3]);
+            }
+            ExprKind::List(items) if matches_head(items, "match") && items.len() >= 4 => {
+                self.validate_match_bodies(
+                    expr,
+                    items,
+                    "subscriptions",
+                    Self::validate_subscription_expr,
+                );
+            }
+            ExprKind::List(items) if matches_head(items, "let") => {
+                self.with_let_command_scope(items, |validator, body| {
+                    validator.validate_subscription_expr(body);
+                });
+            }
+            ExprKind::List(items) if matches_head(items, "do") => {
+                if let Some(last) = items.last() {
+                    self.validate_subscription_expr(last);
+                }
+            }
+            ExprKind::List(items) => {
+                if let Some(name) = function_call_name(items) {
+                    if matches!(
+                        name,
+                        "Sub.batch"
+                            | "Sub.timer/every"
+                            | "Sub.media-query"
+                            | "Sub.window/event"
+                            | "Sub.dom-ref/resize"
+                            | "scope-subscriptions"
+                    ) {
+                        return;
+                    }
+                }
+                self.diagnostics.push(Diagnostic::error(
+                    expr.span,
+                    "subscriptions must return Sub data such as Sub.none or {:kind :sub/timer/every}",
+                ));
+            }
+            ExprKind::Symbol(name) if name == "Sub.none" => {}
+            ExprKind::Symbol(_) => {}
+            _ => self.diagnostics.push(Diagnostic::error(
+                expr.span,
+                "subscriptions must return Sub data such as Sub.none or {:kind :sub/timer/every}",
             )),
         }
     }
@@ -710,6 +795,18 @@ impl EffectValidator<'_> {
 
         self.validating_helpers.remove(name);
         self.validated_helpers.insert(name.to_string());
+    }
+
+    fn validate_task_perform_expr(&mut self, expr: &Expr, items: &[Expr]) {
+        if items.len() != 4 && items.len() != 5 {
+            self.diagnostics.push(Diagnostic::error(
+                expr.span,
+                format!(
+                    "Task.perform expects 3 or 4 arguments, found {}",
+                    items.len().saturating_sub(1)
+                ),
+            ));
+        }
     }
 }
 
@@ -850,6 +947,16 @@ fn validate_command_map(validator: &mut EffectValidator<'_>, span: Span, entries
         );
     }
 
+    if kind == "task/perform" {
+        require_command_fields(
+            span,
+            entries,
+            &["task", "onSuccess", "onError"],
+            "task/perform",
+            &mut validator.diagnostics,
+        );
+    }
+
     match kind.as_str() {
         "timer/after" => {
             require_command_fields(
@@ -899,6 +1006,68 @@ fn validate_command_map(validator: &mut EffectValidator<'_>, span: Span, entries
                 span,
                 entries,
                 &["key", "value"],
+                &kind,
+                &mut validator.diagnostics,
+            );
+        }
+        "browser/history-replace-search-param" => {
+            require_command_fields(
+                span,
+                entries,
+                &["name", "value"],
+                &kind,
+                &mut validator.diagnostics,
+            );
+        }
+        "browser/history-write-route" => {
+            require_command_fields(
+                span,
+                entries,
+                &["url", "op", "definition"],
+                &kind,
+                &mut validator.diagnostics,
+            );
+        }
+        "browser/theme-load" => {
+            require_command_fields(span, entries, &["key"], &kind, &mut validator.diagnostics);
+            require_success_command_field(span, entries, &kind, &mut validator.diagnostics);
+        }
+        "browser/theme-apply" => {
+            require_command_fields(
+                span,
+                entries,
+                &["theme", "key"],
+                &kind,
+                &mut validator.diagnostics,
+            );
+        }
+        "browser/clipboard-write" => {
+            require_command_fields(span, entries, &["text"], &kind, &mut validator.diagnostics);
+        }
+        "browser/set-cookie" => {
+            require_command_fields(
+                span,
+                entries,
+                &["name", "value"],
+                &kind,
+                &mut validator.diagnostics,
+            );
+        }
+        "auth-storage/load" => {
+            require_command_fields(
+                span,
+                entries,
+                &["sourceUrl"],
+                &kind,
+                &mut validator.diagnostics,
+            );
+            require_success_command_field(span, entries, &kind, &mut validator.diagnostics);
+        }
+        "auth-storage/persist" => {
+            require_command_fields(
+                span,
+                entries,
+                &["sourceUrl", "entries"],
                 &kind,
                 &mut validator.diagnostics,
             );
@@ -1011,6 +1180,104 @@ fn validate_command_map(validator: &mut EffectValidator<'_>, span: Span, entries
                 &mut validator.diagnostics,
             );
         }
+        _ => {}
+    }
+}
+
+fn validate_subscription_map(
+    validator: &mut EffectValidator<'_>,
+    span: Span,
+    entries: &[(Expr, Expr)],
+) {
+    let Some(kind_expr) = map_get(entries, "kind") else {
+        validator.diagnostics.push(Diagnostic::error(
+            span,
+            "subscription record is missing a :kind field",
+        ));
+        return;
+    };
+
+    let Some(kind) = command_kind_literal(kind_expr) else {
+        return;
+    };
+
+    if !is_known_subscription_kind(&kind) {
+        validator.diagnostics.push(Diagnostic::error(
+            kind_expr.span,
+            format!("unknown subscription kind :{}", kind),
+        ));
+        return;
+    }
+
+    match kind.as_str() {
+        "batch" => {
+            let Some(subscriptions) =
+                map_get(entries, "subscriptions").or_else(|| map_get(entries, "subs"))
+            else {
+                validator.diagnostics.push(Diagnostic::error(
+                    span,
+                    "batch subscription is missing a :subscriptions vector",
+                ));
+                return;
+            };
+            match &subscriptions.kind {
+                ExprKind::Vector(items) | ExprKind::List(items) => {
+                    for item in items {
+                        validator.validate_subscription_expr(item);
+                    }
+                }
+                _ => validator.diagnostics.push(Diagnostic::error(
+                    subscriptions.span,
+                    "batch :subscriptions must be a vector of subscription records",
+                )),
+            }
+        }
+        "sub/timer/every" => {
+            require_command_fields(
+                span,
+                entries,
+                &["id", "ms", "msg"],
+                &kind,
+                &mut validator.diagnostics,
+            );
+        }
+        "sub/dom-ref/resize" => {
+            require_command_fields(
+                span,
+                entries,
+                &["ref", "onChange"],
+                &kind,
+                &mut validator.diagnostics,
+            );
+        }
+        "sub/window/event" => {
+            require_command_fields(
+                span,
+                entries,
+                &["type", "onEvent"],
+                &kind,
+                &mut validator.diagnostics,
+            );
+        }
+        "sub/media-query" => {
+            require_command_fields(
+                span,
+                entries,
+                &["query", "onChange"],
+                &kind,
+                &mut validator.diagnostics,
+            );
+        }
+        "sub/simulation/heart-rate" | "sub/bluetooth/connect-heart-rate" => {
+            require_command_fields(
+                span,
+                entries,
+                &["id", "onReading"],
+                &kind,
+                &mut validator.diagnostics,
+            );
+        }
+        "none" => {}
         _ => {}
     }
 }
@@ -1260,6 +1527,15 @@ fn type_expr_is_cmd(expr: &Expr) -> bool {
 
 fn collect_forbidden_browser_access(expr: &Expr, diagnostics: &mut Vec<Diagnostic>) {
     match &expr.kind {
+        ExprKind::Symbol(name) if event_mutation_symbol(name) => {
+            diagnostics.push(Diagnostic::error(
+                expr.span,
+                format!(
+                    "`{}` mutates a browser event; return Event.prevent/Event.stop data instead",
+                    name
+                ),
+            ));
+        }
         ExprKind::Symbol(name) if browser_api_symbol(name) => {
             diagnostics.push(Diagnostic::error(
                 expr.span,
@@ -1319,16 +1595,61 @@ fn collect_forbidden_browser_access_html_node(
 fn browser_api_symbol(name: &str) -> bool {
     matches!(
         name,
-        "window" | "document" | "navigator" | "localStorage" | "fetch"
+        "window"
+            | "document"
+            | "navigator"
+            | "history"
+            | "localStorage"
+            | "sessionStorage"
+            | "fetch"
+            | "setTimeout"
+            | "setInterval"
+            | "clearTimeout"
+            | "clearInterval"
+            | "requestAnimationFrame"
+            | "cancelAnimationFrame"
+            | "browser-current-url"
+            | "browser-theme-initial"
+            | "browser-theme-toggle"
+            | "history-replace-search-param"
+            | "history-write-route"
+            | "auth-storage-load"
+            | "auth-storage-persist"
+            | "clipboard-write"
+            | "browser-set-cookie"
+            | "selected-file-or-blob"
+            | "selected-file-by-test-id"
+            | "has-selected-file"
+            | "multipart-form-body"
     ) || [
         "window.",
         "document.",
         "navigator.",
+        "location.",
+        "history.",
         "localStorage.",
+        "sessionStorage.",
         "fetch.",
+        "setTimeout.",
+        "setInterval.",
+        "clearTimeout.",
+        "clearInterval.",
+        "requestAnimationFrame.",
+        "cancelAnimationFrame.",
     ]
     .iter()
     .any(|prefix| name.starts_with(prefix))
+}
+
+fn event_mutation_symbol(name: &str) -> bool {
+    matches!(
+        name,
+        "event.preventDefault"
+            | "event.stopPropagation"
+            | "event.preventDefault."
+            | "event.stopPropagation."
+    ) || name.starts_with("event.preventDefault.")
+        || name.starts_with("event.stopPropagation.")
 }
 
 fn matches_symbol(expr: &Expr, expected: &str) -> bool {
@@ -1396,9 +1717,18 @@ pub fn is_known_command_kind(kind: &str) -> bool {
             | "storage/get"
             | "storage/set"
             | "storage/remove"
+            | "browser/history-replace-search-param"
+            | "browser/history-write-route"
+            | "browser/theme-load"
+            | "browser/theme-apply"
+            | "browser/clipboard-write"
+            | "browser/set-cookie"
+            | "auth-storage/load"
+            | "auth-storage/persist"
             | "random/number"
             | "simulation/heart-rate"
             | "simulation/stop"
+            | "task/perform"
             | "file/download"
             | "file/import"
             | "file/read-selected"
@@ -1414,6 +1744,20 @@ pub fn is_known_command_kind(kind: &str) -> bool {
             | "media-query/watch"
             | "media-query/unwatch"
             | "http/request"
+    )
+}
+
+pub fn is_known_subscription_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "none"
+            | "batch"
+            | "sub/timer/every"
+            | "sub/dom-ref/resize"
+            | "sub/window/event"
+            | "sub/media-query"
+            | "sub/simulation/heart-rate"
+            | "sub/bluetooth/connect-heart-rate"
     )
 }
 
@@ -1439,7 +1783,7 @@ mod tests {
         let source = syntax::parse_source("(def bad fetch)");
         let report = validate_purity(&source);
 
-        assert_eq!(report.commands.len(), 12);
+        assert_eq!(report.commands.len(), 13);
         assert!(
             report
                 .diagnostics
@@ -1461,6 +1805,64 @@ mod tests {
             "{:?}",
             report.diagnostics
         );
+    }
+
+    #[test]
+    fn flags_additional_host_globals_as_browser_api_access() {
+        let source = syntax::parse_source(
+            "(def session sessionStorage)\n\
+             (def path location.pathname)\n\
+             (def timer setInterval)\n\
+             (def frame requestAnimationFrame)",
+        );
+        let report = validate_purity(&source);
+
+        for name in [
+            "sessionStorage",
+            "location.pathname",
+            "setInterval",
+            "requestAnimationFrame",
+        ] {
+            assert!(
+                report
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.message.contains(name)),
+                "missing diagnostic for {name}: {:?}",
+                report.diagnostics
+            );
+        }
+    }
+
+    #[test]
+    fn flags_deprecated_browser_intrinsics_as_browser_api_access() {
+        let source = syntax::parse_source(
+            "(def current (browser-current-url))\n\
+             (def theme (browser-theme-initial \"theme\"))\n\
+             (def auth (auth-storage-load \"/docs\"))\n\
+             (def file (selected-file-by-test-id \"upload\"))\n\
+             (def has-file (has-selected-file \"upload\"))\n\
+             (def form (multipart-form-body [] {}))",
+        );
+        let report = validate_purity(&source);
+
+        for name in [
+            "browser-current-url",
+            "browser-theme-initial",
+            "auth-storage-load",
+            "selected-file-by-test-id",
+            "has-selected-file",
+            "multipart-form-body",
+        ] {
+            assert!(
+                report
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.message.contains(name)),
+                "missing diagnostic for {name}: {:?}",
+                report.diagnostics
+            );
+        }
     }
 
     #[test]
@@ -1490,6 +1892,23 @@ mod tests {
                 .diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.message.contains("fetch")),
+            "{:?}",
+            report.diagnostics
+        );
+    }
+
+    #[test]
+    fn flags_event_mutation_inside_html_event_handler() {
+        let source = syntax::parse_source(
+            "(defn view [state] #html <button on:click={(do (event.preventDefault) {:kind :clicked})}>Load</button>)",
+        );
+        let report = validate_purity(&source);
+
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("Event.prevent")),
             "{:?}",
             report.diagnostics
         );
@@ -1760,6 +2179,16 @@ mod tests {
     }
 
     #[test]
+    fn validates_task_perform_as_command_boundary() {
+        let source = syntax::parse_source(
+            "(defn update [state msg]\n  [state (Task.perform (Http.get-text state.url)\n                              (fn [text] {:kind :loaded :value text})\n                              (fn [error] {:kind :failed :error error}))])",
+        );
+        let report = validate_purity(&source);
+
+        assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    }
+
+    #[test]
     fn validates_effectful_init_command_records() {
         let source = syntax::parse_source(
             "(defn init []\n  [{:label \"Loading\"} {:kind :storage/get :key \"heartRateExercise.log.v1\" :format :json :onSuccess :log-loaded :onError :log-load-failed}])",
@@ -1864,6 +2293,16 @@ mod tests {
     fn validates_match_update_command_records() {
         let source = syntax::parse_source(
             "(defn update [state msg]\n  (match msg\n    {:kind :start} [state {:kind :storage/set :key \"x\" :value \"y\" :msg :stored}]\n    _ [state {:kind :none}]))",
+        );
+        let report = validate_purity(&source);
+
+        assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    }
+
+    #[test]
+    fn validates_browser_side_effect_command_records() {
+        let source = syntax::parse_source(
+            "(defn update [state msg]\n  [state {:kind :batch\n          :commands [{:kind :browser/history-replace-search-param :name \"op\" :value nil}\n                     {:kind :browser/history-write-route :url \"/docs\" :op nil :definition nil}\n                     {:kind :browser/theme-load :key \"theme\" :onSuccess :theme-loaded}\n                     {:kind :browser/theme-apply :theme \"dark\" :key \"theme\"}\n                     {:kind :browser/clipboard-write :text \"copied\"}\n                     {:kind :browser/set-cookie :name \"token\" :value \"secret\"}\n                     {:kind :auth-storage/load :sourceUrl \"/docs\" :onSuccess :auth-loaded}\n                     {:kind :auth-storage/persist :sourceUrl \"/docs\" :entries {}}]}])",
         );
         let report = validate_purity(&source);
 

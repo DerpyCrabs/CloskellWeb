@@ -155,10 +155,9 @@
                              class="zone-handle"
                              data-boundary={control.id}
                              style={{:left (str control.leftPercent "%")}}
-                             on:pointerdown={(do (event.preventDefault)
-                                                 {:kind :start-drag
-                                                  :index control.index
-                                                  :clientX event.clientX})}>
+                             on:pointerdown={(Event.prevent {:kind :start-drag
+                                                             :index control.index
+                                                             :clientX event.clientX})}>
                        {control.max}
                      </button>)}
           </div>

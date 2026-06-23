@@ -174,6 +174,122 @@ function fileUrl(path) {{
     );
 }
 
+#[test]
+fn runtime_hydrate_app_uses_init_state_without_boot_command() {
+    if !node_available() {
+        eprintln!("skipping hydrateApp runtime test because node is unavailable");
+        return;
+    }
+
+    let temp_dir = env::temp_dir().join(format!("closkell-hydrate-app-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+    copy_runtime_package(&temp_dir);
+
+    let source = temp_dir.join("hydrate_app.clsk");
+    fs::write(
+        &source,
+        "(def init [{:count 0} {:kind :time/now :onSuccess :loaded}])\n\
+         \n\
+         (defn update [state msg]\n\
+           (match msg\n\
+             {:kind :inc} [(assoc state :count (+ state.count 1)) {:kind :none}]\n\
+             _ [state {:kind :none}]))\n\
+         \n\
+         (defn view [state]\n\
+           #html <section data-testid=\"count\"><button type=\"button\" on:click={{:kind :inc}}>Count {state.count}</button></section>)\n",
+    )
+    .expect("hydrate app source should be written");
+    let output = temp_dir.join("hydrate-app.mjs");
+
+    let build = Command::new(env!("CARGO_BIN_EXE_closkell"))
+        .arg("build")
+        .arg(&source)
+        .arg("--out")
+        .arg(&output)
+        .output()
+        .expect("closkell build should run");
+    assert!(
+        build.status.success(),
+        "closkell build failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let runtime = temp_dir
+        .join("node_modules")
+        .join("@closkell")
+        .join("runtime")
+        .join("src")
+        .join("index.js");
+    let script = format!(
+        r#"
+const runtime = await import(fileUrl({runtimePath}));
+const mod = await import(fileUrl({modulePath}));
+
+const root = document.createElement("main");
+const serverSection = document.createElement("section");
+serverSection.setAttribute("data-closkell-template", "template0");
+serverSection.setAttribute("data-testid", "count");
+const serverButton = document.createElement("button");
+serverButton.setAttribute("type", "button");
+serverButton.appendChild(document.createTextNode("Count "));
+const serverValue = document.createTextNode("7");
+serverButton.appendChild(serverValue);
+serverSection.appendChild(serverButton);
+root.appendChild(serverSection);
+
+let bootCommands = 0;
+const app = runtime.hydrateApp({{
+  root,
+  initState: {{ count: 7 }},
+  update: mod.update,
+  view: mod.view,
+  handlers: {{
+    "time/now"() {{
+      bootCommands += 1;
+      return {{ kind: Symbol.for("loaded"), value: 100 }};
+    }}
+  }}
+}});
+
+if (bootCommands !== 0) throw new Error("hydrateApp ran the boot command");
+if (root.children.length !== 1) throw new Error(`hydrateApp left duplicate roots: ${{root.children.length}}`);
+if (root.children[0] !== serverSection) throw new Error("hydrateApp did not reuse the server root");
+if (root.textContent !== "Count 7") throw new Error(`hydrateApp rendered wrong initial state: ${{root.textContent}}`);
+if (!root.children[0].hasAttribute("data-closkell-hydrated")) throw new Error("hydrateApp did not mark hydrated root");
+if (!serverButton.listeners.click?.length) throw new Error("hydrateApp did not attach event listener to server button");
+
+serverButton.click();
+if (app.state.count !== 8) throw new Error(`hydrateApp dispatch returned wrong state: ${{app.state.count}}`);
+if (root.textContent !== "Count 8") throw new Error(`hydrateApp did not update DOM: ${{root.textContent}}`);
+if (serverValue.nodeValue !== "8") throw new Error(`hydrateApp did not update the reused text node: ${{serverValue.nodeValue}}`);
+
+function fileUrl(path) {{
+  return "file:///" + path.replace(/\\/g, "/").replace(/^([A-Za-z]):/, "$1:");
+}}
+"#,
+        modulePath = js_string(&output),
+        runtimePath = js_string(&runtime)
+    );
+
+    let node = Command::new("node")
+        .arg("--input-type=module")
+        .arg("--eval")
+        .arg(script)
+        .output()
+        .expect("node should run");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+
+    assert!(
+        node.status.success(),
+        "hydrateApp runtime test failed under Node\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&node.stdout),
+        String::from_utf8_lossy(&node.stderr)
+    );
+}
+
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
 }

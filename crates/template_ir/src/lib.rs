@@ -309,7 +309,7 @@ impl Lowerer<'_> {
                             component_call_reads(expr, &spec, self.read_summaries),
                             self.read_aliases,
                         ),
-                        component_uses: vec![spec.name.to_string()],
+                        component_uses: component_spec_uses(&spec),
                     });
                     return node_id;
                 }
@@ -521,7 +521,7 @@ fn collect_branch_component_uses(
             collect_branch_component_uses(&spec.else_branch, components, uses);
         }
         TemplateBranch::Component { spec, .. } => {
-            uses.insert(spec.name.to_string());
+            collect_component_spec_uses(spec, uses);
         }
     }
 }
@@ -554,11 +554,27 @@ fn collect_html_component_uses_inner(
                 return;
             }
             if let Some(spec) = ComponentSpec::parse(expr, components) {
-                uses.insert(spec.name.to_string());
+                collect_component_spec_uses(&spec, uses);
             }
         }
         HtmlNode::Text { .. } => {}
     }
+}
+
+fn collect_component_spec_uses(spec: &ComponentSpec<'_>, uses: &mut BTreeSet<String>) {
+    if spec.name == "scope-view" {
+        if let Some(view_name) = spec.args.get(1).and_then(symbol_name) {
+            uses.insert(view_name.to_string());
+            return;
+        }
+    }
+    uses.insert(spec.name.to_string());
+}
+
+fn component_spec_uses(spec: &ComponentSpec<'_>) -> Vec<String> {
+    let mut uses = BTreeSet::new();
+    collect_component_spec_uses(spec, &mut uses);
+    uses.into_iter().collect()
 }
 
 fn collect_branch_reads(
@@ -609,6 +625,10 @@ fn collect_html_reads(
                 reads.extend(spec.reads(components, read_summaries));
                 return;
             }
+            if let Some(spec) = ComponentSpec::parse(expr, components) {
+                reads.extend(component_call_reads(expr, &spec, read_summaries));
+                return;
+            }
             reads.extend(collect_template_reads(expr, read_summaries));
         }
         HtmlNode::Text { .. } => {}
@@ -626,7 +646,7 @@ impl<'a> ComponentSpec<'a> {
         let ExprKind::Symbol(name) = &head.kind else {
             return None;
         };
-        if !components.contains(name) {
+        if name != "scope-view" && !components.contains(name) {
             return None;
         }
 
@@ -704,10 +724,32 @@ fn component_call_reads(
     spec: &ComponentSpec<'_>,
     read_summaries: &BTreeMap<String, ReadSummary>,
 ) -> Vec<String> {
+    if spec.name == "scope-view" {
+        return scope_view_reads(spec, read_summaries);
+    }
     let Some(summary) = read_summaries.get(spec.name) else {
         return collect_template_reads(expr, read_summaries);
     };
     project_call_reads(summary, spec.args, read_summaries)
+}
+
+fn scope_view_reads(
+    spec: &ComponentSpec<'_>,
+    read_summaries: &BTreeMap<String, ReadSummary>,
+) -> Vec<String> {
+    let Some(view_expr) = spec.args.get(1) else {
+        return Vec::new();
+    };
+    let Some(state_expr) = spec.args.get(2) else {
+        return Vec::new();
+    };
+    let Some(view_name) = symbol_name(view_expr) else {
+        return collect_template_reads(state_expr, read_summaries);
+    };
+    let Some(summary) = read_summaries.get(view_name) else {
+        return collect_template_reads(state_expr, read_summaries);
+    };
+    project_call_reads(summary, std::slice::from_ref(state_expr), read_summaries)
 }
 
 fn project_call_reads(

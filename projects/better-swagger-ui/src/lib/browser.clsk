@@ -1,7 +1,10 @@
 (import "yaml" [(parse as parseYaml)])
 
+(foreign pure parseYaml (Fn [String] Js))
+
 (def theme-storage-key "better-swagger-theme")
 
+(ann hasOpenApiShape? (Fn [Js] Bool))
 (defn hasOpenApiShape? [value]
   (and (object? value)
        (or (string? value.openapi) (string? value.swagger))
@@ -14,10 +17,10 @@
         (ends-with? path ".yml")
         (regex-test? url "\\.(json|ya?ml)(\\?|#|$)" "i"))))
 
-(defn validHttpUrl? [value]
+(defn validHttpUrl? [baseUrl value]
   (let [trimmed (trim value)]
     (and (regex-test? trimmed "^https?://" "i")
-         (some? (url-resolve trimmed (browser-current-url))))))
+         (some? (url-resolve trimmed baseUrl)))))
 
 (defn looksLikeSpecContent [text]
   (let [trimmed (trim text)]
@@ -26,6 +29,7 @@
         (or (starts-with? trimmed "{")
             (regex-test? trimmed "^(openapi|swagger)\\s*:" "m")))))
 
+(ann parseSpecText (Fn [String] Js))
 (defn parseSpecText [text]
   (let [trimmed (trim text)]
     (if (= trimmed "")
@@ -33,10 +37,11 @@
         (if (starts-with? trimmed "{")
             (let [parsed (json-parse-result trimmed)]
               (if (get parsed :ok)
-                  (unwrap-or parsed {})
+                  (unsafe-cast Js (unwrap-or parsed {}))
                   (fail "Invalid JSON spec")))
             (parseYaml trimmed)))))
 
+(ann parseOpenApiText (Fn [String] Js))
 (defn parseOpenApiText [text]
   (let [parsed (parseSpecText text)]
     (if (hasOpenApiShape? parsed)
@@ -53,8 +58,8 @@
   (let [spec (parseOpenApiText text)]
     {:ok true :spec spec :specUrl specUrl}))
 
-(defn absoluteUrl [value]
-  (let [resolved (url-resolve value (browser-current-url))]
+(defn absoluteUrl [baseUrl value]
+  (let [resolved (url-resolve value baseUrl)]
     (if (some? resolved) resolved value)))
 
 (defn absoluteUrlFrom [value base]
@@ -90,8 +95,8 @@
   (let [found (regex-capture text "configUrl\\s*:\\s*[\"']([^\"']+)[\"']" "")]
     (if (= found "") "" (absoluteUrlFrom found baseUrl))))
 
-(defn analyzeSourceResponse [sourceInput text definitionName]
-  (let [sourceUrl (absoluteUrl sourceInput)
+(defn analyzeSourceResponse [baseUrl sourceInput text definitionName]
+  (let [sourceUrl (absoluteUrl baseUrl sourceInput)
         querySpecUrl (url-search-param sourceUrl "url")
         queryConfigUrl (url-search-param sourceUrl "configUrl")
         pathname (url-pathname sourceUrl)]
@@ -159,76 +164,85 @@
   (let [selected (pickDefinition definitions name)]
     selected.url))
 
-(defn initialUrlInput []
-  (url-search-param (browser-current-url) "url"))
+(defn initialUrlInput [boot]
+  (url-search-param boot.currentUrl "url"))
 
-(defn initialDefinitionParam []
-  (url-search-param (browser-current-url) "definition"))
+(defn initialDefinitionParam [boot]
+  (url-search-param boot.currentUrl "definition"))
 
-(defn initialOpParam []
-  (url-search-param (browser-current-url) "op"))
+(defn initialOpParam [boot]
+  (url-search-param boot.currentUrl "op"))
 
-(defn initialTheme []
-  (browser-theme-initial theme-storage-key))
+(defn loadThemeCommand []
+  {:kind :browser/theme-load
+   :key theme-storage-key
+   :toMessage (fn [theme] {:kind :theme-loaded :theme theme})})
 
 (defn toggleTheme [current]
-  (browser-theme-toggle current theme-storage-key))
+  (if (= current "dark") "light" "dark"))
+
+(defn applyThemeCommand [theme]
+  {:kind :browser/theme-apply
+   :theme theme
+   :key theme-storage-key})
 
 (defn loadStoredAuthEntries [sourceUrl]
-  (auth-storage-load sourceUrl))
+  {:kind :auth-storage/load
+   :sourceUrl sourceUrl
+   :toMessage (fn [entries] {:kind :auth-storage-loaded :entries entries})})
 
 (defn persistAuthEntries [sourceUrl entries]
-  (auth-storage-persist sourceUrl entries))
+  {:kind :auth-storage/persist
+   :sourceUrl sourceUrl
+   :entries entries})
 
 (defn resolveTokenExpiry [response token]
   (resolve-token-expiry (get response :expires_in) token))
 
 (defn setOpQueryParam [value]
-  (history-replace-search-param "op" value))
+  {:kind :browser/history-replace-search-param
+   :name "op"
+   :value value})
 
 (defn setDefinitionQueryParam [value]
-  (history-replace-search-param "definition" value))
+  {:kind :browser/history-replace-search-param
+   :name "definition"
+   :value value})
 
 (defn setUrlQueryParam [url name value]
   (url-set-search-param url name value))
 
 (defn writeRoute [url op definition]
-  (history-write-route url op definition))
+  {:kind :browser/history-write-route
+   :url url
+   :op op
+   :definition definition})
 
 (defn setDeepObjectQueryParam [url name value]
   (url-set-deep-object-param url name value))
 
-(defn resolveApiUrl [serverUrl path]
+(defn resolveApiUrl [baseUrl serverUrl path]
   (let [resolvedPath (path-fill-params path "550e8400-e29b-41d4-a716-446655440000")
         base serverUrl
         suffix (if (starts-with? resolvedPath "/") resolvedPath (str "/" resolvedPath))
-        resolved (url-resolve (str base suffix) (browser-current-url))]
+        resolved (url-resolve (str base suffix) baseUrl)]
     (if (some? resolved) resolved (str base suffix))))
 
-(defn resolvedSpecUrl [specUrl]
-  (let [resolved (url-resolve specUrl (browser-current-url))]
-    (if (some? resolved) resolved (browser-current-url))))
+(defn resolvedSpecUrl [baseUrl specUrl]
+  (let [resolved (url-resolve specUrl baseUrl)]
+    (if (some? resolved) resolved baseUrl)))
 
 (defn clipboardText [event]
   (clipboard-text event))
 
 (defn copyText [text]
-  (clipboard-write text))
+  {:kind :browser/clipboard-write
+   :text text})
 
 (defn setCookie [name value]
-  (browser-set-cookie name value))
-
-(defn selectedRequestBodyFile []
-  (selected-file-by-test-id "request-body-file"))
-
-(defn hasSelectedRequestBodyFile? []
-  (has-selected-file "request-body-file"))
-
-(defn hasSelectedMultipartFile? [name]
-  (has-selected-file (str "request-body-multipart-" name)))
-
-(defn buildMultipartFormBody [fields values]
-  (multipart-form-body fields values))
+  {:kind :browser/set-cookie
+   :name name
+   :value value})
 
 (defn buildUrlEncodedFormBody [fields values]
   (urlencoded-form-body fields values))

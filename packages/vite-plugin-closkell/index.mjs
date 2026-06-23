@@ -35,6 +35,12 @@ function withRuntimeOptimizeDepsExclude(exclude = []) {
   return [...new Set([...exclude, RUNTIME_PACKAGE])];
 }
 
+function withRuntimeSsrNoExternal(noExternal) {
+  if (noExternal === true) return true;
+  const entries = Array.isArray(noExternal) ? noExternal : noExternal ? [noExternal] : [];
+  return [...new Set([...entries, RUNTIME_PACKAGE])];
+}
+
 function isRuntimeOptimizedFile(file) {
   return file.startsWith(RUNTIME_OPTIMIZED_PREFIX);
 }
@@ -45,6 +51,30 @@ function isRuntimeOptimizedRequest(pathname) {
     path.posix.basename(pathname).startsWith(RUNTIME_OPTIMIZED_PREFIX) &&
     pathname.endsWith(".js")
   );
+}
+
+function exportedBindingNames(code) {
+  const names = new Set();
+  for (const match of code.matchAll(/\bexport\s+(?:const|let|var|function)\s+([A-Za-z_$][\w$]*)/g)) {
+    names.add(match[1]);
+  }
+  return [...names].sort();
+}
+
+function appendVitestRegistration(code) {
+  const exports = exportedBindingNames(code);
+  if (exports.length === 0) return code;
+  const moduleObject = exports
+    .map((name) => `${name}: typeof ${name} !== "undefined" ? ${name} : undefined`)
+    .join(", ");
+  const suffix = [
+    "",
+    "import { registerVitestTests as __closkellRegisterVitestTests } from \"@closkell/runtime\";",
+    "import { describe as __closkellVitestDescribe, test as __closkellVitestTest } from \"vitest\";",
+    `__closkellRegisterVitestTests({ ${moduleObject} }, { describe: __closkellVitestDescribe, test: __closkellVitestTest });`,
+    ""
+  ].join("\n");
+  return code.endsWith("\n") ? `${code}${suffix}` : `${code}\n${suffix}`;
 }
 
 async function pruneOptimizedRuntimeMetadata(metadataPath) {
@@ -220,6 +250,7 @@ export function closkell(options = {}) {
     rootId = "root",
     css = "src/styles.css",
     app = true,
+    vitest = false,
     sourceMap = false,
     vendorRuntime = true,
     inspect = true,
@@ -456,6 +487,21 @@ export function closkell(options = {}) {
     }
   }
 
+  function isGeneratedClskOutput(id) {
+    if (!vitest || !generatedRoot) return false;
+    const resolved = path.resolve(stripQuery(id));
+    if (!resolved.endsWith(".mjs")) return false;
+    const relative = path.relative(generatedRoot, resolved);
+    return Boolean(relative) && !relative.startsWith("..") && !path.isAbsolute(relative);
+  }
+
+  async function loadGeneratedClskOutput(id) {
+    if (!isGeneratedClskOutput(id)) return null;
+    const file = stripQuery(id);
+    const code = await fs.readFile(file, "utf8");
+    return appendVitestRegistration(code);
+  }
+
   return {
     name: "vite-plugin-closkell",
     enforce: "pre",
@@ -464,6 +510,9 @@ export function closkell(options = {}) {
       return {
         optimizeDeps: {
           exclude: withRuntimeOptimizeDepsExclude(userConfig.optimizeDeps?.exclude)
+        },
+        ssr: {
+          noExternal: withRuntimeSsrNoExternal(userConfig.ssr?.noExternal)
         }
       };
     },
@@ -504,6 +553,10 @@ export function closkell(options = {}) {
       const sourcePath = resolveClskId(source, importer);
       const output = await compile(sourcePath);
       return output;
+    },
+
+    async load(id) {
+      return loadGeneratedClskOutput(id);
     },
 
     configureServer(server) {

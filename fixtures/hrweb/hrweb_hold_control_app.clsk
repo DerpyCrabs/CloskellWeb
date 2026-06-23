@@ -94,8 +94,7 @@
                   on:pointercancel={{:kind :stop-hold-cancel}}
                   on:keydown={(if (or (= event.key "Enter")
                                        (= event.key " "))
-                                   (do (event.preventDefault)
-                                       {:kind :stop-hold-start})
+                                   (Event.prevent {:kind :stop-hold-start})
                                    {:kind :none})}
                   on:keyup={(if (or (= event.key "Enter")
                                      (= event.key " "))
@@ -113,8 +112,7 @@
                   on:pointercancel={{:kind :delete-hold-cancel}}
                   on:keydown={(if (or (= event.key "Enter")
                                        (= event.key " "))
-                                   (do (event.preventDefault)
-                                       {:kind :delete-hold-start})
+                                   (Event.prevent {:kind :delete-hold-start})
                                    {:kind :none})}
                   on:keyup={(if (or (= event.key "Enter")
                                      (= event.key " "))

@@ -34,6 +34,8 @@ pub fn emit_module(source: &SourceFile) -> EmitResult {
     let mut emitter = Emitter {
         diagnostics: Vec::new(),
         needs_html_runtime: false,
+        needs_decoder_runtime: false,
+        needs_value_equal_helper: false,
         component_fns: collect_template_defns(source),
         read_summaries: collect_read_summaries(source),
         next_template_id: 0,
@@ -58,7 +60,7 @@ pub fn emit_module(source: &SourceFile) -> EmitResult {
                 }
                 continue;
             }
-            if is_type_form(form) || is_ann_form(form) {
+            if is_type_form(form) || is_ann_form(form) || is_foreign_form(form) {
                 continue;
             }
 
@@ -100,7 +102,13 @@ pub fn emit_module(source: &SourceFile) -> EmitResult {
     let mut generated_line = 0;
     if emitter.needs_html_runtime {
         code.push_str(
-            "import { createTemplateComponent as __closkellCreateTemplate, setAttr as __closkellSetAttr, setComponent as __closkellSetComponent, setConditional as __closkellSetConditional, setEvent as __closkellSetEvent, setKeyedList as __closkellSetKeyedList, setRef as __closkellSetRef, setText as __closkellSetText, shouldUpdateSlot as __closkellShouldUpdateSlot } from \"@closkell/runtime\";\n\n",
+            "import { createTemplateComponent as __closkellCreateTemplate, renderToString as __closkellRenderToString, scopeSubscriptions as __closkellScopeSubscriptions, scopeUpdate as __closkellScopeUpdate, scopeView as __closkellScopeView, setAttr as __closkellSetAttr, setComponent as __closkellSetComponent, setConditional as __closkellSetConditional, setEvent as __closkellSetEvent, setKeyedList as __closkellSetKeyedList, setRef as __closkellSetRef, setText as __closkellSetText, shouldUpdateSlot as __closkellShouldUpdateSlot } from \"@closkell/runtime\";\n\n",
+        );
+        generated_line += 2;
+    }
+    if emitter.needs_decoder_runtime {
+        code.push_str(
+            "import { Decoder as __closkellDecoder, decode as __closkellDecode } from \"@closkell/runtime\";\n\n",
         );
         generated_line += 2;
     }
@@ -113,6 +121,10 @@ pub fn emit_module(source: &SourceFile) -> EmitResult {
         );
         code.push('\n');
         generated_line += 1;
+    }
+    if emitter.needs_value_equal_helper {
+        code.push_str(VALUE_EQUAL_HELPER);
+        generated_line += VALUE_EQUAL_HELPER.lines().count();
     }
     push_emitted_lines(&mut code, &lines, &mut source_mappings, &mut generated_line);
 
@@ -239,12 +251,10 @@ fn parse_import_name(expr: &Expr) -> Result<ImportName, Diagnostic> {
                 local: local.clone(),
             })
         }
-        _ => {
-            Err(Diagnostic::error(
-                expr.span,
-                "imported name must be a symbol, (default local), or (name as local)",
-            ))
-        }
+        _ => Err(Diagnostic::error(
+            expr.span,
+            "imported name must be a symbol, (default local), or (name as local)",
+        )),
     }
 }
 
@@ -254,6 +264,10 @@ fn is_type_form(expr: &Expr) -> bool {
 
 fn is_ann_form(expr: &Expr) -> bool {
     matches!(&expr.kind, ExprKind::List(items) if items.first().is_some_and(|head| matches_symbol(head, "ann")))
+}
+
+fn is_foreign_form(expr: &Expr) -> bool {
+    matches!(&expr.kind, ExprKind::List(items) if items.first().is_some_and(|head| matches_symbol(head, "foreign")))
 }
 
 fn emit_import(spec: &ImportSpec) -> Option<String> {
@@ -286,9 +300,10 @@ fn emit_import(spec: &ImportSpec) -> Option<String> {
     let path = escape_js(&js_import_path(&spec.path));
     match (default_name, names.is_empty()) {
         (Some(default_name), true) => Some(format!("import {} from \"{}\";", default_name, path)),
-        (Some(default_name), false) => {
-            Some(format!("import {}, {{ {} }} from \"{}\";", default_name, names, path))
-        }
+        (Some(default_name), false) => Some(format!(
+            "import {}, {{ {} }} from \"{}\";",
+            default_name, names, path
+        )),
         (None, false) => Some(format!("import {{ {} }} from \"{}\";", names, path)),
         (None, true) => None,
     }
@@ -302,6 +317,9 @@ pub fn is_runtime_import_name(name: &str) -> bool {
 }
 
 fn js_import_path(path: &str) -> String {
+    if path == "closkell/test" {
+        return "@closkell/runtime".to_string();
+    }
     path.strip_suffix(".clsk")
         .map(|prefix| format!("{}.mjs", prefix))
         .unwrap_or_else(|| path.to_string())
@@ -310,11 +328,15 @@ fn js_import_path(path: &str) -> String {
 struct Emitter {
     diagnostics: Vec<Diagnostic>,
     needs_html_runtime: bool,
+    needs_decoder_runtime: bool,
+    needs_value_equal_helper: bool,
     component_fns: BTreeSet<String>,
     read_summaries: BTreeMap<String, ReadSummary>,
     next_template_id: usize,
     next_temp_id: usize,
 }
+
+const VALUE_EQUAL_HELPER: &str = "const __closkellValueEqual = (...__values) => { const __symbolKey = (__value) => Symbol.keyFor(__value) ?? __value.description ?? \"\"; const __plain = (__value) => __value !== null && typeof __value === \"object\" && !Array.isArray(__value) && !(__value instanceof Map) && !(__value instanceof Set); const __eq = (__left, __right) => { if (Object.is(__left, __right)) return true; if (typeof __left === \"symbol\" || typeof __right === \"symbol\") return typeof __left === \"symbol\" && typeof __right === \"symbol\" && __symbolKey(__left) === __symbolKey(__right); if (Array.isArray(__left) || Array.isArray(__right)) return Array.isArray(__left) && Array.isArray(__right) && __left.length === __right.length && __left.every((__value, __index) => __eq(__value, __right[__index])); if (__left instanceof Set || __right instanceof Set) { if (!(__left instanceof Set) || !(__right instanceof Set) || __left.size !== __right.size) return false; const __remaining = Array.from(__right); return Array.from(__left).every((__item) => { const __match = __remaining.findIndex((__candidate) => __eq(__item, __candidate)); if (__match < 0) return false; __remaining.splice(__match, 1); return true; }); } if (__left instanceof Map || __right instanceof Map) { if (!(__left instanceof Map) || !(__right instanceof Map) || __left.size !== __right.size) return false; const __remaining = Array.from(__right); return Array.from(__left).every(([__key, __value]) => { const __match = __remaining.findIndex(([__rightKey, __rightValue]) => __eq(__key, __rightKey) && __eq(__value, __rightValue)); if (__match < 0) return false; __remaining.splice(__match, 1); return true; }); } if (__plain(__left) || __plain(__right)) { if (!__plain(__left) || !__plain(__right)) return false; const __leftKeys = Object.keys(__left).sort(); const __rightKeys = Object.keys(__right).sort(); return __eq(__leftKeys, __rightKeys) && __leftKeys.every((__key) => __eq(__left[__key], __right[__key])); } return false; }; for (let __index = 1; __index < __values.length; __index += 1) if (!__eq(__values[__index - 1], __values[__index])) return false; return true; };\n\n";
 
 struct TailEmission {
     code: String,
@@ -338,7 +360,7 @@ impl Emitter {
             ExprKind::Number(value) => value.clone(),
             ExprKind::String(value) => format!("\"{}\"", escape_js(value)),
             ExprKind::Keyword(name) => format!("Symbol.for(\"{}\")", escape_js(name)),
-            ExprKind::Symbol(name) => emit_symbol_read(name),
+            ExprKind::Symbol(name) => self.emit_symbol_read(name),
             ExprKind::Vector(items) => self.emit_array(items),
             ExprKind::Set(items) => format!("new Set({})", self.emit_array(items)),
             ExprKind::Map(entries) => self.emit_map_or_record(entries),
@@ -367,6 +389,14 @@ impl Emitter {
         )
     }
 
+    fn emit_symbol_read(&mut self, name: &str) -> String {
+        if let Some(property) = primitive_decoder_runtime_property(name) {
+            self.needs_decoder_runtime = true;
+            return format!("__closkellDecoder.{}", property);
+        }
+        emit_symbol_read(name)
+    }
+
     fn emit_list(&mut self, expr: &Expr, items: &[Expr]) -> String {
         let Some((head, args)) = items.split_first() else {
             return "[]".to_string();
@@ -379,11 +409,39 @@ impl Emitter {
                 "if" => return self.emit_if(expr, args),
                 "match" => return self.emit_match(expr, args),
                 "do" => return self.emit_do(args),
+                "unsafe-cast" => return self.emit_unsafe_cast(args),
+                "Event.prevent" => return self.emit_event_control(args, true, false),
+                "Event.stop" => return self.emit_event_control(args, false, true),
+                "Event.prevent-stop" => return self.emit_event_control(args, true, true),
+                "Task.succeed" => return self.emit_task_succeed(args),
+                "Task.fail" => return self.emit_task_fail(args),
+                "Task.map" => return self.emit_task_combinator(args, "task/map", "mapper"),
+                "Task.map-error" => {
+                    return self.emit_task_combinator(args, "task/map-error", "mapper");
+                }
+                "Task.and-then" => return self.emit_task_combinator(args, "task/and-then", "next"),
+                "Task.perform" => return self.emit_task_perform(args),
+                "Http.get-text" => return self.emit_http_task(args, "task/http/get-text"),
+                "Http.get-json" => return self.emit_http_task(args, "task/http/get-json"),
+                "scope-update" => return self.emit_scope_update(args),
+                "scope-subscriptions" => return self.emit_scope_subscriptions(args),
+                "scope-view" => return self.emit_scope_view(args),
+                "render-to-string" => return self.emit_render_to_string(args),
+                "Sub.batch" => return self.emit_sub_batch(args),
+                "Sub.timer/every" => return self.emit_sub_timer_every(args),
+                "Sub.media-query" => {
+                    return self.emit_sub_change(args, "sub/media-query", "query");
+                }
+                "Sub.window/event" => return self.emit_sub_window_event(args),
+                "Sub.dom-ref/resize" => {
+                    return self.emit_sub_change(args, "sub/dom-ref/resize", "ref");
+                }
                 "+" | "-" | "*" | "/" | "<" | ">" | "<=" | ">=" => {
                     return self.emit_infix(name, args);
                 }
                 "%" | "mod" => return self.emit_mod(args),
-                "=" => return self.emit_infix("===", args),
+                "=" => return self.emit_value_equal(args),
+                "identical?" => return self.emit_identical(args),
                 "max" => return self.emit_math_call("max", args),
                 "min" => return self.emit_math_call("min", args),
                 "max-of" => return self.emit_numeric_vector_aggregate("max", args),
@@ -455,6 +513,15 @@ impl Emitter {
                 "json-stringify" => return self.emit_json_stringify(args),
                 "json-parse" => return self.emit_json_parse(args),
                 "json-parse-result" => return self.emit_json_parse_result(args),
+                "decoder-string" => return self.emit_zero_arg_decoder(args, "string"),
+                "decoder-number" => return self.emit_zero_arg_decoder(args, "number"),
+                "decoder-bool" => return self.emit_zero_arg_decoder(args, "bool"),
+                "decoder-keyword" => return self.emit_zero_arg_decoder(args, "keyword"),
+                "decoder-literal" => return self.emit_decoder_literal(args),
+                "decoder-optional" => return self.emit_decoder_unary(args, "optional"),
+                "decoder-vector" => return self.emit_decoder_unary(args, "vector"),
+                "decoder-record" => return self.emit_decoder_record(args),
+                "decode" => return self.emit_decode(args),
                 "object-entries" => return self.emit_object_entries(args),
                 "object-keys" => return self.emit_object_projection(args, "keys"),
                 "object-values" => return self.emit_object_projection(args, "values"),
@@ -471,11 +538,15 @@ impl Emitter {
                 "url-origin" => return self.emit_url_part(args, "origin", false),
                 "url-hostname" => return self.emit_url_part(args, "hostname", false),
                 "url-pathname" => return self.emit_url_part(args, "pathname", false),
-                "browser-current-url" => return self.emit_zero_arg_expr(args, "globalThis.location?.href ?? \"\""),
+                "browser-current-url" => {
+                    return self.emit_zero_arg_expr(args, "globalThis.location?.href ?? \"\"");
+                }
                 "url-search-param" => return self.emit_url_search_param(args),
                 "url-set-search-param" => return self.emit_url_set_search_param(args),
                 "url-set-deep-object-param" => return self.emit_url_set_deep_object_param(args),
-                "history-replace-search-param" => return self.emit_history_replace_search_param(args),
+                "history-replace-search-param" => {
+                    return self.emit_history_replace_search_param(args);
+                }
                 "history-write-route" => return self.emit_history_write_route(args),
                 "browser-theme-initial" => return self.emit_browser_theme_initial(args),
                 "browser-theme-toggle" => return self.emit_browser_theme_toggle(args),
@@ -493,7 +564,9 @@ impl Emitter {
                 "multipart-form-body" => return self.emit_multipart_form_body(args),
                 "urlencoded-form-body" => return self.emit_urlencoded_form_body(args),
                 "regex-capture" => return self.emit_regex_capture(args),
-                "install-virtual-json-viewer" => return self.emit_install_virtual_json_viewer(args),
+                "install-virtual-json-viewer" => {
+                    return self.emit_install_virtual_json_viewer(args);
+                }
                 "base64-encode" => return self.emit_base64(true, args),
                 "base64-decode" => return self.emit_base64(false, args),
                 "fail" => return self.emit_fail(args),
@@ -516,9 +589,11 @@ impl Emitter {
                 "map-entries" => return self.emit_map_entries(args),
                 "map-keys" => return self.emit_map_projection(args, "keys"),
                 "map-values" => return self.emit_map_projection(args, "values"),
+                "get-in" => return self.emit_get_in(args),
                 "assoc" => return self.emit_assoc(expr, args),
                 "merge" => return self.emit_merge(args),
                 "dissoc" => return self.emit_dissoc(expr, args),
+                "update-in" => return self.emit_update_in(expr, args),
                 "str" => {
                     if args.len() == 1 {
                         return format!("String({})", self.emit_expr(&args[0]));
@@ -542,6 +617,200 @@ impl Emitter {
             .collect::<Vec<_>>()
             .join(", ");
         format!("{}({})", callee, args)
+    }
+
+    fn emit_unsafe_cast(&mut self, args: &[Expr]) -> String {
+        if args.len() != 2 {
+            return "undefined".to_string();
+        }
+        self.emit_expr(&args[1])
+    }
+
+    fn emit_event_control(
+        &mut self,
+        args: &[Expr],
+        prevent_default: bool,
+        stop_propagation: bool,
+    ) -> String {
+        if args.len() != 1 {
+            return "undefined".to_string();
+        }
+        format!(
+            "{{ __closkellEvent: true, preventDefault: {}, stopPropagation: {}, message: {} }}",
+            prevent_default,
+            stop_propagation,
+            self.emit_expr(&args[0])
+        )
+    }
+
+    fn emit_task_succeed(&mut self, args: &[Expr]) -> String {
+        if args.len() != 1 {
+            return "{ kind: Symbol.for(\"task/succeed\"), value: undefined }".to_string();
+        }
+        format!(
+            "{{ kind: Symbol.for(\"task/succeed\"), value: {} }}",
+            self.emit_expr(&args[0])
+        )
+    }
+
+    fn emit_task_fail(&mut self, args: &[Expr]) -> String {
+        if args.len() != 1 {
+            return "{ kind: Symbol.for(\"task/fail\"), error: undefined }".to_string();
+        }
+        format!(
+            "{{ kind: Symbol.for(\"task/fail\"), error: {} }}",
+            self.emit_expr(&args[0])
+        )
+    }
+
+    fn emit_task_combinator(&mut self, args: &[Expr], kind: &str, fn_field: &str) -> String {
+        if args.len() != 2 {
+            return "{ kind: Symbol.for(\"task/fail\"), error: \"invalid task\" }".to_string();
+        }
+        format!(
+            "{{ kind: Symbol.for(\"{}\"), task: {}, {}: {} }}",
+            kind,
+            self.emit_expr(&args[0]),
+            fn_field,
+            self.emit_expr(&args[1])
+        )
+    }
+
+    fn emit_task_perform(&mut self, args: &[Expr]) -> String {
+        match args.len() {
+            3 => format!(
+                "{{ kind: Symbol.for(\"task/perform\"), task: {}, onSuccess: {}, onError: {} }}",
+                self.emit_expr(&args[0]),
+                self.emit_expr(&args[1]),
+                self.emit_expr(&args[2])
+            ),
+            4 => format!(
+                "{{ kind: Symbol.for(\"task/perform\"), task: {}({}), onSuccess: {}, onError: {} }}",
+                self.emit_expr(&args[0]),
+                self.emit_expr(&args[1]),
+                self.emit_expr(&args[2]),
+                self.emit_expr(&args[3])
+            ),
+            _ => "{ kind: Symbol.for(\"none\") }".to_string(),
+        }
+    }
+
+    fn emit_http_task(&mut self, args: &[Expr], kind: &str) -> String {
+        if args.len() != 1 {
+            return "{ kind: Symbol.for(\"task/fail\"), error: \"invalid HTTP task\" }".to_string();
+        }
+        format!(
+            "{{ kind: Symbol.for(\"{}\"), url: {} }}",
+            kind,
+            self.emit_expr(&args[0])
+        )
+    }
+
+    fn emit_scope_update(&mut self, args: &[Expr]) -> String {
+        self.needs_html_runtime = true;
+        if args.len() != 5 {
+            return "[undefined, { kind: Symbol.for(\"none\") }]".to_string();
+        }
+        format!(
+            "__closkellScopeUpdate({}, {}, {}, {}, {})",
+            self.emit_expr(&args[0]),
+            self.emit_expr(&args[1]),
+            self.emit_expr(&args[2]),
+            self.emit_expr(&args[3]),
+            self.emit_expr(&args[4])
+        )
+    }
+
+    fn emit_scope_subscriptions(&mut self, args: &[Expr]) -> String {
+        self.needs_html_runtime = true;
+        if args.len() != 3 {
+            return "{ kind: Symbol.for(\"none\") }".to_string();
+        }
+        format!(
+            "__closkellScopeSubscriptions({}, {}, {})",
+            self.emit_expr(&args[0]),
+            self.emit_expr(&args[1]),
+            self.emit_expr(&args[2])
+        )
+    }
+
+    fn emit_scope_view(&mut self, args: &[Expr]) -> String {
+        self.needs_html_runtime = true;
+        if args.len() != 3 {
+            return "__closkellScopeView(Symbol.for(\"scope\"), () => ({ mount() {}, update() {}, dispose() {}, root: null }), undefined)".to_string();
+        }
+        format!(
+            "__closkellScopeView({}, {}, {})",
+            self.emit_expr(&args[0]),
+            self.emit_expr(&args[1]),
+            self.emit_expr(&args[2])
+        )
+    }
+
+    fn emit_render_to_string(&mut self, args: &[Expr]) -> String {
+        self.needs_html_runtime = true;
+        match args.len() {
+            1 => format!("__closkellRenderToString({})", self.emit_expr(&args[0])),
+            2 => format!(
+                "__closkellRenderToString({}, {})",
+                self.emit_expr(&args[0]),
+                self.emit_expr(&args[1])
+            ),
+            _ => "__closkellRenderToString(null)".to_string(),
+        }
+    }
+
+    fn emit_sub_batch(&mut self, args: &[Expr]) -> String {
+        if args.len() != 1 {
+            return "{ kind: Symbol.for(\"batch\"), subscriptions: [] }".to_string();
+        }
+        format!(
+            "{{ kind: Symbol.for(\"batch\"), subscriptions: {} }}",
+            self.emit_expr(&args[0])
+        )
+    }
+
+    fn emit_sub_timer_every(&mut self, args: &[Expr]) -> String {
+        if args.len() != 3 {
+            return "{ kind: Symbol.for(\"none\") }".to_string();
+        }
+        format!(
+            "{{ kind: Symbol.for(\"sub/timer/every\"), id: {}, ms: {}, msg: {} }}",
+            self.emit_expr(&args[0]),
+            self.emit_expr(&args[1]),
+            self.emit_expr(&args[2])
+        )
+    }
+
+    fn emit_sub_change(&mut self, args: &[Expr], kind: &str, target_field: &str) -> String {
+        if args.len() != 3 {
+            return "{ kind: Symbol.for(\"none\") }".to_string();
+        }
+        format!(
+            "{{ kind: Symbol.for(\"{}\"), id: {}, {}: {}, onChange: {} }}",
+            kind,
+            self.emit_expr(&args[0]),
+            target_field,
+            self.emit_expr(&args[1]),
+            self.emit_expr(&args[2])
+        )
+    }
+
+    fn emit_sub_window_event(&mut self, args: &[Expr]) -> String {
+        if args.len() != 3 && args.len() != 4 {
+            return "{ kind: Symbol.for(\"none\") }".to_string();
+        }
+        let options = args
+            .get(3)
+            .map(|arg| format!(", options: {}", self.emit_expr(arg)))
+            .unwrap_or_default();
+        format!(
+            "{{ kind: Symbol.for(\"sub/window/event\"), id: {}, type: {}, onEvent: {}{} }}",
+            self.emit_expr(&args[0]),
+            self.emit_expr(&args[1]),
+            self.emit_expr(&args[2]),
+            options
+        )
     }
 
     fn emit_defn(&mut self, name: &str, expr: &Expr, args: &[Expr]) -> String {
@@ -667,7 +936,7 @@ impl Emitter {
             .join(" ");
 
         format!(
-            "export function {}({}) {{ const __closkellComponent = {}; __closkellComponent.definition.params = {}; return {{ mount(parent, dispatch) {{ return __closkellComponent.mount(parent, dispatch); }}, update({}) {{ {} return __closkellComponent.update(dispatch, updateContext); }}, dispose() {{ __closkellComponent.dispose(); }}, get root() {{ return __closkellComponent.root; }}, definition: __closkellComponent.definition }}; }}",
+            "export function {}({}) {{ const __closkellComponent = {}; __closkellComponent.definition.params = {}; return {{ mount(parent, dispatch, hydrateNode) {{ return __closkellComponent.mount(parent, dispatch, hydrateNode); }}, update({}) {{ {} return __closkellComponent.update(dispatch, updateContext); }}, dispose() {{ __closkellComponent.dispose(); }}, get root() {{ return __closkellComponent.root; }}, definition: __closkellComponent.definition }}; }}",
             sanitize_identifier(name),
             param_list,
             component_expr,
@@ -759,7 +1028,7 @@ impl Emitter {
             .join(" ");
 
         format!(
-            "export function {}({}) {{ {} const __closkellRefresh = () => {{ {} }}; __closkellRefresh(); const __closkellComponent = {}; __closkellComponent.definition.params = {}; return {{ mount(parent, dispatch) {{ return __closkellComponent.mount(parent, dispatch); }}, update({}) {{ {} __closkellRefresh(); return __closkellComponent.update(dispatch, updateContext); }}, dispose() {{ __closkellComponent.dispose(); }}, get root() {{ return __closkellComponent.root; }}, definition: __closkellComponent.definition }}; }}",
+            "export function {}({}) {{ {} const __closkellRefresh = () => {{ {} }}; __closkellRefresh(); const __closkellComponent = {}; __closkellComponent.definition.params = {}; return {{ mount(parent, dispatch, hydrateNode) {{ return __closkellComponent.mount(parent, dispatch, hydrateNode); }}, update({}) {{ {} __closkellRefresh(); return __closkellComponent.update(dispatch, updateContext); }}, dispose() {{ __closkellComponent.dispose(); }}, get root() {{ return __closkellComponent.root; }}, definition: __closkellComponent.definition }}; }}",
             sanitize_identifier(name),
             param_list,
             declarations,
@@ -991,6 +1260,34 @@ impl Emitter {
             .join(&format!(" {} ", op))
     }
 
+    fn emit_value_equal(&mut self, args: &[Expr]) -> String {
+        if args.len() < 2 {
+            return "undefined".to_string();
+        }
+        self.needs_value_equal_helper = true;
+        let values = args
+            .iter()
+            .map(|arg| self.emit_expr(arg))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("__closkellValueEqual({})", values)
+    }
+
+    fn emit_identical(&mut self, args: &[Expr]) -> String {
+        if args.len() < 2 {
+            return "undefined".to_string();
+        }
+        let values = args
+            .iter()
+            .map(|arg| self.emit_expr(arg))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "((...__values) => {{ for (let __index = 1; __index < __values.length; __index += 1) if (!Object.is(__values[__index - 1], __values[__index])) return false; return true; }})({})",
+            values
+        )
+    }
+
     fn emit_mod(&mut self, args: &[Expr]) -> String {
         if args.len() != 2 {
             return "undefined".to_string();
@@ -1212,6 +1509,18 @@ impl Emitter {
 
         format!(
             "((__value, __key) => __value instanceof Map ? (__value.has(__key) ? __value.get(__key) : null) : (__value?.[__key] ?? null))({}, {})",
+            self.emit_expr(&args[0]),
+            self.emit_expr(&args[1])
+        )
+    }
+
+    fn emit_get_in(&mut self, args: &[Expr]) -> String {
+        if args.len() != 2 {
+            return "undefined".to_string();
+        }
+
+        format!(
+            "((__value, __path) => {{ const __keyName = (__key) => typeof __key === \"symbol\" ? (Symbol.keyFor(__key) ?? __key.description ?? String(__key)) : __key; const __get = (__current, __key) => {{ if (__current == null) return null; const __name = __keyName(__key); if (__current instanceof Map) return __current.has(__key) ? __current.get(__key) : (__current.has(__name) ? __current.get(__name) : null); return __current?.[__name] ?? null; }}; return Array.isArray(__path) ? __path.reduce((__current, __key) => __get(__current, __key), __value) : null; }})({}, {})",
             self.emit_expr(&args[0]),
             self.emit_expr(&args[1])
         )
@@ -1829,6 +2138,50 @@ impl Emitter {
         )
     }
 
+    fn emit_zero_arg_decoder(&mut self, args: &[Expr], name: &str) -> String {
+        self.needs_decoder_runtime = true;
+        if !args.is_empty() {
+            return "undefined".to_string();
+        }
+        format!("__closkellDecoder.{}", name)
+    }
+
+    fn emit_decoder_literal(&mut self, args: &[Expr]) -> String {
+        self.needs_decoder_runtime = true;
+        if args.len() != 1 {
+            return "undefined".to_string();
+        }
+        format!("__closkellDecoder.literal({})", self.emit_expr(&args[0]))
+    }
+
+    fn emit_decoder_unary(&mut self, args: &[Expr], name: &str) -> String {
+        self.needs_decoder_runtime = true;
+        if args.len() != 1 {
+            return "undefined".to_string();
+        }
+        format!("__closkellDecoder.{}({})", name, self.emit_expr(&args[0]))
+    }
+
+    fn emit_decoder_record(&mut self, args: &[Expr]) -> String {
+        self.needs_decoder_runtime = true;
+        if args.len() != 1 {
+            return "undefined".to_string();
+        }
+        format!("__closkellDecoder.record({})", self.emit_expr(&args[0]))
+    }
+
+    fn emit_decode(&mut self, args: &[Expr]) -> String {
+        self.needs_decoder_runtime = true;
+        if args.len() != 2 {
+            return "undefined".to_string();
+        }
+        format!(
+            "__closkellDecode({}, {})",
+            self.emit_expr(&args[0]),
+            self.emit_expr(&args[1])
+        )
+    }
+
     fn emit_global_string_call(&mut self, callee: &str, args: &[Expr]) -> String {
         if args.len() != 1 {
             return "undefined".to_string();
@@ -2343,6 +2696,34 @@ impl Emitter {
         }
         statements.push(format!("return {};", record));
         format!("(() => {{ {} }})()", statements.join(" "))
+    }
+
+    fn emit_update_in(&mut self, expr: &Expr, args: &[Expr]) -> String {
+        if args.len() < 3 {
+            self.diagnostics.push(Diagnostic::error(
+                expr.span,
+                "update-in emission expects a record, path, updater, and optional arguments",
+            ));
+            return "undefined".to_string();
+        }
+
+        let extra_args = args
+            .iter()
+            .skip(3)
+            .map(|arg| self.emit_expr(arg))
+            .collect::<Vec<_>>();
+        let extra_args = if extra_args.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", extra_args.join(", "))
+        };
+        format!(
+            "((__value, __path, __updater, ...__args) => {{ const __keyName = (__key) => typeof __key === \"symbol\" ? (Symbol.keyFor(__key) ?? __key.description ?? String(__key)) : __key; const __get = (__current, __key) => {{ if (__current == null) return null; const __name = __keyName(__key); if (__current instanceof Map) return __current.has(__key) ? __current.get(__key) : (__current.has(__name) ? __current.get(__name) : null); return __current?.[__name] ?? null; }}; const __set = (__current, __key, __next) => {{ const __name = __keyName(__key); if (__current instanceof Map) {{ const __map = new Map(__current); __map.set(__map.has(__key) ? __key : (__map.has(__name) ? __name : __key), __next); return __map; }} if (Array.isArray(__current)) {{ const __array = __current.slice(); __array[__name] = __next; return __array; }} return {{ ...(__current ?? {{}}), [__name]: __next }}; }}; const __update = (__current, __index) => __index >= __path.length ? __updater(__current, ...__args) : __set(__current, __path[__index], __update(__get(__current, __path[__index]), __index + 1)); return Array.isArray(__path) ? __update(__value, 0) : __value; }})({}, {}, {}{})",
+            self.emit_expr(&args[0]),
+            self.emit_expr(&args[1]),
+            self.emit_expr(&args[2]),
+            extra_args
+        )
     }
 
     fn emit_map_or_record(&mut self, entries: &[(Expr, Expr)]) -> String {
@@ -3079,7 +3460,7 @@ impl TemplateEmitter<'_> {
             };
         let component_expr = self.owner.emit_template_component(spec.template);
         let render = format!(
-            "({}) => {{ let {} = {};{} const __closkellItemComponent = {}; return {{ mount(parent, dispatch) {{ return __closkellItemComponent.mount(parent, dispatch); }}, update({}, dispatch, updateContext) {{ {} = {};{} return __closkellItemComponent.update(dispatch, updateContext); }}, dispose() {{ __closkellItemComponent.dispose(); }}, get root() {{ return __closkellItemComponent.root; }}, definition: __closkellItemComponent.definition }}; }}",
+            "({}) => {{ let {} = {};{} const __closkellItemComponent = {}; return {{ mount(parent, dispatch, hydrateNode) {{ return __closkellItemComponent.mount(parent, dispatch, hydrateNode); }}, update({}, dispatch, updateContext) {{ {} = {};{} return __closkellItemComponent.update(dispatch, updateContext); }}, dispose() {{ __closkellItemComponent.dispose(); }}, get root() {{ return __closkellItemComponent.root; }}, definition: __closkellItemComponent.definition }}; }}",
             render_params,
             item,
             item_param,
@@ -3166,7 +3547,7 @@ impl TemplateEmitter<'_> {
         };
 
         format!(
-            "(() => {{ const {component} = {render}; return {{ mount(parent, dispatch) {{ return {component}.mount(parent, dispatch); }}, update(dispatch, updateContext) {{ return {component}.update({update_args}dispatch, updateContext); }}, dispose() {{ {component}.dispose?.(); }}, get root() {{ return {component}.root; }}, definition: {component}.definition }}; }})()"
+            "(() => {{ const {component} = {render}; return {{ mount(parent, dispatch, hydrateNode) {{ return {component}.mount(parent, dispatch, hydrateNode); }}, update(dispatch, updateContext) {{ return {component}.update({update_args}dispatch, updateContext); }}, dispose() {{ {component}.dispose?.(); }}, get root() {{ return {component}.root; }}, definition: {component}.definition }}; }})()"
         )
     }
 
@@ -3487,7 +3868,7 @@ impl<'a> ComponentSpec<'a> {
         let ExprKind::Symbol(name) = &head.kind else {
             return None;
         };
-        if !components.contains(name) {
+        if name != "scope-view" && !components.contains(name) {
             return None;
         }
 
@@ -4093,6 +4474,10 @@ fn collect_html_node_reads(
                 symbols.extend(collect_conditional_reads(&spec, components, read_summaries));
                 return;
             }
+            if let Some(spec) = ComponentSpec::parse(expr, components) {
+                symbols.extend(component_call_reads(&spec, read_summaries));
+                return;
+            }
             collect_template_reads_inner(expr, symbols, read_summaries);
         }
         HtmlNode::Text { .. } => {}
@@ -4159,6 +4544,9 @@ fn component_call_reads(
     spec: &ComponentSpec<'_>,
     read_summaries: &BTreeMap<String, ReadSummary>,
 ) -> Vec<String> {
+    if spec.name == "scope-view" {
+        return scope_view_reads(spec, read_summaries);
+    }
     let Some(summary) = read_summaries.get(spec.name) else {
         return spec
             .args
@@ -4169,6 +4557,25 @@ fn component_call_reads(
             .collect();
     };
     project_call_reads(summary, spec.args, read_summaries)
+}
+
+fn scope_view_reads(
+    spec: &ComponentSpec<'_>,
+    read_summaries: &BTreeMap<String, ReadSummary>,
+) -> Vec<String> {
+    let Some(view_expr) = spec.args.get(1) else {
+        return Vec::new();
+    };
+    let Some(state_expr) = spec.args.get(2) else {
+        return Vec::new();
+    };
+    let Some(view_name) = symbol_name(view_expr) else {
+        return collect_template_reads(state_expr, read_summaries);
+    };
+    let Some(summary) = read_summaries.get(view_name) else {
+        return collect_template_reads(state_expr, read_summaries);
+    };
+    project_call_reads(summary, std::slice::from_ref(state_expr), read_summaries)
 }
 
 fn project_call_reads(
@@ -4261,6 +4668,10 @@ fn sanitize_identifier(name: &str) -> String {
 }
 
 fn emit_symbol_read(name: &str) -> String {
+    if name == "Sub.none" {
+        return "{ kind: Symbol.for(\"none\") }".to_string();
+    }
+
     let parts = name.split('.').collect::<Vec<_>>();
     if parts.len() < 2 || parts.iter().any(|part| part.is_empty()) {
         return sanitize_identifier(name);
@@ -4271,6 +4682,16 @@ fn emit_symbol_read(name: &str) -> String {
         output.push_str(&property_access(part));
     }
     output
+}
+
+fn primitive_decoder_runtime_property(name: &str) -> Option<&'static str> {
+    match name {
+        "decoder-string" => Some("string"),
+        "decoder-number" => Some("number"),
+        "decoder-bool" => Some("bool"),
+        "decoder-keyword" => Some("keyword"),
+        _ => None,
+    }
 }
 
 fn object_key(expr: &Expr) -> Option<String> {
@@ -4456,6 +4877,22 @@ mod tests {
     }
 
     #[test]
+    fn emits_closkell_test_import_from_runtime() {
+        let source = syntax::parse_source(
+            "(import \"closkell/test\" [describe test expect= expect-not= expect-match expect-throws])\n\
+             (describe \"math\" (test \"adds\" (expect= (+ 1 1) 2) (expect-not= 2 3) (expect-match {:kind :ok :value 2} {:kind :ok}) (expect-throws (fn [] (fail \"boom\")) \"boom\")))",
+        );
+        let emitted = emit_module(&source);
+
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        assert!(emitted.code.contains("import { describe, test, expect_, expect_not_, expect_match, expect_throws } from \"@closkell/runtime\";"));
+        assert!(emitted.code.contains("expect_(1 + 1, 2)"));
+        assert!(emitted.code.contains("expect_not_(2, 3)"));
+        assert!(emitted.code.contains("expect_match("));
+        assert!(emitted.code.contains("expect_throws("));
+    }
+
+    #[test]
     fn erases_type_only_names_from_esm_imports() {
         let source = syntax::parse_source(
             "(import \"./chart.clsk\" [HeartReading HeartZone heart-chart-command])\n\
@@ -4501,6 +4938,136 @@ mod tests {
         assert_eq!(
             emitted.source_mappings[0].source_offset,
             source.forms[2].span.start
+        );
+    }
+
+    #[test]
+    fn emits_subscription_helpers_as_plain_data() {
+        let source = syntax::parse_source(
+            "(defn subscriptions [state]\n  (Sub.batch [(if state.running?\n                   (Sub.timer/every \"clock\" 250 {:kind :tick})\n                   Sub.none)\n              (Sub.media-query \"mobile\" \"(max-width: 700px)\" :media-changed)\n              (Sub.window/event \"dev\" \"keydown\" :key {:passive true})]))",
+        );
+        let emitted = emit_module(&source);
+
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        assert!(emitted.code.contains("kind: Symbol.for(\"batch\")"));
+        assert!(
+            emitted
+                .code
+                .contains("kind: Symbol.for(\"sub/timer/every\")")
+        );
+        assert!(
+            emitted
+                .code
+                .contains("kind: Symbol.for(\"sub/media-query\")")
+        );
+        assert!(
+            emitted
+                .code
+                .contains("kind: Symbol.for(\"sub/window/event\")")
+        );
+        assert!(emitted.code.contains("kind: Symbol.for(\"none\")"));
+        assert!(!emitted.code.contains("Sub."));
+    }
+
+    #[test]
+    fn emits_task_helpers_as_plain_data() {
+        let source = syntax::parse_source(
+            "(defn decode [text]\n  (Task.succeed {:title text}))\n\
+             (defn load [url]\n  (Task.perform\n    (Task.and-then (Http.get-text url) decode)\n    (fn [spec] {:kind :loaded :value spec})\n    (fn [error] {:kind :failed :error error})))",
+        );
+        let emitted = emit_module(&source);
+
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        assert!(emitted.code.contains("kind: Symbol.for(\"task/perform\")"));
+        assert!(emitted.code.contains("kind: Symbol.for(\"task/and-then\")"));
+        assert!(
+            emitted
+                .code
+                .contains("kind: Symbol.for(\"task/http/get-text\")")
+        );
+        assert!(emitted.code.contains("kind: Symbol.for(\"task/succeed\")"));
+        assert!(!emitted.code.contains("Task."));
+        assert!(!emitted.code.contains("Http.get"));
+    }
+
+    #[test]
+    fn emits_scoped_composition_helpers() {
+        let source = syntax::parse_source(
+            "(defn child-view [state]\n  #html <button>{state.count}</button>)\n\
+             (defn child-update [state msg]\n  [state {:kind :none}])\n\
+             (defn child-subscriptions [state]\n  Sub.none)\n\
+             (defn update [state msg]\n  (scope-update state :log msg child-update :log))\n\
+             (defn subscriptions [state]\n  (scope-subscriptions state.log child-subscriptions :log))\n\
+             (defn view [state]\n  #html <main>{(scope-view :log child-view state.log)}</main>)",
+        );
+        let emitted = emit_module(&source);
+
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        assert!(emitted.code.contains("__closkellScopeUpdate"));
+        assert!(emitted.code.contains("__closkellScopeSubscriptions"));
+        assert!(emitted.code.contains("__closkellScopeView"));
+        assert!(emitted.code.contains("__closkellSetComponent"));
+        assert!(
+            emitted
+                .code
+                .contains("() => __closkellScopeView(Symbol.for(\"log\"), child_view, state.log)")
+        );
+        assert!(
+            emitted
+                .code
+                .contains("[Symbol.for(\"log\"), child_view, state.log]")
+        );
+    }
+
+    #[test]
+    fn emits_render_to_string_helper() {
+        let source = syntax::parse_source(
+            "(defn view [state]\n  #html <main>{state.title}</main>)\n\
+             (def html (render-to-string view {:title \"Pulse\"}))",
+        );
+        let emitted = emit_module(&source);
+
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        assert!(
+            emitted
+                .code
+                .contains("renderToString as __closkellRenderToString")
+        );
+        assert!(emitted.code.contains("__closkellRenderToString(view,"));
+    }
+
+    #[test]
+    fn emits_decoder_runtime_helpers() {
+        let source = syntax::parse_source(
+            "(def spec-decoder\n\
+               (decoder-record {:title decoder-string\n\
+                                :tags (decoder-vector decoder-string)\n\
+                                :draft (decoder-optional decoder-number)}))\n\
+             (def decoded\n\
+               (decode spec-decoder (json-parse \"{\\\"title\\\":\\\"Pulse\\\",\\\"tags\\\":[\\\"zone\\\"]}\")))",
+        );
+        let emitted = emit_module(&source);
+
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        assert!(emitted.code.contains(
+            "import { Decoder as __closkellDecoder, decode as __closkellDecode } from \"@closkell/runtime\";"
+        ));
+        assert!(emitted.code.contains("__closkellDecoder.record({"));
+        assert!(emitted.code.contains("title: __closkellDecoder.string"));
+        assert!(
+            emitted
+                .code
+                .contains("tags: __closkellDecoder.vector(__closkellDecoder.string)")
+        );
+        assert!(
+            emitted
+                .code
+                .contains("draft: __closkellDecoder.optional(__closkellDecoder.number)")
+        );
+        assert!(
+            emitted
+                .code
+                .contains("__closkellDecode(spec_decoder, JSON.parse(")
         );
     }
 
@@ -4867,7 +5434,7 @@ mod tests {
         assert!(
             emitted
                 .code
-            .contains("update(next_summary, dispatch, updateContext)")
+                .contains("update(next_summary, dispatch, updateContext)")
         );
     }
 
@@ -4893,9 +5460,9 @@ mod tests {
             emitted.code
         );
         assert!(
-            emitted
-                .code
-                .contains("kind: { component: \"scheme-card\" }, reads: [\"scheme.id\", \"scheme.kind\"]"),
+            emitted.code.contains(
+                "kind: { component: \"scheme-card\" }, reads: [\"scheme.id\", \"scheme.kind\"]"
+            ),
             "component metadata should include conditional branch reads:\n{}",
             emitted.code
         );
@@ -5223,6 +5790,21 @@ mod tests {
     }
 
     #[test]
+    fn emits_value_equality_and_identity_predicates() {
+        let source = syntax::parse_source(
+            "(def equal-records (= {:items [1 2] :tag :ok} {:tag :ok :items [1 2]}))\n\
+             (def shared-identity (let [value {:items [1 2]}] (identical? value value)))",
+        );
+        let emitted = emit_module(&source);
+
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        assert!(emitted.code.contains("const __eq = (__left, __right)"));
+        assert!(emitted.code.contains("__left instanceof Set"));
+        assert!(emitted.code.contains("__left instanceof Map"));
+        assert!(emitted.code.contains("Object.is(__values[__index - 1]"));
+    }
+
+    #[test]
     fn emits_collection_transforms() {
         let source = syntax::parse_source(
             "(defn sample [entries]\n  {:visible (filter entries (fn [entry] (not (some? entry.hiddenAt))))\n   :bars (map (take-last (sort-by entries (fn [entry] entry.stoppedAt)) 2)\n              (fn [entry] {:label entry.id :value entry.durationMs}))\n   :ranked (map-indexed (sort-by-desc entries (fn [entry] entry.stoppedAt))\n              (fn [entry index] {:id entry.id :rank (+ index 1)}))\n   :custom (sort-with entries (fn [first second] (- second.stoppedAt first.stoppedAt)))\n   :types (sort-with [\"Strength\" \"LISS\"] (fn [first second] (locale-compare first second)))\n   :allTyped (every? entries (fn [entry] (some? entry.exerciseType)))\n   :page (slice entries 0 2)\n   :hasSelected (any? entries (fn [entry] (= entry.id \"warmup\")))\n   :appended (conj entries {:id \"next\"})})",
@@ -5441,7 +6023,9 @@ mod tests {
         let source = syntax::parse_source(
             "(defn update-entry [entry value] (assoc entry :exerciseType value :hiddenAt 42))\n\
              (defn import-complete [state entries] (merge state {:entries entries :message \"Imported\"}))\n\
-             (defn clear-message [state] (dissoc state :message))",
+             (defn clear-message [state] (dissoc state :message))\n\
+             (defn summary-value [state] (get-in state [:summary :value]))\n\
+             (defn bump-summary [state] (update-in state [:summary :value] (fn [value] (+ value 1))))",
         );
         let emitted = emit_module(&source);
 
@@ -5457,6 +6041,12 @@ mod tests {
                 .contains("Object.assign({}, state, { entries: entries, message: \"Imported\" })")
         );
         assert!(emitted.code.contains("delete __closkell_record_0.message;"));
+        assert!(emitted.code.contains("Array.isArray(__path)"));
+        assert!(
+            emitted
+                .code
+                .contains("const __update = (__current, __index)")
+        );
     }
 
     #[test]

@@ -1,0 +1,76 @@
+(import "closkell/test" [describe test expect= expect-ok render fire text class? messages])
+(import "./lib/build-request-url.clsk" [buildRequestHeaders buildUrl])
+(import "./lib/param-schema.clsk" [validateAllParams validateParamValue])
+(import "./lib/request-body.clsk" [requestBodyMode resolveBodyFormFields])
+
+(def binary-media
+  {:contentType "application/octet-stream"
+   :schema {:type "string" :format "binary"}})
+
+(def multipart-media
+  {:contentType "multipart/form-data"
+   :schema {:type "object"}
+   :properties [{:name "title"
+                 :required true
+                 :type "string"
+                 :description "Document title"}
+                {:name "upload"
+                 :required true
+                 :type "string"
+                 :format "binary"
+                 :description "File upload"}]})
+
+(def request-defs
+  [{:name "id" :in "path" :kind "string"}
+   {:name "include" :in "query" :kind "array" :style "form" :explode true}
+   {:name "X-Trace" :in "header" :kind "string"}])
+
+(def request-values
+  {"id" "pet 1"
+   "include" "name,tag"
+   "X-Trace" "trace-7"})
+
+(defn body-mode-chip [media]
+  (let [mode (requestBodyMode media)]
+    #html <button type="button"
+                  data-testid="body-mode"
+                  class={{:multipart (= mode "multipart")
+                          :file (= mode "file")}}
+                  on:click={{:kind :mode-picked
+                             :mode mode}}>{mode}</button>))
+
+(describe "request building"
+  (test "serializes path query and header parameters"
+    (expect= (buildUrl "https://api.example.com/v1/"
+                       "https://docs.example.com/openapi.json"
+                       "/pets/{id}"
+                       request-defs
+                       request-values)
+             "https://api.example.com/v1/pets/pet%201?include=name&include=tag")
+    (expect= (buildRequestHeaders request-defs request-values {"Accept" "application/json"})
+             {"Accept" "application/json" "X-Trace" "trace-7"})))
+
+(describe "request bodies and validation"
+  (test "classifies file and multipart request bodies"
+    (expect= (requestBodyMode binary-media) "file")
+    (expect= (requestBodyMode multipart-media) "multipart")
+    (expect= (resolveBodyFormFields multipart-media true)
+             [{:name "title" :required true :kind "text" :description "Document title"}
+              {:name "upload" :required true :kind "file" :description "File upload"}]))
+
+  (test "validates parameter inputs"
+    (let [defs [{:name "limit" :kind "integer" :required true}
+                {:name "filter" :kind "object" :required false}]]
+      (expect= (validateParamValue (first defs) "") "Required")
+      (expect= (validateParamValue (first defs) "abc") "Must be an integer")
+      (expect= (validateParamValue (first defs) "25") nil)
+      (expect= (validateAllParams defs {"limit" "" "filter" "{\"type\":\"pet\"}"})
+               {"limit" "Required"}))))
+
+(describe "component harness"
+  (test "renders a project-driven request body chip"
+    (let [h (render (body-mode-chip multipart-media))
+          _ (fire.click h "[data-testid='body-mode']")]
+      (expect= (text h "[data-testid='body-mode']") "multipart")
+      (expect-ok (class? h "[data-testid='body-mode']" "multipart"))
+      (expect= (messages h) [{:kind :mode-picked :mode "multipart"}]))))

@@ -297,6 +297,132 @@ try {{
 }
 
 #[test]
+fn vite_plugin_registers_closkell_tests_for_vitest() {
+    if !node_available() {
+        eprintln!("skipping Vite plugin Vitest registration test because node is unavailable");
+        return;
+    }
+
+    let hrweb_dir = workspace_root().join("projects").join("hrweb");
+    if !hrweb_dir.join("node_modules").join("vite").is_dir()
+        || !hrweb_dir
+            .join("node_modules")
+            .join("@closkell")
+            .join("vite-plugin")
+            .is_dir()
+    {
+        eprintln!(
+            "skipping Vite plugin Vitest registration test because hrweb npm deps are not installed"
+        );
+        return;
+    }
+
+    let temp_dir = temp_dir("closkell-vite-plugin-vitest");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(temp_dir.join("src")).expect("temp Vite src dir should be created");
+    fs::write(temp_dir.join("package.json"), "{\"type\":\"module\"}\n")
+        .expect("package.json should be written");
+    fs::write(
+        temp_dir.join("src").join("sample_test.clsk"),
+        "(import \"closkell/test\" [describe test expect= expect-match expect-throws])\n\
+         \n\
+         (describe \"closkell vitest\"\n\
+           (test \"registers generated tests\"\n\
+             (expect= (+ 1 1) 2)\n\
+             (expect-match {:kind :ready :value 42} {:kind :ready})\n\
+             (expect-throws (fn [] (fail \"boom\")) \"boom\")))\n",
+    )
+    .expect("sample_test.clsk should be written");
+    let fake_vitest = temp_dir.join("fake-vitest.mjs");
+    fs::write(
+        &fake_vitest,
+        "export function describe(name, fn) {\n  globalThis.__closkellVitestEvents.push(['describe', name]);\n  fn();\n}\n\
+         export function test(name, fn) {\n  try {\n    fn();\n    globalThis.__closkellVitestEvents.push(['test', name, 'ok']);\n  } catch (error) {\n    globalThis.__closkellVitestEvents.push(['test', name, 'failed', error?.message || String(error)]);\n  }\n}\n",
+    )
+    .expect("fake Vitest module should be written");
+
+    let script = format!(
+        r#"
+import {{ createServer }} from "vite";
+import {{ closkell }} from "@closkell/vite-plugin";
+
+const root = {root};
+const manifestPath = {manifest_path};
+const fakeVitest = {fake_vitest};
+let server;
+
+try {{
+  globalThis.__closkellVitestEvents = [];
+  server = await createServer({{
+    root,
+    configFile: false,
+    logLevel: "error",
+    appType: "custom",
+    plugins: [
+      closkell({{
+        entry: null,
+        app: false,
+        vitest: true,
+        sourceRoot: "src",
+        manifestPath,
+        inspect: false,
+        vendorRuntime: false
+      }})
+    ],
+    resolve: {{
+      alias: [
+        {{ find: "vitest", replacement: fakeVitest }}
+      ]
+    }},
+    server: {{
+      host: "127.0.0.1",
+      port: 0
+    }}
+  }});
+
+  await server.listen();
+  await server.ssrLoadModule("/src/sample_test.clsk");
+  const events = globalThis.__closkellVitestEvents;
+  if (!events.some((event) => event[0] === "describe" && event[1] === "closkell vitest")) {{
+    throw new Error(`Closkell tests did not register a Vitest describe: ${{JSON.stringify(events)}}`);
+  }}
+  if (!events.some((event) => event[0] === "test" && event[1] === "registers generated tests" && event[2] === "ok")) {{
+    throw new Error(`Closkell tests did not register/pass a Vitest test: ${{JSON.stringify(events)}}`);
+  }}
+}} finally {{
+  if (server) {{
+    await Promise.race([
+      server.close(),
+      new Promise((resolve) => setTimeout(resolve, 1000))
+    ]);
+  }}
+}}
+"#,
+        root = json_string_for_test(&temp_dir.display().to_string()),
+        manifest_path =
+            json_string_for_test(&workspace_root().join("Cargo.toml").display().to_string()),
+        fake_vitest = json_string_for_test(&fake_vitest.display().to_string())
+    );
+
+    let node = Command::new("node")
+        .arg("--input-type=module")
+        .arg("--eval")
+        .arg(script)
+        .current_dir(&hrweb_dir)
+        .output()
+        .expect("node should run the Vite plugin Vitest registration test");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+
+    assert!(
+        node.status.success(),
+        "Vite plugin Vitest registration test failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&node.stdout),
+        String::from_utf8_lossy(&node.stderr)
+    );
+}
+
+#[test]
 fn vite_plugin_builds_direct_clsk_entry_with_tailwind() {
     if !node_available() {
         eprintln!("skipping Vite Tailwind integration test because node is unavailable");

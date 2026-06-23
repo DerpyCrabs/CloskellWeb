@@ -1,3 +1,263 @@
+class CloskellTestTextNode {
+  constructor(value = "", ownerDocument = null) {
+    this.nodeType = 3;
+    this.nodeValue = String(value ?? "");
+    this.parentNode = null;
+    this.ownerDocument = ownerDocument;
+  }
+
+  get textContent() {
+    return this.nodeValue;
+  }
+
+  set textContent(value) {
+    this.nodeValue = String(value ?? "");
+  }
+
+  get nextSibling() {
+    return siblingForNode(this, 1);
+  }
+
+  cloneNode() {
+    return new CloskellTestTextNode(this.nodeValue, this.ownerDocument);
+  }
+}
+
+class CloskellTestElement {
+  constructor(tagName = "div", ownerDocument = null, namespaceURI = "http://www.w3.org/1999/xhtml") {
+    this.nodeType = 1;
+    this.tagName = String(tagName || "div").toLowerCase();
+    this.nodeName = this.tagName;
+    this.namespaceURI = namespaceURI;
+    this.ownerDocument = ownerDocument;
+    this.parentNode = null;
+    this.children = [];
+    this.attributes = {};
+    this.listeners = {};
+    this.style = new CloskellTestStyle();
+    this.className = "";
+    this.value = "";
+    this.checked = false;
+  }
+
+  get childNodes() {
+    return this.children;
+  }
+
+  get firstChild() {
+    return this.children[0] || null;
+  }
+
+  get nextSibling() {
+    return siblingForNode(this, 1);
+  }
+
+  appendChild(node) {
+    if (node?.nodeType === 11) {
+      for (const child of [...node.children]) this.appendChild(child);
+      return node;
+    }
+    if (node?.parentNode) node.parentNode.removeChild(node);
+    this.children.push(node);
+    if (node) node.parentNode = this;
+    return node;
+  }
+
+  insertBefore(node, marker) {
+    if (node?.nodeType === 11) {
+      for (const child of [...node.children]) this.insertBefore(child, marker);
+      return node;
+    }
+    if (node?.parentNode) node.parentNode.removeChild(node);
+    const index = this.children.indexOf(marker);
+    if (index === -1) this.children.push(node);
+    else this.children.splice(index, 0, node);
+    if (node) node.parentNode = this;
+    return node;
+  }
+
+  removeChild(node) {
+    const index = this.children.indexOf(node);
+    if (index !== -1) this.children.splice(index, 1);
+    if (node) node.parentNode = null;
+    return node;
+  }
+
+  replaceChildren(...nodes) {
+    for (const child of [...this.children]) this.removeChild(child);
+    for (const node of nodes) this.appendChild(node);
+  }
+
+  setAttribute(name, value) {
+    const key = String(name);
+    const next = String(value ?? "");
+    this.attributes[key] = next;
+    if (key === "class") this.className = next;
+    if (key === "value") this.value = next;
+    if (key === "checked") this.checked = true;
+  }
+
+  getAttribute(name) {
+    const key = String(name);
+    return Object.prototype.hasOwnProperty.call(this.attributes, key) ? this.attributes[key] : null;
+  }
+
+  hasAttribute(name) {
+    return Object.prototype.hasOwnProperty.call(this.attributes, String(name));
+  }
+
+  removeAttribute(name) {
+    const key = String(name);
+    delete this.attributes[key];
+    if (key === "class") this.className = "";
+    if (key === "checked") this.checked = false;
+  }
+
+  addEventListener(type, listener) {
+    this.listeners[type] ||= [];
+    this.listeners[type].push(listener);
+  }
+
+  removeEventListener(type, listener) {
+    this.listeners[type] = (this.listeners[type] || []).filter((entry) => entry !== listener);
+  }
+
+  dispatchEvent(event) {
+    event.target ||= this;
+    event.currentTarget = this;
+    for (const listener of [...(this.listeners[event.type] || [])]) listener(event);
+    return !event.defaultPrevented;
+  }
+
+  click() {
+    return this.dispatchEvent(createTestEvent("click", { target: this, currentTarget: this }));
+  }
+
+  matches(selector) {
+    return selectorMatchesNode(this, selector);
+  }
+
+  querySelector(selector) {
+    return this.querySelectorAll(selector)[0] || null;
+  }
+
+  querySelectorAll(selector) {
+    return querySelectorAllFrom(this, selector);
+  }
+
+  cloneNode(deep = false) {
+    const clone = new CloskellTestElement(this.tagName, this.ownerDocument, this.namespaceURI);
+    for (const [name, value] of Object.entries(this.attributes)) clone.setAttribute(name, value);
+    clone.style.cssText = this.style.cssText;
+    clone.value = this.value;
+    clone.checked = this.checked;
+    if (deep) {
+      for (const child of this.children) clone.appendChild(child.cloneNode?.(true) ?? child);
+    }
+    return clone;
+  }
+
+  get textContent() {
+    return this.children.map((child) => child.textContent ?? "").join("");
+  }
+
+  set textContent(value) {
+    this.replaceChildren(new CloskellTestTextNode(value, this.ownerDocument));
+  }
+
+  get innerHTML() {
+    return this.children.map(serializeTestNode).join("");
+  }
+
+  set innerHTML(value) {
+    this.replaceChildren(new CloskellTestTextNode(value, this.ownerDocument));
+  }
+}
+
+class CloskellTestDocumentFragment extends CloskellTestElement {
+  constructor(ownerDocument = null) {
+    super("#fragment", ownerDocument);
+    this.nodeType = 11;
+  }
+
+  cloneNode(deep = false) {
+    const fragment = new CloskellTestDocumentFragment(this.ownerDocument);
+    if (deep) {
+      for (const child of this.children) fragment.appendChild(child.cloneNode?.(true) ?? child);
+    }
+    return fragment;
+  }
+}
+
+class CloskellTestStyle {
+  constructor() {
+    this.values = {};
+  }
+
+  setProperty(name, value) {
+    this.values[String(name)] = String(value ?? "");
+  }
+
+  getPropertyValue(name) {
+    return this.values[String(name)] ?? "";
+  }
+
+  removeProperty(name) {
+    const key = String(name);
+    const previous = this.values[key] ?? "";
+    delete this.values[key];
+    return previous;
+  }
+
+  get cssText() {
+    return Object.entries(this.values).map(([name, value]) => `${name}: ${value};`).join(" ");
+  }
+
+  set cssText(value) {
+    this.values = {};
+    for (const part of String(value || "").split(";")) {
+      const index = part.indexOf(":");
+      if (index === -1) continue;
+      this.setProperty(part.slice(0, index).trim(), part.slice(index + 1).trim());
+    }
+  }
+}
+
+function ensureRuntimeDocument() {
+  if (globalThis.document?.createElement && globalThis.document?.createTextNode) {
+    return globalThis.document;
+  }
+  const documentRef = {
+    createElement(tagName) {
+      const element = new CloskellTestElement(tagName, documentRef);
+      if (String(tagName).toLowerCase() === "template") {
+        element.content = new CloskellTestDocumentFragment(documentRef);
+      }
+      return element;
+    },
+    createElementNS(namespaceURI, tagName) {
+      return new CloskellTestElement(tagName, documentRef, namespaceURI);
+    },
+    createTextNode(value) {
+      return new CloskellTestTextNode(value, documentRef);
+    },
+    createDocumentFragment() {
+      return new CloskellTestDocumentFragment(documentRef);
+    },
+    querySelector(selector) {
+      return documentRef.body.querySelector(selector);
+    },
+    querySelectorAll(selector) {
+      return documentRef.body.querySelectorAll(selector);
+    }
+  };
+  documentRef.body = new CloskellTestElement("body", documentRef);
+  globalThis.document = documentRef;
+  return documentRef;
+}
+
+ensureRuntimeDocument();
+
 export function htmlTemplate(source) {
   const template = document.createElement("template");
   template.innerHTML = source;
@@ -216,12 +476,16 @@ export function createTemplateComponent(definition) {
 
   return {
     definition,
-    mount(parent, dispatch = lastDispatch) {
+    mount(parent, dispatch = lastDispatch, hydrateNode = null) {
       lastDispatch = dispatch || lastDispatch;
       const current = ensureInstance();
       reportTemplateMount(current, lastDispatch, definition);
       if (!current.mounted) {
-        parent.appendChild(current.root);
+        if (hydrateNode && claimHydratedTemplateInstance(current, definition, hydrateNode)) {
+          if (current.root.parentNode !== parent) parent.appendChild(current.root);
+        } else {
+          parent.appendChild(current.root);
+        }
         current.mounted = true;
       }
       definition.update(current, lastDispatch, null);
@@ -242,6 +506,9 @@ export function createTemplateComponent(definition) {
     },
     get root() {
       return ensureInstance().root;
+    },
+    get __closkellInstance() {
+      return instance;
     }
   };
 }
@@ -251,6 +518,42 @@ export function shouldUpdateSlot(instance, slot, updateContext) {
   const shouldUpdate = shouldUpdateSlotForReads(slotMetadata.reads || [], updateContext);
   recordTemplateSlot(updateContext, slotMetadata, shouldUpdate);
   return shouldUpdate;
+}
+
+function claimHydratedTemplateInstance(instance, definition, hydrateNode) {
+  if (!hydrateNode || hydrateNode.nodeType !== 1) return false;
+  const templateName = hydrateNode.getAttribute?.("data-closkell-template");
+  if (!templateName || templateName !== definition.name) return false;
+
+  const nodeMap = new Map();
+  if (!claimHydratedTree(instance.root, hydrateNode, nodeMap)) return false;
+
+  instance.root = hydrateNode;
+  instance.nodes = (instance.nodes || []).map((node) => nodeMap.get(node) || node);
+  instance.hydrated = true;
+  return true;
+}
+
+function claimHydratedTree(blueprint, existing, nodeMap) {
+  if (!hydrationNodesCompatible(blueprint, existing)) return false;
+  nodeMap.set(blueprint, existing);
+
+  const blueprintChildren = Array.from(blueprint?.childNodes || blueprint?.children || []);
+  const existingChildren = Array.from(existing?.childNodes || existing?.children || []);
+  if (blueprintChildren.length !== existingChildren.length) return false;
+
+  for (let index = 0; index < blueprintChildren.length; index += 1) {
+    if (!claimHydratedTree(blueprintChildren[index], existingChildren[index], nodeMap)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function hydrationNodesCompatible(blueprint, existing) {
+  if (!blueprint || !existing || blueprint.nodeType !== existing.nodeType) return false;
+  if (blueprint.nodeType !== 1) return true;
+  return String(blueprint.tagName || "").toLowerCase() === String(existing.tagName || "").toLowerCase();
 }
 
 function shouldUpdateSlotForReads(reads, updateContext) {
@@ -518,12 +821,23 @@ export function setEvent(instance, slot, node, eventName, messageForEvent, dispa
 
   if (!current.listener) {
     current.listener = (event) => {
-      current.dispatch(current.messageForEvent(event), event);
+      dispatchTemplateEventResult(current.messageForEvent(event), event, current.dispatch);
     };
     node.addEventListener(eventName, current.listener);
   }
 
   instance.eventSlots[slot] = current;
+}
+
+function dispatchTemplateEventResult(result, event, dispatch) {
+  if (result && typeof result === "object" && result.__closkellEvent === true) {
+    if (result.preventDefault) event?.preventDefault?.();
+    if (result.stopPropagation) event?.stopPropagation?.();
+    if (result.message !== undefined && result.message !== null) dispatch(result.message, event);
+    return;
+  }
+
+  if (result !== undefined && result !== null) dispatch(result, event);
 }
 
 export function setRef(instance, slot, node, value, dispatch) {
@@ -924,6 +1238,533 @@ export const Cmd = {
   }
 };
 
+export const Sub = {
+  none: { kind: Symbol.for("none") },
+  batch(subscriptions) {
+    return { kind: Symbol.for("batch"), subscriptions };
+  },
+  timerEvery(id, ms, msg) {
+    return { kind: Symbol.for("sub/timer/every"), id, ms, msg };
+  },
+  domRefResize(ref, onChange, id, onError) {
+    return { kind: Symbol.for("sub/dom-ref/resize"), ref, onChange, id: id || ref, onError };
+  },
+  windowEvent(type, onEvent, id, options, onError) {
+    return { kind: Symbol.for("sub/window/event"), type, onEvent, id: id || type, options, onError };
+  },
+  mediaQuery(query, onChange, id, onError) {
+    return { kind: Symbol.for("sub/media-query"), query, onChange, id: id || query, onError };
+  }
+};
+
+export const Task = {
+  succeed(value) {
+    return { kind: Symbol.for("task/succeed"), value };
+  },
+  fail(error) {
+    return { kind: Symbol.for("task/fail"), error };
+  },
+  map(task, mapper) {
+    return { kind: Symbol.for("task/map"), task, mapper };
+  },
+  mapError(task, mapper) {
+    return { kind: Symbol.for("task/map-error"), task, mapper };
+  },
+  andThen(task, next) {
+    return { kind: Symbol.for("task/and-then"), task, next };
+  },
+  perform(task, onSuccess, onError) {
+    return { kind: Symbol.for("task/perform"), task, onSuccess, onError };
+  }
+};
+
+export const Http = {
+  getText(url, options) {
+    return { kind: Symbol.for("task/http/get-text"), url, options };
+  },
+  getJson(url, options) {
+    return { kind: Symbol.for("task/http/get-json"), url, options };
+  }
+};
+
+export const Decoder = {
+  string: primitiveDecoder("String", (value) => typeof value === "string"),
+  number: primitiveDecoder("Number", (value) => typeof value === "number" && Number.isFinite(value)),
+  bool: primitiveDecoder("Bool", (value) => typeof value === "boolean"),
+  keyword: primitiveDecoder("Keyword", (value) => typeof value === "symbol"),
+  literal(expected) {
+    return {
+      decode(value, path = "value") {
+        return decoderValueEqual(value, expected)
+          ? { ok: true, value }
+          : { ok: false, error: `${path} expected ${decoderFormatValue(expected)}` };
+      }
+    };
+  },
+  optional(decoder) {
+    return {
+      optional: true,
+      decode(value, path = "value") {
+        if (value == null) return { ok: true, value: null };
+        return runDecoder(decoder, value, path);
+      }
+    };
+  },
+  vector(decoder) {
+    return {
+      decode(value, path = "value") {
+        if (!Array.isArray(value)) return decoderTypeError(path, "Vector");
+        const output = [];
+        for (let index = 0; index < value.length; index += 1) {
+          const decoded = runDecoder(decoder, value[index], `${path}[${index}]`);
+          if (!decoded.ok) return decoded;
+          output.push(decoded.value);
+        }
+        return { ok: true, value: output };
+      }
+    };
+  },
+  record(spec) {
+    const entries = decoderSpecEntries(spec);
+    return {
+      decode(value, path = "value") {
+        if (!plainObject(value)) return decoderTypeError(path, "Record");
+        const output = {};
+        for (const [field, decoder] of entries) {
+          const fieldPath = decoderFieldPath(path, field);
+          if (!hasOwn(value, field)) {
+            if (decoder?.optional) {
+              output[field] = null;
+              continue;
+            }
+            return { ok: false, error: `${fieldPath} is required` };
+          }
+          const decoded = runDecoder(decoder, value[field], fieldPath);
+          if (!decoded.ok) return decoded;
+          output[field] = decoded.value;
+        }
+        return { ok: true, value: output };
+      }
+    };
+  }
+};
+
+export function decode(decoder, value) {
+  return runDecoder(decoder, value, "value");
+}
+
+export function describe(name, ...entries) {
+  return {
+    __closkellTestGroup: true,
+    name: String(name ?? ""),
+    tests: flattenTestEntries(entries)
+  };
+}
+
+export function test(name, ...assertions) {
+  return {
+    __closkellTest: true,
+    name: String(name ?? ""),
+    assertions: flattenAssertions(assertions)
+  };
+}
+
+export function expect_(actual, expected) {
+  return { __closkellAssert: "equal", actual, expected };
+}
+
+export function expect_not_(actual, expected) {
+  return { __closkellAssert: "not-equal", actual, expected };
+}
+
+export function expect_ok(actual) {
+  return { __closkellAssert: "ok", actual };
+}
+
+export function expect_err(actual) {
+  return { __closkellAssert: "err", actual };
+}
+
+export function expect_some(actual) {
+  return { __closkellAssert: "some", actual };
+}
+
+export function expect_nil(actual) {
+  return { __closkellAssert: "nil", actual };
+}
+
+export function expect_match(actual, pattern) {
+  return { __closkellAssert: "match", actual, pattern };
+}
+
+export function expect_throws(thunk, expected) {
+  return { __closkellAssert: "throws", thunk, expected };
+}
+
+export function collectCloskellTests(moduleExports) {
+  const tests = "tests" in (moduleExports || {})
+    ? flattenModuleTestEntries(moduleExports.tests, [], true)
+    : Object.keys(moduleExports || {})
+      .sort()
+      .flatMap((name) => flattenModuleTestEntries(moduleExports[name], [], false));
+  return { tests };
+}
+
+export function runCloskellTest(testValue, index = 0) {
+  const name = closkellTestName(testValue, index);
+  if (!testValue || typeof testValue !== "object") {
+    return { name, ok: false, error: "expected a test record or closkell/test value" };
+  }
+
+  const assertions = closkellTestAssertions(testValue);
+  if (assertions.length === 0) {
+    return { name, ok: false, error: "expected at least one assertion" };
+  }
+
+  for (const assertion of assertions) {
+    const result = runCloskellAssertion(assertion);
+    if (!result.ok) return { name, ...result };
+  }
+  return { name, ok: true };
+}
+
+export function runCloskellAssertion(assertion) {
+  if (!assertion || typeof assertion !== "object") {
+    return { ok: false, error: "expected an assertion record" };
+  }
+  const kind = assertionKind(assertion);
+  if (!kind && ("actual" in assertion || "expected" in assertion)) {
+    return runEqualAssertion(assertion.actual, assertion.expected, false);
+  }
+  switch (kind) {
+    case "equal":
+      return runEqualAssertion(assertion.actual, assertion.expected, false);
+    case "not-equal":
+      return runEqualAssertion(assertion.actual, assertion.expected, true);
+    case "ok":
+      return assertion.actual === true
+        ? { ok: true }
+        : { ok: false, expected: "true", actual: formatTestValue(assertion.actual) };
+    case "err":
+      return assertion.actual?.ok === false
+        ? { ok: true }
+        : { ok: false, expected: "err", actual: formatTestValue(assertion.actual) };
+    case "some":
+      return assertion.actual != null
+        ? { ok: true }
+        : { ok: false, expected: "some value", actual: formatTestValue(assertion.actual) };
+    case "nil":
+      return assertion.actual == null
+        ? { ok: true }
+        : { ok: false, expected: "nil", actual: formatTestValue(assertion.actual) };
+    case "match":
+      return runMatchAssertion(assertion.actual, assertion.pattern);
+    case "throws":
+      return runThrowsAssertion(assertion.thunk, assertion.expected);
+    default:
+      return { ok: false, error: `unknown assertion kind \`${kind}\`` };
+  }
+}
+
+export function registerVitestTests(moduleExports, api = {}) {
+  const describeFn = api.describe || globalThis.describe;
+  const testFn = api.test || api.it || globalThis.test || globalThis.it;
+  if (typeof describeFn !== "function" || typeof testFn !== "function") {
+    throw new Error("registerVitestTests requires Vitest describe and test functions.");
+  }
+
+  let index = 0;
+  for (const entry of moduleTestEntries(moduleExports)) {
+    index = registerVitestEntry(entry, describeFn, testFn, index);
+  }
+}
+
+export function render(component) {
+  const documentRef = ensureRuntimeDocument();
+  const root = documentRef.createElement("main");
+  root.setAttribute("data-closkell-test-root", "");
+  const harness = {
+    __closkellHarness: true,
+    kind: "component",
+    root,
+    component,
+    messages: [],
+    events: [],
+    frames: [],
+    disposed: false
+  };
+  const dispatch = testDispatchForHarness(harness);
+  harness.dispatch = dispatch;
+  component?.mount?.(root, dispatch);
+  return harness;
+}
+
+export function renderToString(viewOrComponent, state) {
+  const documentRef = ensureRuntimeDocument();
+  const root = documentRef.createElement("main");
+  const component = typeof viewOrComponent === "function" && arguments.length >= 2
+    ? viewOrComponent(state)
+    : viewOrComponent;
+  const dispatch = serverRenderDispatch();
+  component?.mount?.(root, dispatch);
+  annotateServerRenderedComponent(component);
+  const html = root.innerHTML ?? (root.children || []).map(serializeTestNode).join("");
+  component?.dispose?.();
+  root.replaceChildren?.();
+  return html;
+}
+
+export const render_to_string = renderToString;
+
+export function rerender(harness, component) {
+  if (!harness?.__closkellHarness) return harness;
+  if (harness.disposed) return harness;
+  if (harness.component?.root?.parentNode) harness.component.root.parentNode.removeChild(harness.component.root);
+  harness.component?.dispose?.();
+  harness.component = component;
+  component?.mount?.(harness.root, harness.dispatch || testDispatchForHarness(harness));
+  return harness;
+}
+
+export function dispose(harness) {
+  if (!harness || harness.disposed) return null;
+  if (harness.kind === "app") {
+    harness.app?.dispose?.();
+  } else {
+    harness.component?.dispose?.();
+  }
+  harness.root?.replaceChildren?.();
+  harness.disposed = true;
+  return null;
+}
+
+export function find(harness, selector) {
+  return harnessRoot(harness)?.querySelector?.(selector) ?? null;
+}
+
+export function find_all(harness, selector) {
+  return Array.from(harnessRoot(harness)?.querySelectorAll?.(selector) ?? []);
+}
+
+export function text(harness, selector) {
+  const node = selector == null ? harnessRoot(harness) : find(harness, selector);
+  return node?.textContent ?? "";
+}
+
+export function html(harness, selector) {
+  const node = selector == null ? harnessRoot(harness) : find(harness, selector);
+  return node?.innerHTML ?? "";
+}
+
+export function attr(harness, selector, name) {
+  const node = find(harness, selector);
+  return node?.getAttribute?.(name) ?? null;
+}
+
+export function class_(harness, selector, name) {
+  const node = find(harness, selector);
+  const className = node?.getAttribute?.("class") ?? "";
+  return className.split(/\s+/).filter(Boolean).includes(String(name));
+}
+
+export function style(harness, selector, name) {
+  const node = find(harness, selector);
+  const styleName = cssStylePropertyName(name);
+  return node?.style?.getPropertyValue?.(styleName) ?? node?.style?.[jsStylePropertyName(name)] ?? "";
+}
+
+export function messages(harness) {
+  return Array.from(harness?.messages ?? []);
+}
+
+export function commands(harness) {
+  if (harness?.kind === "app") {
+    return Array.from(harness.app?.commands ?? []).map((entry) => entry?.command ?? entry);
+  }
+  return Array.from(harness?.commands ?? []);
+}
+
+export function subscriptions(harness) {
+  if (harness?.kind === "app") return Array.from(harness.app?.subscriptions ?? []);
+  return Array.from(harness?.subscriptions ?? []);
+}
+
+export function dispatch(harness, message) {
+  return harness?.dispatch?.(message);
+}
+
+export function mount_app(appSpec = {}, options = {}) {
+  const documentRef = ensureRuntimeDocument();
+  const root = testOption(options, "root") || documentRef.createElement("main");
+  root.setAttribute?.("data-closkell-app-test-root", "");
+  const harness = {
+    __closkellHarness: true,
+    kind: "app",
+    root,
+    app: null,
+    frames: [],
+    subscriptionEvents: [],
+    messages: [],
+    disposed: false
+  };
+  const testDevtools = testOption(options, "devtools") || {
+    emit(event) {
+      if (event?.type === "template/update") harness.frames.push(event);
+    }
+  };
+  const handlers =
+    normalizeTestHandlers(testOption(options, "handlers") || testOption(options, "commandHandlers"))
+    || createCommandHandlers(normalizeTestCommandEnv(options));
+  const subscriptionHandlers =
+    normalizeTestHandlers(testOption(options, "subscriptionHandlers"))
+    || createSubscriptionHandlers({ ...normalizeTestCommandEnv(options), commandHandlers: handlers });
+  const app = startApp({
+    root,
+    init: testOption(appSpec, "init"),
+    update: testOption(appSpec, "update"),
+    view: testOption(appSpec, "view"),
+    subscriptions: testOption(appSpec, "subscriptions"),
+    handlers,
+    subscriptionHandlers,
+    devtools: testDevtools,
+    onSubscription(event) {
+      harness.subscriptionEvents.push(event);
+      testOption(options, "onSubscription")?.(event);
+    },
+    onCommand(event) {
+      testOption(options, "onCommand")?.(event);
+    }
+  });
+  harness.app = app;
+  harness.dispatch = (message) => app.dispatch(message);
+  Object.defineProperties(harness, {
+    state: {
+      get() {
+        return app.state;
+      }
+    },
+    activeSubscriptions: {
+      get() {
+        return app.subscriptions;
+      }
+    },
+    commandLog: {
+      get() {
+        return app.commands;
+      }
+    }
+  });
+  return harness;
+}
+
+export const fire = {
+  event(harness, selector, type, init = {}) {
+    const node = find(harness, selector);
+    if (!node) return null;
+    return dispatchTestEvent(harness, node, type, init);
+  },
+  click(harness, selector, init = {}) {
+    const node = find(harness, selector);
+    if (!node) return null;
+    return dispatchTestEvent(harness, node, "click", init);
+  },
+  input(harness, selector, valueOrInit = {}) {
+    const node = find(harness, selector);
+    if (!node) return null;
+    const init = testEventInit(valueOrInit);
+    applyTestInputValue(node, init);
+    return dispatchTestEvent(harness, node, "input", init);
+  },
+  change(harness, selector, valueOrInit = {}) {
+    const node = find(harness, selector);
+    if (!node) return null;
+    const init = testEventInit(valueOrInit);
+    applyTestInputValue(node, init);
+    return dispatchTestEvent(harness, node, "change", init);
+  },
+  keydown(harness, selector, init = {}) {
+    const node = find(harness, selector);
+    if (!node) return null;
+    return dispatchTestEvent(harness, node, "keydown", init);
+  },
+  pointerdown(harness, selector, init = {}) {
+    const node = find(harness, selector);
+    if (!node) return null;
+    return dispatchTestEvent(harness, node, "pointerdown", init);
+  }
+};
+
+export function scopeUpdate(parentState, field, childMessage, update, tag) {
+  const fieldName = scopeKey(field);
+  const [childState, childCommand] = normalizeUpdateResult(update(parentState?.[fieldName], childMessage));
+  return [
+    { ...(parentState || {}), [fieldName]: childState },
+    mapScopedCommand(childCommand, tag)
+  ];
+}
+
+export function scopeSubscriptions(childState, subscriptions, tag) {
+  if (typeof subscriptions !== "function") return Sub.none;
+  return mapScopedSubscription(subscriptions(childState), tag);
+}
+
+export function scopeView(tag, view, childState) {
+  let currentTag = tag;
+  let currentView = view;
+  let currentState = childState;
+  let child = currentView(currentState);
+  let parentDispatch = null;
+
+  const renderChild = () => {
+    child = currentView(currentState);
+    return child;
+  };
+
+  const scopedDispatch = () => scopedMessageDispatch(parentDispatch, currentTag);
+
+  return {
+    mount(parent, dispatch, hydrateNode = null) {
+      parentDispatch = dispatch;
+      return child.mount(parent, scopedDispatch(), hydrateNode);
+    },
+    update(nextTag, nextView, nextState, dispatch, updateContext) {
+      const previousState = currentState;
+      parentDispatch = dispatch || parentDispatch;
+      const viewChanged = nextView && nextView !== currentView;
+      currentTag = nextTag;
+      currentView = nextView || currentView;
+      currentState = nextState;
+
+      if (viewChanged) {
+        const parent = child.root?.parentNode;
+        const anchor = child.root?.nextSibling || null;
+        if (child.root?.parentNode) child.root.parentNode.removeChild(child.root);
+        child.dispose?.();
+        renderChild();
+        child.update?.(currentState, scopedDispatch(), forceUpdateContext(updateContext));
+        if (parent && child.root?.parentNode !== parent) parent.insertBefore(child.root, anchor);
+      } else {
+        child.update?.(currentState, scopedDispatch(), scopedViewUpdateContext(updateContext, previousState, currentState));
+      }
+      return child.root;
+    },
+    dispose() {
+      child?.dispose?.();
+    },
+    get root() {
+      return child?.root;
+    },
+    definition: {
+      name: "scope-view",
+      params: ["tag", "view", "state"],
+      scoped: true,
+      get child() {
+        return child?.definition;
+      }
+    }
+  };
+}
+
 export function createCommandHandlers(env = {}) {
   const host = env.host || globalThis;
   const timers = env.timers || host;
@@ -933,6 +1774,10 @@ export function createCommandHandlers(env = {}) {
   const random = env.random || Math.random;
   const now = env.now || (() => Date.now());
   const animation = env.animation || host;
+  const clipboard = env.clipboard || host.navigator?.clipboard;
+  const sessionStorage = env.sessionStorage || host.sessionStorage;
+  const documentRef = env.document || host.document;
+  const FormDataCtor = env.FormData || host.FormData || globalThis.FormData;
   const requestAnimationFrameImpl = env.requestAnimationFrame || animation.requestAnimationFrame?.bind(animation);
   const cancelAnimationFrameImpl = env.cancelAnimationFrame || animation.cancelAnimationFrame?.bind(animation);
   const matchMedia = env.matchMedia || host.matchMedia?.bind(host);
@@ -1166,6 +2011,37 @@ export function createCommandHandlers(env = {}) {
         return commandErrorMessage(command, error);
       }
     },
+    "browser/history-replace-search-param"(command) {
+      replaceBrowserSearchParam(host, command.name, command.value);
+      return commandMessage(command);
+    },
+    "browser/history-write-route"(command) {
+      writeBrowserRoute(host, command.url, command.op, command.definition);
+      return commandMessage(command);
+    },
+    "browser/theme-load"(command) {
+      const theme = loadBrowserTheme(host, storage, sessionStorage, command.key);
+      return commandMessage(command, theme);
+    },
+    "browser/theme-apply"(command) {
+      applyBrowserTheme(host, storage, sessionStorage, command.key, command.theme);
+      return commandMessage(command, command.theme);
+    },
+    "browser/clipboard-write"(command) {
+      void clipboard?.writeText?.(String(command.text ?? ""));
+      return commandMessage(command);
+    },
+    "browser/set-cookie"(command) {
+      setBrowserCookie(host, command.name, command.value);
+      return commandMessage(command);
+    },
+    "auth-storage/persist"(command) {
+      persistAuthStorage(storage, command.sourceUrl, command.entries);
+      return commandMessage(command);
+    },
+    "auth-storage/load"(command) {
+      return commandMessage(command, loadAuthStorage(storage, sessionStorage, command.sourceUrl));
+    },
     "random/number"(command) {
       const min = command.min ?? 0;
       const max = command.max ?? 1;
@@ -1209,11 +2085,22 @@ export function createCommandHandlers(env = {}) {
       }
       return commandMessage(command, { id });
     },
+    "task/perform": async function(command) {
+      try {
+        const value = await runTask(command.task, { fetch: fetchImpl });
+        return taskSuccessMessage(command, value);
+      } catch (error) {
+        return taskErrorMessage(command, error);
+      }
+    },
     "http/request": async function(command) {
       if (!fetchImpl) return commandErrorMessage(command, new Error("No fetch implementation is available for http/request"));
 
       try {
-        const { url, options } = httpRequestFetchArgs(command);
+        const { url, options } = httpRequestFetchArgs(command, {
+          document: documentRef,
+          FormData: FormDataCtor
+        });
         const started = nowMs();
         const response = await fetchImpl(url, options);
         const responseFormat = commandValueName(command.response || command.format || "json");
@@ -1444,12 +2331,75 @@ export function createCommandHandlers(env = {}) {
   return handlers;
 }
 
-export function startApp({ root, init, update, view, handlers = {}, onCommand = () => {}, devtools = null }) {
-  const [initialState, initialCommand] = normalizeUpdateResult(typeof init === "function" ? init() : init);
+export function createBrowserBootInput(env = {}) {
+  const host = env.host || globalThis;
+  return {
+    currentUrl: host.location?.href ?? ""
+  };
+}
+
+export function createSubscriptionHandlers(env = {}) {
+  const commandHandlers = env.commandHandlers || createCommandHandlers(env);
+
+  const handlers = {
+    start(subscription, dispatch) {
+      const command = startCommandForSubscription(subscription);
+      const kind = commandKind(command);
+      const handler = commandHandlers[kind];
+      if (typeof handler !== "function") {
+        if (subscription?.onError !== undefined) {
+          return commandErrorMessage(subscription, new Error(`No handler registered for subscription kind ${subscriptionKind(subscription)}`));
+        }
+        return undefined;
+      }
+      return handler(command, dispatch);
+    },
+    stop(subscription, dispatch) {
+      const command = stopCommandForSubscription(subscription);
+      if (!command) return undefined;
+      const kind = commandKind(command);
+      const handler = commandHandlers[kind];
+      if (typeof handler !== "function") return undefined;
+      return handler(command, dispatch);
+    },
+    dispose() {
+      commandHandlers.dispose?.();
+    }
+  };
+
+  Object.defineProperty(handlers, "__closkellCommandHandlers", {
+    value: commandHandlers
+  });
+
+  return handlers;
+}
+
+export function startApp({
+  root,
+  init,
+  update,
+  view,
+  subscriptions = null,
+  handlers = {},
+  subscriptionHandlers = null,
+  onCommand = () => {},
+  onSubscription = () => {},
+  devtools = null,
+  hydrate = false,
+  boot = undefined
+}) {
+  const initValue = typeof init === "function"
+    ? (boot === undefined ? init() : init(boot))
+    : init;
+  const [initialState, initialCommand] = normalizeUpdateResult(initValue);
   let state = initialState;
   let component = null;
   let disposed = false;
   const commandLog = [];
+  const subscriptionLog = [];
+  const activeSubscriptions = new Map();
+  const resolvedSubscriptionHandlers =
+    subscriptionHandlers || createSubscriptionHandlers({ commandHandlers: handlers });
   const refs = new Map();
   const isActive = () => !disposed;
 
@@ -1470,6 +2420,7 @@ export function startApp({ root, init, update, view, handlers = {}, onCommand = 
       command,
       changedPaths
     });
+    syncSubscriptions();
     runCommand(command, dispatch, handlers, commandLog, onCommand, isActive);
     return state;
   };
@@ -1478,13 +2429,29 @@ export function startApp({ root, init, update, view, handlers = {}, onCommand = 
 
   emitDevtools(devtools, { type: "app/init", state });
   component = view(state);
-  component.mount(root, dispatch);
+  mountAppComponent(root, component, dispatch, hydrate);
   emitDevtools(devtools, { type: "app/mount", root: component.root, state });
+  syncSubscriptions();
   runCommand(initialCommand, dispatch, handlers, commandLog, onCommand, isActive);
+
+  function syncSubscriptions() {
+    if (typeof subscriptions !== "function" || disposed) return;
+    const nextSubscriptions = flattenSubscriptions(subscriptions(state));
+    reconcileSubscriptions(
+      activeSubscriptions,
+      nextSubscriptions,
+      dispatch,
+      resolvedSubscriptionHandlers,
+      subscriptionLog,
+      onSubscription,
+      isActive
+    );
+  }
 
   return {
     dispatch,
     commands: commandLog,
+    subscriptionEvents: subscriptionLog,
     refs,
     getRef(name) {
       return refs.get(refName(name));
@@ -1492,17 +2459,190 @@ export function startApp({ root, init, update, view, handlers = {}, onCommand = 
     get state() {
       return state;
     },
+    get subscriptions() {
+      return Array.from(activeSubscriptions.values()).map((entry) => entry.subscription);
+    },
     get root() {
       return component.root;
     },
     dispose() {
       if (disposed) return;
       disposed = true;
+      stopAllSubscriptions(
+        activeSubscriptions,
+        dispatch,
+        resolvedSubscriptionHandlers,
+        subscriptionLog,
+        onSubscription
+      );
+      if (resolvedSubscriptionHandlers.__closkellCommandHandlers !== handlers) {
+        resolvedSubscriptionHandlers.dispose?.();
+      }
       handlers.dispose?.();
       component?.dispose?.();
       emitDevtools(devtools, { type: "app/dispose", state });
     }
   };
+}
+
+export function hydrateApp(options = {}) {
+  const root = resolveHydrationRoot(options.root);
+  const initState = options.initState ?? options.state;
+  return startApp({
+    ...options,
+    root,
+    init: [initState, { kind: Symbol.for("none") }],
+    hydrate: true
+  });
+}
+
+function mountAppComponent(root, component, dispatch, hydrate) {
+  const previousChildren = hydrate ? Array.from(root?.childNodes ?? root?.children ?? []) : [];
+  const hydrateNode = hydrate ? hydrationCandidateForComponent(root, component) : null;
+  component.mount(root, dispatch, hydrateNode);
+  if (!hydrate) return;
+  for (const child of previousChildren) {
+    if (child !== component.root && child?.parentNode === root) {
+      root.removeChild?.(child);
+    }
+  }
+  component.root?.setAttribute?.("data-closkell-hydrated", "");
+}
+
+function hydrationCandidateForComponent(root, component) {
+  const templateName = component?.definition?.name;
+  if (!templateName) return null;
+  return Array.from(root?.childNodes ?? root?.children ?? []).find(
+    (child) => child?.nodeType === 1 && child.getAttribute?.("data-closkell-template") === templateName
+  ) || null;
+}
+
+function resolveHydrationRoot(root) {
+  if (typeof root === "string") {
+    const resolved = globalThis.document?.querySelector?.(root);
+    if (resolved) return resolved;
+    throw new Error(`hydrateApp root selector did not match: ${root}`);
+  }
+  const resolved = root ?? globalThis.document?.getElementById?.("app");
+  if (!resolved) throw new Error("hydrateApp requires a root element or selector.");
+  return resolved;
+}
+
+function flattenSubscriptions(subscription) {
+  if (subscription == null || subscription === false) return [];
+  if (Array.isArray(subscription)) return subscription.flatMap(flattenSubscriptions);
+
+  const kind = subscriptionKind(subscription);
+  if (!kind || kind === "none") return [];
+  if (kind === "batch") {
+    return flattenSubscriptions(subscription.subscriptions ?? subscription.subs ?? subscription.commands);
+  }
+  return [subscription];
+}
+
+function reconcileSubscriptions(
+  activeSubscriptions,
+  nextSubscriptions,
+  dispatch,
+  handlers,
+  subscriptionLog,
+  onSubscription,
+  isActive
+) {
+  const nextByKey = new Map();
+  for (const subscription of nextSubscriptions) {
+    const key = subscriptionKey(subscription);
+    if (!key) continue;
+    nextByKey.set(key, {
+      subscription,
+      signature: subscriptionSignature(subscription)
+    });
+  }
+
+  for (const [key, active] of Array.from(activeSubscriptions.entries())) {
+    const next = nextByKey.get(key);
+    if (next && next.signature === active.signature) continue;
+    stopSubscription(active.subscription, dispatch, handlers, subscriptionLog, onSubscription);
+    activeSubscriptions.delete(key);
+  }
+
+  for (const [key, next] of nextByKey.entries()) {
+    if (activeSubscriptions.has(key)) continue;
+    startSubscription(next.subscription, dispatch, handlers, subscriptionLog, onSubscription, isActive);
+    activeSubscriptions.set(key, next);
+  }
+}
+
+function stopAllSubscriptions(activeSubscriptions, dispatch, handlers, subscriptionLog, onSubscription) {
+  for (const active of activeSubscriptions.values()) {
+    stopSubscription(active.subscription, dispatch, handlers, subscriptionLog, onSubscription);
+  }
+  activeSubscriptions.clear();
+}
+
+function startSubscription(subscription, dispatch, handlers, subscriptionLog, onSubscription, isActive) {
+  const kind = subscriptionKind(subscription);
+  const event = { type: "subscription/start", kind, subscription };
+  subscriptionLog.push(event);
+  onSubscription(event);
+  emitDispatchDevtools(dispatch, event);
+  runSubscriptionHandler("start", subscription, dispatch, handlers, isActive);
+}
+
+function stopSubscription(subscription, dispatch, handlers, subscriptionLog, onSubscription) {
+  const kind = subscriptionKind(subscription);
+  const event = { type: "subscription/stop", kind, subscription };
+  subscriptionLog.push(event);
+  onSubscription(event);
+  emitDispatchDevtools(dispatch, event);
+  runSubscriptionHandler("stop", subscription, dispatch, handlers, () => false);
+}
+
+function runSubscriptionHandler(action, subscription, dispatch, handlers, isActive) {
+  let result;
+  try {
+    result = callSubscriptionHandler(action, subscription, dispatch, handlers);
+  } catch (error) {
+    handleSubscriptionError(subscription, error, dispatch, isActive);
+    return;
+  }
+
+  if (result && typeof result.then === "function") {
+    result
+      .then((message) => {
+        if (message !== undefined && message !== null && isActive()) dispatch(message);
+      })
+      .catch((error) => handleSubscriptionError(subscription, error, dispatch, isActive));
+  } else if (result !== undefined && result !== null && isActive()) {
+    dispatch(result);
+  }
+}
+
+function callSubscriptionHandler(action, subscription, dispatch, handlers) {
+  if (typeof handlers?.[action] === "function") {
+    return handlers[action](subscription, dispatch);
+  }
+
+  const byKind = handlers?.[subscriptionKind(subscription)];
+  if (typeof byKind === "function" && action === "start") {
+    return byKind(subscription, dispatch);
+  }
+  if (typeof byKind?.[action] === "function") {
+    return byKind[action](subscription, dispatch);
+  }
+  return undefined;
+}
+
+function handleSubscriptionError(subscription, error, dispatch, isActive) {
+  emitDispatchDevtools(dispatch, {
+    type: "subscription/error",
+    kind: subscriptionKind(subscription),
+    subscription,
+    error: errorMessage(error)
+  });
+  if (!isActive()) return;
+  const message = commandErrorMessage(subscription, error);
+  if (message !== undefined && isActive()) dispatch(message);
 }
 
 function normalizeUpdateResult(result) {
@@ -1560,6 +2700,574 @@ function runCommand(command, dispatch, handlers, commandLog, onCommand, isActive
   } else if (result !== undefined && isActive()) {
     dispatch(result);
   }
+}
+
+async function runTask(task, context = {}) {
+  if (task == null) return task;
+  if (typeof task === "function") return task();
+  if (typeof task?.then === "function") return task;
+
+  const kind = commandKind(task);
+  switch (kind) {
+    case "task/succeed":
+      return task.value;
+    case "task/fail":
+      throw task.error;
+    case "task/map": {
+      const value = await runTask(task.task, context);
+      return task.mapper(value);
+    }
+    case "task/map-error": {
+      try {
+        return await runTask(task.task, context);
+      } catch (error) {
+        throw task.mapper(error);
+      }
+    }
+    case "task/and-then": {
+      const value = await runTask(task.task, context);
+      return runTask(task.next(value), context);
+    }
+    case "task/http/get-text":
+      return runHttpTask(task, context, "text");
+    case "task/http/get-json":
+      return runHttpTask(task, context, "json");
+    default:
+      throw new Error(`Unknown task kind ${kind || String(task.kind || "")}`);
+  }
+}
+
+async function runHttpTask(task, context, format) {
+  const fetchImpl = context.fetch || globalThis.fetch;
+  if (!fetchImpl) throw "No fetch implementation is available for HTTP tasks.";
+
+  try {
+    const response = await fetchImpl(task.url, task.options || {});
+    if (!response?.ok) {
+      const status = response?.status ?? 0;
+      const statusText = response?.statusText || "HTTP request failed";
+      throw `HTTP ${status} ${statusText}`;
+    }
+    return format === "json" ? response.json() : response.text();
+  } catch (error) {
+    throw typeof error === "string" ? error : errorMessage(error);
+  }
+}
+
+function taskSuccessMessage(command, value) {
+  if (typeof command.onSuccess === "function") return command.onSuccess(value);
+  return commandMessage(command, value);
+}
+
+function taskErrorMessage(command, error) {
+  if (typeof command.onError === "function") return command.onError(error);
+  return commandErrorMessage(command, error);
+}
+
+function flattenTestEntries(entries) {
+  return entries.flatMap((entry) => {
+    if (entry == null || entry === false) return [];
+    if (Array.isArray(entry)) return flattenTestEntries(entry);
+    return [entry];
+  });
+}
+
+function flattenAssertions(assertions) {
+  return assertions.flatMap((assertion) => {
+    if (assertion == null || assertion === false) return [];
+    if (Array.isArray(assertion)) return flattenAssertions(assertion);
+    return [assertion];
+  });
+}
+
+function moduleTestEntries(moduleExports) {
+  if ("tests" in (moduleExports || {})) {
+    return normalizeModuleTestEntries(moduleExports.tests, true);
+  }
+  return Object.keys(moduleExports || {})
+    .sort()
+    .flatMap((name) => normalizeModuleTestEntries(moduleExports[name], false));
+}
+
+function normalizeModuleTestEntries(value, strict) {
+  if (value == null || value === false) return [];
+  if (Array.isArray(value)) return value.flatMap((entry) => normalizeModuleTestEntries(entry, strict));
+  if (isTestGroup(value) || isTestCase(value) || isLegacyTestRecord(value)) return [value];
+  return strict ? [value] : [];
+}
+
+function flattenModuleTestEntries(value, prefix = [], strict = true) {
+  if (value == null || value === false) return [];
+  if (Array.isArray(value)) {
+    return value.flatMap((entry) => flattenModuleTestEntries(entry, prefix, strict));
+  }
+  if (isTestGroup(value)) {
+    const nextPrefix = [...prefix, String(value.name ?? "")];
+    return flattenModuleTestEntries(value.tests ?? [], nextPrefix, strict);
+  }
+  if (isTestCase(value)) {
+    return [{ ...value, name: fullTestName(prefix, closkellTestName(value, 0)) }];
+  }
+  if (isLegacyTestRecord(value)) {
+    const name = value.name ? fullTestName(prefix, String(value.name)) : fullTestName(prefix, "");
+    return [{ ...value, name }];
+  }
+  return strict ? [value] : [];
+}
+
+function registerVitestEntry(entry, describeFn, testFn, index) {
+  if (Array.isArray(entry)) {
+    for (const item of entry) index = registerVitestEntry(item, describeFn, testFn, index);
+    return index;
+  }
+  if (entry == null || entry === false) return index;
+  if (isTestGroup(entry)) {
+    describeFn(String(entry.name ?? ""), () => {
+      let groupIndex = 0;
+      for (const item of normalizeModuleTestEntries(entry.tests ?? [], true)) {
+        groupIndex = registerVitestEntry(item, describeFn, testFn, groupIndex);
+      }
+    });
+    return index;
+  }
+  if (isTestCase(entry) || isLegacyTestRecord(entry)) {
+    const testIndex = index;
+    testFn(closkellTestName(entry, testIndex), () => {
+      const result = runCloskellTest(entry, testIndex);
+      if (!result.ok) throw new Error(formatTestFailure(result));
+    });
+    return index + 1;
+  }
+  return index;
+}
+
+function isTestGroup(value) {
+  return value && typeof value === "object" && value.__closkellTestGroup;
+}
+
+function isTestCase(value) {
+  return value && typeof value === "object" && value.__closkellTest;
+}
+
+function isLegacyTestRecord(value) {
+  return value && typeof value === "object" && ("actual" in value || "expected" in value);
+}
+
+function assertionKind(assertion) {
+  const kind = assertion?.__closkellAssert;
+  if (typeof kind === "symbol") return symbolKey(kind);
+  return String(kind ?? "");
+}
+
+function closkellTestAssertions(testValue) {
+  if (isTestCase(testValue)) return testValue.assertions ?? [];
+  return [testValue];
+}
+
+function closkellTestName(testValue, index) {
+  if (testValue && typeof testValue.name === "string" && testValue.name.length > 0) {
+    return testValue.name;
+  }
+  return `test ${index + 1}`;
+}
+
+function fullTestName(prefix, name) {
+  return [...prefix, name].filter((part) => part && part.length > 0).join(" / ");
+}
+
+function runEqualAssertion(actual, expected, negated) {
+  const equal = deepEqual(actual, expected);
+  if (negated ? !equal : equal) return { ok: true };
+  return {
+    ok: false,
+    expected: negated ? `not ${formatTestValue(expected)}` : formatTestValue(expected),
+    actual: formatTestValue(actual)
+  };
+}
+
+function runMatchAssertion(actual, pattern) {
+  if (deepMatch(actual, pattern)) return { ok: true };
+  return {
+    ok: false,
+    expected: `match ${formatTestValue(pattern)}`,
+    actual: formatTestValue(actual)
+  };
+}
+
+function runThrowsAssertion(thunk, expected) {
+  if (typeof thunk !== "function") {
+    return { ok: false, expected: "function that throws", actual: formatTestValue(thunk) };
+  }
+  try {
+    thunk();
+  } catch (error) {
+    const message = errorMessage(error);
+    if (expected === undefined || String(message).includes(String(expected))) return { ok: true };
+    return {
+      ok: false,
+      expected: `throw containing ${formatTestValue(expected)}`,
+      actual: formatTestValue(message)
+    };
+  }
+  return { ok: false, expected: "throw", actual: "no throw" };
+}
+
+function deepEqual(left, right) {
+  if (Object.is(left, right)) return true;
+  if (typeof left === "symbol" || typeof right === "symbol") {
+    return symbolKey(left) === symbolKey(right);
+  }
+  if (Array.isArray(left) || Array.isArray(right)) {
+    if (!Array.isArray(left) || !Array.isArray(right)) return false;
+    if (left.length !== right.length) return false;
+    return left.every((value, index) => deepEqual(value, right[index]));
+  }
+  if (left instanceof Set || right instanceof Set) {
+    if (!(left instanceof Set) || !(right instanceof Set) || left.size !== right.size) return false;
+    return Array.from(left).every((leftItem) =>
+      Array.from(right).some((rightItem) => deepEqual(leftItem, rightItem))
+    );
+  }
+  if (left instanceof Map || right instanceof Map) {
+    if (!(left instanceof Map) || !(right instanceof Map) || left.size !== right.size) return false;
+    return Array.from(left).every(([key, value]) => right.has(key) && deepEqual(value, right.get(key)));
+  }
+  if (isPlainObject(left) || isPlainObject(right)) {
+    if (!isPlainObject(left) || !isPlainObject(right)) return false;
+    const leftKeys = Object.keys(left).sort();
+    const rightKeys = Object.keys(right).sort();
+    if (!deepEqual(leftKeys, rightKeys)) return false;
+    return leftKeys.every((key) => deepEqual(left[key], right[key]));
+  }
+  return false;
+}
+
+function deepMatch(actual, pattern) {
+  if (typeof pattern === "function") return pattern(actual) === true;
+  if (Object.is(actual, pattern)) return true;
+  if (typeof actual === "symbol" || typeof pattern === "symbol") {
+    return symbolKey(actual) === symbolKey(pattern);
+  }
+  if (Array.isArray(pattern)) {
+    if (!Array.isArray(actual) || actual.length !== pattern.length) return false;
+    return pattern.every((value, index) => deepMatch(actual[index], value));
+  }
+  if (pattern instanceof Set) {
+    if (!(actual instanceof Set)) return false;
+    return Array.from(pattern).every((patternItem) =>
+      Array.from(actual).some((actualItem) => deepEqual(actualItem, patternItem))
+    );
+  }
+  if (pattern instanceof Map) {
+    if (!(actual instanceof Map)) return false;
+    return Array.from(pattern).every(([key, value]) => actual.has(key) && deepMatch(actual.get(key), value));
+  }
+  if (isPlainObject(pattern)) {
+    if (!isPlainObject(actual)) return false;
+    return Object.keys(pattern).every((key) => deepMatch(actual[key], pattern[key]));
+  }
+  return false;
+}
+
+function isPlainObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function symbolKey(value) {
+  if (typeof value !== "symbol") return null;
+  return Symbol.keyFor(value) ?? value.description ?? "";
+}
+
+function formatTestValue(value) {
+  if (typeof value === "symbol") return `:${symbolKey(value)}`;
+  if (typeof value === "undefined") return "undefined";
+  if (value instanceof Set) return `#{${Array.from(value).map(formatTestValue).join(" ")}}`;
+  if (value instanceof Map) {
+    const entries = Array.from(value.entries()).map(([key, entry]) => `${formatTestValue(key)} ${formatTestValue(entry)}`);
+    return `(hash-map ${entries.join(" ")})`;
+  }
+  return JSON.stringify(
+    value,
+    (_key, next) => (typeof next === "symbol" ? `:${symbolKey(next)}` : next)
+  );
+}
+
+function formatTestFailure(result) {
+  if (result.error) return result.error;
+  return `expected ${result.expected}, actual ${result.actual}`;
+}
+
+function harnessRoot(harness) {
+  if (harness?.__closkellHarness) return harness.root;
+  return harness?.root ?? harness;
+}
+
+function testDispatchForHarness(harness) {
+  const dispatch = (message, event) => {
+    harness.messages.push(message);
+    if (event) harness.events.push(testEventSnapshot(event));
+  };
+  dispatch.__closkellRefs = new Map();
+  dispatch.__closkellDevtools = {
+    emit(event) {
+      if (event?.type === "template/update") harness.frames.push(event);
+    }
+  };
+  return dispatch;
+}
+
+function serverRenderDispatch() {
+  const dispatch = () => {};
+  dispatch.__closkellRefs = new Map();
+  dispatch.__closkellDevtools = { emit() {} };
+  return dispatch;
+}
+
+function annotateServerRenderedComponent(component, seen = new Set()) {
+  if (!component || seen.has(component)) return;
+  seen.add(component);
+
+  const root = component.root;
+  const name = component.definition?.name;
+  if (root?.nodeType === 1 && name) {
+    root.setAttribute?.("data-closkell-template", name);
+    const slots = serverSlotMetadata(component.definition);
+    if (slots.length) root.setAttribute?.("data-closkell-slots", JSON.stringify(slots));
+  }
+
+  const instance = component.__closkellInstance;
+  if (!instance) return;
+  for (const slot of instance.componentSlots || []) {
+    annotateServerRenderedComponent(slot?.component, seen);
+  }
+  for (const slot of instance.conditionalSlots || []) {
+    annotateServerRenderedComponent(slot?.component, seen);
+  }
+  for (const slot of instance.keyedSlots || []) {
+    for (const entry of slot?.byKey?.values?.() || []) {
+      annotateServerRenderedComponent(entry.component, seen);
+    }
+  }
+}
+
+function serverSlotMetadata(definition) {
+  return (definition?.slots || [])
+    .filter((slot) => slot?.kind?.event || slot?.kind?.ref)
+    .map((slot) => ({
+      id: slot.id,
+      node: slot.node,
+      kind: slot.kind
+    }));
+}
+
+function dispatchTestEvent(harness, node, type, init = {}) {
+  const event = createTestEvent(type, { ...init, target: node, currentTarget: node });
+  node.dispatchEvent?.(event);
+  harness?.events?.push?.(testEventSnapshot(event));
+  return event;
+}
+
+function createTestEvent(type, init = {}) {
+  const event = {
+    type: String(type),
+    bubbles: init.bubbles !== false,
+    cancelable: init.cancelable !== false,
+    defaultPrevented: false,
+    propagationStopped: false,
+    target: init.target ?? null,
+    currentTarget: init.currentTarget ?? init.target ?? null,
+    key: init.key ?? "",
+    altKey: Boolean(init.altKey),
+    ctrlKey: Boolean(init.ctrlKey),
+    metaKey: Boolean(init.metaKey),
+    shiftKey: Boolean(init.shiftKey),
+    clientX: Number(init.clientX ?? 0),
+    clientY: Number(init.clientY ?? 0),
+    preventDefault() {
+      this.defaultPrevented = true;
+    },
+    stopPropagation() {
+      this.propagationStopped = true;
+    }
+  };
+  return event;
+}
+
+function testEventSnapshot(event) {
+  return {
+    type: event.type,
+    defaultPrevented: Boolean(event.defaultPrevented),
+    propagationStopped: Boolean(event.propagationStopped)
+  };
+}
+
+function testEventInit(valueOrInit) {
+  if (valueOrInit && typeof valueOrInit === "object" && !Array.isArray(valueOrInit)) {
+    return valueOrInit;
+  }
+  return { value: valueOrInit };
+}
+
+function applyTestInputValue(node, init) {
+  if ("value" in init) {
+    node.value = String(init.value ?? "");
+    node.setAttribute?.("value", node.value);
+  }
+  if ("checked" in init) {
+    node.checked = Boolean(init.checked);
+    if (node.checked) node.setAttribute?.("checked", "");
+    else node.removeAttribute?.("checked");
+  }
+}
+
+function testOption(value, name) {
+  if (value instanceof Map) {
+    if (value.has(name)) return value.get(name);
+    const symbol = Symbol.for(name);
+    if (value.has(symbol)) return value.get(symbol);
+  }
+  return value?.[name];
+}
+
+function normalizeTestHandlers(handlers) {
+  if (!handlers) return null;
+  if (!(handlers instanceof Map)) return handlers;
+  const normalized = {};
+  for (const [key, value] of handlers.entries()) normalized[handlerKey(key)] = value;
+  return normalized;
+}
+
+function handlerKey(key) {
+  if (typeof key === "symbol") return Symbol.keyFor(key) || key.description || String(key);
+  return String(key);
+}
+
+function normalizeTestCommandEnv(options = {}) {
+  const env = options instanceof Map ? normalizeTestHandlers(options) : { ...(options || {}) };
+  if (env.now !== undefined && typeof env.now !== "function") {
+    const value = Number(env.now);
+    env.now = () => value;
+  }
+  if (env.random !== undefined && typeof env.random !== "function") {
+    const value = Number(env.random);
+    env.random = () => value;
+  }
+  if (env.storage instanceof Map) env.storage = testStorageFromMap(env.storage);
+  return env;
+}
+
+function testStorageFromMap(values) {
+  return {
+    values: new Map(values),
+    getItem(key) {
+      return this.values.has(key) ? this.values.get(key) : null;
+    },
+    setItem(key, value) {
+      this.values.set(key, String(value));
+    },
+    removeItem(key) {
+      this.values.delete(key);
+    }
+  };
+}
+
+function siblingForNode(node, offset) {
+  const siblings = node?.parentNode?.children;
+  if (!siblings) return null;
+  const index = siblings.indexOf(node);
+  return index === -1 ? null : siblings[index + offset] || null;
+}
+
+function querySelectorAllFrom(root, selector) {
+  const selectors = String(selector || "").split(",").map((part) => part.trim()).filter(Boolean);
+  const matches = [];
+  for (const node of descendantsOf(root)) {
+    if (selectors.some((candidate) => selectorMatchesNode(node, candidate))) matches.push(node);
+  }
+  return matches;
+}
+
+function descendantsOf(root) {
+  const nodes = [];
+  for (const child of root?.children || []) {
+    nodes.push(child);
+    nodes.push(...descendantsOf(child));
+  }
+  return nodes;
+}
+
+function selectorMatchesNode(node, selector) {
+  if (!node || node.nodeType !== 1) return false;
+  const parts = String(selector || "").trim().split(/\s+/).filter(Boolean);
+  if (!parts.length) return false;
+  return selectorChainMatches(node, parts.length - 1, parts);
+}
+
+function selectorChainMatches(node, index, parts) {
+  if (!simpleSelectorMatches(node, parts[index])) return false;
+  if (index === 0) return true;
+  let parent = node.parentNode;
+  while (parent) {
+    if (selectorChainMatches(parent, index - 1, parts)) return true;
+    parent = parent.parentNode;
+  }
+  return false;
+}
+
+function simpleSelectorMatches(node, selector) {
+  if (selector === "*") return true;
+  const tagMatch = selector.match(/^[A-Za-z][A-Za-z0-9_-]*/);
+  if (tagMatch && node.tagName !== tagMatch[0].toLowerCase()) return false;
+
+  const idMatches = selector.match(/#[A-Za-z0-9_-]+/g) || [];
+  for (const id of idMatches) {
+    if (node.getAttribute?.("id") !== id.slice(1)) return false;
+  }
+
+  const classMatches = selector.match(/\.[A-Za-z0-9_-]+/g) || [];
+  const classes = (node.getAttribute?.("class") || "").split(/\s+/).filter(Boolean);
+  for (const className of classMatches) {
+    if (!classes.includes(className.slice(1))) return false;
+  }
+
+  const attrMatches = selector.match(/\[[^\]]+\]/g) || [];
+  for (const raw of attrMatches) {
+    const content = raw.slice(1, -1).trim();
+    const match = content.match(/^([^=\s]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s]+)))?$/);
+    if (!match) return false;
+    const name = match[1];
+    const expected = match[2] ?? match[3] ?? match[4];
+    if (!node.hasAttribute?.(name)) return false;
+    if (expected !== undefined && node.getAttribute?.(name) !== expected) return false;
+  }
+
+  return true;
+}
+
+function serializeTestNode(node) {
+  if (node?.nodeType === 3) return escapeHtmlText(node.nodeValue);
+  if (node?.nodeType === 11) return node.children.map(serializeTestNode).join("");
+  const attrs = serializableAttributes(node)
+    .map(([name, value]) => value === "" ? ` ${name}` : ` ${name}="${escapeHtmlText(value)}"`)
+    .join("");
+  const children = (node?.children || []).map(serializeTestNode).join("");
+  return `<${node.tagName}${attrs}>${children}</${node.tagName}>`;
+}
+
+function serializableAttributes(node) {
+  const attrs = Object.entries(node?.attributes || {});
+  const hasStyleAttr = attrs.some(([name]) => name === "style");
+  const styleText = String(node?.style?.cssText || "");
+  if (styleText && !hasStyleAttr) attrs.push(["style", styleText]);
+  return attrs;
+}
+
+function escapeHtmlText(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }
 
 function handleCommandError(command, error, dispatch, isActive) {
@@ -1667,6 +3375,175 @@ function commandKind(command) {
   return String(kind || "");
 }
 
+function scopeKey(value) {
+  if (typeof value === "symbol") return Symbol.keyFor(value) || value.description || String(value);
+  return String(value || "");
+}
+
+function wrapScopedMessage(message, tag) {
+  if (message === undefined || message === null) return message;
+  return { kind: tag, msg: message };
+}
+
+function scopedMessageDispatch(parentDispatch, tag) {
+  const dispatch = (message, event) => parentDispatch?.(wrapScopedMessage(message, tag), event);
+  dispatch.__closkellRefs = parentDispatch?.__closkellRefs;
+  dispatch.__closkellDevtools = parentDispatch?.__closkellDevtools;
+  return dispatch;
+}
+
+function scopedViewUpdateContext(updateContext, previousState, nextState) {
+  if (!updateContext) return null;
+  return {
+    ...updateContext,
+    localChangedPaths: [
+      ...(updateContext.localChangedPaths || []),
+      ...changedStatePaths(previousState, nextState)
+    ],
+    localReadPrefixes: [...(updateContext.localReadPrefixes || []), "state"],
+    frames: updateContext.frames
+  };
+}
+
+function mapScopedCommand(command, tag) {
+  if (!command) return command;
+  if (Array.isArray(command)) return command.map((item) => mapScopedCommand(item, tag));
+
+  const kind = commandKind(command);
+  if (kind === "none") return command;
+  if (kind === "batch") {
+    return {
+      ...command,
+      commands: (command.commands || []).map((item) => mapScopedCommand(item, tag))
+    };
+  }
+
+  return mapScopedContinuations(command, tag);
+}
+
+function mapScopedSubscription(subscription, tag) {
+  if (!subscription) return subscription;
+  if (Array.isArray(subscription)) return subscription.map((item) => mapScopedSubscription(item, tag));
+
+  const kind = subscriptionKind(subscription);
+  if (kind === "none") return subscription;
+  if (kind === "batch") {
+    const subscriptions = subscription.subscriptions ?? subscription.subs ?? subscription.commands ?? [];
+    return {
+      ...subscription,
+      subscriptions: subscriptions.map((item) => mapScopedSubscription(item, tag))
+    };
+  }
+
+  return mapScopedContinuations(subscription, tag);
+}
+
+function mapScopedContinuations(effect, tag) {
+  const mapped = { ...effect };
+  if (effect.msg !== undefined) mapped.msg = wrapScopedMessage(effect.msg, tag);
+  if (effect.toMessage !== undefined) {
+    mapped.toMessage = (value) => wrapScopedMessage(effect.toMessage(value), tag);
+  }
+  mapScopedPayloadContinuation(mapped, effect, "onSuccess", tag, (value) => ({ value }));
+  mapScopedPayloadContinuation(mapped, effect, "onError", tag, (error) => ({ error: errorMessage(error) }));
+  mapScopedPayloadContinuation(mapped, effect, "onFrame", tag, (value) => value);
+  mapScopedPayloadContinuation(mapped, effect, "onChange", tag, (value) => value);
+  mapScopedPayloadContinuation(mapped, effect, "onReading", tag, (value) => value);
+  mapScopedPayloadContinuation(mapped, effect, "onEvent", tag, (value) => value);
+  mapScopedPayloadContinuation(mapped, effect, "onCancel", tag, () => ({}));
+  mapScopedPayloadContinuation(mapped, effect, "onDisconnected", tag, () => ({}));
+  return mapped;
+}
+
+function mapScopedPayloadContinuation(target, source, field, tag, payloadForValue) {
+  if (source[field] === undefined) return;
+  const continuation = source[field];
+  target[field] = (value) => wrapScopedMessage(namedCommandMessage(continuation, payloadForValue(value)), tag);
+}
+
+function subscriptionKind(subscription) {
+  return commandKind(subscription);
+}
+
+function subscriptionKey(subscription) {
+  const kind = subscriptionKind(subscription);
+  if (!kind || kind === "none" || kind === "batch") return "";
+  const id =
+    subscription.id ??
+    subscription.ref ??
+    subscription.query ??
+    subscription.type ??
+    subscription.event ??
+    kind;
+  return `${kind}:${subscriptionIdentityPart(id)}`;
+}
+
+function subscriptionIdentityPart(value) {
+  if (typeof value === "symbol") return Symbol.keyFor(value) || value.description || String(value);
+  if (value === null || value === undefined) return "";
+  return String(value);
+}
+
+function subscriptionSignature(subscription) {
+  const seen = new WeakSet();
+  const normalize = (value) => {
+    if (typeof value === "symbol") return `:${Symbol.keyFor(value) || value.description || String(value)}`;
+    if (typeof value === "function") return "[Function]";
+    if (value && typeof value === "object") {
+      if (seen.has(value)) return "[Circular]";
+      seen.add(value);
+      if (Array.isArray(value)) return value.map(normalize);
+      const sorted = {};
+      for (const key of Object.keys(value).sort()) {
+        sorted[key] = normalize(value[key]);
+      }
+      return sorted;
+    }
+    return value;
+  };
+  return JSON.stringify(normalize(subscription));
+}
+
+function startCommandForSubscription(subscription) {
+  const kind = subscriptionKind(subscription);
+  switch (kind) {
+    case "sub/timer/every":
+      return { ...subscription, kind: Symbol.for("timer/every") };
+    case "sub/dom-ref/resize":
+      return { ...subscription, kind: Symbol.for("dom-ref/resize-watch") };
+    case "sub/window/event":
+      return { ...subscription, kind: Symbol.for("window/event-watch") };
+    case "sub/media-query":
+      return { ...subscription, kind: Symbol.for("media-query/watch") };
+    case "sub/simulation/heart-rate":
+      return { ...subscription, kind: Symbol.for("simulation/heart-rate") };
+    case "sub/bluetooth/connect-heart-rate":
+      return { ...subscription, kind: Symbol.for("bluetooth/connect-heart-rate") };
+    default:
+      return subscription;
+  }
+}
+
+function stopCommandForSubscription(subscription) {
+  const kind = subscriptionKind(subscription);
+  switch (kind) {
+    case "sub/timer/every":
+      return { kind: Symbol.for("timer/cancel"), id: subscription.id };
+    case "sub/dom-ref/resize":
+      return { kind: Symbol.for("dom-ref/resize-unwatch"), id: subscription.id || subscription.ref };
+    case "sub/window/event":
+      return { kind: Symbol.for("window/event-unwatch"), id: subscription.id || subscription.type || subscription.event };
+    case "sub/media-query":
+      return { kind: Symbol.for("media-query/unwatch"), id: subscription.id || subscription.query };
+    case "sub/simulation/heart-rate":
+      return { kind: Symbol.for("simulation/stop"), id: subscription.id };
+    case "sub/bluetooth/connect-heart-rate":
+      return { kind: Symbol.for("bluetooth/disconnect"), id: subscription.id };
+    default:
+      return undefined;
+  }
+}
+
 function commandMessage(command, value) {
   if (typeof command.toMessage === "function") {
     return command.toMessage(value);
@@ -1675,6 +3552,7 @@ function commandMessage(command, value) {
     return command.msg;
   }
   if (command.onSuccess !== undefined) {
+    if (typeof command.onSuccess === "function") return command.onSuccess(value);
     return { kind: command.onSuccess, value };
   }
   return undefined;
@@ -1682,11 +3560,13 @@ function commandMessage(command, value) {
 
 function namedCommandMessage(kind, fields = {}) {
   if (kind === undefined) return undefined;
+  if (typeof kind === "function") return kind(fields);
   return { kind, ...fields };
 }
 
 function commandErrorMessage(command, error) {
   if (command.onError !== undefined) {
+    if (typeof command.onError === "function") return command.onError(errorMessage(error));
     return {
       kind: command.onError,
       error: errorMessage(error)
@@ -1701,6 +3581,7 @@ function errorMessage(error) {
 
 function commandCancelMessage(command) {
   if (command.onCancel !== undefined) {
+    if (typeof command.onCancel === "function") return command.onCancel();
     return { kind: command.onCancel };
   }
   return undefined;
@@ -1756,12 +3637,15 @@ const HTTP_REQUEST_OPTION_FIELDS = [
   "signal"
 ];
 
-function httpRequestFetchArgs(command) {
+function httpRequestFetchArgs(command, env = {}) {
   const request = plainObject(command.request) ? command.request : {};
   const options = plainObject(command.options) ? command.options : {};
   const merged = { ...request, ...options };
   for (const field of HTTP_REQUEST_OPTION_FIELDS) {
     if (command[field] !== undefined) merged[field] = command[field];
+  }
+  if (merged.body !== undefined) {
+    merged.body = resolveHttpRequestBody(merged.body, env);
   }
   const url = request.url ?? command.url;
   delete merged.url;
@@ -1769,6 +3653,108 @@ function httpRequestFetchArgs(command) {
     url,
     options: Object.keys(merged).length ? merged : undefined
   };
+}
+
+function resolveHttpRequestBody(body, env = {}) {
+  const kind = commandValueName(body?.kind);
+  if (kind === "browser/selected-file") {
+    return selectedFileByTestId(env.document, body.testId);
+  }
+  if (kind === "browser/multipart-form") {
+    return multipartFormBody(env, body.fields, body.values);
+  }
+  return body;
+}
+
+function selectedFileByTestId(documentRef, testId) {
+  const selector = `[data-testid="${cssAttr(String(testId ?? ""))}"]`;
+  const input = documentRef?.querySelector?.(selector);
+  return input?.files?.[0] ?? null;
+}
+
+function multipartFormBody(env, fields, values) {
+  const FormDataCtor = env.FormData || globalThis.FormData;
+  if (typeof FormDataCtor !== "function") {
+    throw new Error("FormData is not available for multipart http/request body");
+  }
+
+  const form = new FormDataCtor();
+  for (const field of Array.isArray(fields) ? fields : []) {
+    const name = String(field?.name ?? "");
+    if (!name) continue;
+
+    if (field.kind === "file") {
+      const file = selectedFileByTestId(env.document, `request-body-multipart-${name}`);
+      if (file) form.append(name, file, file.name);
+    } else {
+      const value = values && hasOwn(values, name) ? values[name] : "";
+      const text = String(value ?? "").trim();
+      if (text) form.append(name, text);
+    }
+  }
+  return form;
+}
+
+function cssAttr(value) {
+  return String(value).replace(/\\/g, "\\\\").replace(/"/g, "\\\"");
+}
+
+function primitiveDecoder(name, predicate) {
+  return {
+    decode(value, path = "value") {
+      return predicate(value) ? { ok: true, value } : decoderTypeError(path, name);
+    }
+  };
+}
+
+function runDecoder(decoder, value, path = "value") {
+  if (!decoder || typeof decoder.decode !== "function") {
+    return { ok: false, error: `${path} expected Decoder` };
+  }
+  try {
+    const result = decoder.decode(value, path);
+    if (result?.ok === true) return { ok: true, value: result.value };
+    return { ok: false, error: String(result?.error ?? `${path} did not match decoder`) };
+  } catch (error) {
+    return { ok: false, error: error?.message ?? String(error) };
+  }
+}
+
+function decoderSpecEntries(spec) {
+  if (spec instanceof Map) {
+    return Array.from(spec.entries()).map(([key, value]) => [decoderFieldName(key), value]);
+  }
+  if (plainObject(spec)) return Object.entries(spec);
+  return [];
+}
+
+function decoderFieldName(key) {
+  if (typeof key === "symbol") return Symbol.keyFor(key) || key.description || String(key);
+  return String(key);
+}
+
+function decoderFieldPath(path, field) {
+  return /^[A-Za-z_$][\w$]*$/.test(field) ? `${path}.${field}` : `${path}[${JSON.stringify(field)}]`;
+}
+
+function decoderTypeError(path, expected) {
+  return { ok: false, error: `${path} expected ${expected}` };
+}
+
+function decoderValueEqual(left, right) {
+  if (typeof left === "symbol" || typeof right === "symbol") {
+    return typeof left === "symbol"
+      && typeof right === "symbol"
+      && (Symbol.keyFor(left) || left.description) === (Symbol.keyFor(right) || right.description);
+  }
+  return Object.is(left, right);
+}
+
+function decoderFormatValue(value) {
+  if (typeof value === "symbol") return `:${Symbol.keyFor(value) || value.description || String(value)}`;
+  if (value === null) return "nil";
+  if (typeof value === "string") return JSON.stringify(value);
+  return String(value);
 }
 
 function plainObject(value) {
@@ -2137,6 +4123,86 @@ function parseStoredValue(value, format) {
     return JSON.parse(value);
   } catch {
     return value;
+  }
+}
+
+function replaceBrowserSearchParam(host, name, value) {
+  try {
+    const next = new URL(host.location?.href ?? "http://localhost/");
+    if (value === null || value === undefined || String(value) === "") next.searchParams.delete(String(name));
+    else next.searchParams.set(String(name), String(value));
+    host.history?.replaceState?.(null, "", `${next.pathname}${next.search}${next.hash}`);
+  } catch {}
+}
+
+function writeBrowserRoute(host, url, op, definition) {
+  try {
+    const params = new URLSearchParams();
+    if (url !== null && url !== undefined && String(url) !== "") params.set("url", String(url));
+    if (definition !== null && definition !== undefined && String(definition) !== "") {
+      params.set("definition", String(definition));
+    }
+    if (op !== null && op !== undefined && String(op) !== "") params.set("op", String(op));
+    const query = params.toString();
+    const pathname = host.location?.pathname ?? "/";
+    const next = query ? `${pathname}?${query}` : pathname;
+    if (next !== `${pathname}${host.location?.search ?? ""}`) host.history?.replaceState?.(null, "", next);
+  } catch {}
+}
+
+function loadBrowserTheme(host, storage, sessionStorage, key) {
+  let stored = null;
+  try {
+    stored = sessionStorage?.getItem(String(key)) ?? storage?.getItem(String(key));
+  } catch {}
+  const theme = stored === "light" ? "light" : "dark";
+  host.document?.documentElement?.classList?.toggle("dark", theme === "dark");
+  return theme;
+}
+
+function applyBrowserTheme(host, storage, sessionStorage, key, theme) {
+  const nextTheme = theme === "light" ? "light" : "dark";
+  host.document?.documentElement?.classList?.toggle("dark", nextTheme === "dark");
+  try {
+    sessionStorage?.setItem(String(key), nextTheme);
+    storage?.setItem(String(key), nextTheme);
+  } catch {}
+}
+
+function setBrowserCookie(host, name, value) {
+  const documentRef = host.document;
+  if (!documentRef) return;
+  documentRef.cookie = `${encodeURIComponent(String(name ?? ""))}=${encodeURIComponent(String(value ?? ""))}; path=/`;
+}
+
+function persistAuthStorage(storage, sourceUrl, entries) {
+  const key = `better-swagger-auth:${String(sourceUrl ?? "")}`;
+  try {
+    storage?.setItem(key, JSON.stringify(Object.values(entries ?? {})));
+  } catch {}
+}
+
+function loadAuthStorage(storage, sessionStorage, sourceUrl) {
+  const key = `better-swagger-auth:${String(sourceUrl ?? "")}`;
+  let raw = null;
+  try {
+    raw = storage?.getItem(key) ?? sessionStorage?.getItem(key);
+  } catch {}
+  if (!raw) return {};
+
+  try {
+    const parsed = JSON.parse(raw);
+    const now = Date.now();
+    const original = Array.isArray(parsed) ? parsed : [];
+    const valid = original.filter((entry) => !entry?.expiresAt || entry.expiresAt > now);
+    const entries = Object.fromEntries(valid.map((entry) => [entry.schemeId, entry]));
+    if (valid.length !== original.length || sessionStorage?.getItem(key)) {
+      storage?.setItem(key, JSON.stringify(Object.values(entries)));
+      sessionStorage?.removeItem(key);
+    }
+    return entries;
+  } catch {
+    return {};
   }
 }
 

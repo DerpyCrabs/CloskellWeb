@@ -237,6 +237,264 @@ function fileUrl(path) {{
 }
 
 #[test]
+fn runtime_task_helpers_perform_http_tasks() {
+    if !node_available() {
+        eprintln!("skipping Node smoke test because node is not on PATH");
+        return;
+    }
+
+    let runtime = workspace_root()
+        .join("runtime-js")
+        .join("src")
+        .join("index.js");
+    let script = format!(
+        r#"
+const runtime = await import(fileUrl({runtimePath}));
+const {{ Task, Http }} = runtime;
+
+const calls = [];
+const handlers = runtime.createCommandHandlers({{
+  async fetch(url) {{
+    calls.push(url);
+    if (url === "/fail") {{
+      return {{ ok: false, status: 503, statusText: "Offline", text: async () => "", json: async () => ({{}}) }};
+    }}
+    return {{ ok: true, status: 200, statusText: "OK", text: async () => `spec:${{url}}`, json: async () => ({{ title: `spec:${{url}}` }}) }};
+  }}
+}});
+
+const loaded = await handlers["task/perform"](
+  Task.perform(
+    Task.andThen(
+      Http.getText("/spec"),
+      (text) => Task.succeed({{ title: text.toUpperCase() }})
+    ),
+    (spec) => ({{ kind: Symbol.for("loaded"), value: spec }}),
+    (error) => ({{ kind: Symbol.for("failed"), error }})
+  ),
+  () => {{}}
+);
+
+if (loaded.kind !== Symbol.for("loaded")) throw new Error("task success did not map to loaded message");
+if (loaded.value.title !== "SPEC:/SPEC") throw new Error(`task success payload was wrong: ${{JSON.stringify(loaded.value)}}`);
+if (calls[0] !== "/spec") throw new Error("HTTP text task did not call fetch with the URL");
+
+const failed = await handlers["task/perform"](
+  Task.perform(
+    Task.mapError(Http.getText("/fail"), (error) => `wrapped:${{error}}`),
+    (text) => ({{ kind: Symbol.for("loaded"), value: text }}),
+    (error) => ({{ kind: Symbol.for("failed"), error }})
+  ),
+  () => {{}}
+);
+
+if (failed.kind !== Symbol.for("failed")) throw new Error("task error did not map to failed message");
+if (failed.error !== "wrapped:HTTP 503 Offline") throw new Error(`task error payload was wrong: ${{failed.error}}`);
+
+function fileUrl(path) {{
+  return "file:///" + path.replace(/\\/g, "/").replace(/^([A-Za-z]):/, "$1:");
+}}
+"#,
+        runtimePath = js_string(&runtime)
+    );
+
+    let node = Command::new("node")
+        .arg("--input-type=module")
+        .arg("--eval")
+        .arg(script)
+        .output()
+        .expect("node should run");
+
+    assert!(
+        node.status.success(),
+        "runtime Task helpers failed under Node\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&node.stdout),
+        String::from_utf8_lossy(&node.stderr)
+    );
+}
+
+#[test]
+fn runtime_browser_boot_and_load_commands_use_explicit_host_state() {
+    if !node_available() {
+        eprintln!("skipping Node smoke test because node is not on PATH");
+        return;
+    }
+
+    let runtime = workspace_root()
+        .join("runtime-js")
+        .join("src")
+        .join("index.js");
+    let script = format!(
+        r#"
+const runtime = await import(fileUrl({runtimePath}));
+
+const classOps = [];
+const host = {{
+  location: {{ href: "https://docs.example.test/?url=%2Fopenapi.json&op=get%3A%2Fpets" }},
+  document: {{
+    documentElement: {{
+      classList: {{
+        toggle(name, enabled) {{
+          classOps.push([name, enabled]);
+        }}
+      }}
+    }}
+  }}
+}};
+const storage = new Map([
+  ["better-swagger-theme", "light"],
+  ["better-swagger-auth:https://docs.example.test/openapi.json", JSON.stringify([{{ schemeId: "BearerAuth", type: "bearer", token: "persisted-token" }}])]
+]);
+const storageApi = {{
+  getItem(key) {{ return storage.has(String(key)) ? storage.get(String(key)) : null; }},
+  setItem(key, value) {{ storage.set(String(key), String(value)); }},
+  removeItem(key) {{ storage.delete(String(key)); }}
+}};
+const handlers = runtime.createCommandHandlers({{ host, storage: storageApi, sessionStorage: storageApi }});
+
+const boot = runtime.createBrowserBootInput({{ host }});
+if (boot.currentUrl !== host.location.href) throw new Error("boot input did not capture current URL");
+
+const themeMessage = handlers["browser/theme-load"]({{
+  kind: Symbol.for("browser/theme-load"),
+  key: "better-swagger-theme",
+  toMessage: (theme) => ({{ kind: Symbol.for("theme-loaded"), theme }})
+}}, () => {{}});
+if (themeMessage.kind !== Symbol.for("theme-loaded") || themeMessage.theme !== "light") {{
+  throw new Error(`theme load returned wrong message: ${{JSON.stringify(themeMessage)}}`);
+}}
+if (classOps.length !== 1 || classOps[0][0] !== "dark" || classOps[0][1] !== false) {{
+  throw new Error(`theme load did not apply the stored light theme: ${{JSON.stringify(classOps)}}`);
+}}
+
+const authMessage = handlers["auth-storage/load"]({{
+  kind: Symbol.for("auth-storage/load"),
+  sourceUrl: "https://docs.example.test/openapi.json",
+  toMessage: (entries) => ({{ kind: Symbol.for("auth-loaded"), entries }})
+}}, () => {{}});
+if (authMessage.kind !== Symbol.for("auth-loaded")) throw new Error("auth load did not map through toMessage");
+if (authMessage.entries.BearerAuth.token !== "persisted-token") {{
+  throw new Error(`auth load returned wrong entries: ${{JSON.stringify(authMessage.entries)}}`);
+}}
+
+function fileUrl(path) {{
+  return "file:///" + path.replace(/\\/g, "/").replace(/^([A-Za-z]):/, "$1:");
+}}
+"#,
+        runtimePath = js_string(&runtime)
+    );
+
+    let node = Command::new("node")
+        .arg("--input-type=module")
+        .arg("--eval")
+        .arg(script)
+        .output()
+        .expect("node should run");
+
+    assert!(
+        node.status.success(),
+        "runtime browser boot/load commands failed under Node\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&node.stdout),
+        String::from_utf8_lossy(&node.stderr)
+    );
+}
+
+#[test]
+fn runtime_scoped_helpers_wrap_child_effects_and_view_messages() {
+    if !node_available() {
+        eprintln!("skipping Node smoke test because node is not on PATH");
+        return;
+    }
+
+    let runtime = workspace_root()
+        .join("runtime-js")
+        .join("src")
+        .join("index.js");
+    let script = format!(
+        r#"
+const runtime = await import(fileUrl({runtimePath}));
+
+const childUpdate = (state, msg) => [
+  {{ ...state, count: state.count + 1, last: msg.kind }},
+  {{ kind: Symbol.for("time/now"), onSuccess: Symbol.for("child-time") }}
+];
+const [nextState, scopedCommand] = runtime.scopeUpdate(
+  {{ log: {{ count: 1 }}, route: "/logs" }},
+  Symbol.for("log"),
+  {{ kind: Symbol.for("inc") }},
+  childUpdate,
+  Symbol.for("log")
+);
+if (nextState.log.count !== 2 || nextState.route !== "/logs") throw new Error("scopeUpdate did not replace the child state");
+if (typeof scopedCommand.onSuccess !== "function") throw new Error("scopeUpdate did not map command continuations");
+
+const handlers = runtime.createCommandHandlers({{ now: () => 42 }});
+const parentTime = handlers["time/now"](scopedCommand, () => {{}});
+if (parentTime.kind !== Symbol.for("log")) throw new Error("scoped command did not wrap parent kind");
+if (parentTime.msg.kind !== Symbol.for("child-time") || parentTime.msg.value !== 42) throw new Error("scoped command did not preserve child success payload");
+
+const scopedSub = runtime.scopeSubscriptions(
+  {{ count: 2 }},
+  () => runtime.Sub.timerEvery("child-clock", 100, {{ kind: Symbol.for("tick") }}),
+  Symbol.for("log")
+);
+if (scopedSub.kind !== Symbol.for("sub/timer/every")) throw new Error("scopeSubscriptions changed the subscription kind");
+if (scopedSub.msg.kind !== Symbol.for("log") || scopedSub.msg.msg.kind !== Symbol.for("tick")) {{
+  throw new Error("scopeSubscriptions did not wrap timer messages");
+}}
+
+const childMessages = [];
+const childView = (state) => ({{
+  definition: {{ name: "child-view", params: ["state"] }},
+  root: {{ tagName: "BUTTON" }},
+  mount(_parent, dispatch) {{
+    childMessages.push(["mount", state.count]);
+    dispatch({{ kind: Symbol.for("clicked"), count: state.count }});
+  }},
+  update(nextState, dispatch, updateContext) {{
+    childMessages.push(["update", nextState.count, updateContext?.localChangedPaths?.includes("state.count")]);
+    dispatch({{ kind: Symbol.for("updated"), count: nextState.count }});
+  }},
+  dispose() {{
+    childMessages.push(["dispose"]);
+  }}
+}});
+
+const parentMessages = [];
+const parentDispatch = (message) => parentMessages.push(message);
+parentDispatch.__closkellRefs = new Map();
+const scopedView = runtime.scopeView(Symbol.for("log"), childView, {{ count: 2 }});
+scopedView.mount({{}}, parentDispatch);
+scopedView.update(Symbol.for("log"), childView, {{ count: 3 }}, parentDispatch, {{ changedPaths: ["state.log.count"], frames: [] }});
+
+if (parentMessages.length !== 2) throw new Error(`expected two scoped view messages, saw ${{parentMessages.length}}`);
+if (parentMessages[0].kind !== Symbol.for("log") || parentMessages[0].msg.kind !== Symbol.for("clicked")) throw new Error("scopeView did not wrap mount dispatch");
+if (parentMessages[1].kind !== Symbol.for("log") || parentMessages[1].msg.kind !== Symbol.for("updated")) throw new Error("scopeView did not wrap update dispatch");
+if (childMessages[1][2] !== true) throw new Error("scopeView did not project child local changed paths");
+
+function fileUrl(path) {{
+  return "file:///" + path.replace(/\\/g, "/").replace(/^([A-Za-z]):/, "$1:");
+}}
+"#,
+        runtimePath = js_string(&runtime)
+    );
+
+    let node = Command::new("node")
+        .arg("--input-type=module")
+        .arg("--eval")
+        .arg(script)
+        .output()
+        .expect("node should run");
+
+    assert!(
+        node.status.success(),
+        "runtime scoped helpers failed under Node\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&node.stdout),
+        String::from_utf8_lossy(&node.stderr)
+    );
+}
+
+#[test]
 fn runtime_simulation_command_handlers_dispatch_readings_and_cleanup() {
     if !node_available() {
         eprintln!("skipping Node smoke test because node is not on PATH");
@@ -336,6 +594,122 @@ function fileUrl(path) {{
     assert!(
         node.status.success(),
         "runtime simulation command handlers failed under Node\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&node.stdout),
+        String::from_utf8_lossy(&node.stderr)
+    );
+}
+
+#[test]
+fn runtime_start_app_diffs_and_disposes_subscriptions() {
+    if !node_available() {
+        eprintln!("skipping Node smoke test because node is not on PATH");
+        return;
+    }
+
+    let runtime = workspace_root()
+        .join("runtime-js")
+        .join("src")
+        .join("index.js");
+    let script = format!(
+        r#"
+const runtime = await import(fileUrl({runtimePath}));
+
+const intervals = new Map();
+const cleared = [];
+let nextHandle = 0;
+const timers = {{
+  setInterval(callback, ms) {{
+    const handle = `timer-${{++nextHandle}}`;
+    intervals.set(handle, {{ callback, ms }});
+    return handle;
+  }},
+  clearInterval(handle) {{
+    cleared.push(handle);
+    intervals.delete(handle);
+  }}
+}};
+
+const commandHandlers = runtime.createCommandHandlers({{ timers }});
+const devEvents = [];
+let tickCount = 0;
+const app = runtime.startApp({{
+  root: {{}},
+  init() {{
+    return [{{ running: false, ms: 250 }}, {{ kind: Symbol.for("none") }}];
+  }},
+  update(state, msg) {{
+    if (msg.kind === Symbol.for("toggle")) return [{{ ...state, running: !state.running }}, {{ kind: Symbol.for("none") }}];
+    if (msg.kind === Symbol.for("set-ms")) return [{{ ...state, ms: msg.ms }}, {{ kind: Symbol.for("none") }}];
+    if (msg.kind === Symbol.for("tick")) {{
+      tickCount += 1;
+      return [state, {{ kind: Symbol.for("none") }}];
+    }}
+    return [state, {{ kind: Symbol.for("none") }}];
+  }},
+  view() {{
+    return {{
+      root: {{}},
+      mount() {{}},
+      update() {{}},
+      dispose() {{}}
+    }};
+  }},
+  subscriptions(state) {{
+    return state.running
+      ? runtime.Sub.batch([runtime.Sub.timerEvery("clock", state.ms, {{ kind: Symbol.for("tick") }})])
+      : runtime.Sub.none;
+  }},
+  handlers: commandHandlers,
+  subscriptionHandlers: runtime.createSubscriptionHandlers({{ commandHandlers }}),
+  devtools: (event) => devEvents.push(event)
+}});
+
+if (app.subscriptions.length !== 0) throw new Error("inactive app should start with no subscriptions");
+
+app.dispatch({{ kind: Symbol.for("toggle") }});
+if (app.subscriptions.length !== 1) throw new Error("running app should start one subscription");
+if (intervals.size !== 1) throw new Error("timer subscription did not create an interval");
+const firstHandle = [...intervals.keys()][0];
+if (intervals.get(firstHandle).ms !== 250) throw new Error("timer subscription used the wrong interval");
+intervals.get(firstHandle).callback();
+if (tickCount !== 1) throw new Error("timer subscription did not dispatch its message");
+
+app.dispatch({{ kind: Symbol.for("set-ms"), ms: 500 }});
+if (cleared[0] !== firstHandle) throw new Error("changed subscription did not stop the old interval");
+const secondHandle = [...intervals.keys()][0];
+if (secondHandle === firstHandle || intervals.get(secondHandle).ms !== 500) {{
+  throw new Error("changed subscription did not start a replacement interval");
+}}
+
+app.dispatch({{ kind: Symbol.for("toggle") }});
+if (app.subscriptions.length !== 0) throw new Error("stopped app should have no active subscriptions");
+if (cleared[1] !== secondHandle) throw new Error("removed subscription did not clear the replacement interval");
+
+const subscriptionEvents = devEvents.filter((event) => event.type?.startsWith("subscription/"));
+if (subscriptionEvents.map((event) => event.type).join(",") !== "subscription/start,subscription/stop,subscription/start,subscription/stop") {{
+  throw new Error(`unexpected subscription event sequence: ${{subscriptionEvents.map((event) => event.type).join(",")}}`);
+}}
+
+app.dispose();
+if (intervals.size !== 0) throw new Error("dispose left subscription intervals active");
+
+function fileUrl(path) {{
+  return "file:///" + path.replace(/\\/g, "/").replace(/^([A-Za-z]):/, "$1:");
+}}
+"#,
+        runtimePath = js_string(&runtime)
+    );
+
+    let node = Command::new("node")
+        .arg("--input-type=module")
+        .arg("--eval")
+        .arg(script)
+        .output()
+        .expect("node should run");
+
+    assert!(
+        node.status.success(),
+        "runtime subscription diffing failed under Node\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&node.stdout),
         String::from_utf8_lossy(&node.stderr)
     );
@@ -788,6 +1162,17 @@ if (imported.message !== "Imported") throw new Error("dissoc mutated original st
 if (mod.updated_state.visibleCount !== 1) throw new Error(`expected one visible entry, found ${{mod.updated_state.visibleCount}}`);
 if (mod.updated_state.zones[0].max !== 125 || mod.updated_state.zones[1].min !== 126) throw new Error("updated state zones were wrong");
 if (Object.prototype.hasOwnProperty.call(mod.updated_state, "message")) throw new Error("updated state should not keep message");
+
+if (mod.bumped_summary.summary.value !== 2) throw new Error("update-in did not update nested value");
+if (mod.nested_state.summary.value !== 1) throw new Error("update-in mutated the original nested state");
+if (mod.relabeled_summary.summary.label !== "Warmup!") throw new Error("update-in did not pass extra updater args");
+if (mod.bumped_summary.summary.label !== "Warmup") throw new Error("second update-in mutated prior nested state");
+if (mod.nested_summary_value !== 2) throw new Error("get-in did not read nested value");
+
+if (mod.equal_records !== true) throw new Error("value equality did not compare nested Closkell data structurally");
+if (mod.unequal_records !== false) throw new Error("value equality accepted ordered vectors with different values");
+if (mod.identical_shared !== true) throw new Error("identical? did not accept the same record reference");
+if (mod.identical_distinct !== false) throw new Error("identical? treated distinct equal records as identical");
 
 function fileUrl(path) {{
   return "file:///" + path.replace(/\\/g, "/").replace(/^([A-Za-z]):/, "$1:");
@@ -1454,6 +1839,7 @@ fn compiled_hrweb_chart_module_uses_precise_axis_labels() {
     }
 
     let source = workspace_root()
+        .join("projects")
         .join("hrweb")
         .join("src")
         .join("chart.clsk");
@@ -7132,6 +7518,85 @@ if (topLevelRequests[0].options.headers["content-type"] !== "application/json") 
 }}
 if (topLevelMessage.kind !== Symbol.for("created") || topLevelMessage.value.status !== 201 || topLevelMessage.value.body !== "created") {{
   throw new Error("top-level HTTP success payload was wrong");
+}}
+
+const selectedFile = {{ name: "avatar.png", size: 42 }};
+const multipartFile = {{ name: "report.pdf", size: 99 }};
+class FakeFormData {{
+  constructor() {{
+    this.entries = [];
+  }}
+  append(name, value, filename) {{
+    this.entries.push({{ name, value, filename }});
+  }}
+}}
+
+const descriptorRequests = [];
+const descriptorDocument = {{
+  querySelector(selector) {{
+    if (selector === "[data-testid=\"request-body-file\"]") return {{ files: [selectedFile] }};
+    if (selector === "[data-testid=\"request-body-multipart-attachment\"]") return {{ files: [multipartFile] }};
+    return null;
+  }}
+}};
+const descriptorHandlers = runtime.createCommandHandlers({{
+  document: descriptorDocument,
+  FormData: FakeFormData,
+  async fetch(url, options) {{
+    descriptorRequests.push({{ url, options }});
+    return {{
+      status: 200,
+      ok: true,
+      async text() {{
+        return "ok";
+      }}
+    }};
+  }}
+}});
+
+const selectedFileMessage = await descriptorHandlers["http/request"]({{
+  kind: Symbol.for("http/request"),
+  request: {{
+    url: "/upload/file",
+    method: "POST",
+    body: {{ kind: Symbol.for("browser/selected-file"), testId: "request-body-file" }}
+  }},
+  response: Symbol.for("text"),
+  onSuccess: Symbol.for("uploaded"),
+  onError: Symbol.for("upload-failed")
+}});
+if (selectedFileMessage.kind !== Symbol.for("uploaded")) throw new Error("selected-file descriptor did not succeed");
+if (descriptorRequests.length !== 1 || descriptorRequests[0].options.body !== selectedFile) {{
+  throw new Error("selected-file descriptor did not resolve to the selected file");
+}}
+
+const multipartMessage = await descriptorHandlers["http/request"]({{
+  kind: Symbol.for("http/request"),
+  request: {{
+    url: "/upload/form",
+    method: "POST",
+    body: {{
+      kind: Symbol.for("browser/multipart-form"),
+      fields: [
+        {{ name: "title", kind: "text" }},
+        {{ name: "attachment", kind: "file" }}
+      ],
+      values: {{ title: "  Quarterly report  " }}
+    }}
+  }},
+  response: Symbol.for("text"),
+  onSuccess: Symbol.for("uploaded"),
+  onError: Symbol.for("upload-failed")
+}});
+if (multipartMessage.kind !== Symbol.for("uploaded")) throw new Error("multipart descriptor did not succeed");
+const multipartBody = descriptorRequests[1].options.body;
+if (!(multipartBody instanceof FakeFormData)) throw new Error("multipart descriptor did not create FormData");
+if (multipartBody.entries.length !== 2) throw new Error("multipart descriptor appended the wrong entry count");
+if (multipartBody.entries[0].name !== "title" || multipartBody.entries[0].value !== "Quarterly report") {{
+  throw new Error("multipart descriptor did not append trimmed text");
+}}
+if (multipartBody.entries[1].name !== "attachment" || multipartBody.entries[1].value !== multipartFile || multipartBody.entries[1].filename !== "report.pdf") {{
+  throw new Error("multipart descriptor did not append the selected file");
 }}
 
 const requests = [];

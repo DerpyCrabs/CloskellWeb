@@ -51,3 +51,37 @@
     (assoc (clear-message imported)
            :zones zones
            :visibleCount (count (filter hidden (fn [entry] (not (some? entry.hiddenAt))))))))
+
+(def nested-state
+  {:summary {:value 1
+             :label "Warmup"}
+   :status "Ready"})
+
+(def bumped-summary
+  (update-in nested-state [:summary :value] (fn [value] (+ value 1))))
+
+(def relabeled-summary
+  (update-in bumped-summary [:summary :label] (fn [label suffix] (str label suffix)) "!"))
+
+(def nested-summary-value
+  (get-in relabeled-summary [:summary :value]))
+
+(def equal-records
+  (= {:kind :ok
+      :items [1 2]
+      :tags (set "tempo" "steady")
+      :registry (hash-map "zone2" {:id "zone2"})}
+     {:registry (hash-map "zone2" {:id "zone2"})
+      :tags (set "steady" "tempo")
+      :items [1 2]
+      :kind :ok}))
+
+(def unequal-records
+  (= {:items [1 2]} {:items [2 1]}))
+
+(def identical-shared
+  (let [value nested-state]
+    (identical? value nested-state)))
+
+(def identical-distinct
+  (identical? {:value 1} {:value 1}))

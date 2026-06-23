@@ -8,9 +8,10 @@
     "dev": "vite --host 127.0.0.1",
     "build": "vite build",
     "preview": "vite preview --host 127.0.0.1",
-    "test": "playwright test",
+    "test": "npm run test:clsk && npm run test:e2e",
+    "test:clsk": "node ../../packages/closkell-runner.cjs test src/runtime_test.clsk",
     "test:e2e": "playwright test",
-    "verify": "npm run check:closkell && npm run build && npm run test:e2e"
+    "verify": "npm run check:closkell && npm run test:clsk && npm run build && npm run test:e2e"
   },
   "dependencies": {
     "dompurify": "3.4.10",
