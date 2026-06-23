@@ -1,4 +1,3 @@
-(import "./domain.clsk" [exercise-log-storage-key])
 (import "./model.clsk" [HeartReading HeartZone WorkoutEntry])
 (import "./zones.clsk" [normalize-zones default-zone-state])
 
@@ -241,12 +240,6 @@
 (defn log-payload [entries]
   {:version 2
    :entries entries})
-
-(defn persist-log-command [entries]
-  {:kind :storage/set
-   :key exercise-log-storage-key
-   :value (log-payload entries)
-   :msg {:kind :log-saved}})
 
 (defn export-log-json [entries]
   (json-stringify (log-payload entries) 2))

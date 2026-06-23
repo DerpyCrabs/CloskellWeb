@@ -1,10 +1,11 @@
 (import "./domain.clsk" [initial-state zones-storage-key exercise-log-storage-key clock-timer-id simulated-monitor-id stop-hold-timer-id stop-hold-frame-id stop-hold-ms delete-hold-timer-id delete-hold-frame-id delete-hold-ms zone-drag-move-id zone-drag-up-id zone-drag-cancel-id])
 (import "./zones.clsk" [default-zone-state load-zone-state zone-state-payload zone-for-bpm zone-label-for-bpm set-zone-min set-zone-max set-zone-boundary boundary-controls])
-(import "./log.clsk" [all-types-filter untyped-filter current-elapsed workout-entry newest-first visible-log filtered-log selected-log first-visible-id hide-entry update-entry-type load-log-entries import-log-error import-success-message log-payload export-log-json export-log-filename duration-label date-label log-title entry-type-label exercise-types reconciled-selected-id])
+(import "./log.clsk" [all-types-filter untyped-filter current-elapsed workout-entry newest-first visible-log filtered-log selected-log first-visible-id hide-entry update-entry-type load-log-entries import-log-error import-success-message log-payload export-log-json export-log-filename duration-label date-label entry-type-label exercise-types reconciled-selected-id])
 (import "./metrics.clsk" [stat-value average-bpm min-bpm max-bpm zone-display-stats get-metrics-for-type metric-enabled? group-entries-by-type build-zone2-trend build-hrr-trend build-trimp-bars])
 (import "./model.clsk" [HeartReading HeartZone WorkoutEntry MonitorInfo JsonPayload HeartChartRect WindowEventPayload])
 (import "./chart.clsk" [heart-chart-command heart-chart-batch])
 (import "./metric_charts.clsk" [metric-chart-ref metric-chart-command metric-chart-batch])
+(import "./ui-effects.clsk" [no-cmd])
 
 (type AppState
   {:appStatus String
@@ -60,7 +61,7 @@
     {:kind :media-changed :id String :media String :matches Bool}
     {:kind :chart-resized :id String :ref String :x Number :y Number :width Number :height Number :top Number :right Number :bottom Number :left Number :value HeartChartRect}
     {:kind :chart-error :error String}
-    {:kind :dev-key :id String :type String :clientX Number :clientY Number :pageX Number :pageY Number :screenX Number :screenY Number :movementX Number :movementY Number :button Number :buttons Number :pointerId Number :pointerType String :isPrimary Bool :key String :code String :altKey Bool :ctrlKey Bool :metaKey Bool :shiftKey Bool :value WindowEventPayload}
+    {:kind :dev-key :id String :value WindowEventPayload}
     {:kind :dev-opened}
     {:kind :select-tab :view String}
     {:kind :metrics-grouping :value String}
@@ -106,8 +107,8 @@
     {:kind :zone-boundary-drag-start :index Number :clientX Number}
     {:kind :zone-boundary-track-measured :index Number :clientX Number :left Number :width Number :value HeartChartRect}
     {:kind :zone-boundary-track-error :error String}
-    {:kind :zone-boundary-drag-move :id String :type String :clientX Number :clientY Number :pageX Number :pageY Number :screenX Number :screenY Number :movementX Number :movementY Number :button Number :buttons Number :pointerId Number :pointerType String :isPrimary Bool :key String :code String :altKey Bool :ctrlKey Bool :metaKey Bool :shiftKey Bool :value WindowEventPayload}
-    {:kind :zone-boundary-drag-end :id String :type String :clientX Number :clientY Number :pageX Number :pageY Number :screenX Number :screenY Number :movementX Number :movementY Number :button Number :buttons Number :pointerId Number :pointerType String :isPrimary Bool :key String :code String :altKey Bool :ctrlKey Bool :metaKey Bool :shiftKey Bool :value WindowEventPayload}
+    {:kind :zone-boundary-drag-move :id String :value WindowEventPayload}
+    {:kind :zone-boundary-drag-end :id String :value WindowEventPayload}
     {:kind :zones-saved}
     {:kind :zones-save-failed :error String}
     {:kind :select-log :id String}
@@ -150,197 +151,33 @@
 
 (ann init (Fn [] InitResult))
 (ann update (Fn [AppState AppMsg] UpdateResult))
+(ann subscriptions (Fn [AppState] (Sub AppMsg)))
 (ann view (Fn [AppState] Html))
 
-(ann msg-zones-loaded (Fn [JsonPayload] AppMsg))
-(defn msg-zones-loaded [payload]
-  {:kind :zones-loaded
-   :payload payload})
-
-(ann msg-log-loaded (Fn [JsonPayload] AppMsg))
-(defn msg-log-loaded [payload]
-  {:kind :log-loaded
-   :payload payload})
-
-(ann msg-monitor-connected (Fn [MonitorInfo] AppMsg))
-(defn msg-monitor-connected [info]
-  {:kind :monitor-connected
-   :info info})
-
-(ann msg-sim-zone-picked (Fn [Number] AppMsg))
-(defn msg-sim-zone-picked [roll]
-  {:kind :sim-zone-picked
-   :roll roll})
-
-(ann msg-sim-bpm-picked (Fn [Number] AppMsg))
-(defn msg-sim-bpm-picked [bpm]
-  {:kind :sim-bpm-picked
-   :bpm bpm})
-
-(ann msg-sim-connected (Fn [MonitorInfo] AppMsg))
-(defn msg-sim-connected [info]
-  {:kind :sim-connected
-   :info info})
-
-(ann msg-started-at (Fn [Number] AppMsg))
-(defn msg-started-at [timestamp]
-  {:kind :started-at
-   :timestamp timestamp})
-
-(ann msg-paused-at (Fn [Number] AppMsg))
-(defn msg-paused-at [timestamp]
-  {:kind :paused-at
-   :timestamp timestamp})
-
-(ann msg-resumed-at (Fn [Number] AppMsg))
-(defn msg-resumed-at [timestamp]
-  {:kind :resumed-at
-   :timestamp timestamp})
-
-(ann msg-disconnect-paused-at (Fn [Number] AppMsg))
-(defn msg-disconnect-paused-at [timestamp]
-  {:kind :disconnect-paused-at
-   :timestamp timestamp})
-
-(ann msg-clocked-at (Fn [Number] AppMsg))
-(defn msg-clocked-at [timestamp]
-  {:kind :clocked-at
-   :timestamp timestamp})
-
-(ann msg-idle-started-at (Fn [Number] AppMsg))
-(defn msg-idle-started-at [timestamp]
-  {:kind :idle-started-at
-   :timestamp timestamp})
-
-(ann msg-stopped-at (Fn [Number] AppMsg))
-(defn msg-stopped-at [timestamp]
-  {:kind :stopped-at
-   :timestamp timestamp})
-
-(ann msg-stop-hold-started (Fn [Number] AppMsg))
-(defn msg-stop-hold-started [timestamp]
-  {:kind :stop-hold-started
-   :timestamp timestamp})
-
-(ann msg-id-roll (Fn [Number] AppMsg))
-(defn msg-id-roll [roll]
-  {:kind :id-roll
-   :roll roll})
-
-(ann msg-delete-hold-started (Fn [Number] AppMsg))
-(defn msg-delete-hold-started [timestamp]
-  {:kind :delete-hold-started
-   :timestamp timestamp})
-
-(ann msg-delete-selected-at (Fn [Number] AppMsg))
-(defn msg-delete-selected-at [timestamp]
-  {:kind :delete-selected-at
-   :timestamp timestamp})
-
-(ann msg-log-imported (Fn [JsonPayload] AppMsg))
-(defn msg-log-imported [payload]
-  {:kind :log-imported
-   :payload payload})
-
-(ann msg-log-saved (Fn [] AppMsg))
-(defn msg-log-saved []
-  {:kind :log-saved})
-
-(ann msg-zones-saved (Fn [] AppMsg))
-(defn msg-zones-saved []
-  {:kind :zones-saved})
-
-(ann msg-monitor-disconnected (Fn [] AppMsg))
-(defn msg-monitor-disconnected []
-  {:kind :monitor-disconnected})
-
-(ann msg-delete-hold-complete (Fn [] AppMsg))
-(defn msg-delete-hold-complete []
-  {:kind :delete-hold-complete})
-
-(ann msg-stop-hold-complete (Fn [] AppMsg))
-(defn msg-stop-hold-complete []
-  {:kind :stop-hold-complete})
-
-(ann msg-stop-hold-cancelled (Fn [] AppMsg))
-(defn msg-stop-hold-cancelled []
-  {:kind :stop-hold-cancelled})
-
-(ann msg-delete-hold-cancelled (Fn [] AppMsg))
-(defn msg-delete-hold-cancelled []
-  {:kind :delete-hold-cancelled})
-
-(ann msg-dev-opened (Fn [] AppMsg))
-(defn msg-dev-opened []
-  {:kind :dev-opened})
-
-(ann msg-type-picker-focused (Fn [] AppMsg))
-(defn msg-type-picker-focused []
-  {:kind :type-picker-focused})
-
-(ann msg-clock-tick (Fn [] AppMsg))
-(defn msg-clock-tick []
-  {:kind :clock-tick})
-
-(ann msg-import-opened (Fn [] AppMsg))
-(defn msg-import-opened []
-  {:kind :import-opened})
-
-(ann msg-exported (Fn [] AppMsg))
-(defn msg-exported []
-  {:kind :exported})
-
-(ann msg-export-log-at (Fn [Number] AppMsg))
-(defn msg-export-log-at [timestamp]
-  {:kind :export-log-at
-   :timestamp timestamp})
-
-(ann startup-command (Fn [Bool] (Cmd AppMsg)))
-(defn startup-command [dev?]
-  {:kind :batch
-   :commands [{:kind :storage/get
-               :key zones-storage-key
-               :format :json
-               :toMessage msg-zones-loaded
-               :onError :zones-load-failed}
-              {:kind :storage/get
-               :key exercise-log-storage-key
-               :format :json
-               :toMessage msg-log-loaded
-               :onError :log-load-failed}
-              {:kind :media-query/watch
-               :id "mobile"
-               :query "(max-width: 700px)"
-               :onChange :media-changed}
-              (if dev?
-                  {:kind :window/event-watch
-                   :id "dev-hotkey"
-                   :type "keydown"
-                   :preventDefault {:key "h"
-                                    :ctrlKey true
-                                    :shiftKey true
-                                    :altKey false
-                                    :metaKey false}
-                   :onEvent :dev-key}
-                  {:kind :none})]})
+(ann startup-command (Fn [] (Cmd AppMsg)))
+(defn startup-command []
+  (Cmd.batch [(Cmd.storage/get zones-storage-key :json (Msg.mapper :zones-loaded :payload) :zones-load-failed)
+              (Cmd.storage/get exercise-log-storage-key :json (Msg.mapper :log-loaded :payload) :log-load-failed)]))
 
 (ann active-chart-command (Fn [AppState] (Cmd AppMsg)))
 (defn active-chart-command [state]
-  {:kind :batch
-   :commands [(heart-chart-command state)
-              (metric-chart-command state)]})
+  (Cmd.batch [(heart-chart-command state)
+              (metric-chart-command state)]))
 
 (ann active-chart-batch (Fn [AppState] (Cmd AppMsg)))
 (defn active-chart-batch [state]
-  {:kind :batch
-   :commands [(heart-chart-batch state)
-              (metric-chart-batch state)]})
+  (Cmd.batch [(heart-chart-batch state)
+              (metric-chart-batch state)]))
 
 (ann with-active-chart-command (Fn [AppState (Cmd AppMsg)] (Cmd AppMsg)))
 (defn with-active-chart-command [state command]
-  {:kind :batch
-   :commands [command
-              (active-chart-command state)]})
+  (Cmd.batch [command
+              (active-chart-command state)]))
+
+(defmacro active-chart-result [state-expr] `(let [next-state# ~state-expr] [next-state# (active-chart-command next-state#)]))
+(defmacro active-chart-batch-result [state-expr] `(let [next-state# ~state-expr] [next-state# (active-chart-batch next-state#)]))
+(defmacro metric-chart-batch-result [state-expr] `(let [next-state# ~state-expr] [next-state# (metric-chart-batch next-state#)]))
+(defmacro with-active-chart-result [state-expr command-expr] `(let [next-state# ~state-expr] [next-state# (with-active-chart-command next-state# ~command-expr)]))
 
 (defn init []
   (let [dev? (env-dev?)
@@ -349,13 +186,43 @@
                       :zones default-zone-state.zones
                       :targetZoneId default-zone-state.targetZoneId})]
     [state
-     {:kind :batch
-      :commands [(startup-command dev?)
-                 (active-chart-batch state)]}]))
+      (Cmd.batch [(startup-command)
+                  (active-chart-batch state)])]))
 
-(ann command-none (Fn [] (Cmd AppMsg)))
-(defn command-none []
-  {:kind :none})
+(defn subscriptions [state]
+  (Sub.batch
+    [(Sub.media-query "mobile" "(max-width: 700px)" :media-changed)
+     (if state.dev?
+         (Sub.window/event-with "dev-hotkey"
+                                "keydown"
+                                :dev-key
+                                {:preventDefault {:key "h"
+                                                  :ctrlKey true
+                                                  :shiftKey true
+                                                  :altKey false
+                                                  :metaKey false}})
+         Sub.none)
+     (if (some? state.zoneDragIndex)
+         (Sub.window/event-with zone-drag-move-id
+                                "pointermove"
+                                :zone-boundary-drag-move
+                                {:preventDefault true
+                                 :options {:passive false}})
+         Sub.none)
+     (if (some? state.zoneDragIndex)
+         (Sub.window/event-with zone-drag-up-id
+                                "pointerup"
+                                :zone-boundary-drag-end
+                                {:preventDefault true
+                                 :options {:passive false}})
+         Sub.none)
+     (if (some? state.zoneDragIndex)
+         (Sub.window/event-with zone-drag-cancel-id
+                                "pointercancel"
+                                :zone-boundary-drag-end
+                                {:preventDefault true
+                                 :options {:passive false}})
+         Sub.none)]))
 
 (defn set-status [state status message mode]
   (merge state
@@ -441,68 +308,39 @@
   (let [zone (last zones)]
     zone.max))
 
-(defn clamp-to-zones [zones bpm]
-  (max (low-zone-bpm zones)
-       (min (high-zone-bpm zones) bpm)))
-
 (defn target-zone-from-roll [zones roll]
   (nth zones (floor roll)))
 
 (ann log-and-persist-command (Fn [(Vector WorkoutEntry)] (Cmd AppMsg)))
 (defn log-and-persist-command [entries]
-  {:kind :batch
-   :commands [{:kind :timer/cancel
-               :id clock-timer-id}
-              {:kind :storage/set
-               :key exercise-log-storage-key
-               :value (log-payload entries)
-               :onError :log-save-failed
-               :msg (msg-log-saved)}]})
+  (Cmd.batch [(Cmd.timer/cancel clock-timer-id)
+              (Cmd.storage/set exercise-log-storage-key (log-payload entries) (Msg.of :log-saved) :log-save-failed)]))
 
 (ann persist-zone-command (Fn [(Vector HeartZone) Number] (Cmd AppMsg)))
 (defn persist-zone-command [zones target-zone-id]
-  {:kind :storage/set
-   :key zones-storage-key
-   :value (zone-state-payload zones target-zone-id)
-   :onError :zones-save-failed
-   :msg (msg-zones-saved)})
+  (Cmd.storage/set zones-storage-key (zone-state-payload zones target-zone-id) (Msg.of :zones-saved) :zones-save-failed))
 
 (ann persist-zone-silent-command (Fn [(Vector HeartZone) Number] (Cmd AppMsg)))
 (defn persist-zone-silent-command [zones target-zone-id]
-  {:kind :storage/set
-   :key zones-storage-key
-   :value (zone-state-payload zones target-zone-id)
-   :onError :zones-save-failed})
+  (Cmd.storage/set-silent zones-storage-key (zone-state-payload zones target-zone-id) :zones-save-failed))
 
 (ann persist-log-command (Fn [(Vector WorkoutEntry)] (Cmd AppMsg)))
 (defn persist-log-command [entries]
-  {:kind :storage/set
-   :key exercise-log-storage-key
-   :value (log-payload entries)
-   :onError :log-save-failed
-   :msg (msg-log-saved)})
+  (Cmd.storage/set exercise-log-storage-key (log-payload entries) (Msg.of :log-saved) :log-save-failed))
 
 (ann clock-command (Fn [] (Cmd AppMsg)))
 (defn clock-command []
-  {:kind :timer/every
-   :id clock-timer-id
-   :ms 250
-   :msg (msg-clock-tick)})
+  (Cmd.timer/every clock-timer-id 250 (Msg.of :clock-tick)))
 
 (ann cancel-clock-command (Fn [] (Cmd AppMsg)))
 (defn cancel-clock-command []
-  {:kind :timer/cancel
-   :id clock-timer-id})
+  (Cmd.timer/cancel clock-timer-id))
 
 (ann stop-connections-command (Fn [] (Cmd AppMsg)))
 (defn stop-connections-command []
-  {:kind :batch
-   :commands [{:kind :simulation/stop
-                :id simulated-monitor-id}
+  (Cmd.batch [(Cmd.simulation/stop simulated-monitor-id)
               (cancel-clock-command)
-              {:kind :bluetooth/disconnect
-                :id "hrm"
-                :msg (msg-monitor-disconnected)}]})
+              (Cmd.bluetooth/disconnect "hrm" (Msg.of :monitor-disconnected))]))
 
 (defn connected-off-state [state]
   (clear-idle-live-state
@@ -531,49 +369,28 @@
 (ann disconnect-monitor-command (Fn [AppState] (Cmd AppMsg)))
 (defn disconnect-monitor-command [state]
   (if (= state.exerciseState "running")
-      {:kind :time/now
-       :toMessage msg-disconnect-paused-at}
+      (Cmd.time/now (Msg.mapper :disconnect-paused-at :timestamp))
       (stop-connections-command)))
 
 (ann start-stop-progress-command (Fn [] (Cmd AppMsg)))
 (defn start-stop-progress-command []
-  {:kind :batch
-   :commands [{:kind :timer/after
-               :id stop-hold-timer-id
-               :ms stop-hold-ms
-               :msg (msg-stop-hold-complete)}
-              {:kind :animation/frame
-               :id stop-hold-frame-id
-               :onFrame :stop-hold-frame}]})
+  (Cmd.batch [(Cmd.timer/after stop-hold-timer-id stop-hold-ms (Msg.of :stop-hold-complete))
+              (Cmd.animation/frame stop-hold-frame-id :stop-hold-frame)]))
 
 (ann cancel-stop-command (Fn [] (Cmd AppMsg)))
 (defn cancel-stop-command []
-  {:kind :batch
-   :commands [{:kind :timer/cancel
-               :id stop-hold-timer-id}
-              {:kind :animation/cancel
-               :id stop-hold-frame-id
-               :msg (msg-stop-hold-cancelled)}]})
+  (Cmd.batch [(Cmd.timer/cancel stop-hold-timer-id)
+              (Cmd.animation/cancel stop-hold-frame-id (Msg.of :stop-hold-cancelled))]))
 
 (ann start-delete-progress-command (Fn [] (Cmd AppMsg)))
 (defn start-delete-progress-command []
-  {:kind :batch
-   :commands [{:kind :timer/after
-               :id delete-hold-timer-id
-               :ms delete-hold-ms
-               :msg (msg-delete-hold-complete)}
-              {:kind :animation/frame
-               :id delete-hold-frame-id
-               :onFrame :delete-hold-frame}]})
+  (Cmd.batch [(Cmd.timer/after delete-hold-timer-id delete-hold-ms (Msg.of :delete-hold-complete))
+              (Cmd.animation/frame delete-hold-frame-id :delete-hold-frame)]))
 
 (ann cancel-delete-command (Fn [] (Cmd AppMsg)))
 (defn cancel-delete-command []
-  {:kind :batch
-   :commands [{:kind :timer/cancel
-               :id delete-hold-timer-id}
-              {:kind :animation/cancel
-               :id delete-hold-frame-id
-               :msg (msg-delete-hold-cancelled)}]})
+  (Cmd.batch [(Cmd.timer/cancel delete-hold-timer-id)
+              (Cmd.animation/cancel delete-hold-frame-id (Msg.of :delete-hold-cancelled))]))
 
 (def zone-boundary-track-ref "zone-boundary-track")
 
@@ -597,61 +414,65 @@
       (or (= key " ")
           (= key "Space"))))
 
+(defn stop-hold-allowed? [state]
+  (and (or (= state.exerciseState "running")
+           (= state.exerciseState "paused"))
+       (not state.stopHold?)))
+
+(defn start-stop-hold-state [state]
+  (merge state
+         {:stopHold? true
+          :stopHoldStartedAt 0
+          :stopHoldProgress 0
+          :message "Hold to stop"}))
+
+(defn cancel-stop-hold-state [state]
+  (merge state
+         {:stopHold? false
+          :stopHoldStartedAt 0
+          :stopHoldProgress 0
+          :message "Stop cancelled"}))
+
+(defn delete-hold-allowed? [state]
+  (and (some? (selected-log state.entries state.selectedLogId))
+       (not state.deleteHold?)))
+
+(defn start-delete-hold-state [state]
+  (merge state
+         {:deleteHold? true
+          :deleteHoldStartedAt 0
+          :deleteHoldProgress 0
+          :message "Hold to delete"}))
+
+(defn cancel-delete-hold-state [state]
+  (merge state
+         {:deleteHold? false
+          :deleteHoldStartedAt 0
+          :deleteHoldProgress 0
+          :message "Delete cancelled"}))
+
 (defn zone-boundary-status [zones index]
   (let [boundary (nth zones index)]
     (str "Boundary " boundary.max)))
 
 (ann zone-drag-measure-command (Fn [Number Number] (Cmd AppMsg)))
 (defn zone-drag-measure-command [index client-x]
-  {:kind :dom-ref/measure
-   :ref zone-boundary-track-ref
-   :toMessage (fn [rect]
-                {:kind :zone-boundary-track-measured
-                 :index index
-                 :clientX client-x
-                 :left rect.left
-                 :width rect.width
-                 :value {:x rect.x
-                         :y rect.y
-                         :width rect.width
-                         :height rect.height
-                         :top rect.top
-                         :right rect.right
-                         :bottom rect.bottom
-                         :left rect.left}})
-   :onError :zone-boundary-track-error})
-
-(ann zone-drag-watch-command (Fn [] (Cmd AppMsg)))
-(defn zone-drag-watch-command []
-  {:kind :batch
-   :commands [{:kind :window/event-watch
-               :id zone-drag-move-id
-               :type "pointermove"
-               :preventDefault true
-               :options {:passive false}
-               :onEvent :zone-boundary-drag-move}
-              {:kind :window/event-watch
-               :id zone-drag-up-id
-               :type "pointerup"
-               :preventDefault true
-               :options {:passive false}
-               :onEvent :zone-boundary-drag-end}
-              {:kind :window/event-watch
-               :id zone-drag-cancel-id
-               :type "pointercancel"
-               :preventDefault true
-               :options {:passive false}
-               :onEvent :zone-boundary-drag-end}]})
-
-(ann zone-drag-cleanup-command (Fn [] (Cmd AppMsg)))
-(defn zone-drag-cleanup-command []
-  {:kind :batch
-   :commands [{:kind :window/event-unwatch
-               :id zone-drag-move-id}
-              {:kind :window/event-unwatch
-               :id zone-drag-up-id}
-              {:kind :window/event-unwatch
-               :id zone-drag-cancel-id}]})
+  (Cmd.dom-ref/measure zone-boundary-track-ref
+                       (fn [rect]
+                         {:kind :zone-boundary-track-measured
+                          :index index
+                          :clientX client-x
+                          :left rect.left
+                          :width rect.width
+                          :value {:x rect.x
+                                  :y rect.y
+                                  :width rect.width
+                                  :height rect.height
+                                  :top rect.top
+                                  :right rect.right
+                                  :bottom rect.bottom
+                                  :left rect.left}})
+                       :zone-boundary-track-error))
 
 (defn hold-progress-for [duration-ms started-at timestamp]
   (max 0 (min 1 (/ (- timestamp started-at) duration-ms))))
@@ -683,148 +504,150 @@
 
 (ann focus-type-picker-command (Fn [] (Cmd AppMsg)))
 (defn focus-type-picker-command []
-  {:kind :dom-ref/focus
-   :ref type-picker-ref
-   :msg (msg-type-picker-focused)
-   :onError :type-picker-focus-failed})
+  (Cmd.dom-ref/focus type-picker-ref (Msg.of :type-picker-focused) :type-picker-focus-failed))
 
 (defn selected-type-picker? [state entry]
   (match state.typePickerEntryId
     (some id) (= id entry.id)
     nil false))
 
+(defmacro save-entry-type-result [state selected-id draft]
+  `(let [selected-id# ~selected-id
+         draft# ~draft]
+     (if (some? (selected-log (get ~state :entries) selected-id#))
+      (let [entries (update-entry-type (get ~state :entries) selected-id# draft#)]
+        (let [next-state (reconcile-log-state
+                           (merge ~state
+                                  {:entries entries
+                                   :typePickerEntryId nil
+                                   :typePickerDraft ""
+                                   :message "Workout type saved"}))]
+          [next-state
+           (with-active-chart-command next-state (persist-log-command entries))]))
+      (no-cmd ~state))))
+
 (defn update [state msg]
   (match msg
     {:kind :zones-loaded :payload payload}
       (let [zone-state (load-zone-state payload)]
-        (let [next-state (set-status
-                           (merge state
-                                  {:zones zone-state.zones
-                                   :targetZoneId zone-state.targetZoneId
-                                   :zoneStatus "Zones loaded"})
-                           "Ready"
-                           "Zones loaded"
-                           "muted")]
-          [next-state (active-chart-command next-state)]))
+        (active-chart-result
+          (set-status
+            (merge state
+                   {:zones zone-state.zones
+                    :targetZoneId zone-state.targetZoneId
+                    :zoneStatus "Zones loaded"})
+            "Ready"
+            "Zones loaded"
+            "muted")))
     {:kind :zones-load-failed :error error}
-      (let [next-state (set-status
-                         (merge state
-                                {:zones default-zone-state.zones
-                                 :targetZoneId default-zone-state.targetZoneId
-                                 :zoneStatus "Using default zones"})
-                         "Ready"
-                         error
-                         "warn")]
-        [next-state (active-chart-command next-state)])
+      (active-chart-result
+        (set-status
+          (merge state
+                 {:zones default-zone-state.zones
+                  :targetZoneId default-zone-state.targetZoneId
+                  :zoneStatus "Using default zones"})
+          "Ready"
+          error
+          "warn"))
     {:kind :log-loaded :payload payload}
       (let [entries (load-log-entries payload)
-            selected-id (first-visible-id entries)
-            next-state (reconcile-log-state
-                         (set-status
-                           (merge state
-                                  {:entries entries
-                                   :selectedLogId selected-id
-                                   :typePickerEntryId nil
-                                   :typePickerDraft ""
-                                   :importStatus "Ready"})
-                           "Ready"
-                           (str "Loaded " (count (visible-log entries)) " workouts")
-                           "muted"))]
-        [next-state (active-chart-command next-state)])
+            selected-id (first-visible-id entries)]
+        (active-chart-result
+          (reconcile-log-state
+            (set-status
+              (merge state
+                     {:entries entries
+                      :selectedLogId selected-id
+                      :typePickerEntryId nil
+                      :typePickerDraft ""
+                      :importStatus "Ready"})
+              "Ready"
+              (str "Loaded " (count (visible-log entries)) " workouts")
+              "muted"))))
     {:kind :log-load-failed :error error}
-      (let [next-state (set-status
-                         (merge state
-                                {:entries []
-                                 :selectedLogId nil
-                                 :logTypeFilter all-types-filter
-                                 :importStatus "Log reset"})
-                         "Ready"
-                         error
-                         "warn")]
-        [next-state (active-chart-command next-state)])
+      (active-chart-result
+        (set-status
+          (merge state
+                 {:entries []
+                  :selectedLogId nil
+                  :logTypeFilter all-types-filter
+                  :importStatus "Log reset"})
+          "Ready"
+          error
+          "warn"))
     {:kind :media-changed :matches matches}
-      (let [next-state (merge state {:mobile? matches})]
-        [next-state (active-chart-batch next-state)])
+      (active-chart-batch-result (merge state {:mobile? matches}))
     {:kind :chart-resized :width width :height height}
-      (let [next-state (merge state {:chartWidth width :chartHeight height})]
-        [next-state (active-chart-command next-state)])
+      (active-chart-result (merge state {:chartWidth width :chartHeight height}))
     {:kind :chart-error :error error}
-      [(merge state {:message error}) (command-none)]
-    {:kind :dev-key :key key :ctrlKey ctrl? :shiftKey shift? :altKey alt? :metaKey meta?}
+      (no-cmd (merge state {:message error}))
+    {:kind :dev-key :value event}
       (if (and state.dev?
-               ctrl?
-                shift?
-                (not alt?)
-                (not meta?)
-                (= (lower-case key) "h"))
+               event.ctrlKey
+               event.shiftKey
+               (not event.altKey)
+               (not event.metaKey)
+               (= (lower-case event.key) "h"))
            (if state.simulated?
                [(if (= state.exerciseState "running")
                     (set-status state "Disconnecting" "Pausing workout" "warn")
                     (disconnected-status-state state))
-                (disconnect-monitor-command state)]
+               (disconnect-monitor-command state)]
                (if (not state.connected?)
-                   [state {:kind :dom-ref/click
-                           :ref "simulate-monitor"
-                           :msg (msg-dev-opened)}]
-                   [state (command-none)]))
-           [state (command-none)])
+                   [state (Cmd.dom-ref/click "simulate-monitor" (Msg.of :dev-opened))]
+                   (no-cmd state)))
+           (no-cmd state))
     {:kind :dev-opened}
-      [state (command-none)]
+      (no-cmd state)
     {:kind :select-tab :view view}
-      (let [next-state (merge state {:detailView view})]
-        [next-state (active-chart-batch next-state)])
+      (active-chart-batch-result (merge state {:detailView view}))
     {:kind :metrics-grouping :value value}
-      (let [next-state (merge state {:metricsGrouping value})]
-        [next-state (metric-chart-batch next-state)])
+      (metric-chart-batch-result (merge state {:metricsGrouping value}))
     {:kind :filter-log-type :value value}
-      (let [next-state (reconcile-log-state
-                         (merge state
-                                {:logTypeFilter value
-                                 :typePickerEntryId nil
-                                 :typePickerDraft ""
-                                 :message (if (= value all-types-filter)
-                                              "Showing all workout types"
-                                              (if (= value untyped-filter)
-                                                  "Showing untyped workouts"
-                                                  (str "Showing " value)))}))]
-        [next-state (active-chart-command next-state)])
+      (active-chart-result
+        (reconcile-log-state
+          (merge state
+                 {:logTypeFilter value
+                  :typePickerEntryId nil
+                  :typePickerDraft ""
+                  :message (if (= value all-types-filter)
+                               "Showing all workout types"
+                               (if (= value untyped-filter)
+                                   "Showing untyped workouts"
+                                   (str "Showing " value)))})))
     {:kind :active-type-edited :text text}
-      [(merge state {:activeExerciseType text}) (command-none)]
+      (no-cmd (merge state {:activeExerciseType text}))
     {:kind :connect-monitor}
       (if state.connected?
-          [state (command-none)]
+          (no-cmd state)
           [(set-status state "Pairing" "Pairing heart-rate monitor" "warn")
-           {:kind :bluetooth/connect-heart-rate
-            :id "hrm"
-            :filters [{:services ["heart_rate"]}]
-            :optionalServices ["heart_rate"]
-            :toMessage msg-monitor-connected
-            :onError :monitor-error
-            :onReading :heart-rate
-            :onDisconnected :monitor-disconnected}])
+           (Cmd.bluetooth/connect-heart-rate "hrm"
+                                             {:filters [{:services ["heart_rate"]}]
+                                              :optionalServices ["heart_rate"]}
+                                             (Msg.mapper :monitor-connected :info)
+                                             :heart-rate
+                                             :monitor-disconnected
+                                             :monitor-error)])
     {:kind :monitor-connected :info info}
-      (let [next-state (set-status
-                         (merge state
-                                {:connected? true
-                                 :simulated? false
-                                 :deviceName info.deviceName})
-                         "Live"
-                         "Heart-rate monitor connected"
-                         "live")]
-        [next-state
-         (with-active-chart-command
-           next-state
-           (if (= next-state.exerciseState "idle")
-               {:kind :time/now
-                :toMessage msg-idle-started-at}
-               (command-none)))])
+      (with-active-chart-result
+        (set-status
+          (merge state
+                 {:connected? true
+                  :simulated? false
+                  :deviceName info.deviceName})
+          "Live"
+          "Heart-rate monitor connected"
+          "live")
+        (if (= state.exerciseState "idle")
+            (Cmd.time/now (Msg.mapper :idle-started-at :timestamp))
+            Cmd.none))
     {:kind :monitor-error :error error}
       [(set-status
          (merge state {:connected? false})
          "Unavailable"
          error
          "warn")
-       (command-none)]
+       Cmd.none]
     {:kind :monitor-disconnected}
       [(disconnected-status-state state)
        (cancel-clock-command)]
@@ -838,12 +661,9 @@
        (stop-connections-command)]
     {:kind :connect-simulated}
       (if (or (not (env-dev?)) state.connected?)
-          [state (command-none)]
+          (no-cmd state)
           [(set-status state "Pairing" "Choosing simulated zone" "warn")
-           {:kind :random/number
-            :min 0
-            :max (count state.zones)
-            :toMessage msg-sim-zone-picked}])
+           (Cmd.random/number 0 (count state.zones) (Msg.mapper :sim-zone-picked :roll))])
     {:kind :sim-zone-picked :roll roll}
       (let [zone (target-zone-from-roll state.zones roll)]
         [(set-status
@@ -851,178 +671,133 @@
            "Pairing"
            "Choosing simulated BPM"
            "warn")
-         {:kind :random/number
-          :min zone.min
-          :max zone.max
-          :toMessage msg-sim-bpm-picked}])
+         (Cmd.random/number zone.min zone.max (Msg.mapper :sim-bpm-picked :bpm))])
     {:kind :sim-bpm-picked :bpm bpm}
-      (let [connected-state (set-status
-                               (merge state
-                                      {:connected? true
-                                       :simulated? true
-                                      :deviceName "Simulated HRM"})
-                               "Live"
-                               "Simulated monitor"
-                               "live")]
-        [connected-state
-          (with-active-chart-command
-            connected-state
-            {:kind :batch
-             :commands [{:kind :time/now
-                         :toMessage (fn [timestamp]
-                                      {:kind :heart-rate-at
-                                       :bpm (round bpm)
-                                       :timestamp timestamp})}
-                         {:kind :simulation/heart-rate
-                          :id simulated-monitor-id
-                          :ms 1000
-                          :min (low-zone-bpm state.zones)
-                          :max (high-zone-bpm state.zones)
-                          :jitter 3.5
-                          :start (round bpm)
-                          :deviceName "Simulated HRM"
-                          :toMessage msg-sim-connected
-                          :onReading :heart-rate
-                          :onError :monitor-error}]})])
+      (with-active-chart-result
+        (set-status
+          (merge state
+                 {:connected? true
+                  :simulated? true
+                  :deviceName "Simulated HRM"})
+          "Live"
+          "Simulated monitor"
+          "live")
+        (Cmd.batch [(Cmd.time/now (fn [timestamp] (Msg.with2 :heart-rate-at :bpm (round bpm) :timestamp timestamp)))
+                    (Cmd.simulation/heart-rate simulated-monitor-id
+                                               {:ms 1000
+                                                :min (low-zone-bpm state.zones)
+                                                :max (high-zone-bpm state.zones)
+                                                :jitter 3.5
+                                                :start (round bpm)
+                                                :deviceName "Simulated HRM"}
+                                               (Msg.mapper :sim-connected :info)
+                                               :heart-rate
+                                               :monitor-error)]))
     {:kind :sim-connected}
-      [state (command-none)]
+      (no-cmd state)
     {:kind :start}
       (if (or (not (= state.exerciseState "idle"))
               (not state.connected?))
            [(if state.connected?
                 state
                 (set-status state "Disconnected" "Not connected" "warn"))
-           (command-none)]
+           Cmd.none]
           [(set-status state "Starting" "Starting workout" "warn")
-           {:kind :time/now
-            :toMessage msg-started-at}])
+           (Cmd.time/now (Msg.mapper :started-at :timestamp))])
     {:kind :started-at :timestamp now}
-      (let [next-state (set-status
-                         (merge state
-                                {:exerciseState "running"
-                                  :elapsedMs 0
-                                  :displayElapsedMs 0
-                                  :startedAt now
-                                  :sessionStartedAt now
-                                  :idleStartedAt nil
-                                  :lastRate nil
-                                  :detailView "live"
-                                  :readings []})
-                         "Recording"
-                         "Workout in progress"
-                         "live")]
-        [next-state
-         (with-active-chart-command
-           next-state
-           (clock-command))])
+      (with-active-chart-result
+        (set-status
+          (merge state
+                 {:exerciseState "running"
+                  :elapsedMs 0
+                  :displayElapsedMs 0
+                  :startedAt now
+                  :sessionStartedAt now
+                  :idleStartedAt nil
+                  :lastRate nil
+                  :detailView "live"
+                  :readings []})
+          "Recording"
+          "Workout in progress"
+          "live")
+        (clock-command))
     {:kind :pause}
       (if (= state.exerciseState "running")
           [(set-status state "Pausing" "Pausing workout" "warn")
-           {:kind :time/now
-            :toMessage msg-paused-at}]
-          [state (command-none)])
+           (Cmd.time/now (Msg.mapper :paused-at :timestamp))]
+          (no-cmd state))
     {:kind :paused-at :timestamp now}
-      (let [next-state (set-status
-                         (merge state
-                                {:exerciseState "paused"
-                                 :elapsedMs (current-elapsed state now)
-                                 :displayElapsedMs (current-elapsed state now)
-                                 :startedAt nil})
-                         "Paused"
-                         "Workout paused"
-                         "warn")]
-        [next-state
-         (with-active-chart-command
-           next-state
-            (cancel-clock-command))])
+      (with-active-chart-result
+        (set-status
+          (merge state
+                 {:exerciseState "paused"
+                  :elapsedMs (current-elapsed state now)
+                  :displayElapsedMs (current-elapsed state now)
+                  :startedAt nil})
+          "Paused"
+          "Workout paused"
+          "warn")
+        (cancel-clock-command))
     {:kind :resume}
       (if (and (= state.exerciseState "paused")
                state.connected?)
           [(set-status state "Resuming" "Resuming workout" "warn")
-           {:kind :time/now
-            :toMessage msg-resumed-at}]
+           (Cmd.time/now (Msg.mapper :resumed-at :timestamp))]
           [(if state.connected?
                state
                (set-status state "Disconnected" "Not connected" "warn"))
-           (command-none)])
+           Cmd.none])
     {:kind :resumed-at :timestamp now}
-      (let [next-state (set-status
-                         (merge state
-                                {:exerciseState "running"
-                                 :startedAt now})
-                         "Recording"
-                         "Workout in progress"
-                         "live")]
-        [next-state
-         (with-active-chart-command
-           next-state
-           (clock-command))])
+      (with-active-chart-result
+        (set-status
+          (merge state
+                 {:exerciseState "running"
+                  :startedAt now})
+          "Recording"
+          "Workout in progress"
+          "live")
+        (clock-command))
     {:kind :clock-tick}
-      [state {:kind :time/now
-              :toMessage msg-clocked-at}]
+      [state (Cmd.time/now (Msg.mapper :clocked-at :timestamp))]
     {:kind :clocked-at :timestamp now}
-      (let [next-state (merge state {:displayElapsedMs (live-elapsed state now)})]
-        [next-state (active-chart-command next-state)])
+      (active-chart-result (merge state {:displayElapsedMs (live-elapsed state now)}))
     {:kind :heart-rate :bpm bpm}
-      [state
-       {:kind :time/now
-        :toMessage (fn [timestamp]
-                     {:kind :heart-rate-at
-                      :bpm bpm
-                      :timestamp timestamp})}]
+      [state (Cmd.time/now (fn [timestamp] (Msg.with2 :heart-rate-at :bpm bpm :timestamp timestamp)))]
     {:kind :heart-rate-at :bpm bpm :timestamp timestamp}
-      (let [next-state (add-heart-rate-at state bpm timestamp)]
-        [next-state
-         (with-active-chart-command
-           next-state
-           (if (and (= state.exerciseState "idle")
-                    (not (some? state.idleStartedAt)))
-               (clock-command)
-               (command-none)))])
+      (with-active-chart-result
+        (add-heart-rate-at state bpm timestamp)
+        (if (and (= state.exerciseState "idle")
+                 (not (some? state.idleStartedAt)))
+            (clock-command)
+            Cmd.none))
     {:kind :idle-started-at :timestamp timestamp}
-      (let [next-state (if (and (= state.exerciseState "idle")
-                                state.connected?)
-                           (merge state
-                                  {:idleStartedAt timestamp
-                                   :displayElapsedMs 0})
-                           state)]
-        [next-state
-         (with-active-chart-command
-           next-state
-           (if (and (= state.exerciseState "idle")
-                    state.connected?)
-               (clock-command)
-               (command-none)))])
+      (with-active-chart-result
+        (if (and (= state.exerciseState "idle")
+                 state.connected?)
+            (merge state
+                   {:idleStartedAt timestamp
+                    :displayElapsedMs 0})
+            state)
+        (if (and (= state.exerciseState "idle")
+                 state.connected?)
+            (clock-command)
+            Cmd.none))
     {:kind :stop-hold-start}
-      (if (and (or (= state.exerciseState "running")
-                   (= state.exerciseState "paused"))
-               (not state.stopHold?))
-          [(merge state
-                  {:stopHold? true
-                   :stopHoldStartedAt 0
-                   :stopHoldProgress 0
-                   :message "Hold to stop"})
-           {:kind :time/now
-            :toMessage msg-stop-hold-started}]
-          [state (command-none)])
+      (if (stop-hold-allowed? state)
+          [(start-stop-hold-state state)
+           (Cmd.time/now (Msg.mapper :stop-hold-started :timestamp))]
+          (no-cmd state))
     {:kind :stop-hold-key-down :key key}
       (if (and (hold-key? key)
-               (and (or (= state.exerciseState "running")
-                        (= state.exerciseState "paused"))
-                    (not state.stopHold?)))
-          [(merge state
-                  {:stopHold? true
-                   :stopHoldStartedAt 0
-                   :stopHoldProgress 0
-                   :message "Hold to stop"})
-           {:kind :time/now
-            :toMessage msg-stop-hold-started}]
-          [state (command-none)])
+               (stop-hold-allowed? state))
+          [(start-stop-hold-state state)
+           (Cmd.time/now (Msg.mapper :stop-hold-started :timestamp))]
+          (no-cmd state))
     {:kind :stop-hold-started :timestamp timestamp}
       (if state.stopHold?
           [(merge state {:stopHoldStartedAt timestamp})
            (start-stop-progress-command)]
-          [state (command-none)])
+          (no-cmd state))
     {:kind :stop-hold-frame :timestamp timestamp}
       (if state.stopHold?
           (let [progress (stop-progress-for state.stopHoldStartedAt timestamp)]
@@ -1030,32 +805,22 @@
                     {:stopHoldProgress progress
                      :message (str "Stopping " (progress-width progress))})
              (if (< progress 1)
-                 {:kind :animation/frame
-                  :id stop-hold-frame-id
-                  :onFrame :stop-hold-frame}
-                 (command-none))])
-          [state (command-none)])
+                 (Cmd.animation/frame stop-hold-frame-id :stop-hold-frame)
+                 Cmd.none)])
+          (no-cmd state))
     {:kind :stop-hold-cancel}
       (if state.stopHold?
-          [(merge state
-                  {:stopHold? false
-                   :stopHoldStartedAt 0
-                   :stopHoldProgress 0
-                   :message "Stop cancelled"})
+          [(cancel-stop-hold-state state)
            (cancel-stop-command)]
-          [state (command-none)])
+          (no-cmd state))
     {:kind :stop-hold-key-up :key key}
       (if (and (hold-key? key)
                state.stopHold?)
-          [(merge state
-                  {:stopHold? false
-                   :stopHoldStartedAt 0
-                   :stopHoldProgress 0
-                   :message "Stop cancelled"})
+          [(cancel-stop-hold-state state)
            (cancel-stop-command)]
-          [state (command-none)])
+          (no-cmd state))
     {:kind :stop-hold-cancelled}
-      [state (command-none)]
+      (no-cmd state)
     {:kind :stop-hold-complete}
       (if state.stopHold?
           [(set-status
@@ -1063,26 +828,18 @@
              "Stopping"
              "Finalizing workout"
              "warn")
-           {:kind :batch
-            :commands [{:kind :animation/cancel
-                        :id stop-hold-frame-id
-                        :msg (msg-stop-hold-cancelled)}
-                       {:kind :time/now
-                        :toMessage msg-stopped-at}]}]
-          [state (command-none)])
+           (Cmd.batch [(Cmd.animation/cancel stop-hold-frame-id (Msg.of :stop-hold-cancelled))
+                       (Cmd.time/now (Msg.mapper :stopped-at :timestamp))])]
+          (no-cmd state))
     {:kind :stop}
       (if (or (= state.exerciseState "running")
               (= state.exerciseState "paused"))
           [(set-status state "Stopping" "Finalizing workout" "warn")
-           {:kind :time/now
-            :toMessage msg-stopped-at}]
-          [state (command-none)])
+           (Cmd.time/now (Msg.mapper :stopped-at :timestamp))]
+          (no-cmd state))
     {:kind :stopped-at :timestamp stopped-at}
       [(merge state {:pendingStoppedAt stopped-at})
-       {:kind :random/number
-        :min 0
-        :max 1
-        :toMessage msg-id-roll}]
+       (Cmd.random/number 0 1 (Msg.mapper :id-roll :roll))]
     {:kind :id-roll :roll roll}
       (let [stopped-at (if (some? state.pendingStoppedAt)
                            state.pendingStoppedAt
@@ -1112,48 +869,47 @@
                            "Workout added to log"
                            "muted")]
           [next-state
-           {:kind :batch
-            :commands [(log-and-persist-command entries)
+           (Cmd.batch [(log-and-persist-command entries)
                        (active-chart-command next-state)
-                       (focus-type-picker-command)]}]))
+                       (focus-type-picker-command)])]))
     {:kind :target-zone :id id}
-      (let [next-state (merge state
-                              {:targetZoneId id
-                               :zoneStatus (str "Target " id)})]
-        [next-state
-         (with-active-chart-command next-state (persist-zone-command state.zones id))])
+      (with-active-chart-result
+        (merge state
+               {:targetZoneId id
+                :zoneStatus (str "Target " id)})
+        (persist-zone-command state.zones id))
     {:kind :zone-min-edited :id id :raw raw}
       (let [zones (set-zone-min state.zones id raw)]
-        (let [next-state (merge state
-                                {:zones zones
-                                 :zoneStatus "Zones edited"})]
-          [next-state
-           (with-active-chart-command next-state (persist-zone-command zones state.targetZoneId))]))
+        (with-active-chart-result
+          (merge state
+                 {:zones zones
+                  :zoneStatus "Zones edited"})
+          (persist-zone-command zones state.targetZoneId)))
     {:kind :zone-max-edited :id id :raw raw}
       (let [zones (set-zone-max state.zones id raw)]
-        (let [next-state (merge state
-                                {:zones zones
-                                 :zoneStatus "Zones edited"})]
-          [next-state
-           (with-active-chart-command next-state (persist-zone-command zones state.targetZoneId))]))
+        (with-active-chart-result
+          (merge state
+                 {:zones zones
+                  :zoneStatus "Zones edited"})
+          (persist-zone-command zones state.targetZoneId)))
     {:kind :zone-boundary :index index :bpm bpm}
       (let [zones (set-zone-boundary state.zones index bpm)]
-        (let [next-state (merge state
-                                {:zones zones
-                                 :zoneStatus "Boundary moved"})]
-          [next-state
-           (with-active-chart-command next-state (persist-zone-command zones state.targetZoneId))]))
+        (with-active-chart-result
+          (merge state
+                 {:zones zones
+                  :zoneStatus "Boundary moved"})
+          (persist-zone-command zones state.targetZoneId)))
     {:kind :zone-boundary-key :index index :key key}
       (let [delta (zone-boundary-key-delta key)]
         (if (= delta 0)
-            [state (command-none)]
+            (no-cmd state)
             (let [left (nth state.zones index)
                   zones (set-zone-boundary state.zones index (+ left.max delta))]
-              (let [next-state (merge state
-                                      {:zones zones
-                                       :zoneStatus (zone-boundary-status zones index)})]
-                [next-state
-                 (with-active-chart-command next-state (persist-zone-command zones state.targetZoneId))]))))
+              (with-active-chart-result
+                (merge state
+                       {:zones zones
+                        :zoneStatus (zone-boundary-status zones index)})
+                (persist-zone-command zones state.targetZoneId)))))
     {:kind :zone-boundary-drag-start :index index :clientX client-x}
       [(merge state {:zoneStatus "Measuring boundary"})
        (zone-drag-measure-command index client-x)]
@@ -1165,149 +921,90 @@
             zones (set-zone-boundary measured-state.zones
                                      index
                                      (zone-boundary-bpm-from-client-x measured-state client-x))]
-        (let [next-state (merge measured-state
-                                {:zones zones
-                                 :zoneStatus (zone-boundary-status zones index)})]
-          [next-state
-           {:kind :batch
-            :commands [(persist-zone-silent-command zones state.targetZoneId)
-                       (active-chart-command next-state)
-                       (zone-drag-watch-command)]}]))
+        (with-active-chart-result
+          (merge measured-state
+                 {:zones zones
+                  :zoneStatus (zone-boundary-status zones index)})
+          (persist-zone-silent-command zones state.targetZoneId)))
     {:kind :zone-boundary-track-error :error error}
-      [(merge state
-              {:zoneDragIndex nil
-               :zoneStatus error})
-       (zone-drag-cleanup-command)]
-    {:kind :zone-boundary-drag-move :clientX client-x}
+      (no-cmd (merge state
+                     {:zoneDragIndex nil
+                      :zoneStatus error}))
+    {:kind :zone-boundary-drag-move :value event}
       (if (some? state.zoneDragIndex)
           (let [zones (set-zone-boundary state.zones
                                          state.zoneDragIndex
-                                         (zone-boundary-bpm-from-client-x state client-x))]
-            (let [next-state (merge state
-                                    {:zones zones
-                                     :zoneStatus (zone-boundary-status zones state.zoneDragIndex)})]
-              [next-state
-               {:kind :batch
-                :commands [(persist-zone-silent-command zones state.targetZoneId)
-                           (active-chart-command next-state)]}]))
-          [state (command-none)])
+                                         (zone-boundary-bpm-from-client-x state event.clientX))]
+            (with-active-chart-result
+              (merge state
+                     {:zones zones
+                      :zoneStatus (zone-boundary-status zones state.zoneDragIndex)})
+              (persist-zone-silent-command zones state.targetZoneId)))
+          (no-cmd state))
     {:kind :zone-boundary-drag-end}
-      [(merge state
-              {:zoneDragIndex nil
-               :zoneStatus "Boundary set"})
-       (zone-drag-cleanup-command)]
+      (no-cmd (merge state
+                     {:zoneDragIndex nil
+                      :zoneStatus "Boundary set"}))
     {:kind :zones-saved}
-      [(merge state {:zoneStatus "Zones saved"}) (command-none)]
+      (no-cmd (merge state {:zoneStatus "Zones saved"}))
     {:kind :zones-save-failed :error error}
       [(set-status
          (merge state {:zoneStatus error})
          "Save failed"
          error
          "warn")
-       (command-none)]
+       Cmd.none]
     {:kind :select-log :id id}
-      (let [next-state (reconcile-log-state
-                         (merge state
-                                {:selectedLogId id
-                                 :typePickerEntryId nil
-                                 :typePickerDraft ""
-                                 :detailView "log"}))]
-        [next-state (active-chart-command next-state)])
+      (active-chart-result
+        (reconcile-log-state
+          (merge state
+                 {:selectedLogId id
+                  :typePickerEntryId nil
+                  :typePickerDraft ""
+                  :detailView "log"})))
     {:kind :edit-type-draft :text text}
-      [(merge state {:typeDraft text}) (command-none)]
+      (no-cmd (merge state {:typeDraft text}))
     {:kind :type-draft-key :key key}
       (if (= key "Enter")
-          (if (some? (selected-log state.entries state.selectedLogId))
-              (let [entries (update-entry-type state.entries state.selectedLogId state.typeDraft)]
-                (let [next-state (reconcile-log-state
-                                   (merge state
-                                          {:entries entries
-                                           :typePickerEntryId nil
-                                           :typePickerDraft ""
-                                           :message "Workout type saved"}))]
-                  [next-state
-                   (with-active-chart-command next-state (persist-log-command entries))]))
-              [state (command-none)])
-          [state (command-none)])
+          (save-entry-type-result state state.selectedLogId state.typeDraft)
+          (no-cmd state))
     {:kind :type-picker-draft :text text}
-      [(merge state {:typePickerDraft text}) (command-none)]
+      (no-cmd (merge state {:typePickerDraft text}))
     {:kind :type-picker-key :key key}
       (if (= key "Enter")
-          (if (some? (selected-log state.entries state.typePickerEntryId))
-              (let [entries (update-entry-type state.entries state.typePickerEntryId state.typePickerDraft)]
-                (let [next-state (reconcile-log-state
-                                   (merge state
-                                          {:entries entries
-                                           :typePickerEntryId nil
-                                           :typePickerDraft ""
-                                           :message "Workout type saved"}))]
-                  [next-state
-                   (with-active-chart-command next-state (persist-log-command entries))]))
-              [state (command-none)])
-          [state (command-none)])
+          (save-entry-type-result state state.typePickerEntryId state.typePickerDraft)
+          (no-cmd state))
     {:kind :confirm-type-picker}
-      (if (some? (selected-log state.entries state.typePickerEntryId))
-          (let [entries (update-entry-type state.entries state.typePickerEntryId state.typePickerDraft)]
-            (let [next-state (reconcile-log-state
-                               (merge state
-                                      {:entries entries
-                                       :typePickerEntryId nil
-                                       :typePickerDraft ""
-                                       :message "Workout type saved"}))]
-              [next-state
-               (with-active-chart-command next-state (persist-log-command entries))]))
-          [state (command-none)])
+      (save-entry-type-result state state.typePickerEntryId state.typePickerDraft)
     {:kind :skip-type-picker}
       [(reconcile-log-state
          (merge state
                 {:typePickerEntryId nil
                  :typePickerDraft ""
                  :message "Workout type skipped"}))
-       (command-none)]
+       Cmd.none]
     {:kind :type-picker-focused}
-      [state (command-none)]
+      (no-cmd state)
     {:kind :type-picker-focus-failed :error error}
-      [(merge state {:message error}) (command-none)]
+      (no-cmd (merge state {:message error}))
     {:kind :save-type}
-      (if (some? (selected-log state.entries state.selectedLogId))
-          (let [entries (update-entry-type state.entries state.selectedLogId state.typeDraft)]
-            (let [next-state (reconcile-log-state
-                               (merge state
-                                      {:entries entries
-                                       :typePickerEntryId nil
-                                       :typePickerDraft ""
-                                       :message "Workout type saved"}))]
-              [next-state
-               (with-active-chart-command next-state (persist-log-command entries))]))
-          [state (command-none)])
+      (save-entry-type-result state state.selectedLogId state.typeDraft)
     {:kind :delete-hold-start}
-      (if (and (some? (selected-log state.entries state.selectedLogId))
-               (not state.deleteHold?))
-          [(merge state
-                  {:deleteHold? true
-                   :deleteHoldStartedAt 0
-                   :deleteHoldProgress 0
-                   :message "Hold to delete"})
-           {:kind :time/now
-            :toMessage msg-delete-hold-started}]
-          [state (command-none)])
+      (if (delete-hold-allowed? state)
+          [(start-delete-hold-state state)
+           (Cmd.time/now (Msg.mapper :delete-hold-started :timestamp))]
+          (no-cmd state))
     {:kind :delete-hold-key-down :key key}
       (if (and (hold-key? key)
-               (and (some? (selected-log state.entries state.selectedLogId))
-                    (not state.deleteHold?)))
-          [(merge state
-                  {:deleteHold? true
-                   :deleteHoldStartedAt 0
-                   :deleteHoldProgress 0
-                   :message "Hold to delete"})
-           {:kind :time/now
-            :toMessage msg-delete-hold-started}]
-          [state (command-none)])
+               (delete-hold-allowed? state))
+          [(start-delete-hold-state state)
+           (Cmd.time/now (Msg.mapper :delete-hold-started :timestamp))]
+          (no-cmd state))
     {:kind :delete-hold-started :timestamp timestamp}
       (if state.deleteHold?
           [(merge state {:deleteHoldStartedAt timestamp})
            (start-delete-progress-command)]
-          [state (command-none)])
+          (no-cmd state))
     {:kind :delete-hold-frame :timestamp timestamp}
       (if state.deleteHold?
           (let [progress (progress-for state.deleteHoldStartedAt timestamp)]
@@ -1315,123 +1012,102 @@
                     {:deleteHoldProgress progress
                      :message (str "Deleting " (progress-width progress))})
              (if (< progress 1)
-                 {:kind :animation/frame
-                  :id delete-hold-frame-id
-                  :onFrame :delete-hold-frame}
-                 (command-none))])
-          [state (command-none)])
+                 (Cmd.animation/frame delete-hold-frame-id :delete-hold-frame)
+                 Cmd.none)])
+          (no-cmd state))
     {:kind :delete-hold-cancel}
       (if state.deleteHold?
-          [(merge state
-                  {:deleteHold? false
-                   :deleteHoldStartedAt 0
-                   :deleteHoldProgress 0
-                   :message "Delete cancelled"})
+          [(cancel-delete-hold-state state)
            (cancel-delete-command)]
-          [state (command-none)])
+          (no-cmd state))
     {:kind :delete-hold-key-up :key key}
       (if (and (hold-key? key)
                state.deleteHold?)
-          [(merge state
-                  {:deleteHold? false
-                   :deleteHoldStartedAt 0
-                   :deleteHoldProgress 0
-                   :message "Delete cancelled"})
+          [(cancel-delete-hold-state state)
            (cancel-delete-command)]
-          [state (command-none)])
+          (no-cmd state))
     {:kind :delete-hold-cancelled}
-      [state (command-none)]
+      (no-cmd state)
     {:kind :delete-hold-complete}
       (if state.deleteHold?
           [(merge state
                   {:deleteHoldProgress 1
                    :message "Deleting workout"})
-           {:kind :time/now
-            :toMessage msg-delete-selected-at}]
-          [state (command-none)])
+           (Cmd.time/now (Msg.mapper :delete-selected-at :timestamp))]
+          (no-cmd state))
     {:kind :delete-selected-at :timestamp timestamp}
       (let [entries (hide-entry state.entries state.selectedLogId timestamp)
             selected-id (first-visible-id entries)]
-        (let [next-state (reconcile-log-state
-                           (merge state
-                                  {:entries entries
-                                   :selectedLogId selected-id
-                                   :deleteHold? false
-                                   :deleteHoldStartedAt 0
-                                   :deleteHoldProgress 0
-                                   :typePickerEntryId nil
-                                   :typePickerDraft ""
-                                   :message "Workout deleted"}))]
-          [next-state
-           (with-active-chart-command next-state (persist-log-command entries))]))
+        (with-active-chart-result
+          (reconcile-log-state
+            (merge state
+                   {:entries entries
+                    :selectedLogId selected-id
+                    :deleteHold? false
+                    :deleteHoldStartedAt 0
+                    :deleteHoldProgress 0
+                    :typePickerEntryId nil
+                    :typePickerDraft ""
+                    :message "Workout deleted"}))
+          (persist-log-command entries)))
     {:kind :log-saved}
-      [state (command-none)]
+      (no-cmd state)
     {:kind :log-save-failed :error error}
       [(set-status
          (merge state {:importStatus error})
          "Save failed"
          error
          "warn")
-       (command-none)]
+       Cmd.none]
     {:kind :open-import}
       [(merge state {:importStatus "Opening import"})
-       {:kind :dom-ref/click
-        :ref "import-file"
-        :msg (msg-import-opened)
-        :onError :import-failed}]
+       (Cmd.dom-ref/click "import-file" (Msg.of :import-opened) :import-failed)]
     {:kind :import-opened}
-      [(merge state {:importStatus "Choose a JSON file"}) (command-none)]
+      (no-cmd (merge state {:importStatus "Choose a JSON file"}))
     {:kind :read-import}
       [(merge state {:importStatus "Reading import"})
-       {:kind :file/read-selected
-        :ref "import-file"
-        :format :json
-        :toMessage msg-log-imported
-        :onError :import-failed
-        :onCancel :import-cancelled}]
+       (Cmd.file/read-selected "import-file" :json (Msg.mapper :log-imported :payload) :import-failed :import-cancelled)]
     {:kind :log-imported :payload payload}
       (let [entries (load-log-entries payload)
             error (import-log-error payload entries)]
         (if (some? error)
-            [(merge state {:importStatus error}) (command-none)]
+            (no-cmd (merge state {:importStatus error}))
             (let [selected-id (first-visible-id entries)]
-              (let [next-state (reconcile-log-state
-                                 (merge state
-                                        {:entries entries
-                                         :selectedLogId selected-id
-                                         :logTypeFilter all-types-filter
-                                         :typePickerEntryId nil
-                                         :typePickerDraft ""
-                                         :importStatus (import-success-message (count entries))
-                                         :detailView "log"}))]
-                [next-state
-                 (with-active-chart-command next-state (persist-log-command entries))]))))
+              (with-active-chart-result
+                (reconcile-log-state
+                  (merge state
+                         {:entries entries
+                          :selectedLogId selected-id
+                          :logTypeFilter all-types-filter
+                          :typePickerEntryId nil
+                          :typePickerDraft ""
+                          :importStatus (import-success-message (count entries))
+                          :detailView "log"}))
+                (persist-log-command entries)))))
     {:kind :import-cancelled}
-      [(merge state {:importStatus "Import cancelled"}) (command-none)]
+      (no-cmd (merge state {:importStatus "Import cancelled"}))
     {:kind :import-failed :error error}
-      [(merge state {:importStatus error}) (command-none)]
+      (no-cmd (merge state {:importStatus error}))
     {:kind :export-log}
       [(merge state {:importStatus "Exporting log"})
-       {:kind :time/now
-        :toMessage msg-export-log-at}]
+       (Cmd.time/now (Msg.mapper :export-log-at :timestamp))]
     {:kind :export-log-at :timestamp timestamp}
       [(merge state {:importStatus "Exporting log"})
-       {:kind :file/download
-        :name (export-log-filename timestamp)
-        :content (export-log-json (visible-log state.entries))
-        :mime "application/json"
-        :onError :export-failed
-        :msg (msg-exported)}]
+       (Cmd.file/download (export-log-filename timestamp)
+                          (export-log-json (visible-log state.entries))
+                          "application/json"
+                          (Msg.of :exported)
+                          :export-failed)]
     {:kind :export-failed :error error}
       [(set-status
          (merge state {:importStatus error})
          "Export failed"
          error
          "warn")
-       (command-none)]
+       Cmd.none]
     {:kind :exported}
-      [(merge state {:importStatus "Exported log"}) (command-none)]
-    _ [state (command-none)]))
+      (no-cmd (merge state {:importStatus "Exported log"}))
+    _ (no-cmd state)))
 
 (defn latest-bpm-label [state]
   (if (> state.latestBpm 0)
@@ -1581,12 +1257,6 @@
           {(tab-button state "live" "Live")}
           {(tab-button state "log" "Log")}
           {(tab-button state "metrics" "Metrics")}
-        </div>)
-
-(defn stat-tile [label value]
-  #html <div class={(str stat-tile-class " stat-tile [&_strong]:text-[1.1rem] [&_strong]:font-extrabold [&_strong]:tabular-nums [&_strong]:whitespace-nowrap")}>
-          <strong class="block">{value}</strong>
-          <small class="block font-bold text-[#617066]">{label}</small>
         </div>)
 
 (defn summary-stat-tile-class [state]
@@ -1740,9 +1410,6 @@
             </button>
           </div>
         </section>)
-
-(defn connection-pane [state]
-  (monitor-card state))
 
 (defn zones-pane [state]
   #html <section class="zones-pane mt-[18px] max-[820px]:mt-2.5" data-testid="zones-pane" data-status={state.zoneStatus}>

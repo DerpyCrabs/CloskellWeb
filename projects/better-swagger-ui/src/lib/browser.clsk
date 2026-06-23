@@ -4,6 +4,32 @@
 
 (def theme-storage-key "better-swagger-theme")
 
+(type BrowserCommandMsg
+  (Union {:kind :theme-loaded :theme String}
+         {:kind :auth-storage-loaded :entries Js}))
+
+(def swagger-config-paths
+  ["/v3/api-docs/swagger-config" "/swagger-config"])
+
+(def spec-candidate-paths
+  ["/v3/api-docs"
+   "/v2/api-docs"
+   "/swagger.json"
+   "/openapi.json"
+   "/openapi.yaml"
+   "/openapi.yml"
+   "/api-docs"
+   "/openapi/v1.json"])
+
+(def discovery-error-message
+  "Could not find OpenAPI spec. Try pasting the direct spec URL (e.g. /v3/api-docs) if the API allows cross-origin access.")
+
+(defn hasText? [value]
+  (and (string? value) (> (count (trim value)) 0)))
+
+(defn append-all [items more]
+  (reduce more items (fn [result item] (conj result item))))
+
 (ann hasOpenApiShape? (Fn [Js] Bool))
 (defn hasOpenApiShape? [value]
   (and (object? value)
@@ -16,6 +42,11 @@
         (ends-with? path ".yaml")
         (ends-with? path ".yml")
         (regex-test? url "\\.(json|ya?ml)(\\?|#|$)" "i"))))
+
+(defn isPlaceholderSpecUrl? [url]
+  (let [hostname (url-hostname url)]
+    (or (regex-test? hostname "petstore(\\d)?\\.swagger\\.io" "i")
+        (regex-test? url "petstore(\\d)?\\.swagger\\.io" "i"))))
 
 (defn validHttpUrl? [baseUrl value]
   (let [trimmed (trim value)]
@@ -89,11 +120,123 @@
   (if (regex-test? text "urls\\s*:\\s*\\[" "")
       ""
       (let [found (regex-capture text "url\\s*:\\s*[\"']([^\"']+)[\"']" "")]
-        (if (= found "") "" (absoluteUrlFrom found baseUrl)))))
+        (if (= found "")
+            ""
+            (let [resolved (absoluteUrlFrom found baseUrl)]
+              (if (isPlaceholderSpecUrl? resolved) "" resolved))))))
 
 (defn parseConfigUrl [text baseUrl]
   (let [found (regex-capture text "configUrl\\s*:\\s*[\"']([^\"']+)[\"']" "")]
     (if (= found "") "" (absoluteUrlFrom found baseUrl))))
+
+(defn initializerUrlsBlock [text]
+  (let [withTerminator (regex-capture text "urls\\s*:\\s*\\[([\\s\\S]*?)\\]\\s*,?\\s*(?:validatorUrl|oauth2RedirectUrl|presets|configUrl|layout|\\w+\\s*:)" "")
+        loose (regex-capture text "urls\\s*:\\s*\\[([\\s\\S]*?)\\]" "")]
+    (if (hasText? withTerminator) withTerminator loose)))
+
+(defn normalizeInitializerGroup [group index reversed? baseUrl]
+  (let [rawName (if reversed? (first group) (second group))
+        rawUrl (if reversed? (second group) (first group))
+        name (if (hasText? rawName)
+                 (trim rawName)
+                 (if (= index 0) "default" (str "definition-" index)))
+        url (if (hasText? rawUrl) (absoluteUrlFrom rawUrl baseUrl) "")]
+    (if (hasText? url)
+        {:name name :url url}
+        nil)))
+
+(defn normalizeInitializerGroups [groups reversed? baseUrl]
+  (filter (map-indexed groups (fn [group index] (normalizeInitializerGroup group index reversed? baseUrl)))
+          (fn [entry] (some? entry))))
+
+(defn parseInitializerUrls [text baseUrl]
+  (if (regex-test? text "urls\\s*:\\s*\\[" "")
+      (let [block (initializerUrlsBlock text)
+            urlFirst (regex-capture-all block "\\{\\s*url\\s*:\\s*[\"']([^\"']+)[\"']\\s*,\\s*name\\s*:\\s*[\"']([^\"']+)[\"']\\s*\\}" "g")
+            nameFirst (regex-capture-all block "\\{\\s*name\\s*:\\s*[\"']([^\"']+)[\"']\\s*,\\s*url\\s*:\\s*[\"']([^\"']+)[\"']\\s*\\}" "g")]
+        (if (> (count urlFirst) 0)
+            (normalizeInitializerGroups urlFirst false baseUrl)
+            (normalizeInitializerGroups nameFirst true baseUrl)))
+      (let [singleUrl (parseSingleSpecUrl text baseUrl)]
+        (if (hasText? singleUrl)
+            [{:name "default" :url singleUrl}]
+            []))))
+
+(defn pickDefinition [definitions name]
+  (let [match (find definitions (fn [entry] (= entry.name name)))]
+    (if (some? match) match (first definitions))))
+
+(defn selectedDefinitionFrom [definitions definitionName]
+  (let [selected (pickDefinition definitions definitionName)]
+    {:kind "spec-url"
+     :specUrl selected.url
+     :definitions definitions
+     :selectedDefinition selected.name}))
+
+(defn parseInitializerResponse [initializerUrl text definitionName]
+  (let [configUrl (parseConfigUrl text initializerUrl)
+        definitions (parseInitializerUrls text initializerUrl)]
+    (if (hasText? configUrl)
+        {:kind "config-url" :configUrl configUrl}
+        (if (> (count definitions) 0)
+            (selectedDefinitionFrom definitions definitionName)
+            {:kind "error" :error "Could not find OpenAPI spec in swagger-initializer.js"}))))
+
+(defn discoveryEntry [kind url]
+  {:kind kind :url url})
+
+(defn swaggerConfigBaseUrls [sourceUrl]
+  (let [origin (url-origin sourceUrl)
+        basePath (swaggerUiBasePath (url-pathname sourceUrl))]
+    (if (hasText? basePath)
+        (conj [origin] (str origin basePath))
+        [origin])))
+
+(defn swaggerConfigEntriesForBase [base]
+  (reduce swagger-config-paths
+          []
+          (fn [entries path] (conj entries (discoveryEntry "config" (str base path))))))
+
+(defn swaggerConfigEntries [sourceUrl]
+  (reduce (swaggerConfigBaseUrls sourceUrl)
+          []
+          (fn [entries base]
+            (append-all entries (swaggerConfigEntriesForBase base)))))
+
+(defn initializerEntries [sourceUrl]
+  (let [origin (url-origin sourceUrl)
+        basePath (swaggerUiBasePath (url-pathname sourceUrl))
+        rootEntries [(discoveryEntry "initializer" (str origin "/swagger-ui/swagger-initializer.js"))
+                     (discoveryEntry "initializer" (str origin "/swagger-initializer.js"))]]
+    (if (hasText? basePath)
+        (append-all [(discoveryEntry "initializer" (str origin basePath "/swagger-ui/swagger-initializer.js"))]
+                    (append-all rootEntries [(discoveryEntry "initializer" (str origin basePath "/swagger-initializer.js"))]))
+        rootEntries)))
+
+(defn candidatePrefixes [sourceUrl]
+  (let [basePath (swaggerUiBasePath (url-pathname sourceUrl))]
+    (if (hasText? basePath) (conj [""] basePath) [""])))
+
+(defn candidateEntriesForPrefix [origin prefix]
+  (reduce spec-candidate-paths
+          []
+          (fn [entries path] (conj entries (discoveryEntry "candidate" (str origin prefix path))))))
+
+(defn candidateEntries [sourceUrl]
+  (let [origin (url-origin sourceUrl)]
+    (reduce (candidatePrefixes sourceUrl)
+            []
+            (fn [entries prefix]
+              (append-all entries (candidateEntriesForPrefix origin prefix))))))
+
+(defn discoveryQueueFor [sourceUrl]
+  (let [configEntries (swaggerConfigEntries sourceUrl)
+        initEntries (initializerEntries sourceUrl)
+        specEntries (candidateEntries sourceUrl)
+        swaggerPage? (isSwaggerUiPage? (url-pathname sourceUrl))]
+    (if swaggerPage?
+        (append-all (append-all configEntries initEntries) specEntries)
+        (append-all (append-all initEntries configEntries) specEntries))))
 
 (defn analyzeSourceResponse [baseUrl sourceInput text definitionName]
   (let [sourceUrl (absoluteUrl baseUrl sourceInput)
@@ -116,20 +259,21 @@
                  :definitions (defaultDefinitions sourceUrl)
                  :selectedDefinition "default"
                  :spec (parseOpenApiText text)}
-                (let [specUrl (parseSingleSpecUrl text sourceUrl)
-                      configUrl (parseConfigUrl text sourceUrl)]
-                  (if (not (= specUrl ""))
-                      {:kind "spec-url"
-                       :sourceUrl sourceUrl
-                       :specUrl specUrl
-                       :definitions (defaultDefinitions specUrl)
-                       :selectedDefinition "default"}
-                      (if (isSwaggerUiPage? pathname)
-                          {:kind "config-url" :sourceUrl sourceUrl :configUrl (configUrlForSwaggerUiPage sourceUrl)}
-                          (if (not (= configUrl ""))
-                              {:kind "config-url" :sourceUrl sourceUrl :configUrl configUrl}
-                              {:kind "error"
-                               :error "Could not find OpenAPI spec. Try pasting the direct spec URL (e.g. /v3/api-docs) if the API allows cross-origin access."})))))))))
+                (let [configUrl (parseConfigUrl text sourceUrl)
+                      definitions (parseInitializerUrls text sourceUrl)]
+                  (if (hasText? configUrl)
+                      {:kind "config-url" :sourceUrl sourceUrl :configUrl configUrl}
+                      (if (> (count definitions) 0)
+                          (let [selected (pickDefinition definitions definitionName)]
+                            {:kind "spec-url"
+                             :sourceUrl sourceUrl
+                             :specUrl selected.url
+                             :definitions definitions
+                             :selectedDefinition selected.name})
+                           {:kind "discover"
+                            :sourceUrl sourceUrl
+                            :queue (discoveryQueueFor sourceUrl)
+                            :error discovery-error-message}))))))))
 
 (defn normalizeDefinition [entry index baseUrl]
   {:name (if (and (string? entry.name) (not (= (trim entry.name) "")))
@@ -140,25 +284,24 @@
 (defn normalizeDefinitions [entries baseUrl]
   (map-indexed entries (fn [entry index] (normalizeDefinition entry index baseUrl))))
 
-(defn pickDefinition [definitions name]
-  (let [match (find definitions (fn [entry] (= entry.name name)))]
-    (if (some? match) match (first definitions))))
-
 (defn parseSwaggerConfigResponse [configUrl text definitionName]
-  (let [config (json-parse text)
-        urls config.urls
-        definitions (if (and (vector? urls) (> (count urls) 0))
-                        (normalizeDefinitions urls configUrl)
-                        (if (string? config.url)
-                            (defaultDefinitions (absoluteUrlFrom config.url configUrl))
-                            []))]
-    (if (= (count definitions) 0)
-        {:kind "error" :error "Could not find OpenAPI spec in swagger-config response"}
-        (let [selected (pickDefinition definitions definitionName)]
-          {:kind "spec-url"
-           :specUrl selected.url
-           :definitions definitions
-           :selectedDefinition selected.name}))))
+  (let [parsed (json-parse-result text)]
+    (if (err? parsed)
+        {:kind "error" :error "Could not parse swagger-config response"}
+        (let [config (unwrap-or parsed {})
+              urls config.urls
+              definitions (if (and (vector? urls) (> (count urls) 0))
+                              (normalizeDefinitions urls configUrl)
+                              (if (string? config.url)
+                                  (defaultDefinitions (absoluteUrlFrom config.url configUrl))
+                                  []))]
+          (if (= (count definitions) 0)
+              {:kind "error" :error "Could not find OpenAPI spec in swagger-config response"}
+              (let [selected (pickDefinition definitions definitionName)]
+                {:kind "spec-url"
+                 :specUrl selected.url
+                 :definitions definitions
+                 :selectedDefinition selected.name}))))))
 
 (defn definitionUrlByName [definitions name]
   (let [selected (pickDefinition definitions name)]
@@ -173,6 +316,19 @@
 (defn initialOpParam [boot]
   (url-search-param boot.currentUrl "op"))
 
+(defn routeUrlParam [href]
+  (url-search-param href "url"))
+
+(defn routeDefinitionParam [href]
+  (url-search-param href "definition"))
+
+(defn routeOpParam [href]
+  (url-search-param href "op"))
+
+(defn proxyMode? []
+  (= (env-mode) "proxy"))
+
+(ann loadThemeCommand (Fn [] (Cmd BrowserCommandMsg)))
 (defn loadThemeCommand []
   {:kind :browser/theme-load
    :key theme-storage-key
@@ -181,16 +337,19 @@
 (defn toggleTheme [current]
   (if (= current "dark") "light" "dark"))
 
+(ann applyThemeCommand (Fn [String] (Cmd msg)))
 (defn applyThemeCommand [theme]
   {:kind :browser/theme-apply
    :theme theme
    :key theme-storage-key})
 
+(ann loadStoredAuthEntries (Fn [String] (Cmd BrowserCommandMsg)))
 (defn loadStoredAuthEntries [sourceUrl]
   {:kind :auth-storage/load
    :sourceUrl sourceUrl
    :toMessage (fn [entries] {:kind :auth-storage-loaded :entries entries})})
 
+(ann persistAuthEntries (Fn [String entries] (Cmd msg)))
 (defn persistAuthEntries [sourceUrl entries]
   {:kind :auth-storage/persist
    :sourceUrl sourceUrl
@@ -199,11 +358,13 @@
 (defn resolveTokenExpiry [response token]
   (resolve-token-expiry (get response :expires_in) token))
 
+(ann setOpQueryParam (Fn [(Option String)] (Cmd msg)))
 (defn setOpQueryParam [value]
   {:kind :browser/history-replace-search-param
    :name "op"
    :value value})
 
+(ann setDefinitionQueryParam (Fn [(Option String)] (Cmd msg)))
 (defn setDefinitionQueryParam [value]
   {:kind :browser/history-replace-search-param
    :name "definition"
@@ -212,6 +373,7 @@
 (defn setUrlQueryParam [url name value]
   (url-set-search-param url name value))
 
+(ann writeRoute (Fn [String (Option String) (Option String)] (Cmd msg)))
 (defn writeRoute [url op definition]
   {:kind :browser/history-write-route
    :url url
@@ -235,10 +397,12 @@
 (defn clipboardText [event]
   (clipboard-text event))
 
+(ann copyText (Fn [String] (Cmd msg)))
 (defn copyText [text]
   {:kind :browser/clipboard-write
    :text text})
 
+(ann setCookie (Fn [String String] (Cmd msg)))
 (defn setCookie [name value]
   {:kind :browser/set-cookie
    :name name

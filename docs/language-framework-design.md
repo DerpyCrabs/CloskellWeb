@@ -223,11 +223,13 @@ includes:
   `map-assoc`, `map-dissoc`, `map-entries`, `map-keys`, `map-values`.
 - Strings: `trim`, `lower-case`, `upper-case`, `split`, `join`,
   `starts-with?`, `ends-with?`, `includes?`, `pad-start`, `string-slice`,
-  `regex-test?`, `regex-capture`.
+  `regex-test?`, `regex-capture`, `regex-capture-all`.
 - Numbers/dates: arithmetic, `min`, `max`, `min-of`, `max-of`, `sum`, `abs`,
   `round`, `floor`, `ceil`, `mod`, `to-number`, `to-fixed`, date helpers.
 - JSON: `json-parse-result`, `json-stringify`, schema-oriented decoders.
 - URL helpers as pure functions when all inputs are explicit.
+- Explicit build/runtime environment constants such as `env-dev?` and
+  `env-mode`, used for visible capability choices like development proxy mode.
 
 Host reads and writes must not be pure standard library functions. For example,
 clipboard writes, current URL reads, history writes, storage reads, file reads,
@@ -239,22 +241,49 @@ subscriptions.
 ### Command Values
 
 `Cmd Msg` is the effect type for one-shot host operations that may dispatch zero
-or one completion messages, plus `batch`.
+or one completion messages. `Cmd.none` and `Cmd.batch` are compact helpers for
+explicit command data; they do not execute effects.
 
 Examples:
 
 ```clojure
-{:kind :none}
+Cmd.none
 
-{:kind :batch
- :commands [(load-user-command id)
-            (focus-search-command)]}
+(Cmd.batch [(load-user-command id)
+            (focus-search-command)])
 
 {:kind :http/request
  :request {:url "/api/user" :method "GET"}
  :toMessage (fn [response] {:kind :user-loaded :value response})
  :onError :user-load-failed}
 ```
+
+Framework helpers may construct common command records, but they are still
+plain data constructors. They must not perform host work and must not create
+implicit data flow. Completion messages stay explicit through `Msg` helpers:
+
+```clojure
+(Msg.of :saved)
+(Msg.with :selected :id id)
+(Msg.with2 :heart-rate-at :bpm bpm :timestamp timestamp)
+(Msg.mapper :loaded :payload)
+
+(Cmd.storage/get "settings" :json (Msg.mapper :loaded :payload) :load-failed)
+(Cmd.time/now (Msg.mapper :started-at :timestamp))
+(Cmd.dom-ref/measure "track" to-track-message :measure-failed)
+(Cmd.bluetooth/connect-heart-rate "hrm"
+                                  {:filters [{:services ["heart_rate"]}]}
+                                  (Msg.mapper :connected :info)
+                                  :heart-rate
+                                  :disconnected
+                                  :connect-failed)
+```
+
+HTTP command response modes include `:json`, `:text`, and `:auto`. `:auto`
+keeps response handling explicit while avoiding repeated app code: the runtime
+classifies JSON, text, CSV, and file/blob responses, preserves download blobs,
+derives filenames, and exposes copyable text and image preview URLs in the
+success payload.
 
 Rules:
 
@@ -264,6 +293,16 @@ Rules:
 - Completion fields must be type checked against `Msg`.
 - Commands are plain data and may be tested without a browser.
 - Command execution is owned by the runtime, not by Closkell code.
+- Command helper functions may be shared across modules when their public
+  annotation says they return `Cmd`, for example
+  `(ann copy-command (Fn [String] (Cmd msg)))`. Lowercase names inside an
+  annotation are explicit annotation-local type variables; they let no-message
+  helpers stay reusable without widening to `Js` or hiding effects.
+- Network proxying is explicit command data, for example `:proxy true` on
+  `:http/request`, and is usually guarded by `env-mode`.
+- One-shot DOM actions such as scrolling to a known element are commands, for
+  example `{:kind :dom/scroll-into-view :testId "operation-get:/pets"}`. They
+  are not hidden lifecycle hooks.
 
 ### Tasks
 
@@ -300,7 +339,12 @@ watches, resize watches, window events, animation loops, and streams.
     [(if (= state.exerciseState "running")
          (Sub.timer/every clock-timer-id 250 {:kind :clock-tick})
          Sub.none)
-     (Sub.media-query "mobile" "(max-width: 700px)" :media-changed)]))
+     (Sub.media-query "mobile" "(max-width: 700px)" :media-changed)
+     (Sub.window/event-with "drag"
+                            "pointermove"
+                            :drag-moved
+                            {:preventDefault true
+                             :options {:passive false}})]))
 ```
 
 Runtime behavior:
@@ -764,6 +808,7 @@ Inspection JSON remains a first-class product. It includes:
 - state path to slots,
 - JS interop boundaries,
 - effect capability usage,
+- unused top-level definitions and imports reachable from app roots,
 - compiler-derived changed-path summaries when available.
 
 ## AI Editing Feedback
@@ -795,7 +840,7 @@ Compiler feedback requirements:
 - `inspect` exposes the semantic facts an AI needs for edits: exports, imports,
   type declarations, annotations, inferred public signatures, component graph,
   slot reads, command schema, subscription schema, JS interop boundaries, test
-  cases, and changed-path summaries.
+  cases, unused-code reachability, and changed-path summaries.
 
 Compilation is incremental and cache-backed. The compiler maintains a persistent
 cache under the project or workspace, for example `.closkell/cache`, keyed by:

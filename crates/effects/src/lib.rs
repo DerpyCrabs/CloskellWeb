@@ -588,6 +588,9 @@ impl EffectValidator<'_> {
             }
             ExprKind::List(items) => {
                 if let Some(name) = function_call_name(items) {
+                    if is_builtin_command_helper(name) {
+                        return;
+                    }
                     if name == "Task.perform" {
                         self.validate_task_perform_expr(expr, items);
                         return;
@@ -605,6 +608,7 @@ impl EffectValidator<'_> {
                     "command position must be command data such as {:kind :none}",
                 ));
             }
+            ExprKind::Symbol(name) if name == "Cmd.none" => {}
             ExprKind::Symbol(name) => self.validate_command_symbol(name, expr.span),
             _ => self.diagnostics.push(Diagnostic::error(
                 expr.span,
@@ -651,6 +655,7 @@ impl EffectValidator<'_> {
                             | "Sub.timer/every"
                             | "Sub.media-query"
                             | "Sub.window/event"
+                            | "Sub.window/event-with"
                             | "Sub.dom-ref/resize"
                             | "scope-subscriptions"
                     ) {
@@ -808,6 +813,34 @@ impl EffectValidator<'_> {
             ));
         }
     }
+}
+
+fn is_builtin_command_helper(name: &str) -> bool {
+    matches!(
+        name,
+        "Cmd.batch"
+            | "Cmd.storage/get"
+            | "Cmd.storage/set"
+            | "Cmd.storage/set-silent"
+            | "Cmd.time/now"
+            | "Cmd.random/number"
+            | "Cmd.timer/every"
+            | "Cmd.timer/after"
+            | "Cmd.timer/cancel"
+            | "Cmd.animation/frame"
+            | "Cmd.animation/cancel"
+            | "Cmd.dom-ref/click"
+            | "Cmd.dom-ref/focus"
+            | "Cmd.file/read-selected"
+            | "Cmd.file/download"
+            | "Cmd.canvas/draw"
+            | "Cmd.dom-ref/measure"
+            | "Cmd.dom-ref/resize-watch"
+            | "Cmd.bluetooth/connect-heart-rate"
+            | "Cmd.bluetooth/disconnect"
+            | "Cmd.simulation/heart-rate"
+            | "Cmd.simulation/stop"
+    )
 }
 
 fn validate_command_map(validator: &mut EffectValidator<'_>, span: Span, entries: &[(Expr, Expr)]) {
@@ -1125,6 +1158,15 @@ fn validate_command_map(validator: &mut EffectValidator<'_>, span: Span, entries
         "dom-ref/measure" => {
             require_command_fields(span, entries, &["ref"], &kind, &mut validator.diagnostics);
             require_success_command_field(span, entries, &kind, &mut validator.diagnostics);
+        }
+        "dom/scroll-into-view" => {
+            require_one_command_field(
+                span,
+                entries,
+                &["selector", "testId", "id"],
+                &kind,
+                &mut validator.diagnostics,
+            );
         }
         "dom-ref/resize-watch" => {
             require_command_fields(
@@ -1737,6 +1779,7 @@ pub fn is_known_command_kind(kind: &str) -> bool {
             | "dom-ref/focus"
             | "dom-ref/click"
             | "dom-ref/measure"
+            | "dom/scroll-into-view"
             | "dom-ref/resize-watch"
             | "dom-ref/resize-unwatch"
             | "window/event-watch"
@@ -1918,6 +1961,26 @@ mod tests {
     fn validates_update_command_records() {
         let source = syntax::parse_source(
             "(defn update [state msg]\n  (if (= msg :start)\n      [state {:kind :timer/after :ms 1000 :msg :tick}]\n      [state {:kind :none}]))",
+        );
+        let report = validate_purity(&source);
+
+        assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    }
+
+    #[test]
+    fn validates_command_helpers_as_command_data() {
+        let source = syntax::parse_source(
+            "(defn update [state msg]\n  [state (Cmd.batch [Cmd.none\n                         (Cmd.dom-ref/measure \"track\" (fn [rect] {:kind :measured :left rect.left}) :measure-failed)\n                         (Cmd.bluetooth/connect-heart-rate \"hr\" {:filters [{:services [\"heart_rate\"]}]} (fn [info] {:kind :connected :info info}) :heart-rate :disconnected :failed)\n                         (Cmd.simulation/heart-rate \"sim\" {:ms 1000 :min 90 :max 160 :jitter 3 :start 120 :deviceName \"Sim\"} (fn [info] {:kind :connected :info info}) :heart-rate :failed)\n                         {:kind :timer/after :id \"tick\" :ms 1000 :msg :tick}])])",
+        );
+        let report = validate_purity(&source);
+
+        assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    }
+
+    #[test]
+    fn validates_subscription_helpers_as_subscription_data() {
+        let source = syntax::parse_source(
+            "(defn subscriptions [state]\n  (Sub.batch [(Sub.window/event-with \"drag\" \"pointermove\" :move {:preventDefault true :options {:passive false}})\n              (Sub.window/event \"dev\" \"keydown\" :key {:passive true})]))",
         );
         let report = validate_purity(&source);
 
@@ -2668,6 +2731,16 @@ mod tests {
     fn validates_dom_ref_measure_schema() {
         let source = syntax::parse_source(
             "(defn update [state msg]\n  [state {:kind :dom-ref/measure :ref \"heart-chart\" :onSuccess :chart-measured :onError :measure-failed}])",
+        );
+        let report = validate_purity(&source);
+
+        assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    }
+
+    #[test]
+    fn validates_dom_scroll_into_view_schema() {
+        let source = syntax::parse_source(
+            "(defn update [state msg]\n  [state {:kind :dom/scroll-into-view :testId \"operation-get:/pets\" :block \"start\" :behavior \"auto\" :msg :scrolled}])",
         );
         let report = validate_purity(&source);
 

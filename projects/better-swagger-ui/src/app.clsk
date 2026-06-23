@@ -1,10 +1,11 @@
 (import "./lib/operations.clsk" [collectOperations methodColor methodExpandedBg methodHeaderBg tagDescriptions])
 (import "./lib/schema.clsk" [formatRequestBodySchemaForCopy formatResponseSchemaForCopy getRequestBodySchema getResponseSchemas hasCopyableSchema])
 (import "./lib/auth.clsk" [applyAuthHeaders applyAuthUrl authEntriesCount hasAuthSchemes? parseSecuritySchemes])
-(import "./lib/browser.clsk" [analyzeSourceResponse buildUrlEncodedFormBody clipboardText definitionUrlByName initialDefinitionParam initialOpParam initialUrlInput initOAuthUrlForSwaggerUiPage looksLikeSpecContent parseInitOAuth parseSpecDocument parseSwaggerConfigResponse resolvedSpecUrl resolveTokenExpiry setDeepObjectQueryParam setUrlQueryParam validHttpUrl? validUuid])
-(import "./lib/param-schema.clsk" [resolveParameterMeta validateAllParams validateParamValue])
+(import "./lib/browser.clsk" [analyzeSourceResponse append-all applyThemeCommand buildUrlEncodedFormBody clipboardText copyText definitionUrlByName discovery-error-message discoveryQueueFor initialDefinitionParam initialOpParam initialUrlInput initOAuthUrlForSwaggerUiPage loadStoredAuthEntries loadThemeCommand looksLikeSpecContent parseInitOAuth parseInitializerResponse parseSpecDocument parseSwaggerConfigResponse persistAuthEntries proxyMode? resolvedSpecUrl resolveTokenExpiry routeDefinitionParam routeOpParam routeUrlParam setCookie setOpQueryParam toggleTheme validHttpUrl? validUuid writeRoute])
+(import "./lib/param-schema.clsk" [resolveParameterMeta validateAllParams])
 (import "./lib/build-request-url.clsk" [buildRequestHeaders buildUrl])
 (import "./lib/request-body.clsk" [defaultRequestBodyText hasTryItOutRequestBody? primaryTryItOutMedia requestBodyMode resolveBodyFormFields])
+(import "./load-flow.clsk" [completed-spec continue-discovery follow-config-url follow-spec-url load-failed no-cmd])
 (import "marked" [(parse as markedParse)])
 (import "dompurify" [(default domPurify)])
 
@@ -36,6 +37,8 @@
    :pendingSelectedDefinition ""
    :pendingSourceUrl ""
    :pendingSpecUrl ""
+   :discoveryQueue []
+   :discoveryActiveEntry nil
    :oauthInit {}
    :routeOp nil
    :theme "dark"
@@ -50,84 +53,47 @@
    :authLoadingScheme nil
    :authError nil})
 
-(defn commandNone []
-  {:kind :none})
-
-(def themeStorageKey
-  "better-swagger-theme")
-
-(defn toggleTheme [current]
-  (if (= current "dark") "light" "dark"))
-
-(defn applyThemeCommand [theme]
-  {:kind :browser/theme-apply
-   :theme theme
-   :key themeStorageKey})
-
-(defn loadThemeCommand []
-  {:kind :browser/theme-load
-   :key themeStorageKey
-   :toMessage (fn [theme] {:kind :theme-loaded :theme theme})})
-
-(defn loadStoredAuthEntries [sourceUrl]
-  {:kind :auth-storage/load
-   :sourceUrl sourceUrl
-   :toMessage (fn [entries] {:kind :auth-storage-loaded :entries entries})})
-
-(defn persistAuthEntries [sourceUrl entries]
-  {:kind :auth-storage/persist
-   :sourceUrl sourceUrl
-   :entries entries})
-
-(defn setOpQueryParam [value]
-  {:kind :browser/history-replace-search-param
-   :name "op"
-   :value value})
-
-(defn writeRoute [url op definition]
-  {:kind :browser/history-write-route
-   :url url
-   :op op
-   :definition definition})
-
-(defn copyText [text]
-  {:kind :browser/clipboard-write
-   :text text})
-
-(defn setCookie [name value]
-  {:kind :browser/set-cookie
-   :name name
-   :value value})
-
 (defn loadSourceCommand [source definitionName]
   {:kind :http/request
    :url source
    :response :text
+   :proxy (proxyMode?)
    :toMessage (fn [response] {:kind :source-loaded :source source :value response})
-   :onError :spec-failed})
+   :onError :source-load-failed})
 
 (defn loadConfigCommand [configUrl]
   {:kind :http/request
    :url configUrl
    :response :text
+   :proxy (proxyMode?)
    :toMessage (fn [response] {:kind :config-loaded :url configUrl :value response})
-   :onError :spec-failed})
+   :onError :config-failed})
 
 (defn loadSpecDocumentCommand [specUrl]
   {:kind :http/request
    :url specUrl
    :response :text
+   :proxy (proxyMode?)
    :toMessage (fn [response] {:kind :spec-document-loaded :url specUrl :value response})
    :onError :spec-failed})
+
+(defn loadDiscoveryCommand [entry]
+  {:kind :http/request
+   :url entry.url
+   :response :text
+   :proxy (proxyMode?)
+   :toMessage (fn [response] {:kind :discovery-response :entry entry :value response})
+   :onError :discovery-failed})
 
 (defn loadOauthInitCommand [currentUrl sourceUrl]
   (if (validHttpUrl? currentUrl sourceUrl)
       {:kind :http/request
        :url (initOAuthUrlForSwaggerUiPage sourceUrl)
        :response :text
+       :proxy (proxyMode?)
        :toMessage (fn [response] {:kind :oauth-init-loaded :value response})
        :onError :oauth-init-failed}
-      (commandNone)))
+      Cmd.none))
 
 (defn readSpecFileCommand []
   {:kind :file/read-selected
@@ -156,11 +122,16 @@
                           :pendingDefinition definition
                           :routeOp (if (= op "") nil op)
                           :theme "dark"})
-     {:kind :batch
-      :commands [(loadThemeCommand)
+     (Cmd.batch [(loadThemeCommand)
                  (if (= source "")
-                     (commandNone)
-                     (loadSourceCommand source definition))]}]))
+                     Cmd.none
+                     (loadSourceCommand source definition))])]))
+
+(defn subscriptions [state]
+  {:kind :sub/window/event
+   :id "route-popstate"
+   :type "popstate"
+   :onEvent (fn [payload] {:kind :route-changed :href payload.href})})
 
 (defn validSpec? [spec]
   (and (some? spec)
@@ -190,6 +161,18 @@
 
 (defn hasText? [value]
   (and (string? value) (> (count (trim value)) 0)))
+
+(defn optionalText [value]
+  (if (hasText? value) value nil))
+
+(defn scrollOperationCommand [op]
+  (if (hasText? op)
+      {:kind :dom/scroll-into-view
+       :testId (str "operation-" op)
+       :block "start"
+       :behavior "auto"
+       :msg {:kind :noop}}
+      Cmd.none))
 
 (defn markdownHtml [content]
   (if (hasText? content)
@@ -232,9 +215,6 @@
 
 (defn primaryBodyMediaFor [state item]
   (primaryTryItOutMedia (requestBodyInfoFor state item)))
-
-(defn requestBodyModeFor [state item]
-  (requestBodyMode (primaryBodyMediaFor state item)))
 
 (defn requestBodyFormFields [state item mode media]
   (if (= mode "multipart")
@@ -343,7 +323,8 @@
 (defn executeCommand [state item]
   {:kind :http/request
    :request (executeRequestRecord state item)
-   :response :text
+   :response :auto
+   :proxy (proxyMode?)
    :toMessage (fn [response] {:kind :request-finished :id item.id :value response})
    :onError :request-failed})
 
@@ -466,6 +447,7 @@
              (oauthPasswordBody state scheme)
              (oauthClientCredentialsBody state scheme))
    :response :json
+   :proxy (proxyMode?)
    :toMessage (fn [response] {:kind :oauth-token-loaded :schemeId scheme.id :value response})
    :onError :auth-failed})
 
@@ -539,6 +521,12 @@
           (set)
           (fn [tags tag] (conj tags tag))))
 
+(defn routeOperationState [state routeOp]
+  (merge state {:expandedOp routeOp
+                :tryActiveOp routeOp
+                :expandedTags (if (and (some? routeOp) (some? state.spec)) (allTagSet state.spec) state.expandedTags)
+                :routeOp nil}))
+
 (defn completedSpecState [state spec specUrl sourceUrl definitions selectedDefinition]
   (let [routeOp state.routeOp
         expandedTags (if (some? routeOp) (allTagSet spec) (set))
@@ -571,51 +559,19 @@
                   :pendingSelectedDefinition ""
                   :pendingSourceUrl ""
                   :pendingSpecUrl ""
+                  :discoveryQueue []
+                  :discoveryActiveEntry nil
                   :routeOp nil})))
 
 (defn completedSpecCommand [currentUrl sourceUrl routeOp definitions selectedDefinition]
   (let [routeDefinition (if (and (> (count definitions) 1) (hasText? selectedDefinition)) selectedDefinition nil)]
-    {:kind :batch
-     :commands [(if (validHttpUrl? currentUrl sourceUrl) (writeRoute sourceUrl routeOp routeDefinition) (commandNone))
+    (Cmd.batch [(if (validHttpUrl? currentUrl sourceUrl) (writeRoute sourceUrl routeOp routeDefinition) Cmd.none)
                 (loadStoredAuthEntries sourceUrl)
-                (loadOauthInitCommand currentUrl sourceUrl)]}))
+                (loadOauthInitCommand currentUrl sourceUrl)
+                (scrollOperationCommand routeOp)])))
 
-(defn completedSpecTuple [state spec specUrl sourceUrl definitions selectedDefinition]
-  [(completedSpecState state spec specUrl sourceUrl definitions selectedDefinition)
-   (completedSpecCommand state.currentUrl sourceUrl state.routeOp definitions selectedDefinition)])
-
-(defn failedLoadTuple [state error]
-  [(merge state {:loading? false :error error}) (commandNone)])
-
-(defn followLoadDecision [state decision]
-  (let [kind (get decision :kind)]
-    (if (= kind "spec")
-        (completedSpecTuple state
-                            decision.spec
-                            decision.specUrl
-                            decision.sourceUrl
-                            (definitionsOrDefault decision.definitions decision.specUrl)
-                            (chooseText decision.selectedDefinition "default"))
-        (if (= kind "spec-url")
-            [(merge state {:pendingDefinitions (definitionsOrDefault decision.definitions decision.specUrl)
-                           :pendingSelectedDefinition (chooseText decision.selectedDefinition "default")
-                           :pendingSourceUrl (chooseText decision.sourceUrl state.pendingSourceUrl)
-                           :pendingSpecUrl decision.specUrl})
-             (loadSpecDocumentCommand decision.specUrl)]
-            (if (= kind "config-url")
-                [(merge state {:pendingSourceUrl (chooseText decision.sourceUrl state.pendingSourceUrl)})
-                 (loadConfigCommand decision.configUrl)]
-                (failedLoadTuple state decision.error))))))
-
-(defn finishSpecDocument [state decision]
-  (if (get decision :ok)
-      (completedSpecTuple state
-                          decision.spec
-                          decision.specUrl
-                          (chooseText state.pendingSourceUrl decision.specUrl)
-                          (definitionsOrDefault state.pendingDefinitions decision.specUrl)
-                          (chooseText state.pendingSelectedDefinition "default"))
-      (failedLoadTuple state decision.error)))
+(defn prependDiscoveryEntry [state entry]
+  (merge state {:discoveryQueue (append-all [entry] state.discoveryQueue)}))
 
 (defn pastedSpecLabel [value]
   (if (starts-with? (trim value) "{")
@@ -625,7 +581,7 @@
 (defn update [state msg]
   (match msg
     {:kind :url-input :value value}
-      [(merge state {:input value :error nil}) (commandNone)]
+      (no-cmd (merge state {:input value :error nil}))
     {:kind :url-paste :value value}
       (if (validHttpUrl? state.currentUrl value)
           [(merge state {:input (trim value)
@@ -635,73 +591,106 @@
                          :pendingDefinitions []
                          :pendingSelectedDefinition ""
                          :pendingSourceUrl (trim value)
-                         :pendingSpecUrl ""})
+                         :pendingSpecUrl ""
+                         :discoveryQueue []})
            (loadSourceCommand (trim value) "")]
           (if (looksLikeSpecContent value)
           (let [label (pastedSpecLabel value)
                 decision (parseSpecDocument label value)]
             (if (get decision :ok)
-                [(completedSpecState (merge state {:input label
+                (no-cmd (completedSpecState (merge state {:input label
                                                    :pendingDefinitions (defaultDefinitionList label)
                                                    :pendingSelectedDefinition "default"
-                                                   :pendingSourceUrl label})
+                                                   :pendingSourceUrl label
+                                                   :discoveryQueue []})
                                      decision.spec
                                      decision.specUrl
                                      label
                                      (defaultDefinitionList label)
-                                     "default")
-                 (commandNone)]
-                [(merge state {:loading? false :error decision.error}) (commandNone)]))
-          [(merge state {:input value :error nil}) (commandNone)]))
+                                     "default"))
+                (no-cmd (merge state {:loading? false :error decision.error}))))
+          (no-cmd (merge state {:input value :error nil}))))
     {:kind :load}
       (if (not (validHttpUrl? state.currentUrl (trim state.input)))
-          [state (commandNone)]
+          (no-cmd state)
           [(merge state {:loading? true
                          :error nil
                          :pendingDefinition ""
                          :pendingDefinitions []
                          :pendingSelectedDefinition ""
                          :pendingSourceUrl (trim state.input)
-                         :pendingSpecUrl ""})
+                         :pendingSpecUrl ""
+                         :discoveryQueue []})
            (loadSourceCommand (trim state.input) "")])
     {:kind :source-loaded :source source :value response}
       (if (get response :ok)
           (let [decision (analyzeSourceResponse state.currentUrl source (get response :body) state.pendingDefinition)
-                kind (get decision :kind)]
-            (if (= kind "spec")
-                [(completedSpecState state
-                                     decision.spec
-                                     decision.specUrl
-                                     decision.sourceUrl
-                                     (definitionsOrDefault decision.definitions decision.specUrl)
-                                     (chooseText decision.selectedDefinition "default"))
-                 (completedSpecCommand state.currentUrl
-                                       decision.sourceUrl
-                                       state.routeOp
-                                       (definitionsOrDefault decision.definitions decision.specUrl)
-                                       (chooseText decision.selectedDefinition "default"))]
-                (if (= kind "spec-url")
-                    [(merge state {:pendingDefinitions (definitionsOrDefault decision.definitions decision.specUrl)
-                                   :pendingSelectedDefinition (chooseText decision.selectedDefinition "default")
-                                   :pendingSourceUrl (chooseText decision.sourceUrl state.pendingSourceUrl)
-                                   :pendingSpecUrl decision.specUrl})
-                     (loadSpecDocumentCommand decision.specUrl)]
-                    (if (= kind "config-url")
-                        [(merge state {:pendingSourceUrl (chooseText decision.sourceUrl state.pendingSourceUrl)})
-                         (loadConfigCommand decision.configUrl)]
-                        [(merge state {:loading? false :error decision.error}) (commandNone)]))))
-          [(merge state {:loading? false :error "Failed to load spec"}) (commandNone)])
+                nextState (merge state {:pendingSourceUrl (chooseText decision.sourceUrl state.pendingSourceUrl)})]
+            (let [kind (get decision :kind)]
+              (if (= kind "spec")
+                  (completed-spec nextState
+                                  decision.spec
+                                  decision.specUrl
+                                  decision.sourceUrl
+                                  (definitionsOrDefault decision.definitions decision.specUrl)
+                                  (chooseText decision.selectedDefinition "default"))
+                  (if (= kind "spec-url")
+                      (follow-spec-url nextState decision)
+                      (if (= kind "config-url")
+                          (follow-config-url nextState decision)
+                          (if (= kind "discover")
+                              (continue-discovery (merge nextState {:discoveryQueue decision.queue}))
+                              (load-failed nextState decision.error)))))))
+          (continue-discovery (merge state {:pendingSourceUrl source
+                                            :discoveryQueue (discoveryQueueFor source)})))
+    {:kind :source-load-failed :error error}
+      (let [source (chooseText state.pendingSourceUrl state.input)]
+        (continue-discovery (merge state {:pendingSourceUrl source
+                                          :discoveryQueue (discoveryQueueFor source)})))
     {:kind :config-loaded :url url :value response}
       (if (get response :ok)
           (let [decision (parseSwaggerConfigResponse url (get response :body) state.pendingDefinition)
                 kind (get decision :kind)]
             (if (= kind "spec-url")
-                [(merge state {:pendingDefinitions (definitionsOrDefault decision.definitions decision.specUrl)
-                               :pendingSelectedDefinition (chooseText decision.selectedDefinition "default")
-                               :pendingSpecUrl decision.specUrl})
-                 (loadSpecDocumentCommand decision.specUrl)]
-                [(merge state {:loading? false :error decision.error}) (commandNone)]))
-          [(merge state {:loading? false :error "Failed to load spec"}) (commandNone)])
+                (follow-spec-url state decision)
+                (continue-discovery state)))
+          (continue-discovery state))
+    {:kind :config-failed :error error}
+      (continue-discovery state)
+    {:kind :discovery-response :entry entry :value response}
+      (if (get response :ok)
+          (let [entryKind (get entry :kind)
+                body (get response :body)]
+            (if (= entryKind "config")
+                (let [decision (parseSwaggerConfigResponse entry.url body state.pendingDefinition)
+                      kind (get decision :kind)]
+                  (if (= kind "spec-url")
+                      (follow-spec-url state decision)
+                      (if (= kind "config-url")
+                          (continue-discovery (prependDiscoveryEntry state {:kind "config" :url decision.configUrl}))
+                          (continue-discovery state))))
+                (if (= entryKind "initializer")
+                    (let [decision (parseInitializerResponse entry.url body state.pendingDefinition)
+                          kind (get decision :kind)]
+                      (if (= kind "spec-url")
+                          (follow-spec-url state decision)
+                          (if (= kind "config-url")
+                              (continue-discovery (prependDiscoveryEntry state {:kind "config" :url decision.configUrl}))
+                              (continue-discovery state))))
+                    (if (and (= entryKind "candidate") (looksLikeSpecContent body))
+                        (let [decision (parseSpecDocument entry.url body)]
+                          (if (get decision :ok)
+                              (completed-spec state
+                                              decision.spec
+                                              decision.specUrl
+                                              (chooseText state.pendingSourceUrl entry.url)
+                                              (defaultDefinitionList entry.url)
+                                              "default")
+                              (continue-discovery state)))
+                        (continue-discovery state)))))
+          (continue-discovery state))
+    {:kind :discovery-failed :error error}
+      (continue-discovery state)
     {:kind :spec-document-loaded :url url :value response}
       (if (get response :ok)
           (let [decision (parseSpecDocument url (get response :body))]
@@ -717,24 +706,24 @@
                                        state.routeOp
                                        (definitionsOrDefault state.pendingDefinitions decision.specUrl)
                                        (chooseText state.pendingSelectedDefinition "default"))]
-                [(merge state {:loading? false :error decision.error}) (commandNone)]))
-          [(merge state {:loading? false :error "Failed to load spec"}) (commandNone)])
+                (load-failed state decision.error)))
+          (load-failed state "Failed to load spec"))
     {:kind :pasted-spec :label label :value value}
       (let [decision (parseSpecDocument label value)]
         (if (get decision :ok)
-            [(completedSpecState (merge state {:input label
+            (no-cmd (completedSpecState (merge state {:input label
                                                :pendingDefinitions (defaultDefinitionList label)
                                                :pendingSelectedDefinition "default"
-                                               :pendingSourceUrl label})
+                                               :pendingSourceUrl label
+                                               :discoveryQueue []})
                                  decision.spec
                                  decision.specUrl
                                  label
                                  (defaultDefinitionList label)
-                                 "default")
-             (commandNone)]
-            [(merge state {:loading? false :error decision.error}) (commandNone)]))
+                                 "default"))
+            (no-cmd (merge state {:loading? false :error decision.error}))))
     {:kind :spec-file-selected}
-      [(merge state {:loading? true :error nil}) (readSpecFileCommand)]
+      [(merge state {:loading? true :error nil :discoveryQueue []}) (readSpecFileCommand)]
     {:kind :open-spec-file}
       [state (openSpecFileCommand)]
     {:kind :download-schema}
@@ -747,22 +736,55 @@
                        :pendingDefinitions state.definitions
                        :pendingSelectedDefinition name
                        :pendingSourceUrl (chooseText state.sourceUrl state.input)
-                       :pendingSpecUrl specUrl})
-         {:kind :batch
-          :commands [(writeRoute state.sourceUrl nil routeDefinition)
-                     (loadSpecDocumentCommand specUrl)]}])
+                       :pendingSpecUrl specUrl
+                       :discoveryQueue []})
+         (Cmd.batch [(writeRoute state.sourceUrl nil routeDefinition)
+                     (loadSpecDocumentCommand specUrl)])])
+    {:kind :route-changed :href href}
+      (let [url (routeUrlParam href)
+            definition (routeDefinitionParam href)
+            routeOp (optionalText (routeOpParam href))]
+        (if (not (hasText? url))
+            (no-cmd state)
+            (if (not (= url state.sourceUrl))
+            [(merge state {:input url
+                           :loading? true
+                           :error nil
+                           :pendingDefinition definition
+                           :pendingDefinitions []
+                           :pendingSelectedDefinition ""
+                           :pendingSourceUrl url
+                           :pendingSpecUrl ""
+                           :discoveryQueue []
+                           :routeOp routeOp})
+             (loadSourceCommand url definition)]
+            (if (> (count state.definitions) 1)
+                (let [targetName (chooseText definition (get (first state.definitions) :name))
+                      specUrl (definitionUrlByName state.definitions targetName)]
+                  (if (not (= targetName state.selectedDefinition))
+                      [(merge state {:loading? true
+                                     :error nil
+                                     :pendingDefinitions state.definitions
+                                     :pendingSelectedDefinition targetName
+                                     :pendingSourceUrl (chooseText state.sourceUrl state.input)
+                                     :pendingSpecUrl specUrl
+                                     :discoveryQueue []
+                                     :routeOp routeOp})
+                       (loadSpecDocumentCommand specUrl)]
+                      [(routeOperationState state routeOp) (scrollOperationCommand routeOp)]))
+                [(routeOperationState state routeOp) (scrollOperationCommand routeOp)]))))
     {:kind :toggle-theme}
       (let [theme (toggleTheme state.theme)]
         [(merge state {:theme theme}) (applyThemeCommand theme)])
     {:kind :theme-loaded :theme theme}
-      [(merge state {:theme theme}) (commandNone)]
+      (no-cmd (merge state {:theme theme}))
     {:kind :auth-storage-loaded :entries entries}
-      [(merge state {:authEntries entries
-                     :authorized? (> (authEntriesCount entries) 0)}) (commandNone)]
+      (no-cmd (merge state {:authEntries entries
+                     :authorized? (> (authEntriesCount entries) 0)}))
     {:kind :spec-loaded :value response}
       (let [body (get response :body)]
         (if (and (get response :ok) (validSpec? body))
-            [(merge state {:loading? false
+            (no-cmd (merge state {:loading? false
                            :error nil
                            :spec body
                            :expandedOp nil
@@ -774,41 +796,40 @@
                            :bodyValues {}
                            :requestBodyFiles {}
                            :multipartFiles {}
-                           :formError nil}) (commandNone)]
-            [(merge state {:loading? false :error "Response is not an OpenAPI document"}) (commandNone)]))
+                           :formError nil}))
+            (no-cmd (merge state {:loading? false :error "Response is not an OpenAPI document"}))))
     {:kind :spec-failed :error error}
-      [(merge state {:loading? false :error (str "Failed to load spec: " error)}) (commandNone)]
+      (load-failed state (str "Failed to load spec: " error))
     {:kind :oauth-init-loaded :value response}
       (if (get response :ok)
-          [(merge state {:oauthInit (parseInitOAuth (get response :body))}) (commandNone)]
-          [state (commandNone)])
+          (no-cmd (merge state {:oauthInit (parseInitOAuth (get response :body))}))
+          (no-cmd state))
     {:kind :oauth-init-failed :error error}
-      [state (commandNone)]
+      (no-cmd state)
     {:kind :toggle-tag :tag tag}
-      [(merge state {:expandedTags (if (contains? state.expandedTags tag)
+      (no-cmd (merge state {:expandedTags (if (contains? state.expandedTags tag)
                                       (disj state.expandedTags tag)
-                                      (conj state.expandedTags tag))}) (commandNone)]
+                                      (conj state.expandedTags tag))}))
     {:kind :toggle-operation :id id}
       (let [next (if (= state.expandedOp id) nil id)]
         [(merge state {:expandedOp next}) (setOpQueryParam next)])
     {:kind :open-auth :id id}
-      [(merge state {:authDialog? true :pendingAuthOp id}) (commandNone)]
+      (no-cmd (merge state {:authDialog? true :pendingAuthOp id}))
     {:kind :close-auth}
-      [(merge state {:authDialog? false :pendingAuthOp nil}) (commandNone)]
+      (no-cmd (merge state {:authDialog? false :pendingAuthOp nil}))
     {:kind :auth-input :scheme scheme :field field :value value}
-      [(merge state {:authFormValues (object-assoc state.authFormValues (authFieldKey scheme field) value)
-                     :authError nil}) (commandNone)]
+      (no-cmd (merge state {:authFormValues (object-assoc state.authFormValues (authFieldKey scheme field) value)
+                     :authError nil}))
     {:kind :authorize-scheme :scheme scheme}
       (if (or (= scheme.kind "oauth2-password") (= scheme.kind "oauth2-client-credentials"))
           [(merge state {:authLoadingScheme scheme.id :authError nil}) (oauthTokenCommand state scheme)]
           (let [entry (simpleAuthEntry state scheme)
                 entries (object-assoc state.authEntries scheme.id entry)]
             [(afterAuthorizedState state entries)
-             {:kind :batch
-              :commands [(persistAuthEntries state.sourceUrl entries)
+             (Cmd.batch [(persistAuthEntries state.sourceUrl entries)
                          (if (and (= entry.type "apiKey") (= entry.apiKeyIn "cookie"))
                              (setCookie entry.apiKeyName entry.token)
-                             (commandNone))]}]))
+                             Cmd.none)])]))
     {:kind :oauth-token-loaded :schemeId schemeId :value response}
       (if (and (get response :ok) (hasText? (get (get response :body) :access_token)))
           (let [token (get (get response :body) :access_token)
@@ -817,9 +838,9 @@
                                                                   :token token
                                                                   :expiresAt (resolveTokenExpiry (get response :body) token)})]
             [(afterAuthorizedState state entries) (persistAuthEntries state.sourceUrl entries)])
-          [(merge state {:authLoadingScheme nil :authError "Authorization failed"}) (commandNone)])
+          (no-cmd (merge state {:authLoadingScheme nil :authError "Authorization failed"})))
     {:kind :auth-failed :error error}
-      [(merge state {:authLoadingScheme nil :authError (str error)}) (commandNone)]
+      (no-cmd (merge state {:authLoadingScheme nil :authError (str error)}))
     {:kind :logout-scheme :scheme scheme}
       (let [entries (object-dissoc state.authEntries scheme.id)]
         [(merge state {:authEntries entries
@@ -834,52 +855,53 @@
                      :requestBodyFiles {}
                      :multipartFiles {}}) (setOpQueryParam id)]
     {:kind :cancel-try}
-      [(merge state {:tryActiveOp nil
+      (no-cmd (merge state {:tryActiveOp nil
                      :formError nil
                      :requestBodyFiles {}
-                     :multipartFiles {}}) (commandNone)]
+                     :multipartFiles {}}))
     {:kind :param-input :opId opId :name name :value value}
-      [(merge state {:paramValues (object-assoc state.paramValues (paramKey opId name) value)
-                     :formError nil}) (commandNone)]
+      (no-cmd (merge state {:paramValues (object-assoc state.paramValues (paramKey opId name) value)
+                     :formError nil}))
     {:kind :body-input :opId opId :value value}
-      [(merge state {:bodyValues (object-assoc state.bodyValues (bodyKey opId) value)
-                     :formError nil}) (commandNone)]
+      (no-cmd (merge state {:bodyValues (object-assoc state.bodyValues (bodyKey opId) value)
+                     :formError nil}))
     {:kind :request-body-file-selected :opId opId :selected? selected?}
-      [(merge state {:requestBodyFiles (object-assoc state.requestBodyFiles opId selected?)
-                     :formError nil}) (commandNone)]
+      (no-cmd (merge state {:requestBodyFiles (object-assoc state.requestBodyFiles opId selected?)
+                     :formError nil}))
     {:kind :multipart-file-selected :opId opId :name name :selected? selected?}
-      [(merge state {:multipartFiles (object-assoc state.multipartFiles (multipartFileKey opId name) selected?)
-                     :formError nil}) (commandNone)]
+      (no-cmd (merge state {:multipartFiles (object-assoc state.multipartFiles (multipartFileKey opId name) selected?)
+                     :formError nil}))
     {:kind :validate-param :opId opId :name name}
       (let [value (paramValueByName state opId name "")]
         (if (and (= name "id") (not (validUuid value)))
-            [(merge state {:formError "Enter a valid UUID"}) (commandNone)]
-            [state (commandNone)]))
+            (no-cmd (merge state {:formError "Enter a valid UUID"}))
+            (no-cmd state)))
     {:kind :execute :item item}
       (let [message (invalidExecuteMessage state item)]
         (if (some? message)
-            [(merge state {:formError message}) (commandNone)]
+            (no-cmd (merge state {:formError message}))
             [(merge state {:executingOp item.id
                            :formError nil
                            :responses (object-assoc state.responses item.id {:status "Loading" :body ""})})
              (executeCommand state item)]))
     {:kind :request-finished :id id :value response}
-      [(merge state {:responses (object-assoc state.responses id response)
-                     :executingOp nil}) (commandNone)]
+      (no-cmd (merge state {:responses (object-assoc state.responses id response)
+                     :executingOp nil}))
     {:kind :request-failed :error error}
-      [(merge state {:responses (object-assoc state.responses state.executingOp {:status "Error" :body error})
-                     :executingOp nil}) (commandNone)]
-    {:kind :download-response :name name :content content :mime mime}
+      (no-cmd (merge state {:responses (object-assoc state.responses state.executingOp {:status "Error" :body error})
+                     :executingOp nil}))
+    {:kind :download-response :name name :content content :mime mime :blob blob}
       [state {:kind :file/download
               :name name
               :content content
+              :blob blob
               :mime mime
               :msg {:kind :noop}}]
     {:kind :copy-text :value value}
       [state (copyText value)]
     {:kind :noop}
-      [state (commandNone)]
-    _ [state (commandNone)]))
+      (no-cmd state)
+    _ (no-cmd state)))
 
 (defn operationSummary [operation]
   (let [summary (get operation :summary)]
@@ -1235,10 +1257,12 @@
     (if (string? value) value "")))
 
 (defn responseContentType [response]
-  (responseHeaderValue response "content-type"))
+  (let [contentType (get response :contentType)]
+    (if (string? contentType) contentType (responseHeaderValue response "content-type"))))
 
 (defn responseContentDisposition [response]
-  (responseHeaderValue response "content-disposition"))
+  (let [contentDisposition (get response :contentDisposition)]
+    (if (string? contentDisposition) contentDisposition (responseHeaderValue response "content-disposition"))))
 
 (defn responseBaseMime [response]
   (lower-case (trim (first (split (responseContentType response) ";")))))
@@ -1248,9 +1272,12 @@
     (or (includes? mime "json") (ends-with? mime "+json"))))
 
 (defn responseBodyText [response]
-  (let [body (get response :body)]
+  (let [copyText (get response :copyText)
+        body (get response :body)]
     (if (some? response)
-        (if (string? body) body (json-stringify body))
+        (if (string? copyText)
+            copyText
+            (if (string? body) body (json-stringify body)))
         "")))
 
 (defn responseDisplayText [response]
@@ -1271,19 +1298,22 @@
   (includes? (lower-case (responseContentDisposition response)) "attachment"))
 
 (defn responseFile? [response]
-  (let [mime (responseBaseMime response)]
-    (or (attachmentDisposition? response)
-        (= mime "application/octet-stream")
-        (includes? mime "csv")
-        (starts-with? mime "image/")
-        (starts-with? mime "audio/")
-        (starts-with? mime "video/")
-        (= mime "application/pdf")
-        (includes? mime "zip")
-        (includes? mime "excel")
-        (includes? mime "spreadsheet")
-        (includes? mime "msword")
-        (includes? mime "officedocument"))))
+  (let [isFile (get response :isFile)
+        mime (responseBaseMime response)]
+    (if (bool? isFile)
+        isFile
+        (or (attachmentDisposition? response)
+            (= mime "application/octet-stream")
+            (includes? mime "csv")
+            (starts-with? mime "image/")
+            (starts-with? mime "audio/")
+            (starts-with? mime "video/")
+            (= mime "application/pdf")
+            (includes? mime "zip")
+            (includes? mime "excel")
+            (includes? mime "spreadsheet")
+            (includes? mime "msword")
+            (includes? mime "officedocument")))))
 
 (defn extensionFromContentType [contentType]
   (let [mime (lower-case contentType)]
@@ -1306,11 +1336,18 @@
                                     "bin"))))))))))
 
 (defn fileNameFromDisposition [header]
-  (let [quoted (regex-capture header "filename\\s*=\\s*\"([^\"]*)\"" "i")
+  (let [star (regex-capture header "filename\\*\\s*=\\s*(?:UTF-8''|utf-8'')([^;\\n]+)" "i")
+        quoted (regex-capture header "filename\\s*=\\s*\"([^\"]*)\"" "i")
         plain (regex-capture header "filename\\s*=\\s*([^;\\n]+)" "i")]
-    (if (hasText? quoted)
-        quoted
-        (trim plain))))
+    (if (hasText? star)
+        (decode-uri-component (trim star))
+        (if (hasText? quoted)
+            quoted
+            (trim plain)))))
+
+(defn responseFileName [response]
+  (let [fileName (get response :fileName)]
+    (if (string? fileName) fileName "")))
 
 (defn responseFileNameFromUrl [response]
   (let [requestUrl (get response :url)
@@ -1327,14 +1364,24 @@
                 (if (not (= extension "bin")) (str lastPart "." extension) ""))))))
 
 (defn responseDownloadName [item response]
-  (let [fromDisposition (fileNameFromDisposition (responseContentDisposition response))
+  (let [fromRuntime (responseFileName response)
+        fromDisposition (fileNameFromDisposition (responseContentDisposition response))
         fromUrl (responseFileNameFromUrl response)
         mime (responseBaseMime response)]
-    (if (hasText? fromDisposition)
-        fromDisposition
-        (if (hasText? fromUrl)
-            fromUrl
-            (str "download." (extensionFromContentType mime))))))
+    (if (hasText? fromRuntime)
+        fromRuntime
+        (if (hasText? fromDisposition)
+            fromDisposition
+            (if (hasText? fromUrl)
+                fromUrl
+                (str "download." (extensionFromContentType mime)))))))
+
+(defn responseBlob [response]
+  (get response :blob))
+
+(defn responsePreviewUrl [response]
+  (let [previewUrl (get response :previewUrl)]
+    (if (string? previewUrl) previewUrl "")))
 
 (defn responseViewerKey [response]
   (str (responseStatusText response) ":" (responseDurationText response) ":" (responseContentType response) ":" (count (responseBodyText response))))
@@ -1355,7 +1402,8 @@
                                 on:click={{:kind :download-response
                                            :name (responseDownloadName item response)
                                            :content (responseCopyText response)
-                                           :mime (responseContentType response)}}>{(iconDownload "12" "")}</button>
+                                           :mime (responseContentType response)
+                                           :blob (responseBlob response)}}>{(iconDownload "12" "")}</button>
                   #html <span class="hidden"></span>)}
               {(copyTextButton "copy-response" "Copy" (responseCopyText response) (or (not (responseFile? response)) (hasText? (responseCopyText response))) "")}
             </div>
@@ -1379,6 +1427,7 @@
                       </p>
                       {(if (starts-with? (responseBaseMime response) "image/")
                           #html <img alt={(responseDownloadName item response)}
+                                     src={(responsePreviewUrl response)}
                                      class="mt-2 max-h-64 max-w-full rounded border border-zinc-200 dark:border-dm-border"></img>
                           #html <span class="hidden"></span>)}
                     </div>

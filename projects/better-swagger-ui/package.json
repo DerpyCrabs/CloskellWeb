@@ -6,6 +6,7 @@
   "scripts": {
     "check:closkell": "node ../../packages/closkell-runner.cjs check src/app.clsk",
     "dev": "vite --host 127.0.0.1",
+    "dev:proxy": "vite --host 127.0.0.1 --mode proxy",
     "build": "vite build",
     "preview": "vite preview --host 127.0.0.1",
     "test": "npm run test:clsk && npm run test:e2e",

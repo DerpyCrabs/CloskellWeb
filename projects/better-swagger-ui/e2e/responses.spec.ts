@@ -99,6 +99,27 @@ test.describe('response handling', () => {
     await expect(op.getByText('report.csv')).toBeVisible()
   })
 
+  test('uses encoded filename from content disposition', async ({ page }) => {
+    await mockApi(page, async (route) => {
+      await route.fulfill({
+        status: 200,
+        headers: {
+          'Content-Type': 'text/csv',
+          'Content-Disposition': "attachment; filename*=UTF-8''report%20Q1.csv",
+        },
+        body: 'a,b\n1,2',
+      })
+    })
+
+    await expandOperation(page, 'get:/csv')
+    await openTryItOut(page, 'get:/csv')
+    await executeTryItOut(page, 'get:/csv')
+
+    const op = operationLocator(page, 'get:/csv')
+    await expect(op.getByTestId('download-response')).toBeVisible()
+    await expect(op.getByText('report Q1.csv')).toBeVisible()
+  })
+
   test('shows download for octet-stream with disposition filename', async ({ page }) => {
     await mockApi(page, async (route) => {
       await route.fulfill({
@@ -136,7 +157,7 @@ test.describe('response handling', () => {
 
     const op = operationLocator(page, 'get:/image')
     await expect(op.getByTestId('response-status')).toContainText('200', { timeout: 10_000 })
-    await expect(op.locator('img[alt]')).toBeVisible()
+    await expect(op.locator('img[src^="data:image/png"], img[src^="blob:"]')).toBeVisible()
   })
 
   test('displays error status and body', async ({ page }) => {

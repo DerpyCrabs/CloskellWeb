@@ -1,6 +1,7 @@
 (import "./metrics.clsk" [get-metrics-for-type metric-enabled? group-entries-by-type build-zone2-trend build-hrr-trend build-trimp-bars])
 (import "./log.clsk" [visible-log])
 (import "./model.clsk" [HeartReading HeartZone WorkoutEntry HeartChartRect])
+(import "./ui-effects.clsk" [arc-op begin-path-op canvas-op clear-op fill-op fill-rect-op fill-text-op line-to-op move-to-op stroke-op])
 
 (type MetricChartMsg
   (Union
@@ -28,31 +29,6 @@
    :metricsGrouping String})
 
 (def pi 3.14159265)
-
-(def empty-canvas-op
-  {:op :none
-   :x 0
-   :y 0
-   :width 0
-   :height 0
-   :radius 0
-   :start 0
-   :end 0
-   :lineWidth 0
-   :strokeStyle ""
-   :fillStyle ""
-   :font ""
-   :text ""
-   :textAlign ""
-   :textBaseline ""
-   :lineCap ""
-   :lineJoin ""
-   :globalAlpha 1
-   :name ""
-   :value 0})
-
-(defn canvas-op [fields]
-  (merge empty-canvas-op fields))
 
 (defn metric-chart-ref [group-type metric]
   (str "metric-chart-" metric "-" group-type))
@@ -228,36 +204,16 @@
   (let [y (axis-y layout index)
         value (axis-value layout index)]
     (conj ops
-          (canvas-op {:op :begin-path})
-          (canvas-op {:op :move-to
-                      :x layout.left
-                      :y y})
-          (canvas-op {:op :line-to
-                      :x (plot-right layout)
-                      :y y})
-          (canvas-op {:op :stroke
-                      :strokeStyle "#e5ebe6"
-                      :lineWidth layout.gridLineWidth})
-          (canvas-op {:op :fill-text
-                      :text (str (round value) unit)
-                      :x (- layout.left 6)
-                      :y y
-                      :fillStyle "#617066"
-                      :font layout.axisFont
-                      :textAlign "right"
-                      :textBaseline "middle"}))))
+          (begin-path-op)
+          (move-to-op layout.left y)
+          (line-to-op (plot-right layout) y)
+          (stroke-op "#e5ebe6" layout.gridLineWidth)
+          (fill-text-op (str (round value) unit) (- layout.left 6) y "#617066" layout.axisFont "right" "middle"))))
 
 (defn trend-background-ops [layout unit]
   (reduce (range 0 5)
-          [(canvas-op {:op :clear
-                       :width layout.width
-                       :height layout.height})
-           (canvas-op {:op :fill-rect
-                       :x 0
-                       :y 0
-                       :width layout.width
-                       :height layout.height
-                       :fillStyle "#fffdfa"})]
+          [(clear-op layout.width layout.height)
+           (fill-rect-op 0 0 layout.width layout.height "#fffdfa")]
           (fn [ops index]
             (append-trend-grid-ops ops layout index unit))))
 
@@ -266,17 +222,13 @@
         y (y-for-value layout point.value)]
     (conj ops
           (if (= index 0)
-              (canvas-op {:op :move-to
-                          :x x
-                          :y y})
-              (canvas-op {:op :line-to
-                          :x x
-                          :y y})))))
+              (move-to-op x y)
+              (line-to-op x y)))))
 
 (defn append-trend-line-ops [ops layout points color]
   (if (> (count points) 1)
       (conj (reduce-indexed points
-               (conj ops (canvas-op {:op :begin-path}))
+               (conj ops (begin-path-op))
                (fn [line-ops point index]
                  (append-trend-path-point layout (count points) line-ops point index)))
             (canvas-op {:op :stroke
@@ -291,15 +243,9 @@
     ops
     (fn [dot-ops point index]
       (conj dot-ops
-            (canvas-op {:op :begin-path})
-            (canvas-op {:op :arc
-                        :x (x-for-index layout (count points) index)
-                        :y (y-for-value layout point.value)
-                        :radius layout.dotRadius
-                        :start 0
-                        :end (* 2 pi)})
-            (canvas-op {:op :fill
-                        :fillStyle color})))))
+            (begin-path-op)
+            (arc-op (x-for-index layout (count points) index) (y-for-value layout point.value) layout.dotRadius 0 (* 2 pi))
+            (fill-op color)))))
 
 (defn append-trend-label-ops [ops layout points]
   (let [indices (visible-label-indices (count points) 8)]
@@ -309,37 +255,18 @@
         (let [point (nth points point-index)
               ideal-x (x-for-index layout (count points) point-index)]
           (conj label-ops
-                (canvas-op {:op :fill-text
-                            :text point.label
-                            :x (edge-label-x visible-index
-                                             (count indices)
-                                             layout.left
-                                             (plot-right layout)
-                                             ideal-x)
-                            :y (+ layout.bottom 10)
-                            :fillStyle "#617066"
-                            :font layout.labelFont
-                            :textAlign (edge-label-align visible-index (count indices))
-                            :textBaseline "top"})))))))
+                (fill-text-op point.label
+                              (edge-label-x visible-index (count indices) layout.left (plot-right layout) ideal-x)
+                              (+ layout.bottom 10)
+                              "#617066"
+                              layout.labelFont
+                              (edge-label-align visible-index (count indices))
+                              "top")))))))
 
 (defn empty-chart-ops [layout]
-  [(canvas-op {:op :clear
-               :width layout.width
-               :height layout.height})
-   (canvas-op {:op :fill-rect
-               :x 0
-               :y 0
-               :width layout.width
-               :height layout.height
-               :fillStyle "#fffdfa"})
-   (canvas-op {:op :fill-text
-               :text "Not enough data yet"
-               :x (/ layout.width 2)
-               :y (/ layout.height 2)
-               :fillStyle "#617066"
-               :font (scaled-font layout.width 12 90 600)
-               :textAlign "center"
-               :textBaseline "middle"})])
+  [(clear-op layout.width layout.height)
+   (fill-rect-op 0 0 layout.width layout.height "#fffdfa")
+   (fill-text-op "Not enough data yet" (/ layout.width 2) (/ layout.height 2) "#617066" (scaled-font layout.width 12 90 600) "center" "middle")])
 
 (defn trend-chart-ops [layout points color unit]
   (if (empty? points)
@@ -377,26 +304,14 @@
         x (x-for-bar layout points index)
         y (- layout.bottom height)]
     (conj ops
-          (canvas-op {:op :fill-rect
-                      :x x
-                      :y y
-                      :width width
-                      :height height
-                      :fillStyle "#d9184b"}))))
+          (fill-rect-op x y width height "#d9184b"))))
 
 (defn append-bar-label-op [layout points ops point-index visible-index]
   (let [point (nth points point-index)
         width (bar-width layout points)
         ideal-x (+ (x-for-bar layout points point-index) (/ width 2))]
     (conj ops
-          (canvas-op {:op :fill-text
-                      :text point.label
-                      :x ideal-x
-                      :y (+ layout.bottom 10)
-                      :fillStyle "#617066"
-                      :font layout.labelFont
-                      :textAlign "center"
-                      :textBaseline "top"}))))
+          (fill-text-op point.label ideal-x (+ layout.bottom 10) "#617066" layout.labelFont "center" "top"))))
 
 (defn bar-label-ops [ops layout points]
   (let [indices (visible-label-indices (count points) 10)]
@@ -409,25 +324,12 @@
   (if (empty? points)
       (empty-chart-ops layout)
       (let [max-value (max-bar-value points)
-            base-ops [(canvas-op {:op :clear
-                                  :width layout.width
-                                  :height layout.height})
-                      (canvas-op {:op :fill-rect
-                                  :x 0
-                                  :y 0
-                                  :width layout.width
-                                  :height layout.height
-                                  :fillStyle "#fffdfa"})
-                      (canvas-op {:op :begin-path})
-                      (canvas-op {:op :move-to
-                                  :x layout.left
-                                  :y layout.bottom})
-                      (canvas-op {:op :line-to
-                                  :x (plot-right layout)
-                                  :y layout.bottom})
-                      (canvas-op {:op :stroke
-                                  :strokeStyle "#e5ebe6"
-                                  :lineWidth layout.gridLineWidth})]
+            base-ops [(clear-op layout.width layout.height)
+                      (fill-rect-op 0 0 layout.width layout.height "#fffdfa")
+                      (begin-path-op)
+                      (move-to-op layout.left layout.bottom)
+                      (line-to-op (plot-right layout) layout.bottom)
+                      (stroke-op "#e5ebe6" layout.gridLineWidth)]
             bars (reduce-indexed points
                    base-ops
                    (fn [ops point index]
@@ -435,20 +337,10 @@
         (bar-label-ops bars layout points))))
 
 (defn canvas-command [ref layout ops]
-  {:kind :canvas/draw
-   :ref ref
-   :cssWidth layout.width
-   :cssHeight layout.height
-   :devicePixelRatio true
-   :ops ops
-   :onError :chart-error})
+  (Cmd.canvas/draw ref layout.width layout.height ops :chart-error))
 
 (defn metric-watch-command [ref]
-  {:kind :dom-ref/resize-watch
-   :id (str "metric-resize-" ref)
-   :ref ref
-   :onChange :chart-resized
-   :onError :chart-error})
+  (Cmd.dom-ref/resize-watch (str "metric-resize-" ref) ref :chart-resized :chart-error))
 
 (defn zone2-command [state group]
   (let [points (build-zone2-trend group.entries state.metricsGrouping)
@@ -482,49 +374,44 @@
 
 (defn metric-group-chart-command [state group]
   (let [enabled (get-metrics-for-type group.type)]
-    {:kind :batch
-     :commands [(if (metric-enabled? enabled "zone2")
+    (Cmd.batch [(if (metric-enabled? enabled "zone2")
                     (zone2-command state group)
-                    {:kind :none})
+                    Cmd.none)
                 (if (metric-enabled? enabled "hrr")
                     (hrr-command state group)
-                    {:kind :none})
+                    Cmd.none)
                 (if (metric-enabled? enabled "trimp")
                     (trimp-command state group)
-                    {:kind :none})]}))
+                    Cmd.none)])))
 
 (defn metric-group-watch-command [group]
   (let [enabled (get-metrics-for-type group.type)]
-    {:kind :batch
-     :commands [(if (metric-enabled? enabled "zone2")
+    (Cmd.batch [(if (metric-enabled? enabled "zone2")
                     (zone2-watch-command group)
-                    {:kind :none})
+                    Cmd.none)
                 (if (metric-enabled? enabled "hrr")
                     (hrr-watch-command group)
-                    {:kind :none})
+                    Cmd.none)
                 (if (metric-enabled? enabled "trimp")
                     (trimp-watch-command group)
-                    {:kind :none})]}))
+                    Cmd.none)])))
 
 (ann metric-chart-command (Fn [MetricChartState] (Cmd MetricChartMsg)))
 (defn metric-chart-command [state]
   (if (= state.detailView "metrics")
-      {:kind :batch
-       :commands (map (group-entries-by-type (visible-log state.entries))
+      (Cmd.batch (map (group-entries-by-type (visible-log state.entries))
                       (fn [group]
-                        (metric-group-chart-command state group)))}
-      {:kind :none}))
+                        (metric-group-chart-command state group))))
+      Cmd.none))
 
 (defn metric-group-chart-batch [state group]
-  {:kind :batch
-   :commands [(metric-group-chart-command state group)
-              (metric-group-watch-command group)]})
+  (Cmd.batch [(metric-group-chart-command state group)
+              (metric-group-watch-command group)]))
 
 (ann metric-chart-batch (Fn [MetricChartState] (Cmd MetricChartMsg)))
 (defn metric-chart-batch [state]
   (if (= state.detailView "metrics")
-      {:kind :batch
-       :commands (map (group-entries-by-type (visible-log state.entries))
+      (Cmd.batch (map (group-entries-by-type (visible-log state.entries))
                       (fn [group]
-                        (metric-group-chart-batch state group)))}
-      {:kind :none}))
+                        (metric-group-chart-batch state group))))
+      Cmd.none))

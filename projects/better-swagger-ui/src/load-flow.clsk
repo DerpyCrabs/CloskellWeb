@@ -1,0 +1,50 @@
+(defmacro no-cmd [state]
+  `[~state Cmd.none])
+
+(defmacro load-failed [state error]
+  `[(merge ~state {:loading? false
+                   :error ~error
+                   :discoveryQueue []
+                   :discoveryActiveEntry nil})
+    Cmd.none])
+
+(defmacro continue-discovery [state]
+  `(let [discoveryState ~state]
+     (if (> (count discoveryState.discoveryQueue) 0)
+         (let [entry (first discoveryState.discoveryQueue)
+               remaining (slice discoveryState.discoveryQueue 1 (count discoveryState.discoveryQueue))]
+           [(merge discoveryState {:discoveryQueue remaining
+                                   :discoveryActiveEntry entry})
+            (loadDiscoveryCommand entry)])
+         (load-failed discoveryState discovery-error-message))))
+
+(defmacro follow-spec-url [state decision]
+  `(let [loadState ~state
+         loadDecision ~decision]
+     [(merge loadState {:pendingDefinitions (definitionsOrDefault loadDecision.definitions loadDecision.specUrl)
+                        :pendingSelectedDefinition (chooseText loadDecision.selectedDefinition "default")
+                        :pendingSourceUrl (chooseText loadDecision.sourceUrl loadState.pendingSourceUrl)
+                        :pendingSpecUrl loadDecision.specUrl})
+      (loadSpecDocumentCommand loadDecision.specUrl)]))
+
+(defmacro follow-config-url [state decision]
+  `(let [loadState ~state
+         loadDecision ~decision
+         sourceUrl (chooseText loadDecision.sourceUrl loadState.pendingSourceUrl)]
+     [(merge loadState {:pendingSourceUrl sourceUrl
+                        :discoveryQueue (if (> (count loadState.discoveryQueue) 0)
+                                            loadState.discoveryQueue
+                                            (if (> (count sourceUrl) 0)
+                                                (discoveryQueueFor sourceUrl)
+                                                []))})
+      (loadConfigCommand loadDecision.configUrl)]))
+
+(defmacro completed-spec [state spec specUrl sourceUrl definitions selectedDefinition]
+  `(let [completedState ~state
+         completedSpec ~spec
+         completedSpecUrl ~specUrl
+         completedSourceUrl ~sourceUrl
+         completedDefinitions ~definitions
+         completedDefinition ~selectedDefinition]
+     [(completedSpecState completedState completedSpec completedSpecUrl completedSourceUrl completedDefinitions completedDefinition)
+      (completedSpecCommand completedState.currentUrl completedSourceUrl completedState.routeOp completedDefinitions completedDefinition)]))

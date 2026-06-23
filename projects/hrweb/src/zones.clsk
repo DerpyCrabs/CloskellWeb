@@ -1,4 +1,4 @@
-(import "./domain.clsk" [default-zones zones-storage-key])
+(import "./domain.clsk" [default-zones])
 
 (defn clamp-bpm [value]
   (max 30 (min 240 (round value))))
@@ -62,12 +62,6 @@
 (defn zone-state-payload [zones target-zone-id]
   {:zones (map zones zone-storage-entry)
    :targetZoneId target-zone-id})
-
-(defn persist-zone-state-command [zones target-zone-id]
-  {:kind :storage/set
-   :key zones-storage-key
-   :value (zone-state-payload zones target-zone-id)
-   :msg {:kind :zones-saved}})
 
 (defn target-zone [zones target-zone-id]
   (let [found (find zones (fn [zone] (= zone.id target-zone-id)))]

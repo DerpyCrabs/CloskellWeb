@@ -1000,13 +1000,14 @@ export function setConditional(instance, slot, marker, condition, renderThen, re
   instance.conditionalSlots[slot] = current;
 }
 
-export function setComponent(instance, slot, marker, render, args, dispatch, updateContext) {
+export function setComponent(instance, slot, marker, render, args, dispatch, updateContext, expectedKey = null) {
   const parent = marker.parentNode;
   if (!parent) return;
 
   const current = instance.componentSlots[slot] || {};
-  const rendered = typeof render === "function" ? render() : render;
-  const renderedKey = componentRenderKey(rendered);
+  const canReuseExpected = expectedKey && current.component && current.renderKey === expectedKey;
+  const rendered = canReuseExpected ? current.component : (typeof render === "function" ? render() : render);
+  const renderedKey = canReuseExpected ? current.renderKey : (componentRenderKey(rendered) || expectedKey);
   let fresh = false;
   if (!current.component) {
     current.component = rendered;
@@ -2101,17 +2102,19 @@ export function createCommandHandlers(env = {}) {
           document: documentRef,
           FormData: FormDataCtor
         });
+        const fetchUrl = proxiedHttpUrl(url, command, host);
         const started = nowMs();
-        const response = await fetchImpl(url, options);
+        const response = await fetchImpl(fetchUrl, options);
         const responseFormat = commandValueName(command.response || command.format || "json");
-        const body = responseFormat === "text" ? await response.text() : await response.json();
+        const payload = await httpResponsePayload(response, responseFormat, url, env, host);
         return commandMessage(command, {
           status: response.status,
           statusText: response.statusText,
           ok: response.ok,
-          body,
+          ...payload,
           headers: headersToObject(response.headers),
           url: response.url || url,
+          requestUrl: url,
           durationMs: Math.max(0, Math.round(nowMs() - started))
         });
       } catch (error) {
@@ -2122,7 +2125,8 @@ export function createCommandHandlers(env = {}) {
       const payload = {
         name: command.name || "download",
         content: command.content ?? "",
-        mime: command.mime || "application/octet-stream"
+        mime: command.mime || "application/octet-stream",
+        blob: command.blob
       };
       const result = download(payload);
       return commandMessage(command, result ?? payload);
@@ -2233,6 +2237,19 @@ export function createCommandHandlers(env = {}) {
       const rect = measureNode(node);
       return commandMessage(command, { ref: refName(command.ref), ...rect });
     },
+    "dom/scroll-into-view"(command) {
+      queueScrollIntoView(command, {
+        document: documentRef,
+        host,
+        requestAnimationFrame: requestAnimationFrameImpl
+      });
+      return commandMessage(command, {
+        id: command.id || "",
+        ref: command.ref || "",
+        selector: command.selector || "",
+        testId: command.testId || ""
+      });
+    },
     "dom-ref/resize-watch"(command, dispatch) {
       const node = resolveRef(command.ref, dispatch);
       if (!node) return commandErrorMessage(command, new Error(`DOM ref ${String(command.ref)} was not found.`));
@@ -2281,7 +2298,7 @@ export function createCommandHandlers(env = {}) {
       const options = eventListenerOptions(command.options);
       const listener = (event) => {
         applyWindowEventControls(command, event);
-        const message = windowEventMessage(command, event, id);
+        const message = windowEventMessage(command, event, id, host);
         if (message !== undefined) dispatch(message);
       };
       eventTarget.addEventListener(type, listener, options);
@@ -2568,8 +2585,8 @@ function reconcileSubscriptions(
 
   for (const [key, next] of nextByKey.entries()) {
     if (activeSubscriptions.has(key)) continue;
-    startSubscription(next.subscription, dispatch, handlers, subscriptionLog, onSubscription, isActive);
     activeSubscriptions.set(key, next);
+    startSubscription(next.subscription, dispatch, handlers, subscriptionLog, onSubscription, isActive);
   }
 }
 
@@ -3655,6 +3672,246 @@ function httpRequestFetchArgs(command, env = {}) {
   };
 }
 
+function proxiedHttpUrl(url, command, host) {
+  if (!command.proxy) return url;
+  try {
+    const location = host.location;
+    const absolute = new URL(url, location?.href || "http://localhost/");
+    const currentOrigin = location?.origin;
+    if (currentOrigin && absolute.origin === currentOrigin) return url;
+    return `/__proxy?url=${encodeURIComponent(absolute.href)}`;
+  } catch {
+    return url;
+  }
+}
+
+async function httpResponsePayload(response, responseFormat, requestUrl, env = {}, host = globalThis) {
+  if (responseFormat === "text") {
+    return { body: await response.text() };
+  }
+  if (responseFormat === "blob" || responseFormat === "file") {
+    const blob = await response.blob();
+    const contentType = headerValue(response.headers, "content-type") || blob.type || null;
+    const contentDisposition = headerValue(response.headers, "content-disposition");
+    const fileName = resolveHttpFileName(contentDisposition, requestUrl, contentType);
+    return {
+      body: null,
+      blob,
+      fileName,
+      contentDisposition,
+      isFile: true,
+      copyText: textMime(baseMime(contentType)) ? await blob.text() : "",
+      contentType,
+      previewUrl: await blobPreviewUrl(blob, contentType, env, host)
+    };
+  }
+  if (responseFormat !== "auto") {
+    return { body: await response.json() };
+  }
+
+  const headerContentType = headerValue(response.headers, "content-type");
+  const contentDisposition = headerValue(response.headers, "content-disposition");
+  const fileName = resolveHttpFileName(contentDisposition, requestUrl, headerContentType);
+
+  if (isLikelyFileResponse(headerContentType, contentDisposition)) {
+    const blob = await response.blob();
+    const mime = baseMime(headerContentType) || blob.type || "";
+    return {
+      body: null,
+      blob,
+      fileName,
+      contentDisposition,
+      isFile: true,
+      copyText: textMime(mime) || mime.includes("csv") ? await blob.text() : "",
+      contentType: headerContentType,
+      previewUrl: await blobPreviewUrl(blob, headerContentType, env, host)
+    };
+  }
+
+  const raw = await response.text();
+  const mime = baseMime(headerContentType);
+  if (mime.includes("json") || mime.endsWith("+json")) {
+    try {
+      const parsed = JSON.parse(raw);
+      return {
+        body: parsed,
+        fileName,
+        contentDisposition,
+        isFile: false,
+        copyText: JSON.stringify(parsed, null, 2),
+        contentType: headerContentType
+      };
+    } catch {
+      if (looksLikeCsv(raw)) {
+        return textFileResponse(raw, "text/csv", fileName, contentDisposition);
+      }
+      if (looksLikeBinary(raw)) {
+        const BlobCtor = env.Blob || host.Blob || globalThis.Blob;
+        const blob = new BlobCtor([raw], { type: "application/octet-stream" });
+        return {
+          body: null,
+          blob,
+          fileName,
+          contentDisposition,
+          isFile: true,
+          copyText: "",
+          contentType: "application/octet-stream"
+        };
+      }
+      return {
+        body: raw,
+        fileName,
+        contentDisposition,
+        isFile: false,
+        copyText: raw,
+        contentType: "text/plain"
+      };
+    }
+  }
+
+  if (mime.includes("csv") || looksLikeCsv(raw)) {
+    return textFileResponse(raw, "text/csv", fileName, contentDisposition);
+  }
+
+  return {
+    body: raw,
+    fileName,
+    contentDisposition,
+    isFile: false,
+    copyText: raw,
+    contentType: headerContentType
+  };
+}
+
+function headerValue(headers, name) {
+  if (!headers) return null;
+  for (const [key, value] of headers.entries?.() || []) {
+    if (String(key).toLowerCase() === name) return value;
+  }
+  return headers.get?.(name) ?? null;
+}
+
+function baseMime(contentType) {
+  return String(contentType || "").split(";")[0].trim().toLowerCase();
+}
+
+function textMime(mime) {
+  return String(mime || "").startsWith("text/");
+}
+
+function httpFileNameFromDisposition(header) {
+  if (!String(header || "").trim()) return null;
+  const value = String(header).trim();
+  const star = value.match(/filename\*\s*=\s*(?:UTF-8''|utf-8'')([^;\n]+)/i);
+  if (star?.[1]) {
+    try {
+      return decodeURIComponent(star[1].trim());
+    } catch {
+      return star[1].trim();
+    }
+  }
+  const quoted = value.match(/filename\s*=\s*"([^"]*)"/i) || value.match(/filename\s*=\s*'([^']*)'/i);
+  if (quoted?.[1]) return quoted[1];
+  const plain = value.match(/filename\s*=\s*([^;\n]+)/i);
+  return plain?.[1]?.trim().replace(/^["']|["']$/g, "") || null;
+}
+
+function httpExtensionFromContentType(contentType) {
+  const mime = baseMime(contentType);
+  if (mime.includes("csv")) return "csv";
+  if (mime === "application/pdf") return "pdf";
+  if (mime.includes("json")) return "json";
+  if (mime.includes("xml")) return "xml";
+  if (mime.startsWith("image/")) return mime.split("/")[1] || "bin";
+  if (mime.includes("zip")) return "zip";
+  if (mime.includes("excel") || mime.includes("spreadsheet")) return "xlsx";
+  if (mime.includes("word") || mime.includes("msword")) return "docx";
+  return "bin";
+}
+
+function inferHttpFileNameFromUrl(url, contentType) {
+  try {
+    const parts = new URL(url).pathname.split("/").filter(Boolean);
+    if (!parts.length) return null;
+    const last = parts[parts.length - 1];
+    const lastLower = last.toLowerCase();
+    const ext = httpExtensionFromContentType(contentType);
+    if (lastLower.includes(".")) return last;
+    if (lastLower === "csv" && parts.length >= 2) return `${parts[parts.length - 2]}.csv`;
+    if (lastLower === "csv") return "download.csv";
+    if (ext !== "bin") return `${last}.${ext}`;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function resolveHttpFileName(contentDisposition, requestUrl, contentType) {
+  return httpFileNameFromDisposition(contentDisposition) || (requestUrl ? inferHttpFileNameFromUrl(requestUrl, contentType) : null);
+}
+
+function looksLikeCsv(text) {
+  const sample = String(text || "").trim().slice(0, 4096);
+  if (!sample) return false;
+  const lines = sample.split(/\r?\n/).filter(Boolean).slice(0, 5);
+  if (!lines.length) return false;
+  return lines.every((line) => /"[^"]*"[;,]/.test(line) || /^[^;\n]+;[^;\n]+/.test(line));
+}
+
+function looksLikeBinary(text) {
+  return /[\x00-\x08\x0e-\x1f]/.test(String(text || "").slice(0, 512));
+}
+
+function isLikelyFileResponse(contentType, disposition) {
+  const mime = baseMime(contentType);
+  if (/attachment/i.test(String(disposition || ""))) return true;
+  if (!mime) return false;
+  if (mime === "application/json" || mime === "application/problem+json" || mime.endsWith("+json") || mime === "application/xml" || mime === "text/xml") {
+    return false;
+  }
+  if (mime.startsWith("text/") && !mime.includes("csv")) return false;
+  return mime === "application/octet-stream" ||
+    mime.includes("csv") ||
+    mime.startsWith("image/") ||
+    mime.startsWith("audio/") ||
+    mime.startsWith("video/") ||
+    mime === "application/pdf" ||
+    mime.includes("zip") ||
+    mime.includes("excel") ||
+    mime.includes("spreadsheet") ||
+    mime.includes("msword") ||
+    mime.includes("officedocument");
+}
+
+function textFileResponse(raw, mime, fileName, contentDisposition) {
+  const BlobCtor = globalThis.Blob;
+  return {
+    body: null,
+    blob: typeof BlobCtor === "function" ? new BlobCtor([raw], { type: `${mime};charset=utf-8` }) : undefined,
+    fileName,
+    contentDisposition,
+    isFile: true,
+    copyText: raw,
+    contentType: mime
+  };
+}
+
+function blobPreviewUrl(blob, contentType, env = {}, host = globalThis) {
+  const mime = baseMime(contentType || blob?.type);
+  if (!mime.startsWith("image/")) return "";
+  const FileReaderCtor = env.FileReader || host.FileReader || globalThis.FileReader;
+  if (typeof FileReaderCtor === "function") {
+    return new Promise((resolve) => {
+      const reader = new FileReaderCtor();
+      reader.onerror = () => resolve("");
+      reader.onload = () => resolve(typeof reader.result === "string" ? reader.result : "");
+      reader.readAsDataURL(blob);
+    });
+  }
+  const URLRef = env.URL || host.URL || globalThis.URL;
+  return URLRef?.createObjectURL ? URLRef.createObjectURL(blob) : "";
+}
+
 function resolveHttpRequestBody(body, env = {}) {
   const kind = commandValueName(body?.kind);
   if (kind === "browser/selected-file") {
@@ -3843,8 +4100,8 @@ function resizeMessage(command, id, node, rect) {
   });
 }
 
-function windowEventMessage(command, event, id) {
-  const payload = windowEventPayload(event);
+function windowEventMessage(command, event, id, host = globalThis) {
+  const payload = windowEventPayload(event, host);
   return namedCommandMessage(command.onEvent, {
     id,
     ...payload,
@@ -3872,9 +4129,15 @@ function eventControlMatches(rule, event = {}) {
   return true;
 }
 
-function windowEventPayload(event = {}) {
+function windowEventPayload(event = {}, host = globalThis) {
+  const href = String(host.location?.href || "");
+  const path = String(host.location?.pathname || "");
+  const search = String(host.location?.search || "");
   return {
     type: String(event.type || ""),
+    href,
+    path,
+    search,
     clientX: numberOrZero(event.clientX),
     clientY: numberOrZero(event.clientY),
     pageX: numberOrZero(event.pageX),
@@ -3895,6 +4158,43 @@ function windowEventPayload(event = {}) {
     metaKey: Boolean(event.metaKey),
     shiftKey: Boolean(event.shiftKey)
   };
+}
+
+function queueScrollIntoView(command, env = {}) {
+  const schedule = env.requestAnimationFrame || env.host?.requestAnimationFrame?.bind(env.host);
+  const fallback = env.host?.setTimeout?.bind(env.host) || ((fn) => fn());
+  const run = () => {
+    const node = scrollTargetNode(command, env.document);
+    if (!node?.scrollIntoView) return;
+    if (command.skipIfVisible && nodeFullyVisible(node, env.host)) return;
+    const behavior = command.behavior || (command.smooth ? "smooth" : "auto");
+    node.scrollIntoView({
+      behavior,
+      block: command.block || "start",
+      inline: command.inline || "nearest"
+    });
+  };
+  if (schedule) {
+    schedule(() => schedule(run));
+  } else {
+    fallback(run, 0);
+  }
+}
+
+function scrollTargetNode(command, documentRef) {
+  if (!documentRef?.querySelector) return null;
+  if (command.selector) return documentRef.querySelector(String(command.selector));
+  if (command.testId) return documentRef.querySelector(`[data-testid="${cssAttr(String(command.testId))}"]`);
+  if (command.id) return documentRef.getElementById?.(String(command.id)) || null;
+  return null;
+}
+
+function nodeFullyVisible(node, host = globalThis) {
+  const rect = node.getBoundingClientRect?.();
+  if (!rect) return false;
+  const height = host.innerHeight || 0;
+  const width = host.innerWidth || 0;
+  return rect.top >= 0 && rect.left >= 0 && rect.bottom <= height && rect.right <= width;
 }
 
 function animationFrameMessage(command, id, timestamp) {
@@ -4215,7 +4515,7 @@ function downloadWithBrowser(payload, env, host) {
     throw new Error("No browser download implementation is available for file/download");
   }
 
-  const blob = new BlobCtor([payload.content], { type: payload.mime });
+  const blob = payload.blob || new BlobCtor([payload.content], { type: payload.mime });
   const href = URLRef.createObjectURL(blob);
   const link = documentRef.createElement("a");
   link.href = href;

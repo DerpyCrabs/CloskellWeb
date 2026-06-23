@@ -37,6 +37,7 @@ pub fn emit_module(source: &SourceFile) -> EmitResult {
         needs_decoder_runtime: false,
         needs_value_equal_helper: false,
         component_fns: collect_template_defns(source),
+        function_defs: collect_function_defs(source),
         read_summaries: collect_read_summaries(source),
         next_template_id: 0,
         next_temp_id: 0,
@@ -331,6 +332,7 @@ struct Emitter {
     needs_decoder_runtime: bool,
     needs_value_equal_helper: bool,
     component_fns: BTreeSet<String>,
+    function_defs: BTreeMap<String, FunctionDef>,
     read_summaries: BTreeMap<String, ReadSummary>,
     next_template_id: usize,
     next_temp_id: usize,
@@ -410,9 +412,37 @@ impl Emitter {
                 "match" => return self.emit_match(expr, args),
                 "do" => return self.emit_do(args),
                 "unsafe-cast" => return self.emit_unsafe_cast(args),
+                "Msg.of" => return self.emit_msg_of(args),
+                "Msg.with" => return self.emit_msg_with(args),
+                "Msg.with2" => return self.emit_msg_with2(args),
+                "Msg.mapper" => return self.emit_msg_mapper(args),
                 "Event.prevent" => return self.emit_event_control(args, true, false),
                 "Event.stop" => return self.emit_event_control(args, false, true),
                 "Event.prevent-stop" => return self.emit_event_control(args, true, true),
+                "Cmd.batch" => return self.emit_cmd_batch(args),
+                "Cmd.storage/get" => return self.emit_cmd_storage_get(args),
+                "Cmd.storage/set" => return self.emit_cmd_storage_set(args),
+                "Cmd.storage/set-silent" => return self.emit_cmd_storage_set_silent(args),
+                "Cmd.time/now" => return self.emit_cmd_time_now(args),
+                "Cmd.random/number" => return self.emit_cmd_random_number(args),
+                "Cmd.timer/every" => return self.emit_cmd_timer(args, "timer/every"),
+                "Cmd.timer/after" => return self.emit_cmd_timer(args, "timer/after"),
+                "Cmd.timer/cancel" => return self.emit_cmd_timer_cancel(args),
+                "Cmd.animation/frame" => return self.emit_cmd_animation_frame(args),
+                "Cmd.animation/cancel" => return self.emit_cmd_animation_cancel(args),
+                "Cmd.dom-ref/click" => return self.emit_cmd_dom_ref_action(args, "dom-ref/click"),
+                "Cmd.dom-ref/focus" => return self.emit_cmd_dom_ref_action(args, "dom-ref/focus"),
+                "Cmd.file/read-selected" => return self.emit_cmd_file_read_selected(args),
+                "Cmd.file/download" => return self.emit_cmd_file_download(args),
+                "Cmd.canvas/draw" => return self.emit_cmd_canvas_draw(args),
+                "Cmd.dom-ref/measure" => return self.emit_cmd_dom_ref_measure(args),
+                "Cmd.dom-ref/resize-watch" => return self.emit_cmd_resize_watch(args),
+                "Cmd.bluetooth/connect-heart-rate" => {
+                    return self.emit_cmd_bluetooth_connect_heart_rate(args);
+                }
+                "Cmd.bluetooth/disconnect" => return self.emit_cmd_bluetooth_disconnect(args),
+                "Cmd.simulation/heart-rate" => return self.emit_cmd_simulation_heart_rate(args),
+                "Cmd.simulation/stop" => return self.emit_cmd_simulation_stop(args),
                 "Task.succeed" => return self.emit_task_succeed(args),
                 "Task.fail" => return self.emit_task_fail(args),
                 "Task.map" => return self.emit_task_combinator(args, "task/map", "mapper"),
@@ -433,6 +463,7 @@ impl Emitter {
                     return self.emit_sub_change(args, "sub/media-query", "query");
                 }
                 "Sub.window/event" => return self.emit_sub_window_event(args),
+                "Sub.window/event-with" => return self.emit_sub_window_event_with(args),
                 "Sub.dom-ref/resize" => {
                     return self.emit_sub_change(args, "sub/dom-ref/resize", "ref");
                 }
@@ -564,6 +595,7 @@ impl Emitter {
                 "multipart-form-body" => return self.emit_multipart_form_body(args),
                 "urlencoded-form-body" => return self.emit_urlencoded_form_body(args),
                 "regex-capture" => return self.emit_regex_capture(args),
+                "regex-capture-all" => return self.emit_regex_capture_all(args),
                 "install-virtual-json-viewer" => {
                     return self.emit_install_virtual_json_viewer(args);
                 }
@@ -571,6 +603,7 @@ impl Emitter {
                 "base64-decode" => return self.emit_base64(false, args),
                 "fail" => return self.emit_fail(args),
                 "env-dev?" => return self.emit_env_dev(args),
+                "env-mode" => return self.emit_env_mode(args),
                 "not" => return self.emit_prefix("!", args),
                 "and" => return self.emit_infix("&&", args),
                 "or" => return self.emit_infix("||", args),
@@ -706,6 +739,314 @@ impl Emitter {
         )
     }
 
+    fn emit_cmd_batch(&mut self, args: &[Expr]) -> String {
+        if args.len() != 1 {
+            return "{ kind: Symbol.for(\"none\") }".to_string();
+        }
+        format!(
+            "{{ kind: Symbol.for(\"batch\"), commands: {} }}",
+            self.emit_expr(&args[0])
+        )
+    }
+
+    fn emit_cmd_storage_get(&mut self, args: &[Expr]) -> String {
+        if args.len() != 4 {
+            return "{ kind: Symbol.for(\"none\") }".to_string();
+        }
+        format!(
+            "{{ kind: Symbol.for(\"storage/get\"), key: {}, format: {}, toMessage: {}, onError: {} }}",
+            self.emit_expr(&args[0]),
+            self.emit_expr(&args[1]),
+            self.emit_expr(&args[2]),
+            self.emit_expr(&args[3])
+        )
+    }
+
+    fn emit_cmd_storage_set(&mut self, args: &[Expr]) -> String {
+        if args.len() != 3 && args.len() != 4 {
+            return "{ kind: Symbol.for(\"none\") }".to_string();
+        }
+        let on_error = args
+            .get(3)
+            .map(|arg| format!(", onError: {}", self.emit_expr(arg)))
+            .unwrap_or_default();
+        format!(
+            "{{ kind: Symbol.for(\"storage/set\"), key: {}, value: {}, msg: {}{} }}",
+            self.emit_expr(&args[0]),
+            self.emit_expr(&args[1]),
+            self.emit_expr(&args[2]),
+            on_error
+        )
+    }
+
+    fn emit_cmd_storage_set_silent(&mut self, args: &[Expr]) -> String {
+        if args.len() != 3 {
+            return "{ kind: Symbol.for(\"none\") }".to_string();
+        }
+        format!(
+            "{{ kind: Symbol.for(\"storage/set\"), key: {}, value: {}, onError: {} }}",
+            self.emit_expr(&args[0]),
+            self.emit_expr(&args[1]),
+            self.emit_expr(&args[2])
+        )
+    }
+
+    fn emit_cmd_time_now(&mut self, args: &[Expr]) -> String {
+        if args.len() != 1 {
+            return "{ kind: Symbol.for(\"none\") }".to_string();
+        }
+        format!(
+            "{{ kind: Symbol.for(\"time/now\"), toMessage: {} }}",
+            self.emit_expr(&args[0])
+        )
+    }
+
+    fn emit_cmd_random_number(&mut self, args: &[Expr]) -> String {
+        if args.len() != 3 {
+            return "{ kind: Symbol.for(\"none\") }".to_string();
+        }
+        format!(
+            "{{ kind: Symbol.for(\"random/number\"), min: {}, max: {}, toMessage: {} }}",
+            self.emit_expr(&args[0]),
+            self.emit_expr(&args[1]),
+            self.emit_expr(&args[2])
+        )
+    }
+
+    fn emit_cmd_timer(&mut self, args: &[Expr], kind: &str) -> String {
+        if args.len() != 3 {
+            return "{ kind: Symbol.for(\"none\") }".to_string();
+        }
+        format!(
+            "{{ kind: Symbol.for(\"{}\"), id: {}, ms: {}, msg: {} }}",
+            kind,
+            self.emit_expr(&args[0]),
+            self.emit_expr(&args[1]),
+            self.emit_expr(&args[2])
+        )
+    }
+
+    fn emit_cmd_timer_cancel(&mut self, args: &[Expr]) -> String {
+        if args.len() != 1 {
+            return "{ kind: Symbol.for(\"none\") }".to_string();
+        }
+        format!(
+            "{{ kind: Symbol.for(\"timer/cancel\"), id: {} }}",
+            self.emit_expr(&args[0])
+        )
+    }
+
+    fn emit_cmd_animation_frame(&mut self, args: &[Expr]) -> String {
+        if args.len() != 2 {
+            return "{ kind: Symbol.for(\"none\") }".to_string();
+        }
+        format!(
+            "{{ kind: Symbol.for(\"animation/frame\"), id: {}, onFrame: {} }}",
+            self.emit_expr(&args[0]),
+            self.emit_expr(&args[1])
+        )
+    }
+
+    fn emit_cmd_animation_cancel(&mut self, args: &[Expr]) -> String {
+        if args.len() != 2 {
+            return "{ kind: Symbol.for(\"none\") }".to_string();
+        }
+        format!(
+            "{{ kind: Symbol.for(\"animation/cancel\"), id: {}, msg: {} }}",
+            self.emit_expr(&args[0]),
+            self.emit_expr(&args[1])
+        )
+    }
+
+    fn emit_cmd_dom_ref_action(&mut self, args: &[Expr], kind: &str) -> String {
+        if args.len() != 2 && args.len() != 3 {
+            return "{ kind: Symbol.for(\"none\") }".to_string();
+        }
+        let on_error = args
+            .get(2)
+            .map(|arg| format!(", onError: {}", self.emit_expr(arg)))
+            .unwrap_or_default();
+        format!(
+            "{{ kind: Symbol.for(\"{}\"), ref: {}, msg: {}{} }}",
+            kind,
+            self.emit_expr(&args[0]),
+            self.emit_expr(&args[1]),
+            on_error
+        )
+    }
+
+    fn emit_cmd_file_read_selected(&mut self, args: &[Expr]) -> String {
+        if args.len() != 5 {
+            return "{ kind: Symbol.for(\"none\") }".to_string();
+        }
+        format!(
+            "{{ kind: Symbol.for(\"file/read-selected\"), ref: {}, format: {}, toMessage: {}, onError: {}, onCancel: {} }}",
+            self.emit_expr(&args[0]),
+            self.emit_expr(&args[1]),
+            self.emit_expr(&args[2]),
+            self.emit_expr(&args[3]),
+            self.emit_expr(&args[4])
+        )
+    }
+
+    fn emit_cmd_file_download(&mut self, args: &[Expr]) -> String {
+        if args.len() != 5 {
+            return "{ kind: Symbol.for(\"none\") }".to_string();
+        }
+        format!(
+            "{{ kind: Symbol.for(\"file/download\"), name: {}, content: {}, mime: {}, msg: {}, onError: {} }}",
+            self.emit_expr(&args[0]),
+            self.emit_expr(&args[1]),
+            self.emit_expr(&args[2]),
+            self.emit_expr(&args[3]),
+            self.emit_expr(&args[4])
+        )
+    }
+
+    fn emit_cmd_canvas_draw(&mut self, args: &[Expr]) -> String {
+        if args.len() != 5 {
+            return "{ kind: Symbol.for(\"none\") }".to_string();
+        }
+        format!(
+            "{{ kind: Symbol.for(\"canvas/draw\"), ref: {}, cssWidth: {}, cssHeight: {}, devicePixelRatio: true, ops: {}, onError: {} }}",
+            self.emit_expr(&args[0]),
+            self.emit_expr(&args[1]),
+            self.emit_expr(&args[2]),
+            self.emit_expr(&args[3]),
+            self.emit_expr(&args[4])
+        )
+    }
+
+    fn emit_cmd_resize_watch(&mut self, args: &[Expr]) -> String {
+        if args.len() != 4 {
+            return "{ kind: Symbol.for(\"none\") }".to_string();
+        }
+        format!(
+            "{{ kind: Symbol.for(\"dom-ref/resize-watch\"), id: {}, ref: {}, onChange: {}, onError: {} }}",
+            self.emit_expr(&args[0]),
+            self.emit_expr(&args[1]),
+            self.emit_expr(&args[2]),
+            self.emit_expr(&args[3])
+        )
+    }
+
+    fn emit_cmd_dom_ref_measure(&mut self, args: &[Expr]) -> String {
+        if args.len() != 3 {
+            return "{ kind: Symbol.for(\"none\") }".to_string();
+        }
+        format!(
+            "{{ kind: Symbol.for(\"dom-ref/measure\"), ref: {}, toMessage: {}, onError: {} }}",
+            self.emit_expr(&args[0]),
+            self.emit_expr(&args[1]),
+            self.emit_expr(&args[2])
+        )
+    }
+
+    fn emit_cmd_bluetooth_connect_heart_rate(&mut self, args: &[Expr]) -> String {
+        if args.len() != 6 {
+            return "{ kind: Symbol.for(\"none\") }".to_string();
+        }
+        format!(
+            "{{ kind: Symbol.for(\"bluetooth/connect-heart-rate\"), id: {}, ...{}, toMessage: {}, onReading: {}, onDisconnected: {}, onError: {} }}",
+            self.emit_expr(&args[0]),
+            self.emit_expr(&args[1]),
+            self.emit_expr(&args[2]),
+            self.emit_expr(&args[3]),
+            self.emit_expr(&args[4]),
+            self.emit_expr(&args[5])
+        )
+    }
+
+    fn emit_cmd_bluetooth_disconnect(&mut self, args: &[Expr]) -> String {
+        if args.len() != 2 {
+            return "{ kind: Symbol.for(\"none\") }".to_string();
+        }
+        format!(
+            "{{ kind: Symbol.for(\"bluetooth/disconnect\"), id: {}, msg: {} }}",
+            self.emit_expr(&args[0]),
+            self.emit_expr(&args[1])
+        )
+    }
+
+    fn emit_cmd_simulation_heart_rate(&mut self, args: &[Expr]) -> String {
+        if args.len() != 5 && args.len() != 6 {
+            return "{ kind: Symbol.for(\"none\") }".to_string();
+        }
+        let on_disconnected = if args.len() == 6 {
+            format!(", onDisconnected: {}", self.emit_expr(&args[4]))
+        } else {
+            String::new()
+        };
+        let error_arg = if args.len() == 6 { &args[5] } else { &args[4] };
+        format!(
+            "{{ kind: Symbol.for(\"simulation/heart-rate\"), id: {}, ...{}, toMessage: {}, onReading: {}{}, onError: {} }}",
+            self.emit_expr(&args[0]),
+            self.emit_expr(&args[1]),
+            self.emit_expr(&args[2]),
+            self.emit_expr(&args[3]),
+            on_disconnected,
+            self.emit_expr(error_arg)
+        )
+    }
+
+    fn emit_cmd_simulation_stop(&mut self, args: &[Expr]) -> String {
+        if args.len() != 1 {
+            return "{ kind: Symbol.for(\"none\") }".to_string();
+        }
+        format!(
+            "{{ kind: Symbol.for(\"simulation/stop\"), id: {} }}",
+            self.emit_expr(&args[0])
+        )
+    }
+
+    fn emit_msg_of(&mut self, args: &[Expr]) -> String {
+        if args.len() != 1 {
+            return "{ kind: undefined }".to_string();
+        }
+        format!("{{ kind: {} }}", self.emit_expr(&args[0]))
+    }
+
+    fn emit_msg_with(&mut self, args: &[Expr]) -> String {
+        if args.len() != 3 {
+            return "{ kind: undefined }".to_string();
+        }
+        let field = object_key(&args[1]).unwrap_or_else(|| "value".to_string());
+        format!(
+            "{{ kind: {}, {}: {} }}",
+            self.emit_expr(&args[0]),
+            field,
+            self.emit_expr(&args[2])
+        )
+    }
+
+    fn emit_msg_with2(&mut self, args: &[Expr]) -> String {
+        if args.len() != 5 {
+            return "{ kind: undefined }".to_string();
+        }
+        let first = object_key(&args[1]).unwrap_or_else(|| "first".to_string());
+        let second = object_key(&args[3]).unwrap_or_else(|| "second".to_string());
+        format!(
+            "{{ kind: {}, {}: {}, {}: {} }}",
+            self.emit_expr(&args[0]),
+            first,
+            self.emit_expr(&args[2]),
+            second,
+            self.emit_expr(&args[4])
+        )
+    }
+
+    fn emit_msg_mapper(&mut self, args: &[Expr]) -> String {
+        if args.len() != 2 {
+            return "(value) => ({ kind: undefined, value })".to_string();
+        }
+        let field = object_key(&args[1]).unwrap_or_else(|| "value".to_string());
+        format!(
+            "(value) => ({{ kind: {}, {}: value }})",
+            self.emit_expr(&args[0]),
+            field
+        )
+    }
+
     fn emit_scope_update(&mut self, args: &[Expr]) -> String {
         self.needs_html_runtime = true;
         if args.len() != 5 {
@@ -813,6 +1154,19 @@ impl Emitter {
         )
     }
 
+    fn emit_sub_window_event_with(&mut self, args: &[Expr]) -> String {
+        if args.len() != 4 {
+            return "{ kind: Symbol.for(\"none\") }".to_string();
+        }
+        format!(
+            "{{ kind: Symbol.for(\"sub/window/event\"), id: {}, type: {}, onEvent: {}, ...{} }}",
+            self.emit_expr(&args[0]),
+            self.emit_expr(&args[1]),
+            self.emit_expr(&args[2]),
+            self.emit_expr(&args[3])
+        )
+    }
+
     fn emit_defn(&mut self, name: &str, expr: &Expr, args: &[Expr]) -> String {
         let ExprKind::Vector(params) = &args[0].kind else {
             self.diagnostics.push(Diagnostic::error(
@@ -864,7 +1218,7 @@ impl Emitter {
             }
         }
 
-        let body = if has_pattern_params {
+        let mut body = if has_pattern_params {
             let function_body = self.emit_function_body(expr, &args[1..]);
             [pattern_statements.join(" "), function_body]
                 .into_iter()
@@ -875,6 +1229,9 @@ impl Emitter {
             self.emit_tail_recursive_function_body(name, &simple_param_idents, &args[1..])
                 .unwrap_or_else(|| self.emit_function_body(expr, &args[1..]))
         };
+        if !has_pattern_params && contains_reduce_call(&args[1..]) {
+            body = self.emit_memoized_function_body(name, &simple_param_idents, body);
+        }
         let params = js_params.join(", ");
         format!(
             "export function {}({}) {{ {} }}",
@@ -907,6 +1264,34 @@ impl Emitter {
             .map(|(_, ident)| ident.clone())
             .collect::<Vec<_>>();
         (param_names, param_idents)
+    }
+
+    fn emit_memoized_function_body(
+        &mut self,
+        name: &str,
+        params: &[String],
+        body: String,
+    ) -> String {
+        let memo_name = self.next_temp("__closkell_memo");
+        let entry_name = self.next_temp("__closkell_memo_entry");
+        let value_name = self.next_temp("__closkell_memo_value");
+        let function_name = sanitize_identifier(name);
+        let args = params.join(", ");
+        let checks = params
+            .iter()
+            .enumerate()
+            .map(|(index, param)| format!("Object.is({}.args[{}], {})", entry_name, index, param))
+            .collect::<Vec<_>>()
+            .join(" && ");
+        let checks = if checks.is_empty() {
+            "true".to_string()
+        } else {
+            checks
+        };
+        format!(
+            "const {memo_name} = {function_name}.__closkellMemo ??= []; for (const {entry_name} of {memo_name}) {{ if ({entry_name}.args.length === {arity} && {checks}) return {entry_name}.value; }} const {value_name} = (() => {{ {body} }})(); {memo_name}.unshift({{ args: [{args}], value: {value_name} }}); if ({memo_name}.length > 16) {memo_name}.pop(); return {value_name};",
+            arity = params.len()
+        )
     }
 
     fn emit_template_defn(
@@ -1319,20 +1704,105 @@ impl Emitter {
         let Some((values, fallbacks)) = args.split_first() else {
             return "undefined".to_string();
         };
-        let values = parenthesize_expression(self.emit_expr(values));
-        let mut terms = vec![format!("...{}", values)];
-        terms.extend(fallbacks.iter().map(|fallback| self.emit_expr(fallback)));
-        format!("Math.{}({})", method, terms.join(", "))
+        if let Some((collection, mapper, indexed)) = map_call_parts(values) {
+            return self
+                .emit_mapped_numeric_aggregate(method, collection, mapper, indexed, fallbacks);
+        }
+
+        let values = self.emit_expr(values);
+        let identity = if method == "max" {
+            "-Infinity"
+        } else {
+            "Infinity"
+        };
+        let comparison = if method == "max" { ">" } else { "<" };
+        let fallback_terms = fallbacks
+            .iter()
+            .map(|fallback| self.emit_expr(fallback))
+            .collect::<Vec<_>>();
+        let fallback_update = fallback_terms
+            .iter()
+            .map(|fallback| {
+                format!(
+                    "if ({} {} __result) __result = {};",
+                    fallback, comparison, fallback
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!(
+            "((__values) => {{ let __result = {}; for (const __value of __values) if (__value {} __result) __result = __value; {} return __result; }})({})",
+            identity, comparison, fallback_update, values
+        )
     }
 
     fn emit_sum(&mut self, args: &[Expr]) -> String {
         if args.len() != 1 {
             return "undefined".to_string();
         }
+        if let Some((collection, mapper, indexed)) = map_call_parts(&args[0]) {
+            return self.emit_mapped_sum(collection, mapper, indexed);
+        }
         format!(
-            "((__values) => __values.reduce((__sum, __value) => __sum + __value, 0))({})",
+            "((__values) => {{ let __sum = 0; for (const __value of __values) __sum += __value; return __sum; }})({})",
             self.emit_expr(&args[0])
         )
+    }
+
+    fn emit_mapped_sum(&mut self, collection: &Expr, mapper: &Expr, indexed: bool) -> String {
+        let collection = self.emit_expr(collection);
+        let mapper = self.emit_expr(mapper);
+        if indexed {
+            format!(
+                "((__collection) => {{ const __items = Array.isArray(__collection) ? __collection : Array.from(__collection); let __sum = 0; for (let __index = 0; __index < __items.length; __index += 1) {{ const __item = __items[__index]; __sum += {}(__item, __index); }} return __sum; }})({})",
+                mapper, collection
+            )
+        } else {
+            format!(
+                "((__collection) => {{ let __sum = 0; for (const __item of __collection) __sum += {}(__item); return __sum; }})({})",
+                mapper, collection
+            )
+        }
+    }
+
+    fn emit_mapped_numeric_aggregate(
+        &mut self,
+        method: &str,
+        collection: &Expr,
+        mapper: &Expr,
+        indexed: bool,
+        fallbacks: &[Expr],
+    ) -> String {
+        let collection = self.emit_expr(collection);
+        let mapper = self.emit_expr(mapper);
+        let identity = if method == "max" {
+            "-Infinity"
+        } else {
+            "Infinity"
+        };
+        let comparison = if method == "max" { ">" } else { "<" };
+        let fallback_update = fallbacks
+            .iter()
+            .map(|fallback| {
+                let fallback = self.emit_expr(fallback);
+                format!(
+                    "if ({} {} __result) __result = {};",
+                    fallback, comparison, fallback
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        if indexed {
+            format!(
+                "((__collection) => {{ const __items = Array.isArray(__collection) ? __collection : Array.from(__collection); let __result = {}; for (let __index = 0; __index < __items.length; __index += 1) {{ const __item = __items[__index]; const __value = {}(__item, __index); if (__value {} __result) __result = __value; }} {} return __result; }})({})",
+                identity, mapper, comparison, fallback_update, collection
+            )
+        } else {
+            format!(
+                "((__collection) => {{ let __result = {}; for (const __item of __collection) {{ const __value = {}(__item); if (__value {} __result) __result = __value; }} {} return __result; }})({})",
+                identity, mapper, comparison, fallback_update, collection
+            )
+        }
     }
 
     fn emit_date_start_of_week(&mut self, args: &[Expr]) -> String {
@@ -1410,6 +1880,14 @@ impl Emitter {
             return "undefined".to_string();
         }
         "Boolean(globalThis.__CLOSKELL_ENV__?.DEV ?? (import.meta.env && import.meta.env.DEV))"
+            .to_string()
+    }
+
+    fn emit_env_mode(&mut self, args: &[Expr]) -> String {
+        if !args.is_empty() {
+            return "undefined".to_string();
+        }
+        "String(globalThis.__CLOSKELL_ENV__?.MODE ?? (import.meta.env && import.meta.env.MODE) ?? \"\")"
             .to_string()
     }
 
@@ -1829,8 +2307,8 @@ impl Emitter {
             .collect::<Vec<_>>()
             .join(", ");
         format!(
-            "((__collection) => __collection instanceof Set ? new Set([...__collection, {}]) : [...__collection, {}])({})",
-            items, items, collection
+            "((__collection, ...__items) => {{ if (__collection instanceof Set) return new Set([...__collection, ...__items]); const __next = Array.isArray(__collection) ? __collection.slice() : Array.from(__collection); __next.push(...__items); return __next; }})({}, {})",
+            collection, items
         )
     }
 
@@ -1924,20 +2402,394 @@ impl Emitter {
         if args.len() != 3 {
             return "undefined".to_string();
         }
-        let collection = parenthesize_member_base(self.emit_expr(&args[0]));
+        if let Some(optimized) = self.emit_append_reduce(args, indexed) {
+            return optimized;
+        }
+        if let Some(optimized) = self.emit_helper_append_reduce(args, indexed) {
+            return optimized;
+        }
+        if let Some(optimized) = self.emit_inline_reduce(args, indexed) {
+            return optimized;
+        }
+        let collection = self.emit_expr(&args[0]);
         let initial = self.emit_expr(&args[1]);
         let reducer = self.emit_expr(&args[2]);
-        if indexed {
+        let collection_name = self.next_temp("__closkell_reduce_collection");
+        let initial_name = self.next_temp("__closkell_reduce_initial");
+        let reducer_name = self.next_temp("__closkell_reduce_fn");
+        let items_name = self.next_temp("__closkell_reduce_items");
+        let acc_name = self.next_temp("__closkell_reduce_acc");
+        let index_name = self.next_temp("__closkell_reduce_index");
+        let item_name = self.next_temp("__closkell_reduce_item");
+        let call = if indexed {
             format!(
-                "{}.reduce((__acc, __item, __index) => {}(__acc, __item, __index), {})",
-                collection, reducer, initial
+                "{}({}, {}, {})",
+                reducer_name, acc_name, item_name, index_name
             )
         } else {
-            format!(
-                "{}.reduce((__acc, __item) => {}(__acc, __item), {})",
-                collection, reducer, initial
-            )
+            format!("{}({}, {})", reducer_name, acc_name, item_name)
+        };
+        format!(
+            "(({}, {}, {}) => {{ const {} = Array.isArray({}) ? {} : Array.from({}); let {} = {}; for (let {} = 0; {} < {}.length; {} += 1) {{ const {} = {}[{}]; {} = {}; }} return {}; }})({}, {}, {})",
+            collection_name,
+            initial_name,
+            reducer_name,
+            items_name,
+            collection_name,
+            collection_name,
+            collection_name,
+            acc_name,
+            initial_name,
+            index_name,
+            index_name,
+            items_name,
+            index_name,
+            item_name,
+            items_name,
+            index_name,
+            acc_name,
+            call,
+            acc_name,
+            collection,
+            initial,
+            reducer
+        )
+    }
+
+    fn emit_append_reduce(&mut self, args: &[Expr], indexed: bool) -> Option<String> {
+        let reducer = AppendReducer::parse(&args[2], indexed)?;
+        let collection = self.emit_expr(&args[0]);
+        let initial = self.emit_expr(&args[1]);
+        let collection_name = self.next_temp("__closkell_reduce_collection");
+        let initial_name = self.next_temp("__closkell_reduce_initial");
+        let items_name = self.next_temp("__closkell_reduce_items");
+        let acc_name = self.next_temp("__closkell_reduce_acc");
+        let index_name = self.next_temp("__closkell_reduce_index");
+        let item_name = self.next_temp("__closkell_reduce_item");
+        let append_name = self.next_temp("__closkell_append_items");
+        let append_value_name = self.next_temp("__closkell_append_value");
+
+        let mut body = Vec::new();
+        body.push(format!(
+            "const {} = {};",
+            sanitize_identifier(reducer.acc),
+            acc_name
+        ));
+        if reducer.item != "_" {
+            body.push(format!(
+                "const {} = {};",
+                sanitize_identifier(reducer.item),
+                item_name
+            ));
         }
+        if let Some(index) = reducer.index {
+            if index != "_" {
+                body.push(format!(
+                    "const {} = {};",
+                    sanitize_identifier(index),
+                    index_name
+                ));
+            }
+        }
+        for (binding, value) in reducer.bindings {
+            match &binding.kind {
+                ExprKind::Symbol(name) if name == "_" => {
+                    body.push(format!("{};", self.emit_expr(value)));
+                }
+                ExprKind::Symbol(name) => {
+                    body.push(format!(
+                        "const {} = {};",
+                        sanitize_identifier(name),
+                        self.emit_expr(value)
+                    ));
+                }
+                _ => {
+                    let value_name = self.next_temp("__closkell_reduce_let");
+                    body.push(format!("const {} = {};", value_name, self.emit_expr(value)));
+                    self.emit_pattern_assignment_statement(
+                        binding,
+                        &value_name,
+                        "reduce append let pattern did not match",
+                        &mut body,
+                    );
+                }
+            }
+        }
+
+        let append_items = reducer
+            .items
+            .iter()
+            .map(|item| self.emit_expr(item))
+            .collect::<Vec<_>>()
+            .join(", ");
+        body.push(format!("const {} = [{}];", append_name, append_items));
+        body.push(format!(
+            "if ({} instanceof Set) {{ for (const {} of {}) {}.add({}); }} else {{ {}.push(...{}); }}",
+            acc_name,
+            append_value_name,
+            append_name,
+            acc_name,
+            append_value_name,
+            acc_name,
+            append_name
+        ));
+
+        Some(format!(
+            "(({}, {}) => {{ const {} = Array.isArray({}) ? {} : Array.from({}); const {} = {} instanceof Set ? new Set({}) : Array.from({}); for (let {} = 0; {} < {}.length; {} += 1) {{ const {} = {}[{}]; {} }} return {}; }})({}, {})",
+            collection_name,
+            initial_name,
+            items_name,
+            collection_name,
+            collection_name,
+            collection_name,
+            acc_name,
+            initial_name,
+            initial_name,
+            initial_name,
+            index_name,
+            index_name,
+            items_name,
+            index_name,
+            item_name,
+            items_name,
+            index_name,
+            body.join(" "),
+            acc_name,
+            collection,
+            initial
+        ))
+    }
+
+    fn emit_helper_append_reduce(&mut self, args: &[Expr], indexed: bool) -> Option<String> {
+        let reducer = InlineReducer::parse(&args[2], indexed)?;
+        let [body] = reducer.body else {
+            return None;
+        };
+        let ExprKind::List(call_items) = &body.kind else {
+            return None;
+        };
+        let (helper_head, helper_args) = call_items.split_first()?;
+        let ExprKind::Symbol(helper_name) = &helper_head.kind else {
+            return None;
+        };
+        let helper = self.function_defs.get(helper_name)?.clone();
+        if helper.params.len() != helper_args.len() || helper.params.is_empty() {
+            return None;
+        }
+        if !matches_symbol(helper_args.first()?, reducer.acc) {
+            return None;
+        }
+        let [helper_body] = helper.body.as_slice() else {
+            return None;
+        };
+        let helper_acc = helper.params.first()?;
+        let append_body = AppendHelperBody::parse(helper_body, helper_acc)?;
+
+        let collection = self.emit_expr(&args[0]);
+        let initial = self.emit_expr(&args[1]);
+        let collection_name = self.next_temp("__closkell_reduce_collection");
+        let initial_name = self.next_temp("__closkell_reduce_initial");
+        let items_name = self.next_temp("__closkell_reduce_items");
+        let acc_name = self.next_temp("__closkell_reduce_acc");
+        let index_name = self.next_temp("__closkell_reduce_index");
+        let item_name = self.next_temp("__closkell_reduce_item");
+
+        let mut body =
+            self.emit_reduce_iteration_bindings(&reducer, &acc_name, &item_name, &index_name);
+        let helper_params = helper
+            .params
+            .iter()
+            .map(|param| sanitize_identifier(param))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let helper_call_args = helper_args
+            .iter()
+            .map(|arg| self.emit_expr(arg))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let helper_statements = self.emit_append_helper_statements(&append_body, helper_acc);
+        body.push(format!(
+            "(({}) => {{ {} }})({});",
+            helper_params, helper_statements, helper_call_args
+        ));
+
+        Some(format!(
+            "(({}, {}) => {{ const {} = Array.isArray({}) ? {} : Array.from({}); const {} = {} instanceof Set ? new Set({}) : Array.from({}); for (let {} = 0; {} < {}.length; {} += 1) {{ const {} = {}[{}]; {} }} return {}; }})({}, {})",
+            collection_name,
+            initial_name,
+            items_name,
+            collection_name,
+            collection_name,
+            collection_name,
+            acc_name,
+            initial_name,
+            initial_name,
+            initial_name,
+            index_name,
+            index_name,
+            items_name,
+            index_name,
+            item_name,
+            items_name,
+            index_name,
+            body.join(" "),
+            acc_name,
+            collection,
+            initial
+        ))
+    }
+
+    fn emit_inline_reduce(&mut self, args: &[Expr], indexed: bool) -> Option<String> {
+        let reducer = InlineReducer::parse(&args[2], indexed)?;
+        let collection = self.emit_expr(&args[0]);
+        let initial = self.emit_expr(&args[1]);
+        let collection_name = self.next_temp("__closkell_reduce_collection");
+        let initial_name = self.next_temp("__closkell_reduce_initial");
+        let items_name = self.next_temp("__closkell_reduce_items");
+        let acc_name = self.next_temp("__closkell_reduce_acc");
+        let index_name = self.next_temp("__closkell_reduce_index");
+        let item_name = self.next_temp("__closkell_reduce_item");
+
+        let mut body =
+            self.emit_reduce_iteration_bindings(&reducer, &acc_name, &item_name, &index_name);
+        body.push(format!("{} = {};", acc_name, self.emit_do(reducer.body)));
+
+        Some(format!(
+            "(({}, {}) => {{ const {} = Array.isArray({}) ? {} : Array.from({}); let {} = {}; for (let {} = 0; {} < {}.length; {} += 1) {{ const {} = {}[{}]; {} }} return {}; }})({}, {})",
+            collection_name,
+            initial_name,
+            items_name,
+            collection_name,
+            collection_name,
+            collection_name,
+            acc_name,
+            initial_name,
+            index_name,
+            index_name,
+            items_name,
+            index_name,
+            item_name,
+            items_name,
+            index_name,
+            body.join(" "),
+            acc_name,
+            collection,
+            initial
+        ))
+    }
+
+    fn emit_reduce_iteration_bindings(
+        &self,
+        reducer: &InlineReducer<'_>,
+        acc_name: &str,
+        item_name: &str,
+        index_name: &str,
+    ) -> Vec<String> {
+        let mut body = Vec::new();
+        if reducer.acc != "_" {
+            body.push(format!(
+                "const {} = {};",
+                sanitize_identifier(reducer.acc),
+                acc_name
+            ));
+        }
+        if reducer.item != "_" {
+            body.push(format!(
+                "const {} = {};",
+                sanitize_identifier(reducer.item),
+                item_name
+            ));
+        }
+        if let Some(index) = reducer.index {
+            if index != "_" {
+                body.push(format!(
+                    "const {} = {};",
+                    sanitize_identifier(index),
+                    index_name
+                ));
+            }
+        }
+        body
+    }
+
+    fn emit_append_helper_statements(
+        &mut self,
+        append_body: &AppendHelperBody<'_>,
+        acc: &str,
+    ) -> String {
+        let mut append_statements = Vec::new();
+        self.push_append_statements(
+            &mut append_statements,
+            &sanitize_identifier(acc),
+            &append_body.bindings,
+            append_body.items,
+        );
+        let append_code = append_statements.join(" ");
+        match append_body.condition {
+            None => append_code,
+            Some(AppendCondition::When(condition)) => {
+                format!("if ({}) {{ {} }}", self.emit_expr(condition), append_code)
+            }
+            Some(AppendCondition::Unless(condition)) => {
+                format!(
+                    "if (!({})) {{ {} }}",
+                    self.emit_expr(condition),
+                    append_code
+                )
+            }
+        }
+    }
+
+    fn push_append_statements(
+        &mut self,
+        body: &mut Vec<String>,
+        acc_name: &str,
+        bindings: &[(&Expr, &Expr)],
+        items: &[Expr],
+    ) {
+        for (binding, value) in bindings {
+            match &binding.kind {
+                ExprKind::Symbol(name) if name == "_" => {
+                    body.push(format!("{};", self.emit_expr(value)));
+                }
+                ExprKind::Symbol(name) => {
+                    body.push(format!(
+                        "const {} = {};",
+                        sanitize_identifier(name),
+                        self.emit_expr(value)
+                    ));
+                }
+                _ => {
+                    let value_name = self.next_temp("__closkell_reduce_let");
+                    body.push(format!("const {} = {};", value_name, self.emit_expr(value)));
+                    self.emit_pattern_assignment_statement(
+                        binding,
+                        &value_name,
+                        "reduce append let pattern did not match",
+                        body,
+                    );
+                }
+            }
+        }
+
+        let append_name = self.next_temp("__closkell_append_items");
+        let append_value_name = self.next_temp("__closkell_append_value");
+        let append_items = items
+            .iter()
+            .map(|item| self.emit_expr(item))
+            .collect::<Vec<_>>()
+            .join(", ");
+        body.push(format!("const {} = [{}];", append_name, append_items));
+        body.push(format!(
+            "if ({} instanceof Set) {{ for (const {} of {}) {}.add({}); }} else {{ {}.push(...{}); }}",
+            acc_name,
+            append_value_name,
+            append_name,
+            acc_name,
+            append_value_name,
+            acc_name,
+            append_name
+        ));
     }
 
     fn emit_string_method(&mut self, method: &str, args: &[Expr]) -> String {
@@ -2504,6 +3356,22 @@ impl Emitter {
             .unwrap_or_else(|| "\"\"".to_string());
         format!(
             "((__text, __pattern, __flags) => {{ try {{ return new RegExp(__pattern, __flags).exec(String(__text))?.[1] ?? \"\"; }} catch {{ return \"\"; }} }})({}, {}, {})",
+            self.emit_expr(&args[0]),
+            self.emit_expr(&args[1]),
+            flags
+        )
+    }
+
+    fn emit_regex_capture_all(&mut self, args: &[Expr]) -> String {
+        if !(2..=3).contains(&args.len()) {
+            return "undefined".to_string();
+        }
+        let flags = args
+            .get(2)
+            .map(|flags| self.emit_expr(flags))
+            .unwrap_or_else(|| "\"\"".to_string());
+        format!(
+            "((__text, __pattern, __flags) => {{ try {{ const __flagText = String(__flags || \"\"); const __allFlags = __flagText.includes(\"g\") ? __flagText : `${{__flagText}}g`; return Array.from(String(__text).matchAll(new RegExp(__pattern, __allFlags)), (__match) => __match.slice(1).map((__value) => __value ?? \"\")); }} catch {{ return []; }} }})({}, {}, {})",
             self.emit_expr(&args[0]),
             self.emit_expr(&args[1]),
             flags
@@ -3278,6 +4146,193 @@ struct CompiledPattern {
     bindings: String,
 }
 
+#[derive(Clone, Debug)]
+struct FunctionDef {
+    params: Vec<String>,
+    body: Vec<Expr>,
+}
+
+struct AppendReducer<'a> {
+    acc: &'a str,
+    item: &'a str,
+    index: Option<&'a str>,
+    bindings: Vec<(&'a Expr, &'a Expr)>,
+    items: &'a [Expr],
+}
+
+impl<'a> AppendReducer<'a> {
+    fn parse(expr: &'a Expr, indexed: bool) -> Option<Self> {
+        let ExprKind::List(items) = &expr.kind else {
+            return None;
+        };
+        let [head, params, body] = items.as_slice() else {
+            return None;
+        };
+        if !matches_symbol(head, "fn") {
+            return None;
+        }
+        let ExprKind::Vector(params) = &params.kind else {
+            return None;
+        };
+        let expected_params = if indexed { 3 } else { 2 };
+        if params.len() != expected_params {
+            return None;
+        }
+        let acc = symbol_name(&params[0])?;
+        let item = symbol_name(&params[1])?;
+        let index = if indexed {
+            Some(symbol_name(&params[2])?)
+        } else {
+            None
+        };
+        let (bindings, items) = append_conj_parts(body, acc)?;
+        Some(Self {
+            acc,
+            item,
+            index,
+            bindings,
+            items,
+        })
+    }
+}
+
+struct InlineReducer<'a> {
+    acc: &'a str,
+    item: &'a str,
+    index: Option<&'a str>,
+    body: &'a [Expr],
+}
+
+impl<'a> InlineReducer<'a> {
+    fn parse(expr: &'a Expr, indexed: bool) -> Option<Self> {
+        let ExprKind::List(items) = &expr.kind else {
+            return None;
+        };
+        let Some((head, args)) = items.split_first() else {
+            return None;
+        };
+        if !matches_symbol(head, "fn") {
+            return None;
+        }
+        let (params, body) = args.split_first()?;
+        let ExprKind::Vector(params) = &params.kind else {
+            return None;
+        };
+        let expected_params = if indexed { 3 } else { 2 };
+        if params.len() != expected_params || body.is_empty() {
+            return None;
+        }
+        let acc = symbol_name(&params[0])?;
+        let item = symbol_name(&params[1])?;
+        let index = if indexed {
+            Some(symbol_name(&params[2])?)
+        } else {
+            None
+        };
+        Some(Self {
+            acc,
+            item,
+            index,
+            body,
+        })
+    }
+}
+
+struct AppendHelperBody<'a> {
+    condition: Option<AppendCondition<'a>>,
+    bindings: Vec<(&'a Expr, &'a Expr)>,
+    items: &'a [Expr],
+}
+
+enum AppendCondition<'a> {
+    When(&'a Expr),
+    Unless(&'a Expr),
+}
+
+impl<'a> AppendHelperBody<'a> {
+    fn parse(expr: &'a Expr, acc: &str) -> Option<Self> {
+        if let Some((bindings, items)) = append_conj_parts(expr, acc) {
+            return Some(Self {
+                condition: None,
+                bindings,
+                items,
+            });
+        }
+
+        let ExprKind::List(items) = &expr.kind else {
+            return None;
+        };
+        let [head, condition, then_branch, else_branch] = items.as_slice() else {
+            return None;
+        };
+        if !matches_symbol(head, "if") {
+            return None;
+        }
+
+        if matches_symbol(then_branch, acc) {
+            let (bindings, items) = append_conj_parts(else_branch, acc)?;
+            return Some(Self {
+                condition: Some(AppendCondition::Unless(condition)),
+                bindings,
+                items,
+            });
+        }
+        if matches_symbol(else_branch, acc) {
+            let (bindings, items) = append_conj_parts(then_branch, acc)?;
+            return Some(Self {
+                condition: Some(AppendCondition::When(condition)),
+                bindings,
+                items,
+            });
+        }
+
+        None
+    }
+}
+
+fn append_conj_parts<'a>(
+    expr: &'a Expr,
+    acc: &str,
+) -> Option<(Vec<(&'a Expr, &'a Expr)>, &'a [Expr])> {
+    let ExprKind::List(items) = &expr.kind else {
+        return None;
+    };
+    let Some((head, args)) = items.split_first() else {
+        return None;
+    };
+    if matches_symbol(head, "conj") {
+        let Some((target, append_items)) = args.split_first() else {
+            return None;
+        };
+        if !matches_symbol(target, acc) || append_items.is_empty() {
+            return None;
+        }
+        return Some((Vec::new(), append_items));
+    }
+    if matches_symbol(head, "let") {
+        let [bindings_expr, body] = args else {
+            return None;
+        };
+        let ExprKind::Vector(bindings) = &bindings_expr.kind else {
+            return None;
+        };
+        if bindings.len() % 2 != 0 {
+            return None;
+        }
+        let (mut inner_bindings, items) = append_conj_parts(body, acc)?;
+        let mut all_bindings = bindings
+            .chunks(2)
+            .filter_map(|pair| match pair {
+                [binding, value] => Some((binding, value)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        all_bindings.append(&mut inner_bindings);
+        return Some((all_bindings, items));
+    }
+    None
+}
+
 impl CompiledPattern {
     fn always() -> Self {
         Self {
@@ -3677,9 +4732,13 @@ impl TemplateEmitter<'_> {
                     "__closkellSetConditional(instance, {}, instance.nodes[{}], {}, {}, {}, dispatch, updateContext);",
                     slot.id, slot.node_id, condition, render_then, render_else
                 ),
-                TemplateSlotKind::Component { render, args, .. } => format!(
-                    "__closkellSetComponent(instance, {}, instance.nodes[{}], () => {}, {}, dispatch, updateContext);",
-                    slot.id, slot.node_id, render, args
+                TemplateSlotKind::Component { name, render, args } => format!(
+                    "__closkellSetComponent(instance, {}, instance.nodes[{}], () => {}, {}, dispatch, updateContext, \"{}\");",
+                    slot.id,
+                    slot.node_id,
+                    render,
+                    args,
+                    escape_js(name)
                 ),
                 TemplateSlotKind::KeyedList {
                     collection,
@@ -3887,6 +4946,66 @@ fn symbol_name(expr: &Expr) -> Option<&str> {
     }
 }
 
+fn map_call_parts(expr: &Expr) -> Option<(&Expr, &Expr, bool)> {
+    let ExprKind::List(items) = &expr.kind else {
+        return None;
+    };
+    let [head, collection, mapper] = items.as_slice() else {
+        return None;
+    };
+    if matches_symbol(head, "map") {
+        Some((collection, mapper, false))
+    } else if matches_symbol(head, "map-indexed") {
+        Some((collection, mapper, true))
+    } else {
+        None
+    }
+}
+
+fn contains_reduce_call(exprs: &[Expr]) -> bool {
+    exprs.iter().any(expr_contains_reduce_call)
+}
+
+fn expr_contains_reduce_call(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::List(items) => {
+            items.first().is_some_and(|head| {
+                matches_symbol(head, "reduce") || matches_symbol(head, "reduce-indexed")
+            }) || items.iter().any(expr_contains_reduce_call)
+        }
+        ExprKind::Vector(items) | ExprKind::Set(items) => {
+            items.iter().any(expr_contains_reduce_call)
+        }
+        ExprKind::Map(entries) => entries
+            .iter()
+            .any(|(key, value)| expr_contains_reduce_call(key) || expr_contains_reduce_call(value)),
+        ExprKind::HtmlTemplate(node) => html_node_contains_reduce_call(node),
+        ExprKind::Nil
+        | ExprKind::Bool(_)
+        | ExprKind::Number(_)
+        | ExprKind::String(_)
+        | ExprKind::Keyword(_)
+        | ExprKind::Symbol(_)
+        | ExprKind::Quote(_)
+        | ExprKind::QuasiQuote(_)
+        | ExprKind::Unquote(_)
+        | ExprKind::UnquoteSplicing(_) => false,
+    }
+}
+
+fn html_node_contains_reduce_call(node: &HtmlNode) -> bool {
+    match node {
+        HtmlNode::Element(element) => {
+            element.attrs.iter().any(|attr| match &attr.value {
+                HtmlAttrValue::Dynamic { expr, .. } => expr_contains_reduce_call(expr),
+                HtmlAttrValue::Bool(_) | HtmlAttrValue::Static(_) => false,
+            }) || element.children.iter().any(html_node_contains_reduce_call)
+        }
+        HtmlNode::Expr { expr, .. } => expr_contains_reduce_call(expr),
+        HtmlNode::Text { .. } => false,
+    }
+}
+
 fn is_data_constructor_pattern(name: &str) -> bool {
     matches!(name, "some" | "ok" | "err" | "list" | "cons")
 }
@@ -3962,6 +5081,41 @@ fn collect_template_defns(source: &SourceFile) -> BTreeSet<String> {
     }
 
     components
+}
+
+fn collect_function_defs(source: &SourceFile) -> BTreeMap<String, FunctionDef> {
+    source
+        .forms
+        .iter()
+        .filter_map(|form| {
+            let ExprKind::List(items) = &form.kind else {
+                return None;
+            };
+            if items.len() < 4 || !matches_symbol(&items[0], "defn") {
+                return None;
+            }
+            let ExprKind::Symbol(name) = &items[1].kind else {
+                return None;
+            };
+            let ExprKind::Vector(params) = &items[2].kind else {
+                return None;
+            };
+            let params = params
+                .iter()
+                .map(symbol_name)
+                .collect::<Option<Vec<_>>>()?
+                .into_iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            Some((
+                name.clone(),
+                FunctionDef {
+                    params,
+                    body: items[3..].to_vec(),
+                },
+            ))
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -4668,6 +5822,10 @@ fn sanitize_identifier(name: &str) -> String {
 }
 
 fn emit_symbol_read(name: &str) -> String {
+    if name == "Cmd.none" {
+        return "{ kind: Symbol.for(\"none\") }".to_string();
+    }
+
     if name == "Sub.none" {
         return "{ kind: Symbol.for(\"none\") }".to_string();
     }
@@ -4967,6 +6125,52 @@ mod tests {
         );
         assert!(emitted.code.contains("kind: Symbol.for(\"none\")"));
         assert!(!emitted.code.contains("Sub."));
+
+        let source = syntax::parse_source(
+            "(defn subscriptions [state]\n  (Sub.window/event-with \"drag\" \"pointermove\" :move {:preventDefault true :options {:passive false}}))",
+        );
+        let emitted = emit_module(&source);
+
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        assert!(
+            emitted
+                .code
+                .contains("kind: Symbol.for(\"sub/window/event\")")
+        );
+        assert!(emitted.code.contains("preventDefault: true"));
+        assert!(emitted.code.contains("options:"));
+        assert!(!emitted.code.contains("Sub."));
+    }
+
+    #[test]
+    fn emits_command_helpers_as_plain_data() {
+        let source = syntax::parse_source(
+            "(defn update [state msg]\n  [state (Cmd.batch [Cmd.none\n                         (Cmd.dom-ref/measure \"track\" (fn [rect] {:kind :measured :left rect.left}) :measure-failed)\n                         (Cmd.bluetooth/connect-heart-rate \"hr\" {:filters [{:services [\"heart_rate\"]}]} (Msg.mapper :connected :info) :heart-rate :disconnected :failed)\n                         (Cmd.simulation/heart-rate \"sim\" {:ms 1000 :min 90 :max 160 :jitter 3 :start 120 :deviceName \"Sim\"} (Msg.mapper :connected :info) :heart-rate :failed)\n                         {:kind :timer/after :id \"tick\" :ms 1000 :msg {:kind :tick}}])])",
+        );
+        let emitted = emit_module(&source);
+
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        assert!(emitted.code.contains("kind: Symbol.for(\"batch\")"));
+        assert!(emitted.code.contains("commands: ["));
+        assert!(emitted.code.contains("kind: Symbol.for(\"none\")"));
+        assert!(
+            emitted
+                .code
+                .contains("kind: Symbol.for(\"dom-ref/measure\")")
+        );
+        assert!(
+            emitted
+                .code
+                .contains("kind: Symbol.for(\"bluetooth/connect-heart-rate\")")
+        );
+        assert!(
+            emitted
+                .code
+                .contains("kind: Symbol.for(\"simulation/heart-rate\")")
+        );
+        assert!(emitted.code.contains("kind: Symbol.for(\"timer/after\")"));
+        assert!(!emitted.code.contains("Cmd."));
+        assert!(!emitted.code.contains("Msg."));
     }
 
     #[test]
@@ -5779,7 +6983,8 @@ mod tests {
         assert!(emitted.code.contains(".at(-1) ?? null"));
         assert!(emitted.code.contains(".slice(0, -(1))"));
         assert!(emitted.code.contains("Array.from({ length: __count }"));
-        assert!(emitted.code.contains(".reduce((__acc, __item, __index)"));
+        assert!(emitted.code.contains("for (let __closkell_reduce_index"));
+        assert!(emitted.code.contains("let __closkell_reduce_acc"));
         assert!(
             emitted
                 .code
@@ -5822,10 +7027,60 @@ mod tests {
         assert!(emitted.code.contains(".localeCompare("));
         assert!(emitted.code.contains(".slice(-(2))"));
         assert!(emitted.code.contains(".slice(0, 2)"));
+        assert!(emitted.code.contains("__next.push(...__items);"));
+        assert!(emitted.code.contains("entries, { id: \"next\" }"));
+    }
+
+    #[test]
+    fn emits_append_reduce_as_push_loop() {
+        let source = syntax::parse_source(
+            "(defn append-ops [items]\n\
+               (reduce-indexed (rest items)\n\
+                 []\n\
+                 (fn [ops item index]\n\
+                   (let [previous (nth items index)\n\
+                         total (+ previous item)]\n\
+                     (conj ops {:index index :total total} item)))))",
+        );
+        let emitted = emit_module(&source);
+
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        assert!(emitted.code.contains("for (let __closkell_reduce_index"));
+        assert!(emitted.code.contains(".push(...__closkell_append_items"));
         assert!(
             emitted
                 .code
-                .contains(": [...__collection, { id: \"next\" }]")
+                .contains("Array.from(__closkell_reduce_initial")
+        );
+        assert!(
+            !emitted.code.contains(".reduce((__acc"),
+            "append-only reducer should not emit native reduce:\n{}",
+            emitted.code
+        );
+    }
+
+    #[test]
+    fn emits_helper_append_reduce_as_push_loop() {
+        let source = syntax::parse_source(
+            "(defn append-segment [ops items item index]\n\
+               (if (= index 0)\n\
+                   ops\n\
+                   (let [previous (nth items (- index 1))]\n\
+                     (conj ops previous item))))\n\
+             (defn append-all [items]\n\
+               (reduce-indexed items []\n\
+                 (fn [ops item index]\n\
+                   (append-segment ops items item index))))",
+        );
+        let emitted = emit_module(&source);
+
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        assert!(emitted.code.contains("for (let __closkell_reduce_index"));
+        assert!(emitted.code.contains(".push(...__closkell_append_items"));
+        assert!(
+            !emitted.code.contains(".reduce((__acc"),
+            "helper append reducer should not emit native reduce:\n{}",
+            emitted.code
         );
     }
 
@@ -5852,7 +7107,7 @@ mod tests {
         assert!(
             emitted
                 .code
-                .contains("new Set([...__collection, \"tempo\"])")
+                .contains("new Set([...__collection, ...__items])")
         );
         assert!(emitted.code.contains("__next.delete(__item);"));
         assert!(
@@ -6166,6 +7421,24 @@ mod tests {
     }
 
     #[test]
+    fn emits_env_mode_and_regex_capture_all() {
+        let source = syntax::parse_source(
+            "(def mode (env-mode))\n(defn pairs [text]\n  (regex-capture-all text \"name=([^;]+);url=([^;]+)\" \"g\"))",
+        );
+        let emitted = emit_module(&source);
+
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        assert!(emitted.code.contains("globalThis.__CLOSKELL_ENV__?.MODE"));
+        assert!(
+            emitted
+                .code
+                .contains("import.meta.env && import.meta.env.MODE")
+        );
+        assert!(emitted.code.contains(".matchAll(new RegExp"));
+        assert!(emitted.code.contains("__match.slice(1)"));
+    }
+
+    #[test]
     fn emits_numeric_vector_aggregates() {
         let source = syntax::parse_source(
             "(defn bounds [values]\n\
@@ -6176,13 +7449,12 @@ mod tests {
         let emitted = emit_module(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
-        assert!(emitted.code.contains("Math.min(...values, 50)"));
-        assert!(emitted.code.contains("Math.max(...values, 170)"));
-        assert!(
-            emitted
-                .code
-                .contains("__values.reduce((__sum, __value) => __sum + __value, 0)")
-        );
+        assert!(emitted.code.contains("let __result = Infinity"));
+        assert!(emitted.code.contains("let __result = -Infinity"));
+        assert!(emitted.code.contains("if (50 < __result) __result = 50;"));
+        assert!(emitted.code.contains("if (170 > __result) __result = 170;"));
+        assert!(emitted.code.contains("let __sum = 0;"));
+        assert!(emitted.code.contains("for (const __value of __values)"));
     }
 
     #[test]

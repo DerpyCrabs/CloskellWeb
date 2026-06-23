@@ -553,9 +553,57 @@ impl Inferencer {
                 "match" => return self.infer_match(span, args, env),
                 "do" => return self.infer_do(args, env),
                 "unsafe-cast" => return self.infer_unsafe_cast(name, args, env),
+                "Msg.of" => return self.infer_msg_of(name, args, env),
+                "Msg.with" => return self.infer_msg_with(name, args, env),
+                "Msg.with2" => return self.infer_msg_with2(name, args, env),
+                "Msg.mapper" => return self.infer_msg_mapper(name, args, env),
                 "Event.prevent" | "Event.stop" | "Event.prevent-stop" => {
                     return self.infer_event_control(name, args, env);
                 }
+                "Cmd.batch" => return self.infer_cmd_batch(name, args, env),
+                "Cmd.storage/get" => return self.infer_cmd_storage_get(name, args, env),
+                "Cmd.storage/set" => return self.infer_cmd_storage_set(name, args, env),
+                "Cmd.storage/set-silent" => {
+                    return self.infer_cmd_storage_set_silent(name, args, env);
+                }
+                "Cmd.time/now" => {
+                    return self.infer_cmd_payload_mapper(
+                        name,
+                        args,
+                        env,
+                        "time/now",
+                        Type::Number,
+                    );
+                }
+                "Cmd.random/number" => return self.infer_cmd_random_number(name, args, env),
+                "Cmd.timer/every" => return self.infer_cmd_timer(name, args, env, "timer/every"),
+                "Cmd.timer/after" => return self.infer_cmd_timer(name, args, env, "timer/after"),
+                "Cmd.timer/cancel" => return self.infer_cmd_timer_cancel(name, args, env),
+                "Cmd.animation/frame" => return self.infer_cmd_animation_frame(name, args, env),
+                "Cmd.animation/cancel" => return self.infer_cmd_animation_cancel(name, args, env),
+                "Cmd.dom-ref/click" => {
+                    return self.infer_cmd_dom_ref_action(name, args, env, "dom-ref/click");
+                }
+                "Cmd.dom-ref/focus" => {
+                    return self.infer_cmd_dom_ref_action(name, args, env, "dom-ref/focus");
+                }
+                "Cmd.file/read-selected" => {
+                    return self.infer_cmd_file_read_selected(name, args, env);
+                }
+                "Cmd.file/download" => return self.infer_cmd_file_download(name, args, env),
+                "Cmd.canvas/draw" => return self.infer_cmd_canvas_draw(name, args, env),
+                "Cmd.dom-ref/measure" => return self.infer_cmd_dom_ref_measure(name, args, env),
+                "Cmd.dom-ref/resize-watch" => return self.infer_cmd_resize_watch(name, args, env),
+                "Cmd.bluetooth/connect-heart-rate" => {
+                    return self.infer_cmd_bluetooth_connect_heart_rate(name, args, env);
+                }
+                "Cmd.bluetooth/disconnect" => {
+                    return self.infer_cmd_bluetooth_disconnect(name, args, env);
+                }
+                "Cmd.simulation/heart-rate" => {
+                    return self.infer_cmd_simulation_heart_rate(name, args, env);
+                }
+                "Cmd.simulation/stop" => return self.infer_cmd_simulation_stop(name, args, env),
                 "Task.succeed" => return self.infer_task_succeed(name, args, env),
                 "Task.fail" => return self.infer_task_fail(name, args, env),
                 "Task.map" => return self.infer_task_map(name, args, env),
@@ -575,6 +623,9 @@ impl Inferencer {
                     return self.infer_sub_change(name, args, env, "sub/media-query");
                 }
                 "Sub.window/event" => return self.infer_sub_window_event(name, args, env),
+                "Sub.window/event-with" => {
+                    return self.infer_sub_window_event_with(name, args, env);
+                }
                 "Sub.dom-ref/resize" => {
                     return self.infer_sub_change(name, args, env, "sub/dom-ref/resize");
                 }
@@ -631,6 +682,7 @@ impl Inferencer {
                 "not" => return self.infer_unary_bool(name, args, env),
                 "and" | "or" => return self.infer_bool_call(name, args, env),
                 "env-dev?" => return self.infer_zero_arg_bool(name, args),
+                "env-mode" => return self.infer_zero_arg_string(name, args),
                 "fail" => return self.infer_fail(name, args, env),
                 "ok" => return self.infer_ok(name, args, env),
                 "err" => return self.infer_err(name, args, env),
@@ -824,6 +876,7 @@ impl Inferencer {
                     return Type::String;
                 }
                 "regex-capture" => return self.infer_regex_capture(name, args, env),
+                "regex-capture-all" => return self.infer_regex_capture_all(name, args, env),
                 "install-virtual-json-viewer" => return self.infer_zero_arg_nil(name, args),
                 "str" => {
                     for arg in args {
@@ -1185,6 +1238,10 @@ impl Inferencer {
     fn infer_symbol(&mut self, span: Span, name: &str, env: &mut HashMap<String, Type>) -> Type {
         if let Some(ty) = env.get(name) {
             return ty.clone();
+        }
+
+        if name == "Cmd.none" {
+            return Type::Cmd(Box::new(self.fresh()));
         }
 
         if name == "Sub.none" {
@@ -3193,6 +3250,770 @@ impl Inferencer {
         Type::Sub(Box::new(self.resolve(msg)))
     }
 
+    fn infer_cmd_batch(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 1 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                1,
+                args.len(),
+            );
+            return Type::Cmd(Box::new(self.fresh()));
+        }
+
+        let msg = self.fresh();
+        let batch_ty = self.infer_expr(&args[0], env);
+        match self.resolve(batch_ty) {
+            Type::Vector(item) => {
+                self.unify(Type::Cmd(Box::new(msg.clone())), *item, args[0].span);
+            }
+            Type::Tuple(items) => {
+                for item in items {
+                    self.unify(Type::Cmd(Box::new(msg.clone())), item, args[0].span);
+                }
+            }
+            Type::Var(_) => {}
+            other => {
+                let found = self.format_type(&other);
+                self.diagnostics.push(Diagnostic::error(
+                    args[0].span,
+                    format!("Cmd.batch expects a vector of commands, found {}", found),
+                ));
+            }
+        }
+        Type::Cmd(Box::new(self.resolve(msg)))
+    }
+
+    fn infer_msg_of(&mut self, name: &str, args: &[Expr], env: &mut HashMap<String, Type>) -> Type {
+        if args.len() != 1 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                1,
+                args.len(),
+            );
+            return self.msg_record_type(None, BTreeMap::new());
+        }
+
+        let kind = self.infer_expr(&args[0], env);
+        let tag = self.expect_keyword_literal(kind, args[0].span, "Msg.of kind");
+        self.msg_record_type(tag, BTreeMap::new())
+    }
+
+    fn infer_msg_with(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 3 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                3,
+                args.len(),
+            );
+            return self.msg_record_type(None, BTreeMap::new());
+        }
+
+        let kind = self.infer_expr(&args[0], env);
+        let tag = self.expect_keyword_literal(kind, args[0].span, "Msg.with kind");
+        let field = self.infer_expr(&args[1], env);
+        let field_name = self
+            .expect_keyword_literal(field, args[1].span, "Msg.with field")
+            .unwrap_or_else(|| "value".to_string());
+        let value = self.infer_expr(&args[2], env);
+        self.msg_record_type(tag, BTreeMap::from([(field_name, value)]))
+    }
+
+    fn infer_msg_mapper(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 2 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                2,
+                args.len(),
+            );
+            let value = self.fresh();
+            return Type::Fn(
+                vec![value.clone()],
+                Box::new(
+                    self.msg_record_type(None, BTreeMap::from([("value".to_string(), value)])),
+                ),
+            );
+        }
+
+        let kind = self.infer_expr(&args[0], env);
+        let tag = self.expect_keyword_literal(kind, args[0].span, "Msg.mapper kind");
+        let field = self.infer_expr(&args[1], env);
+        let field_name = self
+            .expect_keyword_literal(field, args[1].span, "Msg.mapper field")
+            .unwrap_or_else(|| "value".to_string());
+        let value = self.fresh();
+        Type::Fn(
+            vec![value.clone()],
+            Box::new(self.msg_record_type(tag, BTreeMap::from([(field_name, value)]))),
+        )
+    }
+
+    fn infer_msg_with2(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 5 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                5,
+                args.len(),
+            );
+            return self.msg_record_type(None, BTreeMap::new());
+        }
+
+        let kind = self.infer_expr(&args[0], env);
+        let tag = self.expect_keyword_literal(kind, args[0].span, "Msg.with2 kind");
+        let first_field = self.infer_expr(&args[1], env);
+        let first_field_name = self
+            .expect_keyword_literal(first_field, args[1].span, "Msg.with2 first field")
+            .unwrap_or_else(|| "first".to_string());
+        let first_value = self.infer_expr(&args[2], env);
+        let second_field = self.infer_expr(&args[3], env);
+        let second_field_name = self
+            .expect_keyword_literal(second_field, args[3].span, "Msg.with2 second field")
+            .unwrap_or_else(|| "second".to_string());
+        let second_value = self.infer_expr(&args[4], env);
+        self.msg_record_type(
+            tag,
+            BTreeMap::from([
+                (first_field_name, first_value),
+                (second_field_name, second_value),
+            ]),
+        )
+    }
+
+    fn msg_record_type(&self, tag: Option<String>, mut fields: BTreeMap<String, Type>) -> Type {
+        fields.insert("kind".to_string(), Type::Keyword(tag));
+        Type::Record(fields)
+    }
+
+    fn expect_keyword_literal(&mut self, ty: Type, span: Span, label: &str) -> Option<String> {
+        match self.resolve(ty) {
+            Type::Keyword(Some(name)) => Some(name),
+            Type::Keyword(None) | Type::Var(_) => None,
+            other => {
+                let found = self.format_type(&other);
+                self.diagnostics.push(Diagnostic::error(
+                    span,
+                    format!("{} must be a keyword literal, found {}", label, found),
+                ));
+                None
+            }
+        }
+    }
+
+    fn infer_cmd_payload_mapper(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+        command_kind: &str,
+        payload_ty: Type,
+    ) -> Type {
+        if args.len() != 1 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                1,
+                args.len(),
+            );
+            return Type::Cmd(Box::new(self.fresh()));
+        }
+        let mapper_ty = self.infer_expr(&args[0], env);
+        let msg = self.infer_command_mapper_message(
+            command_kind,
+            mapper_ty,
+            payload_ty,
+            args[0].span,
+            ":toMessage",
+        );
+        Type::Cmd(Box::new(msg))
+    }
+
+    fn infer_cmd_storage_get(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 4 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                4,
+                args.len(),
+            );
+            return Type::Cmd(Box::new(self.fresh()));
+        }
+        self.require_string_arg(&args[0], env);
+        self.infer_expr(&args[1], env);
+        let ok = self.infer_expr(&args[2], env);
+        let payload = self.fresh();
+        let ok_msg = self.infer_command_mapper_message(
+            "storage/get",
+            ok,
+            payload,
+            args[2].span,
+            ":toMessage",
+        );
+        let err_msg = self.infer_command_tag_message("storage/get", "onError", &args[3], env);
+        Type::Cmd(Box::new(self.join_types(ok_msg, err_msg, args[0].span)))
+    }
+
+    fn infer_cmd_storage_set(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 3 && args.len() != 4 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                3,
+                args.len(),
+            );
+            return Type::Cmd(Box::new(self.fresh()));
+        }
+        self.require_string_arg(&args[0], env);
+        self.infer_expr(&args[1], env);
+        let msg = self.infer_expr(&args[2], env);
+        let msg = if let Some(error) = args.get(3) {
+            let err_msg = self.infer_command_tag_message("storage/set", "onError", error, env);
+            self.join_types(msg, err_msg, args[0].span)
+        } else {
+            msg
+        };
+        Type::Cmd(Box::new(msg))
+    }
+
+    fn infer_cmd_storage_set_silent(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 3 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                3,
+                args.len(),
+            );
+            return Type::Cmd(Box::new(self.fresh()));
+        }
+        self.require_string_arg(&args[0], env);
+        self.infer_expr(&args[1], env);
+        let err_msg = self.infer_command_tag_message("storage/set", "onError", &args[2], env);
+        Type::Cmd(Box::new(err_msg))
+    }
+
+    fn infer_cmd_random_number(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 3 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                3,
+                args.len(),
+            );
+            return Type::Cmd(Box::new(self.fresh()));
+        }
+        self.require_number_arg(&args[0], env);
+        self.require_number_arg(&args[1], env);
+        let mapper_ty = self.infer_expr(&args[2], env);
+        let msg = self.infer_command_mapper_message(
+            "random/number",
+            mapper_ty,
+            Type::Number,
+            args[2].span,
+            ":toMessage",
+        );
+        Type::Cmd(Box::new(msg))
+    }
+
+    fn infer_cmd_timer(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+        command_kind: &str,
+    ) -> Type {
+        if args.len() != 3 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                3,
+                args.len(),
+            );
+            return Type::Cmd(Box::new(self.fresh()));
+        }
+        self.require_string_arg(&args[0], env);
+        self.require_number_arg(&args[1], env);
+        let _ = command_kind;
+        Type::Cmd(Box::new(self.infer_expr(&args[2], env)))
+    }
+
+    fn infer_cmd_timer_cancel(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 1 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                1,
+                args.len(),
+            );
+            return Type::Cmd(Box::new(self.fresh()));
+        }
+        self.require_string_arg(&args[0], env);
+        Type::Cmd(Box::new(self.fresh()))
+    }
+
+    fn infer_cmd_animation_frame(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 2 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                2,
+                args.len(),
+            );
+            return Type::Cmd(Box::new(self.fresh()));
+        }
+        self.require_string_arg(&args[0], env);
+        let msg = self.infer_command_tag_message("animation/frame", "onFrame", &args[1], env);
+        Type::Cmd(Box::new(msg))
+    }
+
+    fn infer_cmd_animation_cancel(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 2 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                2,
+                args.len(),
+            );
+            return Type::Cmd(Box::new(self.fresh()));
+        }
+        self.require_string_arg(&args[0], env);
+        Type::Cmd(Box::new(self.infer_expr(&args[1], env)))
+    }
+
+    fn infer_cmd_dom_ref_action(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+        command_kind: &str,
+    ) -> Type {
+        if args.len() != 2 && args.len() != 3 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                2,
+                args.len(),
+            );
+            return Type::Cmd(Box::new(self.fresh()));
+        }
+        self.require_string_arg(&args[0], env);
+        let msg = self.infer_expr(&args[1], env);
+        let msg = if let Some(error) = args.get(2) {
+            let err_msg = self.infer_command_tag_message(command_kind, "onError", error, env);
+            self.join_types(msg, err_msg, args[0].span)
+        } else {
+            msg
+        };
+        Type::Cmd(Box::new(msg))
+    }
+
+    fn infer_cmd_file_read_selected(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 5 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                5,
+                args.len(),
+            );
+            return Type::Cmd(Box::new(self.fresh()));
+        }
+        self.require_string_arg(&args[0], env);
+        self.infer_expr(&args[1], env);
+        let ok = self.infer_expr(&args[2], env);
+        let payload = self.fresh();
+        let ok_msg = self.infer_command_mapper_message(
+            "file/read-selected",
+            ok,
+            payload,
+            args[2].span,
+            ":toMessage",
+        );
+        let err_msg =
+            self.infer_command_tag_message("file/read-selected", "onError", &args[3], env);
+        let cancel_msg =
+            self.infer_command_tag_message("file/read-selected", "onCancel", &args[4], env);
+        let msg = self.join_types(ok_msg, err_msg, args[0].span);
+        Type::Cmd(Box::new(self.join_types(msg, cancel_msg, args[0].span)))
+    }
+
+    fn infer_cmd_file_download(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 5 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                5,
+                args.len(),
+            );
+            return Type::Cmd(Box::new(self.fresh()));
+        }
+        self.require_string_arg(&args[0], env);
+        self.require_string_arg(&args[1], env);
+        self.require_string_arg(&args[2], env);
+        let msg = self.infer_expr(&args[3], env);
+        let err_msg = self.infer_command_tag_message("file/download", "onError", &args[4], env);
+        Type::Cmd(Box::new(self.join_types(msg, err_msg, args[0].span)))
+    }
+
+    fn infer_cmd_canvas_draw(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 5 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                5,
+                args.len(),
+            );
+            return Type::Cmd(Box::new(self.fresh()));
+        }
+        self.require_string_arg(&args[0], env);
+        self.require_number_arg(&args[1], env);
+        self.require_number_arg(&args[2], env);
+        self.infer_expr(&args[3], env);
+        let err_msg = self.infer_command_tag_message("canvas/draw", "onError", &args[4], env);
+        Type::Cmd(Box::new(err_msg))
+    }
+
+    fn infer_cmd_resize_watch(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 4 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                4,
+                args.len(),
+            );
+            return Type::Cmd(Box::new(self.fresh()));
+        }
+        self.require_string_arg(&args[0], env);
+        self.require_string_arg(&args[1], env);
+        let change_msg =
+            self.infer_command_tag_message("dom-ref/resize-watch", "onChange", &args[2], env);
+        let err_msg =
+            self.infer_command_tag_message("dom-ref/resize-watch", "onError", &args[3], env);
+        Type::Cmd(Box::new(self.join_types(change_msg, err_msg, args[0].span)))
+    }
+
+    fn infer_cmd_dom_ref_measure(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 3 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                3,
+                args.len(),
+            );
+            return Type::Cmd(Box::new(self.fresh()));
+        }
+        self.require_string_arg(&args[0], env);
+        let mapper_ty = self.infer_expr(&args[1], env);
+        let payload_ty = self
+            .command_success_value_type(Some("dom-ref/measure"), &BTreeMap::new())
+            .unwrap_or_else(|| self.fresh());
+        let ok_msg = self.infer_command_mapper_message(
+            "dom-ref/measure",
+            mapper_ty,
+            payload_ty,
+            args[1].span,
+            ":toMessage",
+        );
+        let err_msg = self.infer_command_tag_message("dom-ref/measure", "onError", &args[2], env);
+        Type::Cmd(Box::new(self.join_types(ok_msg, err_msg, args[0].span)))
+    }
+
+    fn infer_cmd_bluetooth_connect_heart_rate(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 6 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                6,
+                args.len(),
+            );
+            return Type::Cmd(Box::new(self.fresh()));
+        }
+        self.require_string_arg(&args[0], env);
+        let options_ty = self.infer_expr(&args[1], env);
+        self.unify(Type::Record(BTreeMap::new()), options_ty, args[1].span);
+        let mapper_ty = self.infer_expr(&args[2], env);
+        let payload_ty = self
+            .command_success_value_type(Some("bluetooth/connect-heart-rate"), &BTreeMap::new())
+            .unwrap_or_else(|| self.fresh());
+        let ok_msg = self.infer_command_mapper_message(
+            "bluetooth/connect-heart-rate",
+            mapper_ty,
+            payload_ty,
+            args[2].span,
+            ":toMessage",
+        );
+        let reading_msg = self.infer_command_tag_message(
+            "bluetooth/connect-heart-rate",
+            "onReading",
+            &args[3],
+            env,
+        );
+        let disconnected_msg = self.infer_command_tag_message(
+            "bluetooth/connect-heart-rate",
+            "onDisconnected",
+            &args[4],
+            env,
+        );
+        let err_msg = self.infer_command_tag_message(
+            "bluetooth/connect-heart-rate",
+            "onError",
+            &args[5],
+            env,
+        );
+        let msg = self.join_types(ok_msg, reading_msg, args[0].span);
+        let msg = self.join_types(msg, disconnected_msg, args[0].span);
+        Type::Cmd(Box::new(self.join_types(msg, err_msg, args[0].span)))
+    }
+
+    fn infer_cmd_bluetooth_disconnect(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 2 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                2,
+                args.len(),
+            );
+            return Type::Cmd(Box::new(self.fresh()));
+        }
+        self.require_string_arg(&args[0], env);
+        Type::Cmd(Box::new(self.infer_expr(&args[1], env)))
+    }
+
+    fn infer_cmd_simulation_heart_rate(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 5 && args.len() != 6 {
+            self.diagnostics.push(Diagnostic::error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                format!("{} expects 5 or 6 arguments, found {}", name, args.len()),
+            ));
+            return Type::Cmd(Box::new(self.fresh()));
+        }
+        self.require_string_arg(&args[0], env);
+        let options_ty = self.infer_expr(&args[1], env);
+        self.unify(Type::Record(BTreeMap::new()), options_ty, args[1].span);
+        let mapper_ty = self.infer_expr(&args[2], env);
+        let payload_ty = self
+            .command_success_value_type(Some("simulation/heart-rate"), &BTreeMap::new())
+            .unwrap_or_else(|| self.fresh());
+        let ok_msg = self.infer_command_mapper_message(
+            "simulation/heart-rate",
+            mapper_ty,
+            payload_ty,
+            args[2].span,
+            ":toMessage",
+        );
+        let reading_msg =
+            self.infer_command_tag_message("simulation/heart-rate", "onReading", &args[3], env);
+        let msg = self.join_types(ok_msg, reading_msg, args[0].span);
+        let (msg, error_index) = if args.len() == 6 {
+            let disconnected_msg = self.infer_command_tag_message(
+                "simulation/heart-rate",
+                "onDisconnected",
+                &args[4],
+                env,
+            );
+            (self.join_types(msg, disconnected_msg, args[0].span), 5)
+        } else {
+            (msg, 4)
+        };
+        let err_msg = self.infer_command_tag_message(
+            "simulation/heart-rate",
+            "onError",
+            &args[error_index],
+            env,
+        );
+        Type::Cmd(Box::new(self.join_types(msg, err_msg, args[0].span)))
+    }
+
+    fn infer_cmd_simulation_stop(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 1 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                1,
+                args.len(),
+            );
+            return Type::Cmd(Box::new(self.fresh()));
+        }
+        self.require_string_arg(&args[0], env);
+        Type::Cmd(Box::new(self.fresh()))
+    }
+
+    fn infer_command_mapper_message(
+        &mut self,
+        command_kind: &str,
+        mapper_ty: Type,
+        payload_ty: Type,
+        span: Span,
+        label: &str,
+    ) -> Type {
+        match self.resolve(mapper_ty) {
+            Type::Var(_) => self.fresh(),
+            Type::Fn(args, ret) => {
+                if args.len() != 1 {
+                    self.diagnostics.push(Diagnostic::error(
+                        span,
+                        format!(
+                            "{} command {} must accept exactly one argument",
+                            command_kind, label
+                        ),
+                    ));
+                    return self.fresh();
+                }
+                self.unify(args[0].clone(), payload_ty, span);
+                *ret
+            }
+            other => {
+                let found = self.format_type(&other);
+                self.diagnostics.push(Diagnostic::error(
+                    span,
+                    format!(
+                        "{} command {} must be a function, found {}",
+                        command_kind, label, found
+                    ),
+                ));
+                self.fresh()
+            }
+        }
+    }
+
+    fn infer_command_tag_message(
+        &mut self,
+        command_kind: &str,
+        field: &str,
+        arg: &Expr,
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        let tag_ty = self.infer_expr(arg, env);
+        match self.resolve(tag_ty) {
+            Type::Keyword(Some(tag)) => {
+                self.command_message_tag_type(Some(command_kind), field, &tag, &BTreeMap::new())
+            }
+            Type::Keyword(None) | Type::Var(_) => self.fresh(),
+            other => {
+                let found = self.format_type(&other);
+                self.diagnostics.push(Diagnostic::error(
+                    arg.span,
+                    format!(
+                        "{} command continuation :{} must be a keyword tag, found {}",
+                        command_kind, field, found
+                    ),
+                ));
+                self.fresh()
+            }
+        }
+    }
+
+    fn require_string_arg(&mut self, arg: &Expr, env: &mut HashMap<String, Type>) {
+        let ty = self.infer_expr(arg, env);
+        self.unify(Type::String, ty, arg.span);
+    }
+
+    fn require_number_arg(&mut self, arg: &Expr, env: &mut HashMap<String, Type>) {
+        let ty = self.infer_expr(arg, env);
+        self.unify(Type::Number, ty, arg.span);
+    }
+
     fn infer_sub_timer_every(
         &mut self,
         name: &str,
@@ -3272,6 +4093,38 @@ impl Inferencer {
         if let Some(options) = args.get(3) {
             self.infer_expr(options, env);
         }
+        let msg = self.subscription_tag_message_type(
+            Some("sub/window/event"),
+            "onEvent",
+            tag,
+            args[2].span,
+        );
+        Type::Sub(Box::new(msg))
+    }
+
+    fn infer_sub_window_event_with(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 4 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                4,
+                args.len(),
+            );
+            return Type::Sub(Box::new(self.fresh()));
+        }
+
+        let id = self.infer_expr(&args[0], env);
+        self.unify(Type::String, id, args[0].span);
+        let event_type = self.infer_expr(&args[1], env);
+        self.unify(Type::String, event_type, args[1].span);
+        let tag = self.infer_expr(&args[2], env);
+        let config_ty = self.infer_expr(&args[3], env);
+        self.unify(Type::Record(BTreeMap::new()), config_ty, args[3].span);
         let msg = self.subscription_tag_message_type(
             Some("sub/window/event"),
             "onEvent",
@@ -4378,6 +5231,26 @@ impl Inferencer {
             self.unify(ty, Type::String, arg.span);
         }
         Type::String
+    }
+
+    fn infer_regex_capture_all(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if !(2..=3).contains(&args.len()) {
+            self.diagnostics.push(Diagnostic::error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                format!("{} expects 2 or 3 arguments, found {}", name, args.len()),
+            ));
+            return Type::Vector(Box::new(Type::Vector(Box::new(Type::String))));
+        }
+        for arg in args {
+            let ty = self.infer_expr(arg, env);
+            self.unify(ty, Type::String, arg.span);
+        }
+        Type::Vector(Box::new(Type::Vector(Box::new(Type::String))))
     }
 
     fn infer_split(&mut self, name: &str, args: &[Expr], env: &mut HashMap<String, Type>) -> Type {
@@ -5941,7 +6814,15 @@ impl Inferencer {
                 let right_msg = self.infer_command_record_message_type(right, span);
                 Type::Cmd(Box::new(self.join_types(*left, right_msg, span)))
             }
+            (Type::Cmd(left), Type::Record(right)) if is_command_record_fields(&right) => {
+                let right_msg = self.infer_command_record_message_type(right, span);
+                Type::Cmd(Box::new(self.join_types(*left, right_msg, span)))
+            }
             (Type::Record(left), Type::Cmd(right)) if is_batch_command_record_fields(&left) => {
+                let left_msg = self.infer_command_record_message_type(left, span);
+                Type::Cmd(Box::new(self.join_types(left_msg, *right, span)))
+            }
+            (Type::Record(left), Type::Cmd(right)) if is_command_record_fields(&left) => {
                 let left_msg = self.infer_command_record_message_type(left, span);
                 Type::Cmd(Box::new(self.join_types(left_msg, *right, span)))
             }
@@ -6615,6 +7496,40 @@ impl Inferencer {
                 self.require_command_fields(command_kind, fields, &["ref"], span);
                 self.require_command_field_type(command_kind, fields, "ref", Type::String, span);
                 self.require_success_command_field(command_kind, fields, span);
+            }
+            "dom/scroll-into-view" => {
+                self.require_one_command_field(
+                    command_kind,
+                    fields,
+                    &["selector", "testId", "id"],
+                    span,
+                );
+                self.require_command_field_type(
+                    command_kind,
+                    fields,
+                    "selector",
+                    Type::String,
+                    span,
+                );
+                self.require_command_field_type(command_kind, fields, "testId", Type::String, span);
+                self.require_command_field_type(command_kind, fields, "id", Type::String, span);
+                self.require_command_field_type(
+                    command_kind,
+                    fields,
+                    "behavior",
+                    Type::String,
+                    span,
+                );
+                self.require_command_field_type(command_kind, fields, "block", Type::String, span);
+                self.require_command_field_type(command_kind, fields, "inline", Type::String, span);
+                self.require_command_field_type(
+                    command_kind,
+                    fields,
+                    "skipIfVisible",
+                    Type::Bool,
+                    span,
+                );
+                self.require_command_field_type(command_kind, fields, "smooth", Type::Bool, span);
             }
             "dom-ref/resize-watch" => {
                 self.require_command_fields(command_kind, fields, &["ref", "onChange"], span);
@@ -8016,7 +8931,8 @@ impl Inferencer {
         span: Span,
     ) -> Option<Type> {
         let mut resolving = BTreeSet::new();
-        self.type_syntax_to_type_inner(syntax, aliases, span, &mut resolving)
+        let mut type_vars = HashMap::new();
+        self.type_syntax_to_type_inner(syntax, aliases, span, &mut resolving, &mut type_vars)
     }
 
     fn type_syntax_to_type_inner(
@@ -8025,6 +8941,7 @@ impl Inferencer {
         aliases: &HashMap<String, TypeAlias>,
         span: Span,
         resolving: &mut BTreeSet<String>,
+        type_vars: &mut HashMap<String, Type>,
     ) -> Option<Type> {
         match syntax {
             TypeSyntax::Named(name) => match name.as_str() {
@@ -8038,6 +8955,14 @@ impl Inferencer {
                 "Html" => Some(Type::Html),
                 "TrustedHtml" => Some(Type::TrustedHtml),
                 _ => {
+                    if is_annotation_type_var(name) {
+                        return Some(
+                            type_vars
+                                .entry(name.clone())
+                                .or_insert_with(|| self.fresh())
+                                .clone(),
+                        );
+                    }
                     let Some(alias) = aliases.get(name) else {
                         self.diagnostics.push(Diagnostic::error(
                             span,
@@ -8063,8 +8988,13 @@ impl Inferencer {
                         ));
                         return None;
                     }
-                    let ty =
-                        self.type_syntax_to_type_inner(&alias.syntax, aliases, span, resolving);
+                    let ty = self.type_syntax_to_type_inner(
+                        &alias.syntax,
+                        aliases,
+                        span,
+                        resolving,
+                        type_vars,
+                    );
                     resolving.remove(name);
                     ty
                 }
@@ -8073,7 +9003,8 @@ impl Inferencer {
             TypeSyntax::Record(fields) => {
                 let mut checked = BTreeMap::new();
                 for (name, field) in fields {
-                    let Some(ty) = self.type_syntax_to_type_inner(field, aliases, span, resolving)
+                    let Some(ty) =
+                        self.type_syntax_to_type_inner(field, aliases, span, resolving, type_vars)
                     else {
                         return None;
                     };
@@ -8084,7 +9015,8 @@ impl Inferencer {
             TypeSyntax::Tuple(items) => {
                 let mut checked = Vec::new();
                 for item in items {
-                    let Some(ty) = self.type_syntax_to_type_inner(item, aliases, span, resolving)
+                    let Some(ty) =
+                        self.type_syntax_to_type_inner(item, aliases, span, resolving, type_vars)
                     else {
                         return None;
                     };
@@ -8094,46 +9026,54 @@ impl Inferencer {
             }
             TypeSyntax::Apply { name, args } => match name.as_str() {
                 "Decoder" => self
-                    .type_syntax_to_type_inner(&args[0], aliases, span, resolving)
+                    .type_syntax_to_type_inner(&args[0], aliases, span, resolving, type_vars)
                     .map(|inner| Type::Decoder(Box::new(inner))),
                 "Option" => self
-                    .type_syntax_to_type_inner(&args[0], aliases, span, resolving)
+                    .type_syntax_to_type_inner(&args[0], aliases, span, resolving, type_vars)
                     .map(|inner| Type::Option(Box::new(inner))),
                 "List" => self
-                    .type_syntax_to_type_inner(&args[0], aliases, span, resolving)
+                    .type_syntax_to_type_inner(&args[0], aliases, span, resolving, type_vars)
                     .map(|inner| Type::List(Box::new(inner))),
                 "Vector" => self
-                    .type_syntax_to_type_inner(&args[0], aliases, span, resolving)
+                    .type_syntax_to_type_inner(&args[0], aliases, span, resolving, type_vars)
                     .map(|inner| Type::Vector(Box::new(inner))),
                 "Set" => self
-                    .type_syntax_to_type_inner(&args[0], aliases, span, resolving)
+                    .type_syntax_to_type_inner(&args[0], aliases, span, resolving, type_vars)
                     .map(|inner| Type::Set(Box::new(inner))),
                 "Map" => {
-                    let key = self.type_syntax_to_type_inner(&args[0], aliases, span, resolving)?;
-                    let value =
-                        self.type_syntax_to_type_inner(&args[1], aliases, span, resolving)?;
+                    let key = self
+                        .type_syntax_to_type_inner(&args[0], aliases, span, resolving, type_vars)?;
+                    let value = self
+                        .type_syntax_to_type_inner(&args[1], aliases, span, resolving, type_vars)?;
                     Some(Type::Map(Box::new(key), Box::new(value)))
                 }
                 "Result" => {
-                    let ok = self.type_syntax_to_type_inner(&args[0], aliases, span, resolving)?;
-                    let err = self.type_syntax_to_type_inner(&args[1], aliases, span, resolving)?;
+                    let ok = self
+                        .type_syntax_to_type_inner(&args[0], aliases, span, resolving, type_vars)?;
+                    let err = self
+                        .type_syntax_to_type_inner(&args[1], aliases, span, resolving, type_vars)?;
                     Some(Type::Result(Box::new(ok), Box::new(err)))
                 }
                 "Cmd" => {
-                    let msg = self.type_syntax_to_type_inner(&args[0], aliases, span, resolving)?;
+                    let msg = self
+                        .type_syntax_to_type_inner(&args[0], aliases, span, resolving, type_vars)?;
                     Some(Type::Cmd(Box::new(msg)))
                 }
                 "Sub" => {
-                    let msg = self.type_syntax_to_type_inner(&args[0], aliases, span, resolving)?;
+                    let msg = self
+                        .type_syntax_to_type_inner(&args[0], aliases, span, resolving, type_vars)?;
                     Some(Type::Sub(Box::new(msg)))
                 }
                 "Event" => {
-                    let msg = self.type_syntax_to_type_inner(&args[0], aliases, span, resolving)?;
+                    let msg = self
+                        .type_syntax_to_type_inner(&args[0], aliases, span, resolving, type_vars)?;
                     Some(Type::Event(Box::new(msg)))
                 }
                 "Task" => {
-                    let err = self.type_syntax_to_type_inner(&args[0], aliases, span, resolving)?;
-                    let ok = self.type_syntax_to_type_inner(&args[1], aliases, span, resolving)?;
+                    let err = self
+                        .type_syntax_to_type_inner(&args[0], aliases, span, resolving, type_vars)?;
+                    let ok = self
+                        .type_syntax_to_type_inner(&args[1], aliases, span, resolving, type_vars)?;
                     Some(Type::Task(Box::new(err), Box::new(ok)))
                 }
                 _ => {
@@ -8164,8 +9104,13 @@ impl Inferencer {
                             .zip(args.iter().cloned())
                             .collect::<HashMap<_, _>>();
                         let substituted = substitute_type_syntax(&alias.syntax, &bindings);
-                        let ty =
-                            self.type_syntax_to_type_inner(&substituted, aliases, span, resolving);
+                        let ty = self.type_syntax_to_type_inner(
+                            &substituted,
+                            aliases,
+                            span,
+                            resolving,
+                            type_vars,
+                        );
                         resolving.remove(name);
                         return ty;
                     }
@@ -8179,20 +9124,22 @@ impl Inferencer {
             TypeSyntax::Fn { args, ret } => {
                 let mut checked_args = Vec::new();
                 for arg in args {
-                    let Some(ty) = self.type_syntax_to_type_inner(arg, aliases, span, resolving)
+                    let Some(ty) =
+                        self.type_syntax_to_type_inner(arg, aliases, span, resolving, type_vars)
                     else {
                         return None;
                     };
                     checked_args.push(ty);
                 }
-                let ret = self.type_syntax_to_type_inner(ret, aliases, span, resolving)?;
+                let ret =
+                    self.type_syntax_to_type_inner(ret, aliases, span, resolving, type_vars)?;
                 Some(Type::Fn(checked_args, Box::new(ret)))
             }
             TypeSyntax::Union(variants) => {
                 let mut checked = Vec::new();
                 for variant in variants {
-                    let Some(ty) =
-                        self.type_syntax_to_type_inner(variant, aliases, span, resolving)
+                    let Some(ty) = self
+                        .type_syntax_to_type_inner(variant, aliases, span, resolving, type_vars)
                     else {
                         return None;
                     };
@@ -8340,6 +9287,12 @@ fn is_ann_form(expr: &Expr) -> bool {
 
 fn is_foreign_form(expr: &Expr) -> bool {
     matches!(&expr.kind, ExprKind::List(items) if items.first().is_some_and(|head| matches_symbol(head, "foreign")))
+}
+
+fn is_annotation_type_var(name: &str) -> bool {
+    name.chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_lowercase())
 }
 
 fn definition_name(expr: &Expr) -> Option<&str> {
@@ -9041,6 +9994,10 @@ fn could_be_homogeneous(left: &Type, right: &Type) -> bool {
         (Type::Record(left), Type::Record(right)) => left.keys().eq(right.keys()),
         (Type::Tuple(left), Type::Tuple(right)) => left.len() == right.len(),
         (Type::Var(_), Type::Record(_)) | (Type::Record(_), Type::Var(_)) => false,
+        (Type::Var(_), Type::Cmd(_)) | (Type::Cmd(_), Type::Var(_)) => false,
+        (Type::Var(_), Type::Sub(_)) | (Type::Sub(_), Type::Var(_)) => false,
+        (Type::Var(_), Type::Task(_, _)) | (Type::Task(_, _), Type::Var(_)) => false,
+        (Type::Var(_), Type::Event(_)) | (Type::Event(_), Type::Var(_)) => false,
         (Type::Var(_), _) | (_, Type::Var(_)) => true,
         (Type::Option(left), Type::Option(right))
         | (Type::Decoder(left), Type::Decoder(right))
@@ -9054,7 +10011,7 @@ fn could_be_homogeneous(left: &Type, right: &Type) -> bool {
         (Type::Result(left_ok, left_err), Type::Result(right_ok, right_err)) => {
             could_be_homogeneous(left_ok, right_ok) && could_be_homogeneous(left_err, right_err)
         }
-        (Type::Cmd(left), Type::Cmd(right)) => could_be_homogeneous(left, right),
+        (Type::Cmd(_), Type::Cmd(_)) => false,
         (Type::Task(left_err, left_ok), Type::Task(right_err, right_ok)) => {
             could_be_homogeneous(left_err, right_err) && could_be_homogeneous(left_ok, right_ok)
         }
@@ -9236,6 +10193,7 @@ fn is_known_command_kind(kind: &str) -> bool {
             | "dom-ref/focus"
             | "dom-ref/click"
             | "dom-ref/measure"
+            | "dom/scroll-into-view"
             | "dom-ref/resize-watch"
             | "dom-ref/resize-unwatch"
             | "window/event-watch"
@@ -9715,6 +10673,48 @@ mod tests {
         );
 
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn infers_cmd_none_and_cmd_batch_helpers() {
+        let result = check(
+            "(type State {:count Number})\n\
+             (type Msg (Union {:kind :load} {:kind :tick}))\n\
+             (type UpdateResult [State (Cmd Msg)])\n\
+             (ann update (Fn [State Msg] UpdateResult))\n\
+             (defn update [state msg]\n  (match msg\n    {:kind :load}\n      [state (Cmd.batch [Cmd.none {:kind :timer/after :id \"tick\" :ms 1000 :msg {:kind :tick}}])]\n    _ [state Cmd.none]))",
+        );
+
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn infers_browser_command_constructor_helpers() {
+        let result = check(
+            "(type State {:ready Bool})\n\
+             (type Rect {:x Number :y Number :width Number :height Number :top Number :right Number :bottom Number :left Number})\n\
+             (type Info {:id String :deviceName String :connected Bool})\n\
+             (type Msg (Union {:kind :start} {:kind :measured :left Number :width Number :value Rect} {:kind :measure-failed :error String} {:kind :connected :info Info} {:kind :heart-rate :bpm Number} {:kind :disconnected} {:kind :failed :error String}))\n\
+             (type UpdateResult [State (Cmd Msg)])\n\
+             (ann update (Fn [State Msg] UpdateResult))\n\
+             (defn update [state msg]\n  [state (Cmd.batch [(Cmd.dom-ref/measure \"track\"\n                                                   (fn [rect] {:kind :measured\n                                                               :left rect.left\n                                                               :width rect.width\n                                                               :value {:x rect.x :y rect.y :width rect.width :height rect.height :top rect.top :right rect.right :bottom rect.bottom :left rect.left}})\n                                                   :measure-failed)\n                         (Cmd.bluetooth/connect-heart-rate \"hr\"\n                                                           {:filters [{:services [\"heart_rate\"]}]\n                                                            :optionalServices [\"heart_rate\"]}\n                                                           (Msg.mapper :connected :info)\n                                                           :heart-rate\n                                                           :disconnected\n                                                           :failed)\n                         (Cmd.simulation/heart-rate \"sim\"\n                                                    {:ms 1000 :min 90 :max 160 :jitter 3 :start 120 :deviceName \"Sim\"}\n                                                    (Msg.mapper :connected :info)\n                                                    :heart-rate\n                                                    :failed)])])",
+        );
+
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn keeps_unannotated_cmd_none_update_results_as_tuples() {
+        let result = check(
+            "(defn update [state msg]\n  (match msg\n    {:kind :loaded :value value}\n      [(merge state {:loading? false :value value}) Cmd.none]\n    _ [state Cmd.none]))",
+        );
+
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert!(
+            result.forms[0].ty.contains(" (Cmd "),
+            "update result should keep [state cmd] tuple shape: {}",
+            result.forms[0].ty
+        );
     }
 
     #[test]
@@ -10328,6 +11328,48 @@ mod tests {
         );
 
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn annotation_type_variables_keep_command_helpers_polymorphic() {
+        let helper = check(
+            "(ann silent-command (Fn [String payload] (Cmd msg)))\n\
+             (defn silent-command [key payload]\n  Cmd.none)",
+        );
+        assert!(helper.diagnostics.is_empty(), "{:?}", helper.diagnostics);
+        let binding = imported_binding(&helper, "silent-command");
+
+        let result = check_with_imports(
+            "(import \"./helpers.clsk\" [silent-command])\n\
+             (def one (silent-command \"one\" {:id \"alpha\"}))\n\
+             (def two (silent-command \"two\" {:id \"beta\"}))",
+            &[binding],
+        );
+
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn unannotated_update_joins_imported_cmd_with_plain_command_records() {
+        let helper = check(
+            "(type HelperMsg (Union {:kind :helper-done}))\n\
+             (ann helper-command (Fn [] (Cmd HelperMsg)))\n\
+             (defn helper-command []\n  {:kind :timer/cancel :id \"helper\" :msg {:kind :helper-done}})",
+        );
+        assert!(helper.diagnostics.is_empty(), "{:?}", helper.diagnostics);
+        let binding = imported_binding(&helper, "helper-command");
+
+        let result = check_with_imports(
+            "(import \"./helpers.clsk\" [helper-command])\n\
+             (defn update [state msg]\n\
+               (match msg\n\
+                 {:kind :start} [state (helper-command)]\n\
+                 _ [state {:kind :file/download :name \"x.txt\" :content \"\" :mime \"text/plain\" :msg {:kind :noop}}]))",
+            &[binding],
+        );
+
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert!(result.forms[0].ty.contains("(Cmd (Union"));
     }
 
     #[test]
@@ -11436,6 +12478,23 @@ mod tests {
         assert!(result.forms[0].ty.contains("(Union"));
         assert!(result.forms[0].ty.contains(":id String"));
         assert!(result.forms[0].ty.contains(":onEvent Keyword"));
+    }
+
+    #[test]
+    fn infers_env_mode_and_regex_capture_all() {
+        let result = check(
+            "(defn parse [text]\n\
+               {:mode (env-mode)\n\
+                :pairs (regex-capture-all text \"name=([^;]+);url=([^;]+)\" \"g\")})",
+        );
+
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert!(result.forms[0].ty.contains(":mode String"));
+        assert!(
+            result.forms[0]
+                .ty
+                .contains(":pairs (Vector (Vector String))")
+        );
     }
 
     #[test]

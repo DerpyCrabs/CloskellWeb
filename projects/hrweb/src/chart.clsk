@@ -1,6 +1,7 @@
 (import "./zones.clsk" [target-zone zone-for-bpm])
 (import "./log.clsk" [selected-log])
 (import "./model.clsk" [HeartReading HeartZone HeartChartRect WorkoutEntry])
+(import "./ui-effects.clsk" [arc-op begin-path-op canvas-op clear-op fill-op fill-rect-op fill-text-op line-to-op move-to-op set-op stroke-op stroke-rect-op])
 
 (type HeartChartMsg
   (Union
@@ -37,31 +38,6 @@
 (def log-chart-ref "log-heart-chart")
 (def chart-watch-id "heart-chart-active")
 (def one-minute-ms 60000)
-
-(def empty-canvas-op
-  {:op :none
-   :x 0
-   :y 0
-   :width 0
-   :height 0
-   :radius 0
-   :start 0
-   :end 0
-   :lineWidth 0
-   :strokeStyle ""
-   :fillStyle ""
-   :font ""
-   :text ""
-   :textAlign ""
-   :textBaseline ""
-   :lineCap ""
-   :lineJoin ""
-   :globalAlpha 1
-   :name ""
-   :value 0})
-
-(defn canvas-op [fields]
-  (merge empty-canvas-op fields))
 
 (defn first-reading-time [readings]
   (let [reading (nth readings 0)]
@@ -226,35 +202,16 @@
         height (max 1 (+ (- bottom top) 1))
         target? (= zone.id target-zone-id)
         fill-color (str zone.color (if target? "34" "14"))
-        with-fill (conj ops
-                        (canvas-op {:op :fill-rect
-                                    :x chart.left
-                                    :y top
-                                    :width (plot-width chart)
-                                    :height height
-                                    :fillStyle fill-color}))]
+        with-fill (conj ops (fill-rect-op chart.left top (plot-width chart) height fill-color))]
     (if (and target? (not chart.mobile?))
         (conj with-fill
-              (canvas-op {:op :stroke-rect
-                          :x chart.left
-                          :y top
-                          :width (plot-width chart)
-                          :height (max 1 (- bottom top))
-                          :strokeStyle zone.color
-                          :lineWidth chart.targetLineWidth}))
+              (stroke-rect-op chart.left top (plot-width chart) (max 1 (- bottom top)) zone.color chart.targetLineWidth))
         with-fill)))
 
 (defn zone-band-ops [chart zones target-zone-id]
   (reduce-indexed zones
-    [(canvas-op {:op :clear
-                 :width chart.width
-                 :height chart.height})
-     (canvas-op {:op :fill-rect
-                 :x 0
-                 :y 0
-                 :width chart.width
-                 :height chart.height
-                 :fillStyle "#fffdfa"})]
+    [(clear-op chart.width chart.height)
+     (fill-rect-op 0 0 chart.width chart.height "#fffdfa")]
     (fn [ops zone index]
       (append-zone-band-ops ops chart zones target-zone-id zone index))))
 
@@ -275,14 +232,7 @@
 
 (defn append-boundary-label-op [ops chart boundary]
   (conj ops
-        (canvas-op {:op :fill-text
-                    :text (str boundary.label)
-                    :x (- chart.left 8)
-                    :y (y-for-bpm chart boundary.value)
-                    :fillStyle "#617066"
-                    :font chart.boundaryFont
-                    :textAlign "right"
-                    :textBaseline "middle"})))
+        (fill-text-op (str boundary.label) (- chart.left 8) (y-for-bpm chart boundary.value) "#617066" chart.boundaryFont "right" "middle")))
 
 (defn boundary-label-ops [ops chart zones mobile?]
   (if mobile?
@@ -310,26 +260,25 @@
         x (+ chart.left (* ratio (plot-width chart)))
         align (tick-align index tick-count)]
     (conj ops
-          (canvas-op {:op :begin-path})
-          (canvas-op {:op :move-to :x x :y chart.bottom})
-          (canvas-op {:op :line-to :x x :y (+ chart.bottom chart.tickHeight)})
-          (canvas-op {:op :stroke :strokeStyle "#cbd5ce" :lineWidth chart.axisLineWidth})
-          (canvas-op {:op :fill-text
-                      :text (minute-label chart.durationMs ratio)
-                      :x (if (= index tick-count) (plot-right chart) x)
-                      :y chart.axisTop
-                      :fillStyle "#617066"
-                      :font chart.axisFont
-                      :textAlign align
-                      :textBaseline "top"}))))
+          (begin-path-op)
+          (move-to-op x chart.bottom)
+          (line-to-op x (+ chart.bottom chart.tickHeight))
+          (stroke-op "#cbd5ce" chart.axisLineWidth)
+          (fill-text-op (minute-label chart.durationMs ratio)
+                        (if (= index tick-count) (plot-right chart) x)
+                        chart.axisTop
+                        "#617066"
+                        chart.axisFont
+                        align
+                        "top"))))
 
 (defn time-axis-ops [ops chart tick-count]
   (reduce (range 0 (+ tick-count 1))
           (conj ops
-                (canvas-op {:op :begin-path})
-                (canvas-op {:op :move-to :x chart.left :y (+ chart.bottom 0.5)})
-                (canvas-op {:op :line-to :x (plot-right chart) :y (+ chart.bottom 0.5)})
-                (canvas-op {:op :stroke :strokeStyle "#cbd5ce" :lineWidth chart.axisLineWidth}))
+                (begin-path-op)
+                (move-to-op chart.left (+ chart.bottom 0.5))
+                (line-to-op (plot-right chart) (+ chart.bottom 0.5))
+                (stroke-op "#cbd5ce" chart.axisLineWidth))
           (fn [axis-ops index]
             (append-time-axis-tick-ops axis-ops chart tick-count index))))
 
@@ -350,22 +299,18 @@
                          (<= reading.bpm target.max))
             color (reading-line-color zones target target? reading)]
         (conj ops
-              (canvas-op {:op :begin-path})
-              (canvas-op {:op :move-to
-                          :x (x-for-reading chart readings duration-ms previous)
-                          :y (y-for-bpm chart previous.bpm)})
-              (canvas-op {:op :line-to
-                          :x (x-for-reading chart readings duration-ms reading)
-                          :y (y-for-bpm chart reading.bpm)})
+              (begin-path-op)
+              (move-to-op (x-for-reading chart readings duration-ms previous)
+                          (y-for-bpm chart previous.bpm))
+              (line-to-op (x-for-reading chart readings duration-ms reading)
+                          (y-for-bpm chart reading.bpm))
               (canvas-op {:op :stroke
                           :strokeStyle color
                           :lineWidth chart.lineWidth
                           :lineCap "round"
                           :lineJoin "round"
                           :globalAlpha (if target? 1 0.72)})
-              (canvas-op {:op :set
-                          :name "globalAlpha"
-                          :value 1})))))
+              (set-op "globalAlpha" 1)))))
 
 (defn reading-segment-ops [ops chart zones target-zone-id readings duration-ms]
   (if (< (count readings) 2)
@@ -387,15 +332,9 @@
         zone (zone-for-bpm zones latest.bpm)
         color (if (some? zone) zone.color "#172019")]
     (conj ops
-          (canvas-op {:op :begin-path})
-          (canvas-op {:op :arc
-                      :x (x-for-reading chart readings duration-ms latest)
-                      :y (y-for-bpm chart latest.bpm)
-                      :radius chart.pointRadius
-                      :start 0
-                      :end (* 2 pi)})
-          (canvas-op {:op :fill
-                      :fillStyle color}))))
+          (begin-path-op)
+          (arc-op (x-for-reading chart readings duration-ms latest) (y-for-bpm chart latest.bpm) chart.pointRadius 0 (* 2 pi))
+          (fill-op color))))
 
 (defn heart-chart-ops [state]
   (let [chart (heart-chart-layout state)
@@ -446,32 +385,21 @@
 
 (ann watch-heart-chart-command (Fn [String] (Cmd HeartChartMsg)))
 (defn watch-heart-chart-command [ref]
-  {:kind :dom-ref/resize-watch
-   :id chart-watch-id
-   :ref ref
-   :onChange :chart-resized
-   :onError :chart-error})
+  (Cmd.dom-ref/resize-watch chart-watch-id ref :chart-resized :chart-error))
 
 (ann heart-chart-command (Fn [HeartChartState] (Cmd HeartChartMsg)))
 (defn heart-chart-command [state]
   (if (heart-chart-active? state)
-      (let [chart-state (active-heart-chart-state state)
+        (let [chart-state (active-heart-chart-state state)
             chart (heart-chart-layout chart-state)
             ref (active-heart-chart-ref state)]
-        {:kind :canvas/draw
-         :ref ref
-         :cssWidth chart.width
-         :cssHeight chart.height
-         :devicePixelRatio true
-         :ops (heart-chart-ops chart-state)
-         :onError :chart-error})
-      {:kind :none}))
+        (Cmd.canvas/draw ref chart.width chart.height (heart-chart-ops chart-state) :chart-error))
+      Cmd.none))
 
 (ann heart-chart-batch (Fn [HeartChartState] (Cmd HeartChartMsg)))
 (defn heart-chart-batch [state]
   (if (heart-chart-active? state)
       (let [ref (active-heart-chart-ref state)]
-        {:kind :batch
-         :commands [(watch-heart-chart-command ref)
-                    (heart-chart-command state)]})
-      {:kind :none}))
+        (Cmd.batch [(watch-heart-chart-command ref)
+                    (heart-chart-command state)]))
+      Cmd.none))

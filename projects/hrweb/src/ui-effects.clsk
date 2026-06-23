@@ -1,0 +1,15 @@
+(defmacro no-cmd [state] `[~state Cmd.none])
+
+(defn canvas-op [fields] fields)
+
+(defn clear-op [width height] {:op :clear :width width :height height})
+(defn fill-rect-op [x y width height fill-style] {:op :fill-rect :x x :y y :width width :height height :fillStyle fill-style})
+(defn stroke-rect-op [x y width height stroke-style line-width] {:op :stroke-rect :x x :y y :width width :height height :strokeStyle stroke-style :lineWidth line-width})
+(defn fill-text-op [text x y fill-style font text-align text-baseline] {:op :fill-text :text text :x x :y y :fillStyle fill-style :font font :textAlign text-align :textBaseline text-baseline})
+(defn begin-path-op [] {:op :begin-path})
+(defn move-to-op [x y] {:op :move-to :x x :y y})
+(defn line-to-op [x y] {:op :line-to :x x :y y})
+(defn stroke-op [stroke-style line-width] {:op :stroke :strokeStyle stroke-style :lineWidth line-width})
+(defn arc-op [x y radius start end] {:op :arc :x x :y y :radius radius :start start :end end})
+(defn fill-op [fill-style] {:op :fill :fillStyle fill-style})
+(defn set-op [name value] {:op :set :name name :value value})

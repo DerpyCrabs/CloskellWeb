@@ -2037,6 +2037,109 @@ fn cli_inspect_reports_task_perform_command_schema() {
 }
 
 #[test]
+fn cli_inspect_reports_unused_top_level_defs_and_imports() {
+    let temp_dir = temp_dir("closkell-cli-inspect-unused");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+
+    let api = temp_dir.join("api.clsk");
+    fs::write(
+        &api,
+        "(def used-value 2)\n\
+         (def unused-import 3)\n",
+    )
+    .expect("api module should be written");
+
+    let app = temp_dir.join("app.clsk");
+    fs::write(
+        &app,
+        "(import \"./api.clsk\" [used-value unused-import])\n\
+         (type Msg (Union {:kind :ready}))\n\
+         (type UnusedType {:value Number})\n\
+         (def dead-constant 1)\n\
+         (defn dead-helper [] unused-import)\n\
+         (defn live-helper [count] (+ count used-value))\n\
+         (ann init (Fn [] [{:count Number} (Cmd Msg)]))\n\
+         (defn init [] [{:count (live-helper 1)} Cmd.none])\n\
+         (ann update (Fn [{:count Number} Msg] [{:count Number} (Cmd Msg)]))\n\
+         (defn update [state msg] [state Cmd.none])\n\
+         (defn view [state] #html <button>{state.count}</button>)\n",
+    )
+    .expect("app module should be written");
+
+    let inspect = Command::new(env!("CARGO_BIN_EXE_closkell"))
+        .arg("inspect")
+        .arg(&app)
+        .output()
+        .expect("closkell inspect should run");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+
+    assert!(
+        inspect.status.success(),
+        "closkell inspect failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&inspect.stdout),
+        String::from_utf8_lossy(&inspect.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&inspect.stdout);
+    assert!(
+        stdout.contains("\"unused\":")
+            && stdout.contains("\"name\":\"dead-constant\",\"kind\":\"def\"")
+            && stdout.contains("\"name\":\"dead-helper\",\"kind\":\"defn\"")
+            && stdout.contains("\"name\":\"UnusedType\",\"kind\":\"type\""),
+        "inspect did not report unused top-level code:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("\"imports\":[{\"name\":\"unused-import\"")
+            && !stdout.contains("\"imports\":[{\"name\":\"used-value\""),
+        "inspect did not report only the unused import:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn cli_inspect_reports_cmd_helper_command_schema() {
+    let temp_dir = temp_dir("closkell-cli-inspect-cmd-helpers");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+
+    let app = temp_dir.join("app.clsk");
+    fs::write(
+        &app,
+        "(type State {:ready Bool})\n\
+         (type Msg (Union {:kind :tick}))\n\
+         (ann update (Fn [State Msg] [State (Cmd Msg)]))\n\
+         (defn update [state msg]\n  [state (Cmd.batch [Cmd.none {:kind :timer/after :id \"tick\" :ms 1000 :msg {:kind :tick}}])])\n",
+    )
+    .expect("app module should be written");
+
+    let inspect = Command::new(env!("CARGO_BIN_EXE_closkell"))
+        .arg("inspect")
+        .arg(&app)
+        .output()
+        .expect("closkell inspect should run");
+
+    assert!(
+        inspect.status.success(),
+        "closkell inspect failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&inspect.stdout),
+        String::from_utf8_lossy(&inspect.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&inspect.stdout);
+    assert!(
+        stdout.contains("\"commandLogSchema\":")
+            && stdout.contains("\"kind\":\"batch\"")
+            && stdout.contains("\"kind\":\"none\"")
+            && stdout.contains("\"kind\":\"timer/after\""),
+        "inspect did not include Cmd helper command schema:\n{}",
+        stdout
+    );
+}
+
+#[test]
 fn cli_inspect_reports_scoped_view_reads_and_uses() {
     let temp_dir = temp_dir("closkell-cli-inspect-scope-view");
     let _ = fs::remove_dir_all(&temp_dir);
@@ -2284,8 +2387,7 @@ fn cli_inspect_reports_hrweb_wrapped_panes_and_source_reads() {
         stdout
     );
     assert!(
-        stdout.contains("\"name\":\"startup-command\"")
-            && stdout.contains("(Fn [Bool] (Cmd AppMsg))"),
+        stdout.contains("\"name\":\"startup-command\"") && stdout.contains("(Fn [] (Cmd AppMsg))"),
         "inspect did not report the HRWeb startup command annotation:\n{}",
         stdout
     );

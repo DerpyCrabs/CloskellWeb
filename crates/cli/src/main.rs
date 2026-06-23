@@ -2026,6 +2026,48 @@ struct TestCaseInfo {
     group: Vec<String>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct UnusedReport {
+    top_level: Vec<UnusedTopLevelInfo>,
+    imports: Vec<UnusedImportInfo>,
+}
+
+#[derive(Clone, Debug)]
+struct UnusedTopLevelInfo {
+    name: String,
+    kind: String,
+    annotated: bool,
+    start: usize,
+    end: usize,
+    line: usize,
+    column: usize,
+    end_line: usize,
+    end_column: usize,
+}
+
+#[derive(Clone, Debug)]
+struct UnusedImportInfo {
+    name: String,
+    imported: String,
+    path: String,
+    default: bool,
+    start: usize,
+    end: usize,
+    line: usize,
+    column: usize,
+    end_line: usize,
+    end_column: usize,
+}
+
+#[derive(Clone, Debug)]
+struct TopLevelDefInfo {
+    name: String,
+    kind: String,
+    annotated: bool,
+    span: syntax::Span,
+    deps: BTreeSet<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct ChangedPathSummary {
     source: String,
@@ -2102,6 +2144,13 @@ fn inspect_file(path: &Path, modules: &HashMap<PathBuf, ModuleInfo>) -> Result<S
     let unsafe_casts = collect_unsafe_casts(&input, &expansion.source);
     let tests = collect_test_cases(&expansion.source);
     let changed_path_summaries = collect_changed_path_summaries(&input, &expansion.source);
+    let unused = collect_unused_report(
+        &input,
+        &source,
+        &expansion.source,
+        &imports,
+        &annotation_report.annotations,
+    );
     Ok(render_inspection_json(
         path,
         &imports,
@@ -2116,6 +2165,7 @@ fn inspect_file(path: &Path, modules: &HashMap<PathBuf, ModuleInfo>) -> Result<S
         &changed_path_summaries,
         &unsafe_casts,
         &tests,
+        &unused,
     ))
 }
 
@@ -2183,6 +2233,7 @@ fn render_inspection_json(
     changed_path_summaries: &[ChangedPathSummary],
     unsafe_casts: &[UnsafeCastInfo],
     tests: &[TestCaseInfo],
+    unused: &UnusedReport,
 ) -> String {
     let mut lines = Vec::new();
     lines.push("{".to_string());
@@ -2227,6 +2278,7 @@ fn render_inspection_json(
         unsafe_casts_json(unsafe_casts)
     ));
     lines.push(format!("  \"tests\": {},", tests_json(tests)));
+    lines.push(format!("  \"unused\": {},", unused_report_json(unused)));
     lines.push(format!("  \"templates\": {}", templates_json(templates)));
     lines.push("}".to_string());
     lines.join("\n")
@@ -2398,6 +2450,59 @@ fn test_path(group: &[String], name: &str) -> Vec<String> {
     path
 }
 
+fn unused_report_json(report: &UnusedReport) -> String {
+    format!(
+        "{{\"topLevel\":{},\"imports\":{}}}",
+        unused_top_level_json(&report.top_level),
+        unused_imports_json(&report.imports)
+    )
+}
+
+fn unused_top_level_json(items: &[UnusedTopLevelInfo]) -> String {
+    let entries = items
+        .iter()
+        .map(|item| {
+            format!(
+                "{{\"name\":{},\"kind\":{},\"annotated\":{},\"span\":{{\"start\":{},\"end\":{}}},\"range\":{{\"start\":{{\"line\":{},\"column\":{}}},\"end\":{{\"line\":{},\"column\":{}}}}}}}",
+                json_string(&item.name),
+                json_string(&item.kind),
+                item.annotated,
+                item.start,
+                item.end,
+                item.line,
+                item.column,
+                item.end_line,
+                item.end_column
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{}]", entries)
+}
+
+fn unused_imports_json(items: &[UnusedImportInfo]) -> String {
+    let entries = items
+        .iter()
+        .map(|item| {
+            format!(
+                "{{\"name\":{},\"imported\":{},\"path\":{},\"default\":{},\"span\":{{\"start\":{},\"end\":{}}},\"range\":{{\"start\":{{\"line\":{},\"column\":{}}},\"end\":{{\"line\":{},\"column\":{}}}}}}}",
+                json_string(&item.name),
+                json_string(&item.imported),
+                json_string(&item.path),
+                item.default,
+                item.start,
+                item.end,
+                item.line,
+                item.column,
+                item.end_line,
+                item.end_column
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{}]", entries)
+}
+
 fn templates_json(templates: &[NamedTemplate]) -> String {
     let entries = templates
         .iter()
@@ -2412,6 +2517,427 @@ fn templates_json(templates: &[NamedTemplate]) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!("[{}]", entries)
+}
+
+fn collect_unused_report(
+    input: &str,
+    source: &SourceFile,
+    expanded: &SourceFile,
+    imports: &[ImportSpec],
+    annotations: &[typecheck::TypeAnnotation],
+) -> UnusedReport {
+    let mut defs = collect_top_level_definitions(source, annotations);
+    let local_names = defs.keys().cloned().collect::<BTreeSet<_>>();
+    let import_names = imports
+        .iter()
+        .flat_map(|import| import.names.iter().map(|name| name.name.clone()))
+        .collect::<BTreeSet<_>>();
+    let visible_names = local_names
+        .iter()
+        .chain(import_names.iter())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+
+    merge_definition_dependencies(&mut defs, source, &visible_names);
+    merge_definition_dependencies(&mut defs, expanded, &visible_names);
+    merge_annotation_dependencies(&mut defs, annotations, &visible_names);
+
+    let roots = unused_roots(&defs);
+    let mut reachable = BTreeSet::new();
+    let mut stack = roots.into_iter().collect::<Vec<_>>();
+    while let Some(name) = stack.pop() {
+        if !reachable.insert(name.clone()) {
+            continue;
+        }
+        let Some(def) = defs.get(&name) else {
+            continue;
+        };
+        for dep in &def.deps {
+            if defs.contains_key(dep) && !reachable.contains(dep) {
+                stack.push(dep.clone());
+            } else if import_names.contains(dep) {
+                reachable.insert(dep.clone());
+            }
+        }
+    }
+
+    let mut top_level = defs
+        .values()
+        .filter(|def| !reachable.contains(&def.name))
+        .map(|def| {
+            let (line, column) = line_column(input, def.span.start);
+            let (end_line, end_column) = line_column(input, def.span.end);
+            UnusedTopLevelInfo {
+                name: def.name.clone(),
+                kind: def.kind.clone(),
+                annotated: def.annotated,
+                start: def.span.start,
+                end: def.span.end,
+                line,
+                column,
+                end_line,
+                end_column,
+            }
+        })
+        .collect::<Vec<_>>();
+    top_level.sort_by(|left, right| left.name.cmp(&right.name));
+
+    let mut unused_imports = Vec::new();
+    for import in imports {
+        for name in &import.names {
+            if reachable.contains(&name.name) {
+                continue;
+            }
+            let (line, column) = line_column(input, name.span.start);
+            let (end_line, end_column) = line_column(input, name.span.end);
+            unused_imports.push(UnusedImportInfo {
+                name: name.name.clone(),
+                imported: name.imported.clone(),
+                path: import.path.clone(),
+                default: name.default,
+                start: name.span.start,
+                end: name.span.end,
+                line,
+                column,
+                end_line,
+                end_column,
+            });
+        }
+    }
+    unused_imports.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+
+    UnusedReport {
+        top_level,
+        imports: unused_imports,
+    }
+}
+
+fn collect_top_level_definitions(
+    source: &SourceFile,
+    annotations: &[typecheck::TypeAnnotation],
+) -> BTreeMap<String, TopLevelDefInfo> {
+    let annotated = annotations
+        .iter()
+        .map(|annotation| annotation.name.clone())
+        .collect::<BTreeSet<_>>();
+    let mut defs = BTreeMap::new();
+    for form in &source.forms {
+        let Some((name, kind, span)) = top_level_definition(form) else {
+            continue;
+        };
+        defs.insert(
+            name.clone(),
+            TopLevelDefInfo {
+                annotated: annotated.contains(&name),
+                name,
+                kind,
+                span,
+                deps: BTreeSet::new(),
+            },
+        );
+    }
+    defs
+}
+
+fn top_level_definition(expr: &Expr) -> Option<(String, String, syntax::Span)> {
+    let ExprKind::List(items) = &expr.kind else {
+        return None;
+    };
+    let head = items.first().and_then(symbol_name)?;
+    match head {
+        "def" if items.len() >= 3 => {
+            let name = items.get(1).and_then(symbol_name)?;
+            Some((name.to_string(), "def".to_string(), expr.span))
+        }
+        "defn" if items.len() >= 4 => {
+            let name = items.get(1).and_then(symbol_name)?;
+            Some((name.to_string(), "defn".to_string(), expr.span))
+        }
+        "defmacro" if items.len() >= 4 => {
+            let name = items.get(1).and_then(symbol_name)?;
+            Some((name.to_string(), "defmacro".to_string(), expr.span))
+        }
+        "type" if items.len() >= 3 => {
+            let name = items.get(1).and_then(symbol_name)?;
+            Some((name.to_string(), "type".to_string(), expr.span))
+        }
+        _ => None,
+    }
+}
+
+fn unused_roots(defs: &BTreeMap<String, TopLevelDefInfo>) -> BTreeSet<String> {
+    let has_app_roots = ["init", "update", "view"]
+        .into_iter()
+        .any(|name| defs.contains_key(name));
+    if has_app_roots {
+        return ["init", "update", "view", "subscriptions", "tests"]
+            .into_iter()
+            .filter(|name| defs.contains_key(*name))
+            .map(str::to_string)
+            .collect();
+    }
+
+    let mut roots = defs
+        .values()
+        .filter(|def| def.annotated)
+        .map(|def| def.name.clone())
+        .collect::<BTreeSet<_>>();
+    if defs.contains_key("tests") {
+        roots.insert("tests".to_string());
+    }
+    roots
+}
+
+fn merge_definition_dependencies(
+    defs: &mut BTreeMap<String, TopLevelDefInfo>,
+    source: &SourceFile,
+    visible_names: &BTreeSet<String>,
+) {
+    for form in &source.forms {
+        let Some((name, _, _)) = top_level_definition(form) else {
+            continue;
+        };
+        let deps = definition_dependencies(form, visible_names);
+        if let Some(def) = defs.get_mut(&name) {
+            def.deps.extend(deps);
+            def.deps.remove(&name);
+        }
+    }
+}
+
+fn merge_annotation_dependencies(
+    defs: &mut BTreeMap<String, TopLevelDefInfo>,
+    annotations: &[typecheck::TypeAnnotation],
+    visible_names: &BTreeSet<String>,
+) {
+    for annotation in annotations {
+        let Some(def) = defs.get_mut(&annotation.name) else {
+            continue;
+        };
+        let source = parse_source(&annotation.schema);
+        if let Some(form) = source.forms.first() {
+            let mut refs = BTreeSet::new();
+            collect_symbol_refs_expr(form, &BTreeSet::new(), &mut refs);
+            def.deps
+                .extend(refs.into_iter().filter(|name| visible_names.contains(name)));
+            def.deps.remove(&annotation.name);
+        }
+    }
+}
+
+fn definition_dependencies(expr: &Expr, visible_names: &BTreeSet<String>) -> BTreeSet<String> {
+    let ExprKind::List(items) = &expr.kind else {
+        return BTreeSet::new();
+    };
+    let Some(head) = items.first().and_then(symbol_name) else {
+        return BTreeSet::new();
+    };
+    let mut refs = BTreeSet::new();
+    match head {
+        "def" if items.len() >= 3 => {
+            collect_symbol_refs_expr(&items[2], &BTreeSet::new(), &mut refs);
+        }
+        "defn" | "defmacro" if items.len() >= 4 => {
+            let mut scope = BTreeSet::new();
+            if let Some(params) = items.get(2) {
+                collect_pattern_bindings(params, &mut scope);
+            }
+            for body in items.iter().skip(3) {
+                collect_symbol_refs_expr(body, &scope, &mut refs);
+            }
+        }
+        "type" if items.len() >= 3 => {
+            let mut scope = BTreeSet::new();
+            let schema_start = if items.len() > 3 {
+                for param in &items[2..items.len() - 1] {
+                    if let Some(name) = symbol_name(param) {
+                        scope.insert(name.to_string());
+                    }
+                }
+                items.len() - 1
+            } else {
+                2
+            };
+            for schema in items.iter().skip(schema_start) {
+                collect_symbol_refs_expr(schema, &scope, &mut refs);
+            }
+        }
+        _ => {}
+    }
+    refs.into_iter()
+        .filter(|name| visible_names.contains(name))
+        .collect()
+}
+
+fn collect_symbol_refs_expr(expr: &Expr, scope: &BTreeSet<String>, refs: &mut BTreeSet<String>) {
+    match &expr.kind {
+        ExprKind::Symbol(name) => {
+            let base = name.split('.').next().unwrap_or(name);
+            if !scope.contains(name) && !scope.contains(base) {
+                refs.insert(name.clone());
+                if base != name {
+                    refs.insert(base.to_string());
+                }
+            }
+        }
+        ExprKind::List(items) => collect_symbol_refs_list(items, scope, refs),
+        ExprKind::Vector(items) | ExprKind::Set(items) => {
+            for item in items {
+                collect_symbol_refs_expr(item, scope, refs);
+            }
+        }
+        ExprKind::Map(entries) => {
+            for (key, value) in entries {
+                if !matches!(
+                    key.kind,
+                    ExprKind::Keyword(_) | ExprKind::String(_) | ExprKind::Symbol(_)
+                ) {
+                    collect_symbol_refs_expr(key, scope, refs);
+                }
+                collect_symbol_refs_expr(value, scope, refs);
+            }
+        }
+        ExprKind::Quote(inner)
+        | ExprKind::QuasiQuote(inner)
+        | ExprKind::Unquote(inner)
+        | ExprKind::UnquoteSplicing(inner) => collect_symbol_refs_expr(inner, scope, refs),
+        ExprKind::HtmlTemplate(node) => collect_symbol_refs_html_node(node, scope, refs),
+        ExprKind::Nil
+        | ExprKind::Bool(_)
+        | ExprKind::Number(_)
+        | ExprKind::String(_)
+        | ExprKind::Keyword(_) => {}
+    }
+}
+
+fn collect_symbol_refs_list(items: &[Expr], scope: &BTreeSet<String>, refs: &mut BTreeSet<String>) {
+    let Some(head) = items.first().and_then(symbol_name) else {
+        for item in items {
+            collect_symbol_refs_expr(item, scope, refs);
+        }
+        return;
+    };
+
+    match head {
+        "fn" if items.len() >= 3 => {
+            let mut inner_scope = scope.clone();
+            collect_pattern_bindings(&items[1], &mut inner_scope);
+            for body in items.iter().skip(2) {
+                collect_symbol_refs_expr(body, &inner_scope, refs);
+            }
+        }
+        "let" if items.len() >= 3 => {
+            let mut inner_scope = scope.clone();
+            if let ExprKind::Vector(bindings) = &items[1].kind {
+                for pair in bindings.chunks(2) {
+                    if let [pattern, value] = pair {
+                        collect_symbol_refs_expr(value, &inner_scope, refs);
+                        collect_pattern_bindings(pattern, &mut inner_scope);
+                    }
+                }
+            } else {
+                collect_symbol_refs_expr(&items[1], scope, refs);
+            }
+            for body in items.iter().skip(2) {
+                collect_symbol_refs_expr(body, &inner_scope, refs);
+            }
+        }
+        "match" if items.len() >= 2 => {
+            collect_symbol_refs_expr(&items[1], scope, refs);
+            let mut index = 2;
+            while index + 1 < items.len() {
+                let mut inner_scope = scope.clone();
+                collect_pattern_bindings(&items[index], &mut inner_scope);
+                collect_symbol_refs_expr(&items[index + 1], &inner_scope, refs);
+                index += 2;
+            }
+        }
+        "for" if items.len() >= 3 => {
+            let mut inner_scope = scope.clone();
+            if let ExprKind::Vector(bindings) = &items[1].kind {
+                if let Some(pattern) = bindings.first() {
+                    collect_pattern_bindings(pattern, &mut inner_scope);
+                }
+                if let Some(collection) = bindings.get(1) {
+                    collect_symbol_refs_expr(collection, scope, refs);
+                }
+                if bindings.len() > 3 {
+                    for extra in bindings.iter().skip(3) {
+                        collect_symbol_refs_expr(extra, &inner_scope, refs);
+                    }
+                }
+            } else {
+                collect_symbol_refs_expr(&items[1], scope, refs);
+            }
+            for body in items.iter().skip(2) {
+                collect_symbol_refs_expr(body, &inner_scope, refs);
+            }
+        }
+        "def" | "defn" | "defmacro" | "type" | "ann" | "import" => {}
+        _ => {
+            for item in items {
+                collect_symbol_refs_expr(item, scope, refs);
+            }
+        }
+    }
+}
+
+fn collect_pattern_bindings(pattern: &Expr, scope: &mut BTreeSet<String>) {
+    match &pattern.kind {
+        ExprKind::Symbol(name) if name != "_" => {
+            scope.insert(name.clone());
+        }
+        ExprKind::Vector(items) | ExprKind::Set(items) | ExprKind::List(items) => {
+            for item in items {
+                collect_pattern_bindings(item, scope);
+            }
+        }
+        ExprKind::Map(entries) => {
+            for (_, value) in entries {
+                collect_pattern_bindings(value, scope);
+            }
+        }
+        ExprKind::Quote(inner)
+        | ExprKind::QuasiQuote(inner)
+        | ExprKind::Unquote(inner)
+        | ExprKind::UnquoteSplicing(inner) => collect_pattern_bindings(inner, scope),
+        ExprKind::Nil
+        | ExprKind::Bool(_)
+        | ExprKind::Number(_)
+        | ExprKind::String(_)
+        | ExprKind::Keyword(_)
+        | ExprKind::Symbol(_)
+        | ExprKind::HtmlTemplate(_) => {}
+    }
+}
+
+fn collect_symbol_refs_html_node(
+    node: &syntax::HtmlNode,
+    scope: &BTreeSet<String>,
+    refs: &mut BTreeSet<String>,
+) {
+    match node {
+        syntax::HtmlNode::Element(element) => {
+            for attr in &element.attrs {
+                if let syntax::HtmlAttrValue::Dynamic { expr, .. } = &attr.value {
+                    let mut attr_scope = scope.clone();
+                    if attr.name.starts_with("on:") {
+                        attr_scope.insert("event".to_string());
+                    }
+                    collect_symbol_refs_expr(expr, &attr_scope, refs);
+                }
+            }
+            for child in &element.children {
+                collect_symbol_refs_html_node(child, scope, refs);
+            }
+        }
+        syntax::HtmlNode::Expr { expr, .. } => collect_symbol_refs_expr(expr, scope, refs),
+        syntax::HtmlNode::Text { .. } => {}
+    }
 }
 
 fn collect_unsafe_casts(input: &str, source: &SourceFile) -> Vec<UnsafeCastInfo> {
@@ -3214,6 +3740,11 @@ fn collect_command_shapes_expr(
             collect_command_shapes_expr(inner, shapes, source_name)
         }
         ExprKind::HtmlTemplate(node) => collect_command_shapes_html_node(node, shapes, source_name),
+        ExprKind::Symbol(name) if name == "Cmd.none" => {
+            let entry = shapes.entry("none".to_string()).or_default();
+            entry.fields.insert("kind".to_string());
+            entry.sources.insert(source_name.to_string());
+        }
         ExprKind::Symbol(_)
         | ExprKind::Nil
         | ExprKind::Bool(_)
@@ -3232,6 +3763,74 @@ fn collect_command_helper_shape(
         return;
     };
     let (kind, fields): (&str, &[&str]) = match head {
+        "Cmd.batch" => ("batch", &["kind", "commands"]),
+        "Cmd.storage/get" => (
+            "storage/get",
+            &["kind", "key", "format", "toMessage", "onError"],
+        ),
+        "Cmd.storage/set" => ("storage/set", &["kind", "key", "value", "msg", "onError"]),
+        "Cmd.storage/set-silent" => ("storage/set", &["kind", "key", "value", "onError"]),
+        "Cmd.time/now" => ("time/now", &["kind", "toMessage"]),
+        "Cmd.random/number" => ("random/number", &["kind", "min", "max", "toMessage"]),
+        "Cmd.timer/every" => ("timer/every", &["kind", "id", "ms", "msg"]),
+        "Cmd.timer/after" => ("timer/after", &["kind", "id", "ms", "msg"]),
+        "Cmd.timer/cancel" => ("timer/cancel", &["kind", "id"]),
+        "Cmd.animation/frame" => ("animation/frame", &["kind", "id", "onFrame"]),
+        "Cmd.animation/cancel" => ("animation/cancel", &["kind", "id", "msg"]),
+        "Cmd.dom-ref/click" => ("dom-ref/click", &["kind", "ref", "msg", "onError"]),
+        "Cmd.dom-ref/focus" => ("dom-ref/focus", &["kind", "ref", "msg", "onError"]),
+        "Cmd.dom-ref/measure" => ("dom-ref/measure", &["kind", "ref", "toMessage", "onError"]),
+        "Cmd.dom-ref/resize-watch" => (
+            "dom-ref/resize-watch",
+            &["kind", "id", "ref", "onChange", "onError"],
+        ),
+        "Cmd.file/read-selected" => (
+            "file/read-selected",
+            &["kind", "ref", "format", "toMessage", "onError", "onCancel"],
+        ),
+        "Cmd.file/download" => (
+            "file/download",
+            &["kind", "name", "content", "mime", "msg", "onError"],
+        ),
+        "Cmd.canvas/draw" => (
+            "canvas/draw",
+            &["kind", "ref", "cssWidth", "cssHeight", "ops", "onError"],
+        ),
+        "Cmd.bluetooth/connect-heart-rate" => (
+            "bluetooth/connect-heart-rate",
+            &[
+                "kind",
+                "id",
+                "filters",
+                "optionalServices",
+                "acceptAllDevices",
+                "service",
+                "characteristic",
+                "toMessage",
+                "onReading",
+                "onDisconnected",
+                "onError",
+            ],
+        ),
+        "Cmd.bluetooth/disconnect" => ("bluetooth/disconnect", &["kind", "id", "msg"]),
+        "Cmd.simulation/heart-rate" => (
+            "simulation/heart-rate",
+            &[
+                "kind",
+                "id",
+                "ms",
+                "min",
+                "max",
+                "jitter",
+                "start",
+                "deviceName",
+                "toMessage",
+                "onReading",
+                "onDisconnected",
+                "onError",
+            ],
+        ),
+        "Cmd.simulation/stop" => ("simulation/stop", &["kind", "id"]),
         "Task.perform" => ("task/perform", &["kind", "task", "onSuccess", "onError"]),
         _ => return,
     };
@@ -3312,6 +3911,10 @@ fn collect_subscription_helper_shape(
         "Sub.timer/every" => ("sub/timer/every", &["kind", "id", "ms", "msg"]),
         "Sub.media-query" => ("sub/media-query", &["kind", "id", "query", "onChange"]),
         "Sub.window/event" => ("sub/window/event", &["kind", "id", "type", "onEvent"]),
+        "Sub.window/event-with" => (
+            "sub/window/event",
+            &["kind", "id", "type", "onEvent", "options", "preventDefault"],
+        ),
         "Sub.dom-ref/resize" => ("sub/dom-ref/resize", &["kind", "id", "ref", "onChange"]),
         _ => return,
     };
@@ -3641,7 +4244,7 @@ fn parse_expects_found(message: &str) -> Option<(String, String)> {
 }
 
 const CHECK_CACHE_VERSION: &str = "closkell-check-cache-v1";
-const INSPECT_CACHE_VERSION: &str = "closkell-inspect-cache-v2";
+const INSPECT_CACHE_VERSION: &str = "closkell-inspect-cache-v4";
 
 fn check_cache_probe(path: &Path) -> Result<CacheProbe, String> {
     artifact_cache_probe(path, CHECK_CACHE_VERSION, "check", "cache")

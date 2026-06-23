@@ -28,8 +28,20 @@ test.describe('spec loading', () => {
     await expect(page.getByTestId('api-title')).toHaveText('Definition A')
   })
 
+  test('loads via urls array in Swagger UI page', async ({ page }) => {
+    await loadSpec(page, `${FIXTURE_PATH}/swagger-ui/multi/index.html`)
+    await expect(page.getByTestId('definition-select')).toBeVisible()
+    await expect(page.getByTestId('api-title')).toHaveText('Definition A')
+  })
+
   test('loads via swagger-config path discovery', async ({ page }) => {
     await loadSpec(page, `${FIXTURE_PATH}/swagger-ui/swagger-config/index.html`)
+    await expect(page.getByTestId('definition-select')).toBeVisible()
+    await expect(page.getByTestId('api-title')).toHaveText('Definition A')
+  })
+
+  test('falls back to swagger-config discovery when source page is missing', async ({ page }) => {
+    await loadSpec(page, `${FIXTURE_PATH}/missing-page.html`)
     await expect(page.getByTestId('definition-select')).toBeVisible()
     await expect(page.getByTestId('api-title')).toHaveText('Definition A')
   })
