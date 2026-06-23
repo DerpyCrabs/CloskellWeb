@@ -453,6 +453,7 @@ struct BuildArtifact {
     output: PathBuf,
     source_map: Option<PathBuf>,
     bytes: u64,
+    runtime_effects: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1435,7 +1436,10 @@ fn build_file(
 
     let mut emitted = emit_checked_module(path, &input, &source, modules)?;
     if let Some(app) = &options.app {
-        wrap_app_module(&mut emitted, app);
+        let runtime_registrations =
+            collect_app_runtime_registrations(&emitted.runtime_effects, artifacts);
+        let init_takes_boot = emitted_init_takes_boot(&emitted.code);
+        wrap_app_module(&mut emitted, app, &runtime_registrations, init_takes_boot);
     }
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)
@@ -1469,6 +1473,7 @@ fn build_file(
         bytes: fs::metadata(output)
             .map(|metadata| metadata.len())
             .unwrap_or(0),
+        runtime_effects: emitted.runtime_effects,
     });
     Ok(())
 }
@@ -1563,9 +1568,165 @@ fn emit_checked_module(
     Ok(emitted)
 }
 
-fn wrap_app_module(emitted: &mut js_backend::EmitResult, options: &AppOptions) {
-    let prelude = app_bootstrap_prelude(options);
-    let postlude = app_bootstrap_postlude(options);
+struct AppRuntimeRegistration {
+    import_name: &'static str,
+    kinds: &'static [&'static str],
+}
+
+const APP_RUNTIME_REGISTRATIONS: &[AppRuntimeRegistration] = &[
+    AppRuntimeRegistration {
+        import_name: "registerAnimationCommandHandlers",
+        kinds: &["animation/frame", "animation/cancel"],
+    },
+    AppRuntimeRegistration {
+        import_name: "registerAuthStorageCommandHandlers",
+        kinds: &["auth-storage/persist", "auth-storage/load"],
+    },
+    AppRuntimeRegistration {
+        import_name: "registerBluetoothCommandHandlers",
+        kinds: &[
+            "bluetooth/request-device",
+            "bluetooth/connect-heart-rate",
+            "bluetooth/disconnect",
+            "sub/bluetooth/connect-heart-rate",
+        ],
+    },
+    AppRuntimeRegistration {
+        import_name: "registerBrowserCommandHandlers",
+        kinds: &[
+            "browser/history-replace-search-param",
+            "browser/history-write-route",
+            "browser/theme-load",
+            "browser/theme-apply",
+            "browser/clipboard-write",
+            "browser/set-cookie",
+        ],
+    },
+    AppRuntimeRegistration {
+        import_name: "registerCompiledCanvasDrawCommandHandlers",
+        kinds: &["canvas/draw"],
+    },
+    AppRuntimeRegistration {
+        import_name: "registerCanvasMeasureTextCommandHandlers",
+        kinds: &["canvas/measure-text"],
+    },
+    AppRuntimeRegistration {
+        import_name: "registerDomRefCommandHandlers",
+        kinds: &["dom-ref/focus", "dom-ref/click", "dom-ref/measure"],
+    },
+    AppRuntimeRegistration {
+        import_name: "registerCompiledDomResizeCommandHandlers",
+        kinds: &[
+            "dom-ref/resize-watch",
+            "dom-ref/resize-unwatch",
+            "sub/dom-ref/resize",
+        ],
+    },
+    AppRuntimeRegistration {
+        import_name: "registerDomScrollCommandHandlers",
+        kinds: &["dom/scroll-into-view"],
+    },
+    AppRuntimeRegistration {
+        import_name: "registerFileDownloadCommandHandlers",
+        kinds: &["file/download"],
+    },
+    AppRuntimeRegistration {
+        import_name: "registerFileImportCommandHandlers",
+        kinds: &["file/import"],
+    },
+    AppRuntimeRegistration {
+        import_name: "registerFileReadSelectedCommandHandlers",
+        kinds: &["file/read-selected"],
+    },
+    AppRuntimeRegistration {
+        import_name: "registerHttpCommandHandlers",
+        kinds: &["http/request"],
+    },
+    AppRuntimeRegistration {
+        import_name: "registerCompiledMediaQueryCommandHandlers",
+        kinds: &["media-query/watch", "media-query/unwatch", "sub/media-query"],
+    },
+    AppRuntimeRegistration {
+        import_name: "registerRandomCommandHandlers",
+        kinds: &["random/number"],
+    },
+    AppRuntimeRegistration {
+        import_name: "registerSimulationCommandHandlers",
+        kinds: &[
+            "simulation/heart-rate",
+            "simulation/stop",
+            "sub/simulation/heart-rate",
+        ],
+    },
+    AppRuntimeRegistration {
+        import_name: "registerStorageCommandHandlers",
+        kinds: &["storage/get", "storage/set", "storage/remove"],
+    },
+    AppRuntimeRegistration {
+        import_name: "registerTaskCommandHandlers",
+        kinds: &["task/perform"],
+    },
+    AppRuntimeRegistration {
+        import_name: "registerTimerCommandHandlers",
+        kinds: &["timer/after", "timer/every", "timer/cancel", "sub/timer/every"],
+    },
+    AppRuntimeRegistration {
+        import_name: "registerTimeCommandHandlers",
+        kinds: &["time/now"],
+    },
+    AppRuntimeRegistration {
+        import_name: "registerCompiledWindowEventCommandHandlers",
+        kinds: &["window/event-watch", "window/event-unwatch", "sub/window/event"],
+    },
+];
+
+fn collect_app_runtime_registrations(
+    entry_effects: &BTreeSet<String>,
+    artifacts: &[BuildArtifact],
+) -> BTreeSet<&'static str> {
+    let mut registrations = BTreeSet::new();
+    collect_app_runtime_registrations_from_effects(entry_effects, &mut registrations);
+    for artifact in artifacts {
+        collect_app_runtime_registrations_from_effects(&artifact.runtime_effects, &mut registrations);
+    }
+    registrations
+}
+
+fn collect_app_runtime_registrations_from_effects(
+    effects: &BTreeSet<String>,
+    registrations: &mut BTreeSet<&'static str>,
+) {
+    for registration in APP_RUNTIME_REGISTRATIONS {
+        if registration
+            .kinds
+            .iter()
+            .any(|kind| effects.contains(*kind))
+        {
+            registrations.insert(registration.import_name);
+        }
+    }
+}
+
+fn app_runtime_registration_alias(import_name: &str) -> String {
+    let mut chars = import_name.chars();
+    let Some(first) = chars.next() else {
+        return "__closkellRegister".to_string();
+    };
+    format!(
+        "__closkell{}{}",
+        first.to_ascii_uppercase(),
+        chars.as_str()
+    )
+}
+
+fn wrap_app_module(
+    emitted: &mut js_backend::EmitResult,
+    options: &AppOptions,
+    runtime_registrations: &BTreeSet<&'static str>,
+    init_takes_boot: bool,
+) {
+    let prelude = app_bootstrap_prelude(options, runtime_registrations, init_takes_boot);
+    let postlude = app_bootstrap_postlude(options, runtime_registrations, init_takes_boot);
     let inserted_lines = prelude.lines().count();
     for mapping in &mut emitted.source_mappings {
         mapping.generated_line += inserted_lines;
@@ -1576,11 +1737,29 @@ fn wrap_app_module(emitted: &mut js_backend::EmitResult, options: &AppOptions) {
     emitted.code = format!("{}{}{}", prelude, emitted.code, postlude);
 }
 
-fn app_bootstrap_prelude(options: &AppOptions) -> String {
+fn app_bootstrap_prelude(
+    options: &AppOptions,
+    runtime_registrations: &BTreeSet<&'static str>,
+    init_takes_boot: bool,
+) -> String {
     let mut code = String::new();
-    code.push_str(
-        "import { createBrowserBootInput as __closkellCreateBrowserBootInput, createCommandHandlers as __closkellCreateCommandHandlers, createSubscriptionHandlers as __closkellCreateSubscriptionHandlers, createDevtoolsOverlay as __closkellCreateDevtoolsOverlay, startApp as __closkellStartApp } from \"@closkell/runtime\";\n",
-    );
+    let mut imports = vec![
+        "createSelectedCommandHandlers as __closkellCreateSelectedCommandHandlers".to_string(),
+        "startCompiledApp as __closkellStartApp".to_string(),
+    ];
+    if init_takes_boot {
+        imports.push("createBrowserBootInput as __closkellCreateBrowserBootInput".to_string());
+    }
+    for import_name in runtime_registrations {
+        imports.push(format!(
+            "{} as {}",
+            import_name,
+            app_runtime_registration_alias(import_name)
+        ));
+    }
+    code.push_str("import { ");
+    code.push_str(&imports.join(", "));
+    code.push_str(" } from \"@closkell/runtime\";\n");
     if let Some(css) = &options.css {
         code.push_str("import ");
         code.push_str(&json_string(css));
@@ -1589,7 +1768,11 @@ fn app_bootstrap_prelude(options: &AppOptions) -> String {
     code
 }
 
-fn app_bootstrap_postlude(options: &AppOptions) -> String {
+fn app_bootstrap_postlude(
+    options: &AppOptions,
+    runtime_registrations: &BTreeSet<&'static str>,
+    init_takes_boot: bool,
+) -> String {
     let mut code = String::new();
     code.push_str("const __closkellRoot = document.getElementById(");
     code.push_str(&json_string(&options.root_id));
@@ -1602,27 +1785,39 @@ fn app_bootstrap_postlude(options: &AppOptions) -> String {
     )));
     code.push_str(");\n");
     code.push_str("}\n");
-    code.push_str(
-        "const __closkellDevtools = globalThis.__closkellDevtools ?? (globalThis.__closkellDevtoolsOverlay ? __closkellCreateDevtoolsOverlay(globalThis.__closkellDevtoolsOverlay) : null);\n",
-    );
-    code.push_str("if (__closkellDevtools && globalThis.__closkellDevtoolsOverlay && !globalThis.__closkellDevtoolsOverlayInstance) {\n");
-    code.push_str("  globalThis.__closkellDevtoolsOverlayInstance = __closkellDevtools;\n");
-    code.push_str("}\n");
-    code.push_str("const __closkellHandlers = __closkellCreateCommandHandlers();\n");
+    code.push_str("const __closkellHandlers = __closkellCreateSelectedCommandHandlers(undefined, [");
+    let registrations = runtime_registrations
+        .iter()
+        .map(|import_name| app_runtime_registration_alias(import_name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    code.push_str(&registrations);
+    code.push_str("]);\n");
     code.push_str("export const __closkellApp = __closkellStartApp({\n");
     code.push_str("  root: __closkellRoot,\n");
     code.push_str("  init,\n");
     code.push_str("  update,\n");
     code.push_str("  view,\n");
-    code.push_str("  boot: __closkellCreateBrowserBootInput(),\n");
+    if init_takes_boot {
+        code.push_str("  boot: __closkellCreateBrowserBootInput(),\n");
+    }
     code.push_str(
         "  subscriptions: typeof subscriptions === \"function\" ? subscriptions : undefined,\n",
     );
-    code.push_str("  handlers: __closkellHandlers,\n");
-    code.push_str("  subscriptionHandlers: __closkellCreateSubscriptionHandlers({ commandHandlers: __closkellHandlers }),\n");
-    code.push_str("  devtools: __closkellDevtools\n");
+    code.push_str("  handlers: __closkellHandlers\n");
     code.push_str("});\n\n");
     code
+}
+
+fn emitted_init_takes_boot(code: &str) -> bool {
+    let Some(start) = code.find("export function init(") else {
+        return false;
+    };
+    let params_start = start + "export function init(".len();
+    let Some(params_end) = code[params_start..].find(')') else {
+        return false;
+    };
+    !code[params_start..params_start + params_end].trim().is_empty()
 }
 
 fn runtime_vendor_root(output: &Path) -> PathBuf {

@@ -41,6 +41,12 @@ function withRuntimeSsrNoExternal(noExternal) {
   return [...new Set([...entries, RUNTIME_PACKAGE])];
 }
 
+function withoutModulePreloadPolyfill(modulePreload) {
+  if (modulePreload === false) return false;
+  const config = modulePreload && typeof modulePreload === "object" ? modulePreload : {};
+  return { ...config, polyfill: false };
+}
+
 function isRuntimeOptimizedFile(file) {
   return file.startsWith(RUNTIME_OPTIMIZED_PREFIX);
 }
@@ -341,6 +347,18 @@ export function closkell(options = {}) {
     return path.join(config.root, "node_modules", "@closkell", "runtime", "src", "index.js");
   }
 
+  function workspaceRuntimeSourcePath() {
+    return path.join(manifestRoot, "runtime-js", "src", "index.js");
+  }
+
+  async function vendoredRuntimeIsFresh() {
+    const vendored = vendoredRuntimeSourcePath();
+    if (!existsSync(vendored)) return false;
+    const workspaceRuntime = workspaceRuntimeSourcePath();
+    if (!existsSync(workspaceRuntime)) return true;
+    return (await statMtimeMs(vendored)) >= (await statMtimeMs(workspaceRuntime));
+  }
+
   function entryNeedsVendoredRuntime(source) {
     return vendorRuntime && app && entryPath && samePath(source, entryPath);
   }
@@ -403,7 +421,7 @@ export function closkell(options = {}) {
       if (
         !force &&
         (await outputIsFresh(output)) &&
-        (!entryNeedsVendoredRuntime(resolved) || existsSync(vendoredRuntimeSourcePath()))
+        (!entryNeedsVendoredRuntime(resolved) || (await vendoredRuntimeIsFresh()))
       ) {
         return output;
       }
@@ -446,14 +464,14 @@ export function closkell(options = {}) {
 
   async function runtimeSourcePath({ allowCompile = false } = {}) {
     const vendored = vendoredRuntimeSourcePath();
-    if (existsSync(vendored)) return vendored;
+    if (existsSync(vendored) && (await vendoredRuntimeIsFresh())) return vendored;
 
     if (allowCompile && vendorRuntime && entryPath && existsSync(entryPath)) {
       await compile(entryPath);
       if (existsSync(vendored)) return vendored;
     }
 
-    const workspaceRuntime = path.join(manifestRoot, "runtime-js", "src", "index.js");
+    const workspaceRuntime = workspaceRuntimeSourcePath();
     if (existsSync(workspaceRuntime)) return workspaceRuntime;
 
     throw new Error("Closkell runtime source was not found");
@@ -513,6 +531,9 @@ export function closkell(options = {}) {
         },
         ssr: {
           noExternal: withRuntimeSsrNoExternal(userConfig.ssr?.noExternal)
+        },
+        build: {
+          modulePreload: withoutModulePreloadPolyfill(userConfig.build?.modulePreload)
         }
       };
     },

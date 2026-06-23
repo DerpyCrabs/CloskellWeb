@@ -9,6 +9,7 @@ pub struct EmitResult {
     pub code: String,
     pub diagnostics: Vec<Diagnostic>,
     pub source_mappings: Vec<SourceMapping>,
+    pub runtime_effects: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -36,6 +37,8 @@ pub fn emit_module(source: &SourceFile) -> EmitResult {
         needs_html_runtime: false,
         needs_decoder_runtime: false,
         needs_value_equal_helper: false,
+        needs_count_helper: false,
+        runtime_effects: BTreeSet::new(),
         component_fns: collect_template_defns(source),
         function_defs: collect_function_defs(source),
         read_summaries: collect_read_summaries(source),
@@ -103,7 +106,7 @@ pub fn emit_module(source: &SourceFile) -> EmitResult {
     let mut generated_line = 0;
     if emitter.needs_html_runtime {
         code.push_str(
-            "import { createTemplateComponent as __closkellCreateTemplate, renderToString as __closkellRenderToString, scopeSubscriptions as __closkellScopeSubscriptions, scopeUpdate as __closkellScopeUpdate, scopeView as __closkellScopeView, setAttr as __closkellSetAttr, setComponent as __closkellSetComponent, setConditional as __closkellSetConditional, setEvent as __closkellSetEvent, setKeyedList as __closkellSetKeyedList, setRef as __closkellSetRef, setText as __closkellSetText, shouldUpdateSlot as __closkellShouldUpdateSlot } from \"@closkell/runtime\";\n\n",
+            "import { createCompiledTemplateComponent as __closkellCreateTemplate, renderToString as __closkellRenderToString, scopeSubscriptions as __closkellScopeSubscriptions, scopeUpdate as __closkellScopeUpdate, scopeView as __closkellScopeView, setAttr as __closkellSetAttr, setCompiledComponent as __closkellSetComponent, setCompiledConditional as __closkellSetConditional, setCompiledKeyedList as __closkellSetKeyedList, setEvent as __closkellSetEvent, setRef as __closkellSetRef, setText as __closkellSetText } from \"@closkell/runtime\";\n\n",
         );
         generated_line += 2;
     }
@@ -127,13 +130,57 @@ pub fn emit_module(source: &SourceFile) -> EmitResult {
         code.push_str(VALUE_EQUAL_HELPER);
         generated_line += VALUE_EQUAL_HELPER.lines().count();
     }
+    if emitter.needs_count_helper {
+        code.push_str(COUNT_HELPER);
+        generated_line += COUNT_HELPER.lines().count();
+    }
     push_emitted_lines(&mut code, &lines, &mut source_mappings, &mut generated_line);
-
+    code = compact_symbol_for_calls(&code);
     EmitResult {
         code,
         diagnostics: emitter.diagnostics,
         source_mappings,
+        runtime_effects: emitter.runtime_effects,
     }
+}
+
+fn compact_symbol_for_calls(code: &str) -> String {
+    let mut output = String::with_capacity(code.len());
+    let mut remaining = code;
+    let needle = "Symbol.for(\"";
+    while let Some(start) = remaining.find(needle) {
+        output.push_str(&remaining[..start]);
+        let literal_start = start + needle.len();
+        let literal = &remaining[literal_start..];
+        let mut end = 0;
+        let mut escaped = false;
+        let mut found = false;
+        for (index, ch) in literal.char_indices() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == '"' {
+                end = index;
+                found = literal[index..].starts_with("\")");
+                break;
+            }
+        }
+        if !found {
+            output.push_str(&remaining[start..]);
+            return output;
+        }
+        output.push('"');
+        output.push_str(&literal[..end]);
+        output.push('"');
+        remaining = &literal[end + 2..];
+    }
+    output.push_str(remaining);
+    output
 }
 
 #[derive(Clone, Debug)]
@@ -331,6 +378,8 @@ struct Emitter {
     needs_html_runtime: bool,
     needs_decoder_runtime: bool,
     needs_value_equal_helper: bool,
+    needs_count_helper: bool,
+    runtime_effects: BTreeSet<String>,
     component_fns: BTreeSet<String>,
     function_defs: BTreeMap<String, FunctionDef>,
     read_summaries: BTreeMap<String, ReadSummary>,
@@ -339,6 +388,8 @@ struct Emitter {
 }
 
 const VALUE_EQUAL_HELPER: &str = "const __closkellValueEqual = (...__values) => { const __symbolKey = (__value) => Symbol.keyFor(__value) ?? __value.description ?? \"\"; const __plain = (__value) => __value !== null && typeof __value === \"object\" && !Array.isArray(__value) && !(__value instanceof Map) && !(__value instanceof Set); const __eq = (__left, __right) => { if (Object.is(__left, __right)) return true; if (typeof __left === \"symbol\" || typeof __right === \"symbol\") return typeof __left === \"symbol\" && typeof __right === \"symbol\" && __symbolKey(__left) === __symbolKey(__right); if (Array.isArray(__left) || Array.isArray(__right)) return Array.isArray(__left) && Array.isArray(__right) && __left.length === __right.length && __left.every((__value, __index) => __eq(__value, __right[__index])); if (__left instanceof Set || __right instanceof Set) { if (!(__left instanceof Set) || !(__right instanceof Set) || __left.size !== __right.size) return false; const __remaining = Array.from(__right); return Array.from(__left).every((__item) => { const __match = __remaining.findIndex((__candidate) => __eq(__item, __candidate)); if (__match < 0) return false; __remaining.splice(__match, 1); return true; }); } if (__left instanceof Map || __right instanceof Map) { if (!(__left instanceof Map) || !(__right instanceof Map) || __left.size !== __right.size) return false; const __remaining = Array.from(__right); return Array.from(__left).every(([__key, __value]) => { const __match = __remaining.findIndex(([__rightKey, __rightValue]) => __eq(__key, __rightKey) && __eq(__value, __rightValue)); if (__match < 0) return false; __remaining.splice(__match, 1); return true; }); } if (__plain(__left) || __plain(__right)) { if (!__plain(__left) || !__plain(__right)) return false; const __leftKeys = Object.keys(__left).sort(); const __rightKeys = Object.keys(__right).sort(); return __eq(__leftKeys, __rightKeys) && __leftKeys.every((__key) => __eq(__left[__key], __right[__key])); } return false; }; for (let __index = 1; __index < __values.length; __index += 1) if (!__eq(__values[__index - 1], __values[__index])) return false; return true; };\n\n";
+
+const COUNT_HELPER: &str = "const __closkellCount = (__collection) => __collection instanceof Set || __collection instanceof Map ? __collection.size : (Array.isArray(__collection) || typeof __collection === \"string\" ? __collection.length : (__collection == null ? 0 : Object.keys(__collection).length));\n\n";
 
 struct TailEmission {
     code: String,
@@ -355,6 +406,10 @@ impl TailEmission {
 }
 
 impl Emitter {
+    fn add_runtime_effect(&mut self, kind: &str) {
+        self.runtime_effects.insert(kind.to_string());
+    }
+
     fn emit_expr(&mut self, expr: &Expr) -> String {
         match &expr.kind {
             ExprKind::Nil => "null".to_string(),
@@ -710,6 +765,7 @@ impl Emitter {
     }
 
     fn emit_task_perform(&mut self, args: &[Expr]) -> String {
+        self.add_runtime_effect("task/perform");
         match args.len() {
             3 => format!(
                 "{{ kind: Symbol.for(\"task/perform\"), task: {}, onSuccess: {}, onError: {} }}",
@@ -750,6 +806,7 @@ impl Emitter {
     }
 
     fn emit_cmd_storage_get(&mut self, args: &[Expr]) -> String {
+        self.add_runtime_effect("storage/get");
         if args.len() != 4 {
             return "{ kind: Symbol.for(\"none\") }".to_string();
         }
@@ -763,6 +820,7 @@ impl Emitter {
     }
 
     fn emit_cmd_storage_set(&mut self, args: &[Expr]) -> String {
+        self.add_runtime_effect("storage/set");
         if args.len() != 3 && args.len() != 4 {
             return "{ kind: Symbol.for(\"none\") }".to_string();
         }
@@ -780,6 +838,7 @@ impl Emitter {
     }
 
     fn emit_cmd_storage_set_silent(&mut self, args: &[Expr]) -> String {
+        self.add_runtime_effect("storage/set");
         if args.len() != 3 {
             return "{ kind: Symbol.for(\"none\") }".to_string();
         }
@@ -792,6 +851,7 @@ impl Emitter {
     }
 
     fn emit_cmd_time_now(&mut self, args: &[Expr]) -> String {
+        self.add_runtime_effect("time/now");
         if args.len() != 1 {
             return "{ kind: Symbol.for(\"none\") }".to_string();
         }
@@ -802,6 +862,7 @@ impl Emitter {
     }
 
     fn emit_cmd_random_number(&mut self, args: &[Expr]) -> String {
+        self.add_runtime_effect("random/number");
         if args.len() != 3 {
             return "{ kind: Symbol.for(\"none\") }".to_string();
         }
@@ -814,6 +875,7 @@ impl Emitter {
     }
 
     fn emit_cmd_timer(&mut self, args: &[Expr], kind: &str) -> String {
+        self.add_runtime_effect(kind);
         if args.len() != 3 {
             return "{ kind: Symbol.for(\"none\") }".to_string();
         }
@@ -827,6 +889,7 @@ impl Emitter {
     }
 
     fn emit_cmd_timer_cancel(&mut self, args: &[Expr]) -> String {
+        self.add_runtime_effect("timer/cancel");
         if args.len() != 1 {
             return "{ kind: Symbol.for(\"none\") }".to_string();
         }
@@ -837,6 +900,7 @@ impl Emitter {
     }
 
     fn emit_cmd_animation_frame(&mut self, args: &[Expr]) -> String {
+        self.add_runtime_effect("animation/frame");
         if args.len() != 2 {
             return "{ kind: Symbol.for(\"none\") }".to_string();
         }
@@ -848,6 +912,7 @@ impl Emitter {
     }
 
     fn emit_cmd_animation_cancel(&mut self, args: &[Expr]) -> String {
+        self.add_runtime_effect("animation/cancel");
         if args.len() != 2 {
             return "{ kind: Symbol.for(\"none\") }".to_string();
         }
@@ -859,6 +924,7 @@ impl Emitter {
     }
 
     fn emit_cmd_dom_ref_action(&mut self, args: &[Expr], kind: &str) -> String {
+        self.add_runtime_effect(kind);
         if args.len() != 2 && args.len() != 3 {
             return "{ kind: Symbol.for(\"none\") }".to_string();
         }
@@ -876,6 +942,7 @@ impl Emitter {
     }
 
     fn emit_cmd_file_read_selected(&mut self, args: &[Expr]) -> String {
+        self.add_runtime_effect("file/read-selected");
         if args.len() != 5 {
             return "{ kind: Symbol.for(\"none\") }".to_string();
         }
@@ -890,6 +957,7 @@ impl Emitter {
     }
 
     fn emit_cmd_file_download(&mut self, args: &[Expr]) -> String {
+        self.add_runtime_effect("file/download");
         if args.len() != 5 {
             return "{ kind: Symbol.for(\"none\") }".to_string();
         }
@@ -904,6 +972,7 @@ impl Emitter {
     }
 
     fn emit_cmd_canvas_draw(&mut self, args: &[Expr]) -> String {
+        self.add_runtime_effect("canvas/draw");
         if args.len() != 5 {
             return "{ kind: Symbol.for(\"none\") }".to_string();
         }
@@ -918,6 +987,7 @@ impl Emitter {
     }
 
     fn emit_cmd_resize_watch(&mut self, args: &[Expr]) -> String {
+        self.add_runtime_effect("dom-ref/resize-watch");
         if args.len() != 4 {
             return "{ kind: Symbol.for(\"none\") }".to_string();
         }
@@ -931,6 +1001,7 @@ impl Emitter {
     }
 
     fn emit_cmd_dom_ref_measure(&mut self, args: &[Expr]) -> String {
+        self.add_runtime_effect("dom-ref/measure");
         if args.len() != 3 {
             return "{ kind: Symbol.for(\"none\") }".to_string();
         }
@@ -943,6 +1014,7 @@ impl Emitter {
     }
 
     fn emit_cmd_bluetooth_connect_heart_rate(&mut self, args: &[Expr]) -> String {
+        self.add_runtime_effect("bluetooth/connect-heart-rate");
         if args.len() != 6 {
             return "{ kind: Symbol.for(\"none\") }".to_string();
         }
@@ -958,6 +1030,7 @@ impl Emitter {
     }
 
     fn emit_cmd_bluetooth_disconnect(&mut self, args: &[Expr]) -> String {
+        self.add_runtime_effect("bluetooth/disconnect");
         if args.len() != 2 {
             return "{ kind: Symbol.for(\"none\") }".to_string();
         }
@@ -969,6 +1042,7 @@ impl Emitter {
     }
 
     fn emit_cmd_simulation_heart_rate(&mut self, args: &[Expr]) -> String {
+        self.add_runtime_effect("simulation/heart-rate");
         if args.len() != 5 && args.len() != 6 {
             return "{ kind: Symbol.for(\"none\") }".to_string();
         }
@@ -990,6 +1064,7 @@ impl Emitter {
     }
 
     fn emit_cmd_simulation_stop(&mut self, args: &[Expr]) -> String {
+        self.add_runtime_effect("simulation/stop");
         if args.len() != 1 {
             return "{ kind: Symbol.for(\"none\") }".to_string();
         }
@@ -1112,6 +1187,7 @@ impl Emitter {
     }
 
     fn emit_sub_timer_every(&mut self, args: &[Expr]) -> String {
+        self.add_runtime_effect("sub/timer/every");
         if args.len() != 3 {
             return "{ kind: Symbol.for(\"none\") }".to_string();
         }
@@ -1124,6 +1200,7 @@ impl Emitter {
     }
 
     fn emit_sub_change(&mut self, args: &[Expr], kind: &str, target_field: &str) -> String {
+        self.add_runtime_effect(kind);
         if args.len() != 3 {
             return "{ kind: Symbol.for(\"none\") }".to_string();
         }
@@ -1138,6 +1215,7 @@ impl Emitter {
     }
 
     fn emit_sub_window_event(&mut self, args: &[Expr]) -> String {
+        self.add_runtime_effect("sub/window/event");
         if args.len() != 3 && args.len() != 4 {
             return "{ kind: Symbol.for(\"none\") }".to_string();
         }
@@ -1155,6 +1233,7 @@ impl Emitter {
     }
 
     fn emit_sub_window_event_with(&mut self, args: &[Expr]) -> String {
+        self.add_runtime_effect("sub/window/event");
         if args.len() != 4 {
             return "{ kind: Symbol.for(\"none\") }".to_string();
         }
@@ -1298,20 +1377,19 @@ impl Emitter {
         &mut self,
         name: &str,
         params: &[String],
-        param_names: &[String],
+        _param_names: &[String],
         node: &HtmlNode,
     ) -> String {
         let param_list = params.join(", ");
         let component_expr = self.emit_template_component(node);
-        let param_metadata = js_string_array(param_names);
         let update_params = params
             .iter()
             .map(|param| format!("next_{}", param))
             .collect::<Vec<_>>();
         let update_signature = if update_params.is_empty() {
-            "dispatch, updateContext".to_string()
+            "dispatch".to_string()
         } else {
-            format!("{}, dispatch, updateContext", update_params.join(", "))
+            format!("{}, dispatch", update_params.join(", "))
         };
         let reassign = params
             .iter()
@@ -1321,11 +1399,10 @@ impl Emitter {
             .join(" ");
 
         format!(
-            "export function {}({}) {{ const __closkellComponent = {}; __closkellComponent.definition.params = {}; return {{ mount(parent, dispatch, hydrateNode) {{ return __closkellComponent.mount(parent, dispatch, hydrateNode); }}, update({}) {{ {} return __closkellComponent.update(dispatch, updateContext); }}, dispose() {{ __closkellComponent.dispose(); }}, get root() {{ return __closkellComponent.root; }}, definition: __closkellComponent.definition }}; }}",
+            "export function {}({}) {{ const __closkellComponent = {}; return {{ mount(parent, dispatch) {{ return __closkellComponent.mount(parent, dispatch); }}, update({}) {{ {} return __closkellComponent.update(dispatch); }}, dispose() {{ __closkellComponent.dispose(); }}, get root() {{ return __closkellComponent.root; }} }}; }}",
             sanitize_identifier(name),
             param_list,
             component_expr,
-            param_metadata,
             update_signature,
             reassign
         )
@@ -1335,7 +1412,7 @@ impl Emitter {
         &mut self,
         name: &str,
         params: &[String],
-        param_names: &[String],
+        _param_names: &[String],
         bindings: &[Expr],
         node: &HtmlNode,
     ) -> String {
@@ -1395,15 +1472,14 @@ impl Emitter {
             .join(" ");
         let refresh_body = refresh_lines.join(" ");
         let component_expr = self.emit_template_component_with_read_aliases(node, &read_aliases);
-        let param_metadata = js_string_array(param_names);
         let update_params = params
             .iter()
             .map(|param| format!("next_{}", param))
             .collect::<Vec<_>>();
         let update_signature = if update_params.is_empty() {
-            "dispatch, updateContext".to_string()
+            "dispatch".to_string()
         } else {
-            format!("{}, dispatch, updateContext", update_params.join(", "))
+            format!("{}, dispatch", update_params.join(", "))
         };
         let reassign = params
             .iter()
@@ -1413,13 +1489,12 @@ impl Emitter {
             .join(" ");
 
         format!(
-            "export function {}({}) {{ {} const __closkellRefresh = () => {{ {} }}; __closkellRefresh(); const __closkellComponent = {}; __closkellComponent.definition.params = {}; return {{ mount(parent, dispatch, hydrateNode) {{ return __closkellComponent.mount(parent, dispatch, hydrateNode); }}, update({}) {{ {} __closkellRefresh(); return __closkellComponent.update(dispatch, updateContext); }}, dispose() {{ __closkellComponent.dispose(); }}, get root() {{ return __closkellComponent.root; }}, definition: __closkellComponent.definition }}; }}",
+            "export function {}({}) {{ {} const __closkellRefresh = () => {{ {} }}; __closkellRefresh(); const __closkellComponent = {}; return {{ mount(parent, dispatch) {{ return __closkellComponent.mount(parent, dispatch); }}, update({}) {{ {} __closkellRefresh(); return __closkellComponent.update(dispatch); }}, dispose() {{ __closkellComponent.dispose(); }}, get root() {{ return __closkellComponent.root; }} }}; }}",
             sanitize_identifier(name),
             param_list,
             declarations,
             refresh_body,
             component_expr,
-            param_metadata,
             update_signature,
             reassign
         )
@@ -1598,6 +1673,9 @@ impl Emitter {
             ));
             return "undefined".to_string();
         }
+        if let Some(code) = self.emit_kind_switch_match(args) {
+            return code;
+        }
 
         let value_name = self.next_temp("__closkell_match");
         let value = self.emit_expr(&args[0]);
@@ -1618,6 +1696,48 @@ impl Emitter {
 
         lines.push("throw new Error(\"non-exhaustive match\");".to_string());
         format!("(() => {{ {} }})()", lines.join(" "))
+    }
+
+    fn emit_kind_switch_match(&mut self, args: &[Expr]) -> Option<String> {
+        let plan = kind_match_plan(args)?;
+        let value_name = self.next_temp("__closkell_match");
+        let kind_name = self.next_temp("__closkell_kind");
+        let value = self.emit_expr(&args[0]);
+        let mut lines = vec![
+            format!("const {} = {};", value_name, value),
+            format!(
+                "const {} = typeof {}?.kind === \"symbol\" ? Symbol.keyFor({}.kind) ?? {}.kind.description : {}?.kind;",
+                kind_name, value_name, value_name, value_name, value_name
+            ),
+            format!("switch ({}) {{", kind_name),
+        ];
+
+        for arm in &plan.arms {
+            let bindings = self.emit_kind_pattern_bindings(arm.pattern, &value_name)?;
+            let body = self.emit_expr(arm.body);
+            lines.push(format!(
+                "case \"{}\": {{ {} return {}; }}",
+                escape_js(&arm.kind),
+                bindings,
+                body
+            ));
+        }
+
+        if let Some(default) = &plan.default {
+            let compiled = self.emit_pattern(default.pattern, &value_name);
+            if compiled.test != "true" {
+                return None;
+            }
+            let body = self.emit_expr(default.body);
+            lines.push(format!(
+                "default: {{ {} return {}; }}",
+                compiled.bindings, body
+            ));
+        }
+
+        lines.push("}".to_string());
+        lines.push("throw new Error(\"non-exhaustive match\");".to_string());
+        Some(format!("(() => {{ {} }})()", lines.join(" ")))
     }
 
     fn emit_do(&mut self, args: &[Expr]) -> String {
@@ -1879,8 +1999,7 @@ impl Emitter {
         if !args.is_empty() {
             return "undefined".to_string();
         }
-        "Boolean(globalThis.__CLOSKELL_ENV__?.DEV ?? (import.meta.env && import.meta.env.DEV))"
-            .to_string()
+        "Boolean(import.meta.env && import.meta.env.DEV)".to_string()
     }
 
     fn emit_env_mode(&mut self, args: &[Expr]) -> String {
@@ -1895,20 +2014,16 @@ impl Emitter {
         if args.len() != 1 {
             return "undefined".to_string();
         }
-        format!(
-            "((__collection) => __collection instanceof Set || __collection instanceof Map ? __collection.size : (Array.isArray(__collection) || typeof __collection === \"string\" ? __collection.length : (__collection == null ? 0 : Object.keys(__collection).length)))({})",
-            self.emit_expr(&args[0])
-        )
+        self.needs_count_helper = true;
+        format!("__closkellCount({})", self.emit_expr(&args[0]))
     }
 
     fn emit_empty(&mut self, args: &[Expr]) -> String {
         if args.len() != 1 {
             return "undefined".to_string();
         }
-        format!(
-            "((__collection) => (__collection instanceof Set || __collection instanceof Map ? __collection.size : (Array.isArray(__collection) || typeof __collection === \"string\" ? __collection.length : (__collection == null ? 0 : Object.keys(__collection).length))) === 0)({})",
-            self.emit_expr(&args[0])
-        )
+        self.needs_count_helper = true;
+        format!("__closkellCount({}) === 0", self.emit_expr(&args[0]))
     }
 
     fn emit_some(&mut self, args: &[Expr]) -> String {
@@ -3595,6 +3710,14 @@ impl Emitter {
     }
 
     fn emit_map_or_record(&mut self, entries: &[(Expr, Expr)]) -> String {
+        for (key, value) in entries {
+            if object_key_name(key).is_some_and(|name| name == "kind") {
+                if let Some(kind) = runtime_effect_kind_name(value) {
+                    self.add_runtime_effect(kind);
+                }
+            }
+        }
+
         if entries.iter().all(|(key, _)| object_key(key).is_some()) {
             let fields = entries
                 .iter()
@@ -3822,6 +3945,9 @@ impl Emitter {
             ));
             return TailEmission::without_tail("return undefined;".to_string());
         }
+        if let Some(emitted) = self.emit_tail_kind_switch_match(self_name, params, args) {
+            return emitted;
+        }
 
         let value_name = self.next_temp("__closkell_match");
         let mut lines = vec![format!(
@@ -3848,6 +3974,55 @@ impl Emitter {
             code: format!("{{ {} }}", lines.join(" ")),
             has_tail_call,
         }
+    }
+
+    fn emit_tail_kind_switch_match(
+        &mut self,
+        self_name: &str,
+        params: &[String],
+        args: &[Expr],
+    ) -> Option<TailEmission> {
+        let plan = kind_match_plan(args)?;
+        let value_name = self.next_temp("__closkell_match");
+        let kind_name = self.next_temp("__closkell_kind");
+        let mut lines = vec![
+            format!("const {} = {};", value_name, self.emit_expr(&args[0])),
+            format!(
+                "const {} = typeof {}?.kind === \"symbol\" ? Symbol.keyFor({}.kind) ?? {}.kind.description : {}?.kind;",
+                kind_name, value_name, value_name, value_name, value_name
+            ),
+            format!("switch ({}) {{", kind_name),
+        ];
+        let mut has_tail_call = false;
+
+        for arm in &plan.arms {
+            let bindings = self.emit_kind_pattern_bindings(arm.pattern, &value_name)?;
+            let body = self.emit_tail_expr(self_name, params, arm.body);
+            has_tail_call |= body.has_tail_call;
+            lines.push(format!(
+                "case \"{}\": {{ {} {} }}",
+                escape_js(&arm.kind),
+                bindings,
+                body.code
+            ));
+        }
+
+        if let Some(default) = &plan.default {
+            let compiled = self.emit_pattern(default.pattern, &value_name);
+            if compiled.test != "true" {
+                return None;
+            }
+            let body = self.emit_tail_expr(self_name, params, default.body);
+            has_tail_call |= body.has_tail_call;
+            lines.push(format!("default: {{ {} {} }}", compiled.bindings, body.code));
+        }
+
+        lines.push("}".to_string());
+        lines.push("throw new Error(\"non-exhaustive match\");".to_string());
+        Some(TailEmission {
+            code: format!("{{ {} }}", lines.join(" ")),
+            has_tail_call,
+        })
     }
 
     fn next_temp(&mut self, prefix: &str) -> String {
@@ -3909,6 +4084,31 @@ impl Emitter {
                 }
             }
         }
+    }
+
+    fn emit_kind_pattern_bindings(&mut self, pattern: &Expr, value: &str) -> Option<String> {
+        let info = kind_pattern_info(pattern)?;
+        let mut bindings = Vec::new();
+        if let Some(alias) = info.alias {
+            if alias != "_" {
+                bindings.push(format!("const {} = {};", sanitize_identifier(alias), value));
+            }
+        }
+        for (key, field_pattern) in info.entries {
+            let key = object_key_name(key)?;
+            if key == "kind" {
+                continue;
+            }
+            let field = format!("{}{}", value, property_access(&key));
+            bindings.push(simple_field_pattern_binding(field_pattern, &field)?);
+        }
+        Some(
+            bindings
+                .into_iter()
+                .filter(|binding| !binding.is_empty())
+                .collect::<Vec<_>>()
+                .join(" "),
+        )
     }
 
     fn emit_data_constructor_pattern(
@@ -4099,34 +4299,49 @@ impl Emitter {
     fn emit_template_component_with_read_aliases(
         &mut self,
         root: &HtmlNode,
-        read_aliases: &ReadAliases,
+        _read_aliases: &ReadAliases,
     ) -> String {
         self.needs_html_runtime = true;
         let template_id = self.next_template_id;
         self.next_template_id += 1;
-
         let mut template = TemplateEmitter {
             owner: self,
             template_id,
-            read_aliases,
             svg_depth: 0,
             nodes: Vec::new(),
             slots: Vec::new(),
             create_lines: Vec::new(),
         };
         let root_var = template.emit_node(root);
-        let node_vars = template.nodes.join(", ");
+        let mut used_node_ids = BTreeSet::new();
+        for slot in &template.slots {
+            used_node_ids.insert(slot.node_id);
+        }
+        let mut node_id_remap = BTreeMap::new();
+        let node_vars = used_node_ids
+            .iter()
+            .enumerate()
+            .map(|(next_id, old_id)| {
+                node_id_remap.insert(*old_id, next_id);
+                template.nodes[*old_id].clone()
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        for slot in &mut template.slots {
+            slot.node_id = *node_id_remap
+                .get(&slot.node_id)
+                .expect("slot node should be retained in compact node table");
+        }
         template.create_lines.push(format!(
             "return {{ root: {}, nodes: [{}] }};",
             root_var, node_vars
         ));
         let create_body = template.create_lines.join(" ");
         let update_body = template.emit_update_body();
-        let metadata = template.emit_metadata();
 
         format!(
-            "__closkellCreateTemplate({{ name: \"template{}\", slots: {}, create() {{ {} }}, update(instance, dispatch, updateContext) {{ {} }} }})",
-            template_id, metadata, create_body, update_body
+            "__closkellCreateTemplate({{ create() {{ {} }}, update(instance, dispatch, updateContext) {{ {} }} }})",
+            create_body, update_body
         )
     }
 }
@@ -4134,7 +4349,6 @@ impl Emitter {
 struct TemplateEmitter<'a> {
     owner: &'a mut Emitter,
     template_id: usize,
-    read_aliases: &'a ReadAliases,
     svg_depth: usize,
     nodes: Vec<String>,
     slots: Vec<TemplateSlot>,
@@ -4144,6 +4358,28 @@ struct TemplateEmitter<'a> {
 struct CompiledPattern {
     test: String,
     bindings: String,
+}
+
+struct KindPatternInfo<'a> {
+    kind: String,
+    entries: &'a [(Expr, Expr)],
+    alias: Option<&'a str>,
+}
+
+struct KindMatchArm<'a> {
+    kind: String,
+    pattern: &'a Expr,
+    body: &'a Expr,
+}
+
+struct KindMatchDefault<'a> {
+    pattern: &'a Expr,
+    body: &'a Expr,
+}
+
+struct KindMatchPlan<'a> {
+    arms: Vec<KindMatchArm<'a>>,
+    default: Option<KindMatchDefault<'a>>,
 }
 
 #[derive(Clone, Debug)]
@@ -4342,13 +4578,107 @@ impl CompiledPattern {
     }
 }
 
+fn kind_match_plan(args: &[Expr]) -> Option<KindMatchPlan<'_>> {
+    let mut arms = Vec::new();
+    let mut default = None;
+    let mut seen = BTreeSet::new();
+    let pair_count = args[1..].len() / 2;
+
+    for (index, arm) in args[1..].chunks(2).enumerate() {
+        let [pattern, body] = arm else {
+            return None;
+        };
+        if let Some(info) = kind_pattern_info(pattern) {
+            if default.is_some() || !seen.insert(info.kind.clone()) {
+                return None;
+            }
+            arms.push(KindMatchArm {
+                kind: info.kind,
+                pattern,
+                body,
+            });
+            continue;
+        }
+        if index + 1 == pair_count && is_always_pattern(pattern) {
+            default = Some(KindMatchDefault { pattern, body });
+            continue;
+        }
+        return None;
+    }
+
+    if arms.is_empty() {
+        return None;
+    }
+    Some(KindMatchPlan { arms, default })
+}
+
+fn kind_pattern_info(pattern: &Expr) -> Option<KindPatternInfo<'_>> {
+    match &pattern.kind {
+        ExprKind::Map(entries) => Some(KindPatternInfo {
+            kind: record_kind_pattern(entries)?,
+            entries: entries.as_slice(),
+            alias: None,
+        }),
+        ExprKind::List(items) if items.len() == 3 && matches_symbol(&items[0], "as") => {
+            let alias = symbol_name(&items[2])?;
+            let mut info = kind_pattern_info(&items[1])?;
+            info.alias = Some(alias);
+            Some(info)
+        }
+        _ => None,
+    }
+}
+
+fn record_kind_pattern(entries: &[(Expr, Expr)]) -> Option<String> {
+    for (key, pattern) in entries {
+        if object_key_name(key).is_some_and(|name| name == "kind") {
+            return literal_kind_pattern(pattern);
+        }
+    }
+    None
+}
+
+fn literal_kind_pattern(pattern: &Expr) -> Option<String> {
+    match &pattern.kind {
+        ExprKind::Keyword(name) | ExprKind::String(name) => Some(name.clone()),
+        _ => None,
+    }
+}
+
+fn is_always_pattern(pattern: &Expr) -> bool {
+    matches!(&pattern.kind, ExprKind::Symbol(_))
+}
+
+fn simple_field_pattern_binding(pattern: &Expr, value: &str) -> Option<String> {
+    match &pattern.kind {
+        ExprKind::Symbol(name) if name == "_" => Some(String::new()),
+        ExprKind::Symbol(name) => Some(format!("const {} = {};", sanitize_identifier(name), value)),
+        ExprKind::List(items) if items.len() == 3 && matches_symbol(&items[0], "as") => {
+            let inner = simple_field_pattern_binding(&items[1], value)?;
+            let alias = symbol_name(&items[2])?;
+            let alias = if alias == "_" {
+                String::new()
+            } else {
+                format!("const {} = {};", sanitize_identifier(alias), value)
+            };
+            Some(
+                [inner, alias]
+                    .into_iter()
+                    .filter(|binding| !binding.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            )
+        }
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug)]
 struct TemplateSlot {
     id: usize,
     node_id: usize,
     kind: TemplateSlotKind,
     expr: String,
-    reads: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -4474,6 +4804,9 @@ impl TemplateEmitter<'_> {
             self.svg_depth += 1;
         }
         for child in &element.children {
+            if is_indentation_text_node(child) {
+                continue;
+            }
             let child_var = self.emit_node(child);
             self.create_lines
                 .push(format!("{}.appendChild({});", var, child_var));
@@ -4515,7 +4848,7 @@ impl TemplateEmitter<'_> {
             };
         let component_expr = self.owner.emit_template_component(spec.template);
         let render = format!(
-            "({}) => {{ let {} = {};{} const __closkellItemComponent = {}; return {{ mount(parent, dispatch, hydrateNode) {{ return __closkellItemComponent.mount(parent, dispatch, hydrateNode); }}, update({}, dispatch, updateContext) {{ {} = {};{} return __closkellItemComponent.update(dispatch, updateContext); }}, dispose() {{ __closkellItemComponent.dispose(); }}, get root() {{ return __closkellItemComponent.root; }}, definition: __closkellItemComponent.definition }}; }}",
+            "({}) => {{ let {} = {};{} const __closkellItemComponent = {}; return {{ mount(parent, dispatch) {{ return __closkellItemComponent.mount(parent, dispatch); }}, update({}, dispatch) {{ {} = {};{} return __closkellItemComponent.update(dispatch); }}, dispose() {{ __closkellItemComponent.dispose(); }}, get root() {{ return __closkellItemComponent.root; }} }}; }}",
             render_params,
             item,
             item_param,
@@ -4538,10 +4871,6 @@ impl TemplateEmitter<'_> {
                 render,
             },
             expr: format_expr(expr),
-            reads: expand_reads(
-                collect_keyed_reads(&spec, &self.owner.component_fns, &self.owner.read_summaries),
-                self.read_aliases,
-            ),
         });
         var
     }
@@ -4566,14 +4895,6 @@ impl TemplateEmitter<'_> {
                 render_else,
             },
             expr: format_expr(expr),
-            reads: expand_reads(
-                collect_conditional_reads(
-                    &spec,
-                    &self.owner.component_fns,
-                    &self.owner.read_summaries,
-                ),
-                self.read_aliases,
-            ),
         });
         var
     }
@@ -4602,7 +4923,7 @@ impl TemplateEmitter<'_> {
         };
 
         format!(
-            "(() => {{ const {component} = {render}; return {{ mount(parent, dispatch, hydrateNode) {{ return {component}.mount(parent, dispatch, hydrateNode); }}, update(dispatch, updateContext) {{ return {component}.update({update_args}dispatch, updateContext); }}, dispose() {{ {component}.dispose?.(); }}, get root() {{ return {component}.root; }}, definition: {component}.definition }}; }})()"
+            "(() => {{ const {component} = {render}; return {{ mount(parent, dispatch) {{ return {component}.mount(parent, dispatch); }}, update(dispatch) {{ return {component}.update({update_args}dispatch); }}, dispose() {{ {component}.dispose?.(); }}, get root() {{ return {component}.root; }} }}; }})()"
         )
     }
 
@@ -4615,7 +4936,7 @@ impl TemplateEmitter<'_> {
         let else_component = self.emit_branch_component(&spec.else_branch);
 
         format!(
-            "(() => {{ let {branch} = null; let {component} = null; const {placeholder} = document.createTextNode(\"\"); const __closkellDispose = () => {{ if ({component}?.root?.parentNode) {component}.root.parentNode.removeChild({component}.root); {component}?.dispose?.(); }}; return {{ update(dispatch, updateContext) {{ const __closkellCondition = {condition}; const __closkellNextBranch = __closkellCondition ? \"then\" : \"else\"; let __closkellFresh = false; if ({branch} !== __closkellNextBranch) {{ __closkellDispose(); {component} = __closkellCondition ? {then_component} : {else_component}; {branch} = __closkellNextBranch; __closkellFresh = true; }} const __closkellBranchContext = __closkellFresh && updateContext ? {{ ...updateContext, force: true, frames: updateContext.frames }} : updateContext; {component}?.update?.(dispatch, __closkellBranchContext); return {component}?.root ?? {placeholder}; }}, get root() {{ return {component}?.root ?? {placeholder}; }}, dispose() {{ __closkellDispose(); {component} = null; {branch} = null; }} }}; }})()"
+            "(() => {{ let {branch} = null; let {component} = null; const {placeholder} = document.createTextNode(\"\"); const __closkellDispose = () => {{ if ({component}?.root?.parentNode) {component}.root.parentNode.removeChild({component}.root); {component}?.dispose?.(); }}; return {{ update(dispatch) {{ const __closkellCondition = {condition}; const __closkellNextBranch = __closkellCondition ? \"then\" : \"else\"; if ({branch} !== __closkellNextBranch) {{ __closkellDispose(); {component} = __closkellCondition ? {then_component} : {else_component}; {branch} = __closkellNextBranch; }} {component}?.update?.(dispatch); return {component}?.root ?? {placeholder}; }}, get root() {{ return {component}?.root ?? {placeholder}; }}, dispose() {{ __closkellDispose(); {component} = null; {branch} = null; }} }}; }})()"
         )
     }
 
@@ -4641,10 +4962,6 @@ impl TemplateEmitter<'_> {
                 args: format!("[{}]", args),
             },
             expr: format_expr(expr),
-            reads: expand_reads(
-                component_call_reads(&spec, &self.owner.read_summaries),
-                self.read_aliases,
-            ),
         });
         var
     }
@@ -4665,25 +4982,12 @@ impl TemplateEmitter<'_> {
 
     fn push_slot(&mut self, node_id: usize, kind: TemplateSlotKind, expr: &Expr) {
         let id = self.slots.len();
-        let reads = match &kind {
-            TemplateSlotKind::Event(_) => Vec::new(),
-            TemplateSlotKind::Text
-            | TemplateSlotKind::Attr(_)
-            | TemplateSlotKind::Ref
-            | TemplateSlotKind::Conditional { .. }
-            | TemplateSlotKind::Component { .. }
-            | TemplateSlotKind::KeyedList { .. } => expand_reads(
-                collect_template_reads(expr, &self.owner.read_summaries),
-                self.read_aliases,
-            ),
-        };
         let expr = self.owner.emit_expr(expr);
         self.slots.push(TemplateSlot {
             id,
             node_id,
             kind,
             expr,
-            reads,
         });
     }
 
@@ -4694,7 +4998,6 @@ impl TemplateEmitter<'_> {
             node_id,
             kind,
             expr,
-            reads: Vec::new(),
         });
     }
 
@@ -4729,11 +5032,11 @@ impl TemplateEmitter<'_> {
                     render_then,
                     render_else,
                 } => format!(
-                    "__closkellSetConditional(instance, {}, instance.nodes[{}], {}, {}, {}, dispatch, updateContext);",
+                    "__closkellSetConditional(instance, {}, instance.nodes[{}], {}, {}, {}, dispatch);",
                     slot.id, slot.node_id, condition, render_then, render_else
                 ),
                 TemplateSlotKind::Component { name, render, args } => format!(
-                    "__closkellSetComponent(instance, {}, instance.nodes[{}], () => {}, {}, dispatch, updateContext, \"{}\");",
+                    "__closkellSetComponent(instance, {}, instance.nodes[{}], () => {}, {}, dispatch, \"{}\");",
                     slot.id,
                     slot.node_id,
                     render,
@@ -4753,59 +5056,24 @@ impl TemplateEmitter<'_> {
                         item.clone()
                     };
                     format!(
-                        "__closkellSetKeyedList(instance, {}, instance.nodes[{}], {}, ({}) => {}, {}, dispatch, updateContext);",
-                        slot.id, slot.node_id, collection, key_params, key, render
+                        "__closkellSetKeyedList(instance, {}, instance.nodes[{}], {}, ({}) => {}, {}, dispatch);",
+                        slot.id,
+                        slot.node_id,
+                        collection,
+                        key_params,
+                        key,
+                        render
                     )
                 }
             };
-            lines.push(format!(
-                "if (__closkellShouldUpdateSlot(instance, {}, updateContext)) {{ {} }}",
-                slot.id, update
-            ));
+            lines.push(update);
         }
         lines.join(" ")
     }
+}
 
-    fn emit_metadata(&self) -> String {
-        let slots = self
-            .slots
-            .iter()
-            .map(|slot| {
-                let kind = match &slot.kind {
-                    TemplateSlotKind::Text => "\"text\"".to_string(),
-                    TemplateSlotKind::Attr(name) => format!("{{ attr: \"{}\" }}", escape_js(name)),
-                    TemplateSlotKind::Event(name) => {
-                        format!("{{ event: \"{}\" }}", escape_js(name))
-                    }
-                    TemplateSlotKind::Ref => "{ ref: true }".to_string(),
-                    TemplateSlotKind::Conditional { .. } => "{ conditional: true }".to_string(),
-                    TemplateSlotKind::Component { name, .. } => {
-                        format!("{{ component: \"{}\" }}", escape_js(name))
-                    }
-                    TemplateSlotKind::KeyedList { item, index, .. } => match index {
-                        Some(index) => format!(
-                            "{{ keyed: \"{}\", index: \"{}\" }}",
-                            escape_js(item),
-                            escape_js(index)
-                        ),
-                        None => format!("{{ keyed: \"{}\" }}", escape_js(item)),
-                    },
-                };
-                let reads = slot
-                    .reads
-                    .iter()
-                    .map(|read| format!("\"{}\"", escape_js(read)))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!(
-                    "{{ id: {}, node: {}, kind: {}, reads: [{}] }}",
-                    slot.id, slot.node_id, kind, reads
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!("[{}]", slots)
-    }
+fn is_indentation_text_node(node: &HtmlNode) -> bool {
+    matches!(node, HtmlNode::Text { text, .. } if text.contains('\n') && text.trim().is_empty())
 }
 
 struct ForSpec<'a> {
@@ -5870,6 +6138,13 @@ fn object_key_name(expr: &Expr) -> Option<String> {
     }
 }
 
+fn runtime_effect_kind_name(expr: &Expr) -> Option<&str> {
+    match &expr.kind {
+        ExprKind::Keyword(name) | ExprKind::String(name) if name.contains('/') => Some(name),
+        _ => None,
+    }
+}
+
 fn property_key(name: &str) -> String {
     if is_js_identifier(name) {
         name.to_string()
@@ -5947,15 +6222,6 @@ fn escape_js(value: &str) -> String {
             other => vec![other],
         })
         .collect()
-}
-
-fn js_string_array(values: &[String]) -> String {
-    let entries = values
-        .iter()
-        .map(|value| format!("\"{}\"", escape_js(value)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("[{}]", entries)
 }
 
 #[cfg(test)]

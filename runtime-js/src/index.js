@@ -256,10 +256,9 @@ function ensureRuntimeDocument() {
   return documentRef;
 }
 
-ensureRuntimeDocument();
-
 export function htmlTemplate(source) {
-  const template = document.createElement("template");
+  const documentRef = ensureRuntimeDocument();
+  const template = documentRef.createElement("template");
   template.innerHTML = source;
   return {
     mount(parent) {
@@ -450,7 +449,6 @@ export function createTemplateComponent(definition) {
       instance.conditionalSlots = [];
       instance.componentSlots = [];
       instance.refSlots = [];
-      instance.definition = definition;
     }
     return instance;
   };
@@ -513,11 +511,73 @@ export function createTemplateComponent(definition) {
   };
 }
 
+export function createCompiledTemplateComponent(definition) {
+  let instance = null;
+  let lastDispatch = () => {};
+
+  const ensureInstance = () => {
+    if (!instance) {
+      instance = definition.create();
+      instance.values = [];
+      instance.eventSlots = [];
+      instance.keyedSlots = [];
+      instance.conditionalSlots = [];
+      instance.componentSlots = [];
+      instance.refSlots = [];
+      instance.definition = definition;
+    }
+    return instance;
+  };
+
+  const disposeInstance = (current) => {
+    if (!current) return;
+    disposeEventSlots(current);
+    disposeRefs(current);
+    for (const slot of current.keyedSlots || []) {
+      for (const entry of slot?.byKey?.values?.() || []) disposeComponent(entry.component);
+    }
+    for (const slot of current.conditionalSlots || []) disposeComponent(slot?.component);
+    for (const slot of current.componentSlots || []) disposeComponent(slot?.component);
+    if (current.root?.parentNode?.removeChild) current.root.parentNode.removeChild(current.root);
+    current.mounted = false;
+  };
+
+  return {
+    mount(parent, dispatch = lastDispatch) {
+      lastDispatch = dispatch || lastDispatch;
+      const current = ensureInstance();
+      if (!current.mounted) {
+        parent.appendChild(current.root);
+        current.mounted = true;
+      }
+      definition.update(current, lastDispatch, null);
+      return current.root;
+    },
+    update(dispatch = lastDispatch, updateContext = null) {
+      lastDispatch = dispatch || lastDispatch;
+      const current = ensureInstance();
+      definition.update(current, lastDispatch, updateContext);
+      return current.root;
+    },
+    dispose() {
+      disposeInstance(instance);
+      instance = null;
+    },
+    get root() {
+      return ensureInstance().root;
+    }
+  };
+}
+
 export function shouldUpdateSlot(instance, slot, updateContext) {
   const slotMetadata = instance.definition?.slots?.[slot] || { id: slot, reads: [] };
   const shouldUpdate = shouldUpdateSlotForReads(slotMetadata.reads || [], updateContext);
   recordTemplateSlot(updateContext, slotMetadata, shouldUpdate);
   return shouldUpdate;
+}
+
+export function shouldUpdateCompiledSlot(reads, updateContext) {
+  return shouldUpdateSlotForReads(reads || [], updateContext);
 }
 
 function claimHydratedTemplateInstance(instance, definition, hydrateNode) {
@@ -659,6 +719,63 @@ export function setAttr(instance, slot, node, name, value) {
     return;
   }
   if (!isSvg && name in node) setDomProperty(node, name, value);
+}
+
+export function setCompiledAttr(instance, slot, node, name, value) {
+  const previous = instance.values[slot];
+  if (previous === value) return;
+  instance.values[slot] = value;
+  const isSvg = node.namespaceURI === "http://www.w3.org/2000/svg";
+
+  if (value === false || value == null) {
+    node.removeAttribute(name);
+    if (!isSvg && name in node) setDomProperty(node, name, false);
+    return;
+  }
+
+  if (value === true) {
+    node.setAttribute(name, "");
+    if (!isSvg && name in node) setDomProperty(node, name, true);
+    return;
+  }
+
+  node.setAttribute(name, String(value));
+  if (!isSvg && name in node) setDomProperty(node, name, value);
+}
+
+export function setCompiledClass(instance, slot, node, value) {
+  const previous = instance.values[slot];
+  if (previous === value) return;
+  instance.values[slot] = value;
+  if (isStructuredClassValue(value)) {
+    applyClassValue(node, value);
+    return;
+  }
+  if (value === false || value == null) {
+    node.removeAttribute("class");
+    if ("className" in node) node.className = "";
+    return;
+  }
+  const className = String(value);
+  node.setAttribute("class", className);
+  if ("className" in node) node.className = className;
+}
+
+export function setCompiledStyle(instance, slot, node, value) {
+  const previous = instance.values[slot];
+  if (previous === value) return;
+  instance.values[slot] = value;
+  if (isStyleObject(value)) {
+    applyStyleObject(node, value, previous);
+    return;
+  }
+  if (isStyleObject(previous)) clearStyleObject(node, previous);
+  if (value === false || value == null) {
+    clearStyleAttribute(node);
+    return;
+  }
+  node.setAttribute("style", String(value));
+  if (node.style) node.style.cssText = String(value);
 }
 
 function setDomProperty(node, name, value) {
@@ -858,16 +975,16 @@ export function setRef(instance, slot, node, value, dispatch) {
   instance.refSlots[slot] = { registry, name, node };
 }
 
-export function setKeyedList(instance, slot, marker, items, keyForItem, renderItem, dispatch, updateContext) {
+export function setKeyedList(instance, slot, marker, items, keyForItem, renderItem, dispatch, updateContext, itemName = null, indexName = null) {
   const parent = marker.parentNode;
   if (!parent) return;
 
   const current = instance.keyedSlots[slot] || { byKey: new Map(), duplicateKeys: new Map() };
   if (!current.duplicateKeys) current.duplicateKeys = new Map();
-  const slotMetadata = instance.definition?.slots?.[slot] || {};
-  const keyedKind = slotMetadata.kind || {};
-  const itemName = typeof keyedKind.keyed === "string" ? keyedKind.keyed : null;
-  const indexName = typeof keyedKind.index === "string" ? keyedKind.index : null;
+  const slotMetadata = itemName ? null : instance.definition?.slots?.[slot] || {};
+  const keyedKind = slotMetadata?.kind || {};
+  itemName ||= typeof keyedKind.keyed === "string" ? keyedKind.keyed : null;
+  indexName ||= typeof keyedKind.index === "string" ? keyedKind.index : null;
   const nextByKey = new Map();
   const nextDuplicateKeys = new Map();
   const seenKeys = new Map();
@@ -927,6 +1044,56 @@ export function setKeyedList(instance, slot, marker, items, keyForItem, renderIt
   instance.keyedSlots[slot] = current;
 }
 
+export function setCompiledKeyedList(instance, slot, marker, items, keyForItem, renderItem, dispatch) {
+  const parent = marker.parentNode;
+  if (!parent) return;
+
+  const current = instance.keyedSlots[slot] || { byKey: new Map(), duplicateKeys: new Map() };
+  if (!current.duplicateKeys) current.duplicateKeys = new Map();
+  const nextByKey = new Map();
+  const nextDuplicateKeys = new Map();
+  const seenKeys = new Map();
+  const orderedEntries = [];
+
+  let index = 0;
+  for (const item of items || []) {
+    const rawKey = keyForItem(item, index);
+    const occurrence = seenKeys.get(rawKey) || 0;
+    seenKeys.set(rawKey, occurrence + 1);
+    const key = occurrence === 0 ? rawKey : duplicateStorageKey(current, nextDuplicateKeys, rawKey, occurrence);
+    let entry = current.byKey.get(key);
+    if (!entry) {
+      entry = { key, component: renderItem(item, index) };
+    }
+    updateCompiledKeyedComponent(entry.component, item, index, dispatch);
+    nextByKey.set(key, entry);
+    orderedEntries.push(entry);
+    index += 1;
+  }
+
+  let cursor = marker;
+  for (let i = orderedEntries.length - 1; i >= 0; i -= 1) {
+    const root = orderedEntries[i].component.root;
+    if (root.parentNode !== parent || root.nextSibling !== cursor) {
+      parent.insertBefore(root, cursor);
+    }
+    cursor = root;
+  }
+
+  for (const [key, entry] of current.byKey) {
+    if (!nextByKey.has(key)) {
+      if (entry.component.root?.parentNode?.removeChild) {
+        entry.component.root.parentNode.removeChild(entry.component.root);
+      }
+      disposeComponent(entry.component);
+    }
+  }
+
+  current.byKey = nextByKey;
+  current.duplicateKeys = nextDuplicateKeys;
+  instance.keyedSlots[slot] = current;
+}
+
 function duplicateStorageKey(current, nextDuplicateKeys, rawKey, occurrence) {
   const currentByOccurrence = current.duplicateKeys?.get(rawKey);
   let key = currentByOccurrence?.get(occurrence);
@@ -946,6 +1113,13 @@ function updateKeyedComponent(component, item, index, dispatch, updateContext) {
     return component.update(item, index, dispatch, updateContext);
   }
   return component.update(item, dispatch, updateContext);
+}
+
+function updateCompiledKeyedComponent(component, item, index, dispatch) {
+  if (component.update.length >= 4) {
+    return component.update(item, index, dispatch, null);
+  }
+  return component.update(item, dispatch, null);
 }
 
 function keyedItemUpdateContext(updateContext, itemName, indexName, previousItem, nextItem, previousIndex, nextIndex) {
@@ -1000,6 +1174,35 @@ export function setConditional(instance, slot, marker, condition, renderThen, re
   instance.conditionalSlots[slot] = current;
 }
 
+export function setCompiledConditional(instance, slot, marker, condition, renderThen, renderElse, dispatch) {
+  const parent = marker.parentNode;
+  if (!parent) return;
+
+  const nextBranch = condition ? "then" : "else";
+  const render = condition ? renderThen : renderElse;
+  let current = instance.conditionalSlots[slot] || {};
+
+  if (current.branch !== nextBranch) {
+    if (current.component?.root?.parentNode) {
+      current.component.root.parentNode.removeChild(current.component.root);
+    }
+    disposeComponent(current.component);
+    current = {
+      branch: nextBranch,
+      component: typeof render === "function" ? render() : null
+    };
+  }
+
+  if (current.component) {
+    current.component.update(dispatch, null);
+    if (current.component.root.parentNode !== parent) {
+      parent.insertBefore(current.component.root, marker);
+    }
+  }
+
+  instance.conditionalSlots[slot] = current;
+}
+
 export function setComponent(instance, slot, marker, render, args, dispatch, updateContext, expectedKey = null) {
   const parent = marker.parentNode;
   if (!parent) return;
@@ -1044,6 +1247,49 @@ export function setComponent(instance, slot, marker, render, args, dispatch, upd
     } else {
       current.component.update(dispatch, componentContext);
       current.args = [];
+    }
+    if (current.component.root.parentNode !== parent) {
+      parent.insertBefore(current.component.root, marker);
+    }
+  }
+
+  instance.componentSlots[slot] = current;
+}
+
+export function setCompiledComponent(instance, slot, marker, render, args, dispatch, expectedKey = null) {
+  const parent = marker.parentNode;
+  if (!parent) return;
+
+  const current = instance.componentSlots[slot] || {};
+  const canReuseExpected = expectedKey && current.component && current.renderKey === expectedKey;
+  const rendered = canReuseExpected ? current.component : (typeof render === "function" ? render() : render);
+  const renderedKey = canReuseExpected ? current.renderKey : expectedKey;
+  if (!current.component) {
+    current.component = rendered;
+    current.renderKey = renderedKey;
+  } else if (
+    rendered
+    && rendered !== current.component
+    && renderedKey
+    && current.renderKey
+    && renderedKey !== current.renderKey
+  ) {
+    if (current.component.root?.parentNode) {
+      current.component.root.parentNode.removeChild(current.component.root);
+    }
+    disposeComponent(current.component);
+    current.component = rendered;
+    current.renderKey = renderedKey;
+  } else if (rendered && rendered !== current.component) {
+    disposeComponent(rendered);
+  }
+
+  if (current.component) {
+    const nextArgs = Array.isArray(args) ? args : [];
+    if (nextArgs.length) {
+      current.component.update(...nextArgs, dispatch, null);
+    } else {
+      current.component.update(dispatch, null);
     }
     if (current.component.root.parentNode !== parent) {
       parent.insertBefore(current.component.root, marker);
@@ -1705,7 +1951,7 @@ export function scopeUpdate(parentState, field, childMessage, update, tag) {
 }
 
 export function scopeSubscriptions(childState, subscriptions, tag) {
-  if (typeof subscriptions !== "function") return Sub.none;
+  if (typeof subscriptions !== "function") return { kind: "none" };
   return mapScopedSubscription(subscriptions(childState), tag);
 }
 
@@ -2348,6 +2594,877 @@ export function createCommandHandlers(env = {}) {
   return handlers;
 }
 
+export function createSelectedCommandHandlers(env = {}, registrations = []) {
+  const context = {
+    env,
+    host: env.host || globalThis,
+    disposers: []
+  };
+  const handlers = {};
+  for (const register of registrations) {
+    register(handlers, context);
+  }
+  Object.defineProperty(handlers, "dispose", {
+    value() {
+      for (const dispose of context.disposers.splice(0)) dispose();
+    }
+  });
+  return handlers;
+}
+
+function addCommandDisposer(context, dispose) {
+  context.disposers.push(dispose);
+}
+
+export function registerBluetoothCommandHandlers(handlers, context) {
+  const { env, host } = context;
+  const bluetooth = env.bluetooth || host.navigator?.bluetooth;
+  const bluetoothConnections = new Map();
+
+  const cleanupBluetoothConnection = (connection) => {
+    if (!connection) return;
+    const { device, characteristic, readingListener, disconnectListener } = connection;
+    characteristic?.removeEventListener?.("characteristicvaluechanged", readingListener);
+    try {
+      const stopped = characteristic?.stopNotifications?.();
+      stopped?.catch?.(() => {});
+    } catch {
+      // Browser implementations can throw if notifications are already stopped.
+    }
+    device?.removeEventListener?.("gattserverdisconnected", disconnectListener);
+    device?.gatt?.disconnect?.();
+  };
+
+  addCommandDisposer(context, () => {
+    for (const connection of bluetoothConnections.values()) cleanupBluetoothConnection(connection);
+    bluetoothConnections.clear();
+  });
+
+  handlers["bluetooth/request-device"] = async function(command) {
+    if (!bluetooth?.requestDevice) {
+      return commandErrorMessage(command, new Error("Bluetooth unavailable"));
+    }
+
+    try {
+      const options = bluetoothRequestOptions(command);
+      const device = await bluetooth.requestDevice(options);
+      return commandMessage(command, device);
+    } catch (error) {
+      return commandErrorMessage(command, error);
+    }
+  };
+
+  handlers["bluetooth/connect-heart-rate"] = async function(command, dispatch) {
+    if (!bluetooth?.requestDevice) {
+      return commandErrorMessage(command, new Error("Bluetooth unavailable"));
+    }
+
+    try {
+      const id = command.id || "heart-rate";
+      const options = bluetoothRequestOptions(command);
+      const serviceName = command.service || "heart_rate";
+      const characteristicName = command.characteristic || "heart_rate_measurement";
+      const device = await bluetooth.requestDevice(options);
+      const server = await device.gatt?.connect();
+      if (!server) throw new Error("Bluetooth GATT unavailable");
+
+      const service = await server.getPrimaryService(serviceName);
+      const characteristic = await service.getCharacteristic(characteristicName);
+      await characteristic.startNotifications();
+
+      const readingListener = (event) => {
+        const value = event.target?.value;
+        if (!value) return;
+        const message = namedCommandMessage(command.onReading, {
+          bpm: parseHeartRateMeasurement(value)
+        });
+        if (message !== undefined) dispatch(message);
+      };
+      characteristic.addEventListener("characteristicvaluechanged", readingListener);
+
+      const disconnectListener = () => {
+        bluetoothConnections.delete(id);
+        const message = namedCommandMessage(command.onDisconnected);
+        if (message !== undefined) dispatch(message);
+      };
+      device.addEventListener?.("gattserverdisconnected", disconnectListener);
+
+      bluetoothConnections.set(id, {
+        device,
+        characteristic,
+        readingListener,
+        disconnectListener
+      });
+
+      return commandMessage(command, {
+        id,
+        device,
+        deviceName: device.name || "",
+        connected: Boolean(device.gatt?.connected)
+      });
+    } catch (error) {
+      return commandErrorMessage(command, error);
+    }
+  };
+
+  handlers["bluetooth/disconnect"] = async function(command) {
+    const id = command.id || "heart-rate";
+    const connection = bluetoothConnections.get(id);
+    if (connection) {
+      cleanupBluetoothConnection(connection);
+      bluetoothConnections.delete(id);
+    }
+    return commandMessage(command);
+  };
+}
+
+export function registerTimerCommandHandlers(handlers, context) {
+  const timers = context.env.timers || context.host;
+  const intervals = new Map();
+  const timeouts = new Map();
+
+  addCommandDisposer(context, () => {
+    for (const interval of intervals.values()) timers.clearInterval?.(interval);
+    intervals.clear();
+    for (const timeout of timeouts.values()) timers.clearTimeout?.(timeout);
+    timeouts.clear();
+  });
+
+  handlers["timer/after"] = function(command) {
+    return new Promise((resolve) => {
+      const id = command.id ?? `timeout:${timeouts.size + 1}`;
+      let fired = false;
+      const timeout = timers.setTimeout(() => {
+        fired = true;
+        timeouts.delete(id);
+        resolve(commandMessage(command));
+      }, command.ms ?? 0);
+      if (!fired) timeouts.set(id, timeout);
+    });
+  };
+
+  handlers["timer/every"] = function(command, dispatch) {
+    const id = command.id || `timer:${intervals.size + 1}`;
+    const existing = intervals.get(id);
+    if (existing !== undefined) timers.clearInterval(existing);
+    const interval = timers.setInterval(() => {
+      const message = commandMessage(command);
+      if (message !== undefined) dispatch(message);
+    }, command.ms ?? 0);
+    intervals.set(id, interval);
+  };
+
+  handlers["timer/cancel"] = function(command) {
+    const interval = intervals.get(command.id);
+    if (interval !== undefined) {
+      timers.clearInterval(interval);
+      intervals.delete(command.id);
+    }
+    const timeout = timeouts.get(command.id);
+    if (timeout !== undefined) {
+      timers.clearTimeout?.(timeout);
+      timeouts.delete(command.id);
+    }
+    return commandMessage(command);
+  };
+}
+
+export function registerAnimationCommandHandlers(handlers, context) {
+  const { env, host } = context;
+  const timers = env.timers || host;
+  const now = env.now || (() => Date.now());
+  const animation = env.animation || host;
+  const requestAnimationFrameImpl = env.requestAnimationFrame || animation.requestAnimationFrame?.bind(animation);
+  const cancelAnimationFrameImpl = env.cancelAnimationFrame || animation.cancelAnimationFrame?.bind(animation);
+  const animationFrames = new Map();
+
+  addCommandDisposer(context, () => {
+    for (const entry of animationFrames.values()) cancelAnimationFrameEntry(entry);
+    animationFrames.clear();
+  });
+
+  handlers["animation/frame"] = function(command, dispatch) {
+    const id = command.id || `frame:${animationFrames.size + 1}`;
+    const existing = animationFrames.get(id);
+    if (existing) cancelAnimationFrameEntry(existing);
+
+    const callback = (timestamp) => {
+      animationFrames.delete(id);
+      const message = animationFrameMessage(command, id, timestamp);
+      if (message !== undefined) dispatch(message);
+    };
+
+    let entry;
+    if (requestAnimationFrameImpl) {
+      entry = {
+        kind: "animation",
+        handle: requestAnimationFrameImpl(callback),
+        cancel: cancelAnimationFrameImpl
+      };
+    } else if (timers.setTimeout) {
+      entry = {
+        kind: "timeout",
+        handle: timers.setTimeout(() => callback(now()), 16),
+        cancel: timers.clearTimeout?.bind(timers)
+      };
+    } else {
+      return commandErrorMessage(command, new Error("RAF unavailable"));
+    }
+
+    animationFrames.set(id, entry);
+    return commandMessage(command, { id });
+  };
+
+  handlers["animation/cancel"] = function(command) {
+    const existing = animationFrames.get(command.id);
+    if (existing) {
+      cancelAnimationFrameEntry(existing);
+      animationFrames.delete(command.id);
+    }
+    return commandMessage(command, { id: command.id });
+  };
+}
+
+export function registerTimeCommandHandlers(handlers, context) {
+  const now = context.env.now || (() => Date.now());
+  handlers["time/now"] = function(command) {
+    return commandMessage(command, now());
+  };
+}
+
+export function registerStorageCommandHandlers(handlers, context) {
+  const storage = context.env.storage || context.host.localStorage;
+
+  handlers["storage/get"] = function(command) {
+    try {
+      const raw = storage?.getItem(command.key);
+      return commandMessage(command, raw == null ? null : parseStoredValue(raw, command.format || command.parse));
+    } catch (error) {
+      return commandErrorMessage(command, error);
+    }
+  };
+
+  handlers["storage/set"] = function(command) {
+    try {
+      storage?.setItem(command.key, serializeStoredValue(command.value));
+      return commandMessage(command, command.value);
+    } catch (error) {
+      return commandErrorMessage(command, error);
+    }
+  };
+
+  handlers["storage/remove"] = function(command) {
+    try {
+      storage?.removeItem(command.key);
+      return commandMessage(command, { key: command.key });
+    } catch (error) {
+      return commandErrorMessage(command, error);
+    }
+  };
+}
+
+export function registerBrowserCommandHandlers(handlers, context) {
+  const { env, host } = context;
+  const storage = env.storage || host.localStorage;
+  const sessionStorage = env.sessionStorage || host.sessionStorage;
+  const clipboard = env.clipboard || host.navigator?.clipboard;
+
+  handlers["browser/history-replace-search-param"] = function(command) {
+    replaceBrowserSearchParam(host, command.name, command.value);
+    return commandMessage(command);
+  };
+
+  handlers["browser/history-write-route"] = function(command) {
+    writeBrowserRoute(host, command.url, command.op, command.definition);
+    return commandMessage(command);
+  };
+
+  handlers["browser/theme-load"] = function(command) {
+    const theme = loadBrowserTheme(host, storage, sessionStorage, command.key);
+    return commandMessage(command, theme);
+  };
+
+  handlers["browser/theme-apply"] = function(command) {
+    applyBrowserTheme(host, storage, sessionStorage, command.key, command.theme);
+    return commandMessage(command, command.theme);
+  };
+
+  handlers["browser/clipboard-write"] = function(command) {
+    void clipboard?.writeText?.(String(command.text ?? ""));
+    return commandMessage(command);
+  };
+
+  handlers["browser/set-cookie"] = function(command) {
+    setBrowserCookie(host, command.name, command.value);
+    return commandMessage(command);
+  };
+}
+
+export function registerAuthStorageCommandHandlers(handlers, context) {
+  const storage = context.env.storage || context.host.localStorage;
+  const sessionStorage = context.env.sessionStorage || context.host.sessionStorage;
+
+  handlers["auth-storage/persist"] = function(command) {
+    persistAuthStorage(storage, command.sourceUrl, command.entries);
+    return commandMessage(command);
+  };
+
+  handlers["auth-storage/load"] = function(command) {
+    return commandMessage(command, loadAuthStorage(storage, sessionStorage, command.sourceUrl));
+  };
+}
+
+export function registerRandomCommandHandlers(handlers, context) {
+  const random = context.env.random || Math.random;
+  handlers["random/number"] = function(command) {
+    const min = command.min ?? 0;
+    const max = command.max ?? 1;
+    return commandMessage(command, min + random() * (max - min));
+  };
+}
+
+export function registerSimulationCommandHandlers(handlers, context) {
+  const { env, host } = context;
+  const timers = env.timers || host;
+  const random = env.random || Math.random;
+  const simulations = new Map();
+
+  addCommandDisposer(context, () => {
+    for (const simulation of simulations.values()) timers.clearInterval?.(simulation.interval);
+    simulations.clear();
+  });
+
+  handlers["simulation/heart-rate"] = function(command, dispatch) {
+    const id = command.id || "simulated-heart-rate";
+    const existing = simulations.get(id);
+    if (existing) timers.clearInterval?.(existing.interval);
+
+    const min = numberOr(command.min, 90);
+    const max = Math.max(min, numberOr(command.max, 160));
+    const jitter = command.jitter == null ? null : Math.max(0, numberOr(command.jitter, 0));
+    const ms = Math.max(1, numberOr(command.ms, 1000));
+    let bpm = simulationHeartRateBpm(random, command.start, min, max, null);
+
+    const emitReading = () => {
+      bpm = simulationHeartRateBpm(random, undefined, min, max, jitter, bpm);
+      const message = namedCommandMessage(command.onReading, { bpm });
+      if (message !== undefined) dispatch(message);
+    };
+
+    const interval = timers.setInterval(emitReading, ms);
+    simulations.set(id, { interval, command });
+
+    return commandMessage(command, {
+      id,
+      deviceName: command.deviceName || "Simulated monitor",
+      connected: true,
+      simulated: true
+    });
+  };
+
+  handlers["simulation/stop"] = function(command, dispatch) {
+    const id = command.id || "simulated-heart-rate";
+    const existing = simulations.get(id);
+    if (existing) {
+      timers.clearInterval?.(existing.interval);
+      simulations.delete(id);
+      const disconnected = namedCommandMessage(existing.command?.onDisconnected);
+      if (disconnected !== undefined) dispatch(disconnected);
+    }
+    return commandMessage(command, { id });
+  };
+}
+
+export function registerTaskCommandHandlers(handlers, context) {
+  const fetchImpl = context.env.fetch || context.host.fetch?.bind(context.host);
+  handlers["task/perform"] = async function(command) {
+    try {
+      const value = await runTask(command.task, { fetch: fetchImpl });
+      return taskSuccessMessage(command, value);
+    } catch (error) {
+      return taskErrorMessage(command, error);
+    }
+  };
+}
+
+export function registerHttpCommandHandlers(handlers, context) {
+  const { env, host } = context;
+  const fetchImpl = env.fetch || host.fetch?.bind(host);
+  const documentRef = env.document || host.document;
+  const FormDataCtor = env.FormData || host.FormData || globalThis.FormData;
+
+  handlers["http/request"] = async function(command) {
+    if (!fetchImpl) return commandErrorMessage(command, new Error("No fetch implementation is available for http/request"));
+
+    try {
+      const { url, options } = httpRequestFetchArgs(command, {
+        document: documentRef,
+        FormData: FormDataCtor
+      });
+      const fetchUrl = proxiedHttpUrl(url, command, host);
+      const started = nowMs();
+      const response = await fetchImpl(fetchUrl, options);
+      const responseFormat = commandValueName(command.response || command.format || "json");
+      const payload = await httpResponsePayload(response, responseFormat, url, env, host);
+      return commandMessage(command, {
+        status: response.status,
+        statusText: response.statusText,
+        ok: response.ok,
+        ...payload,
+        headers: headersToObject(response.headers),
+        url: response.url || url,
+        requestUrl: url,
+        durationMs: Math.max(0, Math.round(nowMs() - started))
+      });
+    } catch (error) {
+      return commandErrorMessage(command, error);
+    }
+  };
+}
+
+export function registerFileDownloadCommandHandlers(handlers, context) {
+  const { env, host } = context;
+  const download = env.download || ((payload) => downloadWithBrowser(payload, env, host));
+
+  handlers["file/download"] = function(command) {
+    const payload = {
+      name: command.name || "download",
+      content: command.content ?? "",
+      mime: command.mime || "application/octet-stream",
+      blob: command.blob
+    };
+    const result = download(payload);
+    return commandMessage(command, result ?? payload);
+  };
+}
+
+export function registerFileImportCommandHandlers(handlers, context) {
+  const { env, host } = context;
+  const importFile = env.importFile || ((payload) => importWithBrowser(payload, env, host));
+
+  handlers["file/import"] = async function(command) {
+    const payload = {
+      accept: command.accept || "",
+      multiple: Boolean(command.multiple),
+      format: commandValueName(command.format || command.parse || "text")
+    };
+
+    try {
+      const value = await importFile(payload);
+      if (value === undefined) return commandCancelMessage(command);
+      return commandMessage(command, value);
+    } catch (error) {
+      return commandErrorMessage(command, error);
+    }
+  };
+}
+
+export function registerFileReadSelectedCommandHandlers(handlers) {
+  handlers["file/read-selected"] = async function(command, dispatch) {
+    const input = resolveRef(command.ref, dispatch);
+    if (!input) return commandErrorMessage(command, new Error(`Missing file ref ${String(command.ref)}`));
+
+    const format = commandValueName(command.format || command.parse || "text");
+    const shouldClear = command.clear !== false;
+    try {
+      const files = Array.from(input.files || []);
+      if (!files.length) {
+        if (shouldClear) clearFileInput(input);
+        return commandCancelMessage(command);
+      }
+
+      const imported = command.multiple
+        ? await Promise.all(files.map((file) => readImportedFile(file, format)))
+        : await readImportedFile(files[0], format);
+      if (shouldClear) clearFileInput(input);
+      return commandMessage(command, imported);
+    } catch (error) {
+      if (shouldClear) clearFileInput(input);
+      return commandErrorMessage(command, error);
+    }
+  };
+}
+
+export function registerCanvasDrawCommandHandlers(handlers, context) {
+  const { env, host } = context;
+  handlers["canvas/draw"] = function(command, dispatch) {
+    const canvas = resolveRef(command.ref, dispatch);
+    if (!canvas) return commandErrorMessage(command, new Error(`Missing canvas ref ${String(command.ref)}`));
+    const ctx = canvas.getContext?.("2d");
+    if (!ctx) return commandErrorMessage(command, new Error("Canvas 2D unavailable"));
+
+    const sizing = canvasDrawSizing(command, canvas, env, host);
+    if (sizing.width !== undefined) canvas.width = sizing.width;
+    if (sizing.height !== undefined) canvas.height = sizing.height;
+    if (sizing.cssWidth !== undefined && command.setCssSize === true) setCanvasCssSize(canvas, "width", sizing.cssWidth);
+    if (sizing.cssHeight !== undefined && command.setCssSize === true) setCanvasCssSize(canvas, "height", sizing.cssHeight);
+    setCanvasTransform(ctx, sizing.pixelRatio);
+
+    for (const op of command.ops || []) applyCanvasOp(ctx, canvas, op);
+    return commandMessage(command, {
+      ref: refName(command.ref),
+      width: canvas.width,
+      height: canvas.height,
+      cssWidth: sizing.cssWidth ?? canvas.width,
+      cssHeight: sizing.cssHeight ?? canvas.height,
+      pixelRatio: sizing.pixelRatio
+    });
+  };
+}
+
+export function registerCompiledCanvasDrawCommandHandlers(handlers) {
+  handlers["canvas/draw"] = function(command, dispatch) {
+    const canvas = resolveRef(command.ref, dispatch);
+    if (!canvas) return commandErrorMessage(command, new Error(`Missing canvas ref ${String(command.ref)}`));
+    const ctx = canvas.getContext?.("2d");
+    if (!ctx) return commandErrorMessage(command, new Error("Canvas 2D unavailable"));
+
+    const cssWidth = compiledNumberOrUndefined(command.cssWidth ?? command.width);
+    const cssHeight = compiledNumberOrUndefined(command.cssHeight ?? command.height);
+    const pixelRatio = Math.max(1, numberOrZero(globalThis.devicePixelRatio ?? 1));
+    if (cssWidth !== undefined) canvas.width = Math.round(cssWidth * pixelRatio);
+    if (cssHeight !== undefined) canvas.height = Math.round(cssHeight * pixelRatio);
+    setCanvasTransform(ctx, pixelRatio);
+
+    for (const op of command.ops || []) applyCompiledCanvasOp(ctx, canvas, op);
+    return commandMessage(command, {
+      ref: refName(command.ref),
+      width: canvas.width,
+      height: canvas.height,
+      cssWidth: cssWidth ?? canvas.width,
+      cssHeight: cssHeight ?? canvas.height,
+      pixelRatio
+    });
+  };
+}
+
+export function registerCanvasMeasureTextCommandHandlers(handlers) {
+  handlers["canvas/measure-text"] = function(command, dispatch) {
+    const canvas = resolveRef(command.ref, dispatch);
+    if (!canvas) return commandErrorMessage(command, new Error(`Missing canvas ref ${String(command.ref)}`));
+    const ctx = canvas.getContext?.("2d");
+    if (!ctx?.measureText) return commandErrorMessage(command, new Error("Canvas text unavailable"));
+
+    applyCanvasState(ctx, command, "fill");
+    const texts = canvasMeasureTexts(command);
+    const measurements = texts.map((text) => {
+      const metrics = ctx.measureText(text);
+      return {
+        text,
+        width: numberOrZero(metrics?.width),
+        actualBoundingBoxLeft: numberOrZero(metrics?.actualBoundingBoxLeft),
+        actualBoundingBoxRight: numberOrZero(metrics?.actualBoundingBoxRight),
+        actualBoundingBoxAscent: numberOrZero(metrics?.actualBoundingBoxAscent),
+        actualBoundingBoxDescent: numberOrZero(metrics?.actualBoundingBoxDescent)
+      };
+    });
+    return commandMessage(command, {
+      ref: refName(command.ref),
+      font: ctx.font || "",
+      texts,
+      widths: measurements.map((item) => item.width),
+      measurements
+    });
+  };
+}
+
+export function registerDomRefCommandHandlers(handlers) {
+  handlers["dom-ref/focus"] = function(command, dispatch) {
+    const node = resolveRef(command.ref, dispatch);
+    if (!node?.focus) return commandErrorMessage(command, new Error(`Cannot focus ${String(command.ref)}`));
+    node.focus();
+    return commandMessage(command, { ref: refName(command.ref) });
+  };
+
+  handlers["dom-ref/click"] = function(command, dispatch) {
+    const node = resolveRef(command.ref, dispatch);
+    if (!node?.click) return commandErrorMessage(command, new Error(`Cannot click ${String(command.ref)}`));
+    node.click();
+    return commandMessage(command, { ref: refName(command.ref) });
+  };
+
+  handlers["dom-ref/measure"] = function(command, dispatch) {
+    const node = resolveRef(command.ref, dispatch);
+    if (!node) return commandErrorMessage(command, new Error(`Missing DOM ref ${String(command.ref)}`));
+    const rect = measureNode(node);
+    return commandMessage(command, { ref: refName(command.ref), ...rect });
+  };
+}
+
+export function registerDomScrollCommandHandlers(handlers, context) {
+  const { env, host } = context;
+  const documentRef = env.document || host.document;
+  const animation = env.animation || host;
+  const requestAnimationFrameImpl = env.requestAnimationFrame || animation.requestAnimationFrame?.bind(animation);
+
+  handlers["dom/scroll-into-view"] = function(command) {
+    queueScrollIntoView(command, {
+      document: documentRef,
+      host,
+      requestAnimationFrame: requestAnimationFrameImpl
+    });
+    return commandMessage(command, {
+      id: command.id || "",
+      ref: command.ref || "",
+      selector: command.selector || "",
+      testId: command.testId || ""
+    });
+  };
+}
+
+export function registerDomResizeCommandHandlers(handlers, context) {
+  const { env, host } = context;
+  const ResizeObserverCtor = env.ResizeObserver || host.ResizeObserver;
+  const resizeTarget = env.resizeTarget || host;
+  const resizeObservers = new Map();
+
+  addCommandDisposer(context, () => {
+    for (const entry of resizeObservers.values()) removeResizeObserver(entry);
+    resizeObservers.clear();
+  });
+
+  handlers["dom-ref/resize-watch"] = function(command, dispatch) {
+    const node = resolveRef(command.ref, dispatch);
+    if (!node) return commandErrorMessage(command, new Error(`Missing DOM ref ${String(command.ref)}`));
+    const id = command.id || refName(command.ref);
+    const existing = resizeObservers.get(id);
+    if (existing) removeResizeObserver(existing);
+
+    if (ResizeObserverCtor) {
+      const observer = new ResizeObserverCtor((entries) => {
+        const entry = entries?.find((item) => item.target === node) || entries?.[0];
+        const message = resizeMessage(command, id, node, rectFromResizeEntry(entry, node));
+        if (message !== undefined) dispatch(message);
+      });
+      observer.observe(node);
+      resizeObservers.set(id, { observer, node });
+    } else if (resizeTarget?.addEventListener) {
+      const listener = () => {
+        const message = resizeMessage(command, id, node, measureNode(node));
+        if (message !== undefined) dispatch(message);
+      };
+      resizeTarget.addEventListener("resize", listener);
+      resizeObservers.set(id, { target: resizeTarget, listener });
+    } else {
+      return commandErrorMessage(command, new Error("Resize unavailable"));
+    }
+
+    return resizeMessage(command, id, node, measureNode(node));
+  };
+
+  handlers["dom-ref/resize-unwatch"] = function(command) {
+    const id = command.id || command.ref;
+    const existing = resizeObservers.get(id);
+    if (existing) {
+      removeResizeObserver(existing);
+      resizeObservers.delete(id);
+    }
+    return commandMessage(command, { id });
+  };
+}
+
+export function registerCompiledDomResizeCommandHandlers(handlers, context) {
+  const ResizeObserverCtor = globalThis.ResizeObserver;
+  const resizeObservers = new Map();
+
+  addCommandDisposer(context, () => {
+    for (const entry of resizeObservers.values()) removeResizeObserver(entry);
+    resizeObservers.clear();
+  });
+
+  handlers["dom-ref/resize-watch"] = function(command, dispatch) {
+    const node = resolveRef(command.ref, dispatch);
+    if (!node) return commandErrorMessage(command, new Error(`Missing DOM ref ${String(command.ref)}`));
+    const id = command.id || refName(command.ref);
+    const existing = resizeObservers.get(id);
+    if (existing) removeResizeObserver(existing);
+
+    if (ResizeObserverCtor) {
+      const observer = new ResizeObserverCtor((entries) => {
+        const entry = entries?.find((item) => item.target === node) || entries?.[0];
+        const message = resizeMessage(command, id, node, rectFromResizeEntry(entry, node));
+        if (message !== undefined) dispatch(message);
+      });
+      observer.observe(node);
+      resizeObservers.set(id, { observer, node });
+    } else if (globalThis.addEventListener) {
+      const listener = () => {
+        const message = resizeMessage(command, id, node, measureNode(node));
+        if (message !== undefined) dispatch(message);
+      };
+      globalThis.addEventListener("resize", listener);
+      resizeObservers.set(id, { target: globalThis, listener });
+    } else {
+      return commandErrorMessage(command, new Error("Resize unavailable"));
+    }
+
+    return resizeMessage(command, id, node, measureNode(node));
+  };
+
+  handlers["dom-ref/resize-unwatch"] = function(command) {
+    const id = command.id || command.ref;
+    const existing = resizeObservers.get(id);
+    if (existing) {
+      removeResizeObserver(existing);
+      resizeObservers.delete(id);
+    }
+    return commandMessage(command, { id });
+  };
+}
+
+export function registerWindowEventCommandHandlers(handlers, context) {
+  const { env, host } = context;
+  const eventTarget = env.eventTarget || env.window || host;
+  const windowEvents = new Map();
+
+  addCommandDisposer(context, () => {
+    for (const entry of windowEvents.values()) removeWindowEventListener(entry);
+    windowEvents.clear();
+  });
+
+  handlers["window/event-watch"] = function(command, dispatch) {
+    if (!eventTarget?.addEventListener) return commandErrorMessage(command, new Error("Events unavailable"));
+    const type = String(command.type || command.event || "");
+    if (!type) return commandErrorMessage(command, new Error("Missing event type"));
+    const id = command.id || type;
+    const existing = windowEvents.get(id);
+    if (existing) removeWindowEventListener(existing);
+
+    const options = eventListenerOptions(command.options);
+    const listener = (event) => {
+      applyWindowEventControls(command, event);
+      const message = windowEventMessage(command, event, id, host);
+      if (message !== undefined) dispatch(message);
+    };
+    eventTarget.addEventListener(type, listener, options);
+    windowEvents.set(id, { target: eventTarget, type, listener, options });
+    return commandMessage(command, { id, type });
+  };
+
+  handlers["window/event-unwatch"] = function(command) {
+    const id = command.id || command.type || command.event;
+    const existing = windowEvents.get(id);
+    if (existing) {
+      removeWindowEventListener(existing);
+      windowEvents.delete(id);
+    }
+    return commandMessage(command, { id });
+  };
+}
+
+export function registerCompiledWindowEventCommandHandlers(handlers, context) {
+  const eventTarget = globalThis;
+  const windowEvents = new Map();
+
+  addCommandDisposer(context, () => {
+    for (const entry of windowEvents.values()) removeWindowEventListener(entry);
+    windowEvents.clear();
+  });
+
+  handlers["window/event-watch"] = function(command, dispatch) {
+    if (!eventTarget?.addEventListener) return commandErrorMessage(command, new Error("Events unavailable"));
+    const type = String(command.type || command.event || "");
+    if (!type) return commandErrorMessage(command, new Error("Missing event type"));
+    const id = command.id || type;
+    const existing = windowEvents.get(id);
+    if (existing) removeWindowEventListener(existing);
+
+    const options = eventListenerOptions(command.options);
+    const listener = (event) => {
+      applyWindowEventControls(command, event);
+      const message = windowEventMessage(command, event, id);
+      if (message !== undefined) dispatch(message);
+    };
+    eventTarget.addEventListener(type, listener, options);
+    windowEvents.set(id, { target: eventTarget, type, listener, options });
+    return commandMessage(command, { id, type });
+  };
+
+  handlers["window/event-unwatch"] = function(command) {
+    const id = command.id || command.type || command.event;
+    const existing = windowEvents.get(id);
+    if (existing) {
+      removeWindowEventListener(existing);
+      windowEvents.delete(id);
+    }
+    return commandMessage(command, { id });
+  };
+}
+
+export function registerMediaQueryCommandHandlers(handlers, context) {
+  const matchMedia = context.env.matchMedia || context.host.matchMedia?.bind(context.host);
+  const mediaQueries = new Map();
+
+  addCommandDisposer(context, () => {
+    for (const entry of mediaQueries.values()) removeMediaQueryListener(entry);
+    mediaQueries.clear();
+  });
+
+  handlers["media-query/watch"] = function(command, dispatch) {
+    if (!matchMedia) return commandErrorMessage(command, new Error("matchMedia unavailable"));
+    const query = String(command.query || "");
+    const id = command.id || query;
+    const mediaQuery = matchMedia(query);
+    const existing = mediaQueries.get(id);
+    if (existing) removeMediaQueryListener(existing);
+
+    const listener = (event) => {
+      const message = mediaQueryMessage(command, event, id);
+      if (message !== undefined) dispatch(message);
+    };
+    addMediaQueryListener(mediaQuery, listener);
+    mediaQueries.set(id, { mediaQuery, listener });
+    return mediaQueryMessage(command, mediaQuery, id);
+  };
+
+  handlers["media-query/unwatch"] = function(command) {
+    const id = command.id || command.query;
+    const existing = mediaQueries.get(id);
+    if (existing) {
+      removeMediaQueryListener(existing);
+      mediaQueries.delete(id);
+    }
+    return commandMessage(command, { id });
+  };
+}
+
+export function registerCompiledMediaQueryCommandHandlers(handlers, context) {
+  const matchMedia = globalThis.matchMedia?.bind(globalThis);
+  const mediaQueries = new Map();
+
+  addCommandDisposer(context, () => {
+    for (const entry of mediaQueries.values()) removeMediaQueryListener(entry);
+    mediaQueries.clear();
+  });
+
+  handlers["media-query/watch"] = function(command, dispatch) {
+    if (!matchMedia) return commandErrorMessage(command, new Error("matchMedia unavailable"));
+    const query = String(command.query || "");
+    const id = command.id || query;
+    const mediaQuery = matchMedia(query);
+    const existing = mediaQueries.get(id);
+    if (existing) removeMediaQueryListener(existing);
+
+    const listener = (event) => {
+      const message = mediaQueryMessage(command, event, id);
+      if (message !== undefined) dispatch(message);
+    };
+    addMediaQueryListener(mediaQuery, listener);
+    mediaQueries.set(id, { mediaQuery, listener });
+    return mediaQueryMessage(command, mediaQuery, id);
+  };
+
+  handlers["media-query/unwatch"] = function(command) {
+    const id = command.id || command.query;
+    const existing = mediaQueries.get(id);
+    if (existing) {
+      removeMediaQueryListener(existing);
+      mediaQueries.delete(id);
+    }
+    return commandMessage(command, { id });
+  };
+}
+
 export function createBrowserBootInput(env = {}) {
   const host = env.host || globalThis;
   return {
@@ -2355,9 +3472,7 @@ export function createBrowserBootInput(env = {}) {
   };
 }
 
-export function createSubscriptionHandlers(env = {}) {
-  const commandHandlers = env.commandHandlers || createCommandHandlers(env);
-
+export function createSubscriptionHandlersFor(commandHandlers) {
   const handlers = {
     start(subscription, dispatch) {
       const command = startCommandForSubscription(subscription);
@@ -2391,20 +3506,149 @@ export function createSubscriptionHandlers(env = {}) {
   return handlers;
 }
 
-export function startApp({
+export function createSubscriptionHandlers(env = {}) {
+  const commandHandlers = env.commandHandlers || createCommandHandlers(env);
+  return createSubscriptionHandlersFor(commandHandlers);
+}
+
+export function startConfiguredApp(options = {}) {
+  const handlers = options.handlers || {};
+  const subscriptionHandlers = options.subscriptionHandlers || createSubscriptionHandlersFor(handlers);
+  return startAppCore(options, subscriptionHandlers);
+}
+
+export function startApp(options = {}) {
+  const handlers = options.handlers || {};
+  const subscriptionHandlers = options.subscriptionHandlers || createSubscriptionHandlers({ commandHandlers: handlers });
+  return startAppCore(options, subscriptionHandlers);
+}
+
+export function startCompiledApp(options = {}) {
+  const handlers = options.handlers || {};
+  const subscriptionHandlers = options.subscriptionHandlers || createCompiledSubscriptionHandlersFor(handlers);
+  return startCompiledAppCore(options, subscriptionHandlers);
+}
+
+function createCompiledSubscriptionHandlersFor(commandHandlers) {
+  const handlers = {
+    start(subscription, dispatch) {
+      const command = compiledStartCommandForSubscription(subscription);
+      const handler = commandHandlers[compiledCommandKind(command)];
+      if (typeof handler !== "function") {
+        if (subscription?.onError !== undefined) {
+          return compiledCommandErrorMessage(subscription, new Error(`No handler registered for subscription kind ${compiledCommandKind(subscription)}`));
+        }
+        return undefined;
+      }
+      return handler(command, dispatch);
+    },
+    stop(subscription, dispatch) {
+      const command = compiledStopCommandForSubscription(subscription);
+      if (!command) return undefined;
+      const handler = commandHandlers[compiledCommandKind(command)];
+      if (typeof handler !== "function") return undefined;
+      return handler(command, dispatch);
+    },
+    dispose() {
+      commandHandlers.dispose?.();
+    }
+  };
+
+  Object.defineProperty(handlers, "__closkellCommandHandlers", {
+    value: commandHandlers
+  });
+
+  return handlers;
+}
+
+function startCompiledAppCore({
   root,
   init,
   update,
   view,
   subscriptions = null,
   handlers = {},
-  subscriptionHandlers = null,
+  boot = undefined
+}, subscriptionHandlers) {
+  const initValue = typeof init === "function"
+    ? (boot === undefined ? init() : init(boot))
+    : init;
+  const [initialState, initialCommand] = normalizeUpdateResult(initValue);
+  let state = initialState;
+  let component = null;
+  let disposed = false;
+  const activeSubscriptions = new Map();
+  const refs = new Map();
+  const isActive = () => !disposed;
+
+  const dispatch = (message, event) => {
+    if (disposed) return state;
+    const [nextState, command] = normalizeUpdateResult(update(state, message, event));
+    state = nextState;
+    component.update(state, dispatch, null);
+    syncSubscriptions();
+    runCompiledCommand(command, dispatch, handlers, isActive);
+    return state;
+  };
+  dispatch.__closkellRefs = refs;
+
+  component = view(state);
+  component.mount(root, dispatch);
+  syncSubscriptions();
+  runCompiledCommand(initialCommand, dispatch, handlers, isActive);
+
+  function syncSubscriptions() {
+    if (typeof subscriptions !== "function" || disposed) return;
+    reconcileCompiledSubscriptions(
+      activeSubscriptions,
+      flattenSubscriptions(subscriptions(state)),
+      dispatch,
+      subscriptionHandlers,
+      isActive
+    );
+  }
+
+  return {
+    dispatch,
+    refs,
+    getRef(name) {
+      return refs.get(refName(name));
+    },
+    get state() {
+      return state;
+    },
+    get subscriptions() {
+      return Array.from(activeSubscriptions.values()).map((entry) => entry.subscription);
+    },
+    get root() {
+      return component.root;
+    },
+    dispose() {
+      if (disposed) return;
+      disposed = true;
+      stopAllCompiledSubscriptions(activeSubscriptions, dispatch, subscriptionHandlers);
+      if (subscriptionHandlers.__closkellCommandHandlers !== handlers) {
+        subscriptionHandlers.dispose?.();
+      }
+      handlers.dispose?.();
+      component?.dispose?.();
+    }
+  };
+}
+
+function startAppCore({
+  root,
+  init,
+  update,
+  view,
+  subscriptions = null,
+  handlers = {},
   onCommand = () => {},
   onSubscription = () => {},
   devtools = null,
   hydrate = false,
   boot = undefined
-}) {
+}, resolvedSubscriptionHandlers) {
   const initValue = typeof init === "function"
     ? (boot === undefined ? init() : init(boot))
     : init;
@@ -2415,8 +3659,6 @@ export function startApp({
   const commandLog = [];
   const subscriptionLog = [];
   const activeSubscriptions = new Map();
-  const resolvedSubscriptionHandlers =
-    subscriptionHandlers || createSubscriptionHandlers({ commandHandlers: handlers });
   const refs = new Map();
   const isActive = () => !disposed;
 
@@ -2590,9 +3832,41 @@ function reconcileSubscriptions(
   }
 }
 
+function reconcileCompiledSubscriptions(activeSubscriptions, nextSubscriptions, dispatch, handlers, isActive) {
+  const nextByKey = new Map();
+  for (const subscription of nextSubscriptions) {
+    const key = compiledSubscriptionKey(subscription);
+    if (!key) continue;
+    nextByKey.set(key, {
+      subscription,
+      signature: compiledSubscriptionSignature(subscription)
+    });
+  }
+
+  for (const [key, active] of Array.from(activeSubscriptions.entries())) {
+    const next = nextByKey.get(key);
+    if (next && next.signature === active.signature) continue;
+    runCompiledSubscriptionHandler("stop", active.subscription, dispatch, handlers, () => false);
+    activeSubscriptions.delete(key);
+  }
+
+  for (const [key, next] of nextByKey.entries()) {
+    if (activeSubscriptions.has(key)) continue;
+    activeSubscriptions.set(key, next);
+    runCompiledSubscriptionHandler("start", next.subscription, dispatch, handlers, isActive);
+  }
+}
+
 function stopAllSubscriptions(activeSubscriptions, dispatch, handlers, subscriptionLog, onSubscription) {
   for (const active of activeSubscriptions.values()) {
     stopSubscription(active.subscription, dispatch, handlers, subscriptionLog, onSubscription);
+  }
+  activeSubscriptions.clear();
+}
+
+function stopAllCompiledSubscriptions(activeSubscriptions, dispatch, handlers) {
+  for (const active of activeSubscriptions.values()) {
+    runCompiledSubscriptionHandler("stop", active.subscription, dispatch, handlers, () => false);
   }
   activeSubscriptions.clear();
 }
@@ -2635,6 +3909,26 @@ function runSubscriptionHandler(action, subscription, dispatch, handlers, isActi
   }
 }
 
+function runCompiledSubscriptionHandler(action, subscription, dispatch, handlers, isActive) {
+  let result;
+  try {
+    result = callSubscriptionHandler(action, subscription, dispatch, handlers);
+  } catch (error) {
+    dispatchCompiledCommandError(subscription, error, dispatch, isActive);
+    return;
+  }
+
+  if (result && typeof result.then === "function") {
+    result
+      .then((message) => {
+        if (message !== undefined && message !== null && isActive()) dispatch(message);
+      })
+      .catch((error) => dispatchCompiledCommandError(subscription, error, dispatch, isActive));
+  } else if (result !== undefined && result !== null && isActive()) {
+    dispatch(result);
+  }
+}
+
 function callSubscriptionHandler(action, subscription, dispatch, handlers) {
   if (typeof handlers?.[action] === "function") {
     return handlers[action](subscription, dispatch);
@@ -2666,7 +3960,7 @@ function normalizeUpdateResult(result) {
   if (Array.isArray(result) && result.length === 2) {
     return result;
   }
-  return [result, Cmd.none()];
+  return [result, { kind: "none" }];
 }
 
 function runCommand(command, dispatch, handlers, commandLog, onCommand, isActive = () => true) {
@@ -2678,7 +3972,7 @@ function runCommand(command, dispatch, handlers, commandLog, onCommand, isActive
     return;
   }
 
-  const kind = commandKind(command);
+  const kind = compiledCommandKind(command);
   if (kind === "none") return;
 
   if (kind === "batch") {
@@ -2717,6 +4011,55 @@ function runCommand(command, dispatch, handlers, commandLog, onCommand, isActive
   } else if (result !== undefined && isActive()) {
     dispatch(result);
   }
+}
+
+function runCompiledCommand(command, dispatch, handlers, isActive = () => true) {
+  if (!command || !isActive()) return;
+
+  if (Array.isArray(command)) {
+    command.forEach((item) => runCompiledCommand(item, dispatch, handlers, isActive));
+    return;
+  }
+
+  const kind = commandKind(command);
+  if (kind === "none") return;
+
+  if (kind === "batch") {
+    (command.commands || []).forEach((item) => runCompiledCommand(item, dispatch, handlers, isActive));
+    return;
+  }
+
+  const handler = handlers[kind];
+  if (typeof handler !== "function") {
+    if (command.onError !== undefined) {
+      dispatchCompiledCommandError(command, new Error(`No handler ${kind}`), dispatch, isActive);
+    }
+    return;
+  }
+
+  let result;
+  try {
+    result = handler(command, dispatch);
+  } catch (error) {
+    dispatchCompiledCommandError(command, error, dispatch, isActive);
+    return;
+  }
+
+  if (result && typeof result.then === "function") {
+    result
+      .then((message) => {
+        if (message !== undefined && isActive()) dispatch(message);
+      })
+      .catch((error) => dispatchCompiledCommandError(command, error, dispatch, isActive));
+  } else if (result !== undefined && isActive()) {
+    dispatch(result);
+  }
+}
+
+function dispatchCompiledCommandError(command, error, dispatch, isActive) {
+  if (!isActive()) return;
+  const message = compiledCommandErrorMessage(command, error);
+  if (message !== undefined && isActive()) dispatch(message);
 }
 
 async function runTask(task, context = {}) {
@@ -3392,6 +4735,10 @@ function commandKind(command) {
   return String(kind || "");
 }
 
+function compiledCommandKind(command) {
+  return String(command?.kind || "");
+}
+
 function scopeKey(value) {
   if (typeof value === "symbol") return Symbol.keyFor(value) || value.description || String(value);
   return String(value || "");
@@ -3521,6 +4868,23 @@ function subscriptionSignature(subscription) {
   return JSON.stringify(normalize(subscription));
 }
 
+function compiledSubscriptionKey(subscription) {
+  const kind = compiledCommandKind(subscription);
+  if (!kind || kind === "none" || kind === "batch") return "";
+  const id =
+    subscription.id ??
+    subscription.ref ??
+    subscription.query ??
+    subscription.type ??
+    subscription.event ??
+    kind;
+  return `${kind}:${id == null ? "" : String(id)}`;
+}
+
+function compiledSubscriptionSignature(subscription) {
+  return JSON.stringify(subscription, (_key, value) => typeof value === "function" ? "[Function]" : value);
+}
+
 function startCommandForSubscription(subscription) {
   const kind = subscriptionKind(subscription);
   switch (kind) {
@@ -3541,6 +4905,25 @@ function startCommandForSubscription(subscription) {
   }
 }
 
+function compiledStartCommandForSubscription(subscription) {
+  switch (compiledCommandKind(subscription)) {
+    case "sub/timer/every":
+      return { ...subscription, kind: "timer/every" };
+    case "sub/dom-ref/resize":
+      return { ...subscription, kind: "dom-ref/resize-watch" };
+    case "sub/window/event":
+      return { ...subscription, kind: "window/event-watch" };
+    case "sub/media-query":
+      return { ...subscription, kind: "media-query/watch" };
+    case "sub/simulation/heart-rate":
+      return { ...subscription, kind: "simulation/heart-rate" };
+    case "sub/bluetooth/connect-heart-rate":
+      return { ...subscription, kind: "bluetooth/connect-heart-rate" };
+    default:
+      return subscription;
+  }
+}
+
 function stopCommandForSubscription(subscription) {
   const kind = subscriptionKind(subscription);
   switch (kind) {
@@ -3556,6 +4939,25 @@ function stopCommandForSubscription(subscription) {
       return { kind: Symbol.for("simulation/stop"), id: subscription.id };
     case "sub/bluetooth/connect-heart-rate":
       return { kind: Symbol.for("bluetooth/disconnect"), id: subscription.id };
+    default:
+      return undefined;
+  }
+}
+
+function compiledStopCommandForSubscription(subscription) {
+  switch (compiledCommandKind(subscription)) {
+    case "sub/timer/every":
+      return { kind: "timer/cancel", id: subscription.id };
+    case "sub/dom-ref/resize":
+      return { kind: "dom-ref/resize-unwatch", id: subscription.id || subscription.ref };
+    case "sub/window/event":
+      return { kind: "window/event-unwatch", id: subscription.id || subscription.type || subscription.event };
+    case "sub/media-query":
+      return { kind: "media-query/unwatch", id: subscription.id || subscription.query };
+    case "sub/simulation/heart-rate":
+      return { kind: "simulation/stop", id: subscription.id };
+    case "sub/bluetooth/connect-heart-rate":
+      return { kind: "bluetooth/disconnect", id: subscription.id };
     default:
       return undefined;
   }
@@ -3582,6 +4984,17 @@ function namedCommandMessage(kind, fields = {}) {
 }
 
 function commandErrorMessage(command, error) {
+  if (command.onError !== undefined) {
+    if (typeof command.onError === "function") return command.onError(errorMessage(error));
+    return {
+      kind: command.onError,
+      error: errorMessage(error)
+    };
+  }
+  throw error;
+}
+
+function compiledCommandErrorMessage(command, error) {
   if (command.onError !== undefined) {
     if (typeof command.onError === "function") return command.onError(errorMessage(error));
     return {
@@ -4371,6 +5784,51 @@ function applyCanvasOp(ctx, canvas, op) {
   }
 }
 
+function applyCompiledCanvasOp(ctx, canvas, op) {
+  switch (op.op || op.kind) {
+    case "clear":
+      ctx.clearRect(op.x ?? 0, op.y ?? 0, op.width ?? canvas.width ?? 0, op.height ?? canvas.height ?? 0);
+      break;
+    case "fill-rect":
+      applyCompiledCanvasState(ctx, op, "fill");
+      ctx.fillRect(op.x ?? 0, op.y ?? 0, op.width ?? 0, op.height ?? 0);
+      break;
+    case "stroke-rect":
+      applyCompiledCanvasState(ctx, op, "stroke");
+      ctx.strokeRect(op.x ?? 0, op.y ?? 0, op.width ?? 0, op.height ?? 0);
+      break;
+    case "begin-path":
+      ctx.beginPath();
+      break;
+    case "move-to":
+      ctx.moveTo(op.x ?? 0, op.y ?? 0);
+      break;
+    case "line-to":
+      ctx.lineTo(op.x ?? 0, op.y ?? 0);
+      break;
+    case "arc":
+      ctx.arc(op.x ?? 0, op.y ?? 0, op.radius ?? 0, op.start ?? 0, op.end ?? Math.PI * 2);
+      break;
+    case "stroke":
+      applyCompiledCanvasState(ctx, op, "stroke");
+      ctx.stroke();
+      break;
+    case "fill":
+      applyCompiledCanvasState(ctx, op, "fill");
+      ctx.fill();
+      break;
+    case "fill-text":
+      applyCompiledCanvasState(ctx, op, "fill");
+      ctx.fillText(String(op.text ?? ""), op.x ?? 0, op.y ?? 0);
+      break;
+    case "set":
+      if (op.name) ctx[op.name] = op.value;
+      break;
+    default:
+      throw new Error(`Bad canvas op ${op.op || op.kind}`);
+  }
+}
+
 function applyCanvasState(ctx, op, paintMode) {
   if (paintMode !== "stroke" && (op.fillStyle !== undefined || op.color !== undefined)) {
     ctx.fillStyle = op.fillStyle ?? op.color;
@@ -4389,10 +5847,32 @@ function applyCanvasState(ctx, op, paintMode) {
   if (textBaseline !== undefined) ctx.textBaseline = textBaseline;
 }
 
+function applyCompiledCanvasState(ctx, op, paintMode) {
+  if (paintMode !== "stroke" && (op.fillStyle !== undefined || op.color !== undefined)) {
+    ctx.fillStyle = op.fillStyle ?? op.color;
+  }
+  if (paintMode !== "fill" && (op.strokeStyle !== undefined || op.color !== undefined)) {
+    ctx.strokeStyle = op.strokeStyle ?? op.color;
+  }
+  if (op.lineWidth !== undefined) ctx.lineWidth = op.lineWidth;
+  if (op.lineCap !== undefined) ctx.lineCap = op.lineCap;
+  if (op.lineJoin !== undefined) ctx.lineJoin = op.lineJoin;
+  if (op.globalAlpha !== undefined) ctx.globalAlpha = op.globalAlpha;
+  if (op.font !== undefined) ctx.font = op.font;
+  if (op.textAlign !== undefined) ctx.textAlign = String(op.textAlign || "");
+  if (op.textBaseline !== undefined) ctx.textBaseline = String(op.textBaseline || "");
+}
+
 function canvasTextStateValue(value) {
   if (value === undefined || value === null || value === false) return undefined;
   const name = commandValueName(value);
   return name === "" ? undefined : name;
+}
+
+function compiledNumberOrUndefined(value) {
+  if (value === undefined || value === null) return undefined;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : undefined;
 }
 
 function bluetoothRequestOptions(command) {
