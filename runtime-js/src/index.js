@@ -1273,8 +1273,9 @@ export function setKeyedList(instance, slot, marker, items, keyForItem, renderIt
     if (!entry) {
       const component = renderItem(item, index);
       updateKeyedComponent(component, item, index, dispatch, forceUpdateContext(updateContext));
-      entry = { key, component, item, index };
+      entry = { key, component, item, index, oldIndex: -1 };
     } else {
+      entry.oldIndex = entry.index;
       const itemUpdateContext = keyedItemUpdateContext(
         updateContext,
         itemName,
@@ -1294,14 +1295,7 @@ export function setKeyedList(instance, slot, marker, items, keyForItem, renderIt
     index += 1;
   }
 
-  let cursor = marker;
-  for (let i = orderedEntries.length - 1; i >= 0; i -= 1) {
-    const root = orderedEntries[i].component.root;
-    if (root.parentNode !== parent || root.nextSibling !== cursor) {
-      parent.insertBefore(root, cursor);
-    }
-    cursor = root;
-  }
+  reorderKeyedEntries(parent, marker, orderedEntries);
 
   for (const [key, entry] of current.byKey) {
     if (!nextByKey.has(key)) {
@@ -1336,22 +1330,19 @@ export function setCompiledKeyedList(instance, slot, marker, items, keyForItem, 
     const key = occurrence === 0 ? rawKey : duplicateStorageKey(current, nextDuplicateKeys, rawKey, occurrence);
     let entry = current.byKey.get(key);
     if (!entry) {
-      entry = { key, component: renderItem(item, index) };
+      entry = { key, component: renderItem(item, index), item, index, oldIndex: -1 };
+    } else {
+      entry.oldIndex = entry.index;
     }
     updateCompiledKeyedComponent(entry.component, item, index, dispatch);
+    entry.item = item;
+    entry.index = index;
     nextByKey.set(key, entry);
     orderedEntries.push(entry);
     index += 1;
   }
 
-  let cursor = marker;
-  for (let i = orderedEntries.length - 1; i >= 0; i -= 1) {
-    const root = orderedEntries[i].component.root;
-    if (root.parentNode !== parent || root.nextSibling !== cursor) {
-      parent.insertBefore(root, cursor);
-    }
-    cursor = root;
-  }
+  reorderKeyedEntries(parent, marker, orderedEntries);
 
   for (const [key, entry] of current.byKey) {
     if (!nextByKey.has(key)) {
@@ -1365,6 +1356,54 @@ export function setCompiledKeyedList(instance, slot, marker, items, keyForItem, 
   current.byKey = nextByKey;
   current.duplicateKeys = nextDuplicateKeys;
   instance.keyedSlots[slot] = current;
+}
+
+function reorderKeyedEntries(parent, marker, orderedEntries) {
+  const previousIndexes = orderedEntries.map((entry) => entry.oldIndex ?? -1);
+  const stableIndexes = longestIncreasingSubsequenceIndexes(previousIndexes);
+  let stableCursor = stableIndexes.length - 1;
+  let cursor = marker;
+
+  for (let index = orderedEntries.length - 1; index >= 0; index -= 1) {
+    const root = orderedEntries[index].component.root;
+    if (stableCursor >= 0 && stableIndexes[stableCursor] === index) {
+      cursor = root;
+      stableCursor -= 1;
+      continue;
+    }
+    if (root.parentNode !== parent || root.nextSibling !== cursor) {
+      parent.insertBefore(root, cursor);
+    }
+    cursor = root;
+  }
+}
+
+function longestIncreasingSubsequenceIndexes(values) {
+  const predecessors = new Array(values.length);
+  const result = [];
+
+  for (let index = 0; index < values.length; index += 1) {
+    const value = values[index];
+    if (value < 0) continue;
+
+    let low = 0;
+    let high = result.length;
+    while (low < high) {
+      const mid = (low + high) >> 1;
+      if (values[result[mid]] < value) low = mid + 1;
+      else high = mid;
+    }
+
+    if (low > 0) predecessors[index] = result[low - 1];
+    result[low] = index;
+  }
+
+  let cursor = result[result.length - 1];
+  for (let index = result.length - 1; index >= 0; index -= 1) {
+    result[index] = cursor;
+    cursor = predecessors[cursor];
+  }
+  return result;
 }
 
 function duplicateStorageKey(current, nextDuplicateKeys, rawKey, occurrence) {
