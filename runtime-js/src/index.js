@@ -628,8 +628,9 @@ export function createCompiledTemplateComponent(definition) {
 }
 
 export function createCompiledHtmlTemplateComponent(html, paths, update) {
-  const cloneTemplate = createCompiledHtmlTemplateFactory(html);
-  const nodePaths = paths ? paths.split(";") : [];
+  const shape = compiledHtmlTemplateShape(html, paths);
+  const cloneTemplate = shape.cloneTemplate;
+  const nodePaths = shape.nodePaths;
   let instance = null;
   let lastDispatch = () => {};
 
@@ -696,17 +697,78 @@ function createCompiledHtmlTemplateFactory(html) {
   return () => template.content.firstChild.cloneNode(true);
 }
 
+const compiledHtmlTemplateShapes = new Map();
+
+function compiledHtmlTemplateShape(html, paths) {
+  const key = `${paths || ""}\u0000${html}`;
+  let shape = compiledHtmlTemplateShapes.get(key);
+  if (!shape) {
+    shape = {
+      cloneTemplate: createCompiledHtmlTemplateFactory(html),
+      nodePaths: paths ? paths.split(";").map(compiledHtmlTemplatePath) : []
+    };
+    compiledHtmlTemplateShapes.set(key, shape);
+  }
+  return shape;
+}
+
 function compiledHtmlTemplateNode(root, path) {
-  if (path === "-") return root;
+  if (path === null) return root;
   let node = root;
   for (let index = 0; index < path.length; index += 1) {
-    node = node.childNodes[parseInt(path[index], 36)];
+    node = node.childNodes[path[index]];
   }
   return node;
 }
 
+function compiledHtmlTemplatePath(path) {
+  if (path === "-") return null;
+  const indexes = new Array(path.length);
+  for (let index = 0; index < path.length; index += 1) {
+    indexes[index] = parseInt(path[index], 36);
+  }
+  return indexes;
+}
+
 export function bindCompiledComponent(component, arity, bind) {
+  if (arity === 1) {
+    return {
+      __closkellArity: arity,
+      mount(parent, dispatch) {
+        return component.mount(parent, dispatch);
+      },
+      update(value, dispatch) {
+        if (bind) bind(value, dispatch);
+        return component.update(dispatch);
+      },
+      dispose() {
+        component.dispose();
+      },
+      get root() {
+        return component.root;
+      }
+    };
+  }
+  if (arity === 2) {
+    return {
+      __closkellArity: arity,
+      mount(parent, dispatch) {
+        return component.mount(parent, dispatch);
+      },
+      update(value, index, dispatch) {
+        if (bind) bind(value, index, dispatch);
+        return component.update(dispatch);
+      },
+      dispose() {
+        component.dispose();
+      },
+      get root() {
+        return component.root;
+      }
+    };
+  }
   return {
+    __closkellArity: arity,
     mount(parent, dispatch) {
       return component.mount(parent, dispatch);
     },
@@ -954,6 +1016,7 @@ export function setCompiledClassName(instance, slot, node, value) {
   const next = String(value);
   if (instance.values[slot] === next) return;
   instance.values[slot] = next;
+  if (next === "" && node.className === "" && !node.hasAttribute("class")) return;
   node.setAttribute("class", next);
   node.className = next;
 }
@@ -1188,6 +1251,19 @@ export function setCompiledEvent(instance, slot, node, eventName, messageForEven
     return;
   }
 
+  if (canDelegateCompiledEvent(eventName)) {
+    current = {
+      node,
+      eventName,
+      messageForEvent,
+      dispatch,
+      delegated: true
+    };
+    setDelegatedCompiledEventSlot(node, eventName, current);
+    instance.eventSlots[slot] = current;
+    return;
+  }
+
   current = {
     node,
     eventName,
@@ -1199,6 +1275,62 @@ export function setCompiledEvent(instance, slot, node, eventName, messageForEven
   };
   node.addEventListener(eventName, current.listener);
   instance.eventSlots[slot] = current;
+}
+
+const delegatedCompiledEvents = new Set(["click"]);
+const delegatedCompiledEventListeners = new Map();
+const delegatedCompiledEventSlots = new WeakMap();
+
+function canDelegateCompiledEvent(eventName) {
+  return delegatedCompiledEvents.has(eventName) && typeof document !== "undefined";
+}
+
+function setDelegatedCompiledEventSlot(node, eventName, current) {
+  let slots = delegatedCompiledEventSlots.get(node);
+  if (!slots) {
+    slots = new Map();
+    delegatedCompiledEventSlots.set(node, slots);
+  }
+  slots.set(eventName, current);
+  ensureDelegatedCompiledEventListener(eventName);
+}
+
+function removeDelegatedCompiledEventSlot(current) {
+  const slots = delegatedCompiledEventSlots.get(current.node);
+  if (!slots) return;
+  slots.delete(current.eventName);
+}
+
+function ensureDelegatedCompiledEventListener(eventName) {
+  if (delegatedCompiledEventListeners.has(eventName)) return;
+  const listener = (event) => dispatchDelegatedCompiledEvent(eventName, event);
+  document.addEventListener(eventName, listener);
+  delegatedCompiledEventListeners.set(eventName, listener);
+}
+
+function dispatchDelegatedCompiledEvent(eventName, event) {
+  let node = event.target;
+  if (node?.nodeType === 3) node = node.parentNode;
+
+  while (node && node !== document) {
+    const current = delegatedCompiledEventSlots.get(node)?.get(eventName);
+    if (current) {
+      dispatchTemplateEventResult(current.messageForEvent(delegatedCompiledEvent(event, node)), event, current.dispatch);
+      if (event.cancelBubble) return;
+    }
+    node = node.parentNode;
+  }
+}
+
+function delegatedCompiledEvent(event, currentTarget) {
+  if (event.currentTarget === currentTarget) return event;
+  return new Proxy(event, {
+    get(target, property, receiver) {
+      if (property === "currentTarget") return currentTarget;
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    }
+  });
 }
 
 function dispatchTemplateEventResult(result, event, dispatch) {
@@ -1311,16 +1443,81 @@ export function setKeyedList(instance, slot, marker, items, keyForItem, renderIt
   instance.keyedSlots[slot] = current;
 }
 
-export function setCompiledKeyedList(instance, slot, marker, items, keyForItem, renderItem, dispatch) {
+export function setCompiledKeyedList(instance, slot, marker, items, keyForItem, renderItem, dispatch, stableItemUpdate = false) {
   const parent = marker.parentNode;
   if (!parent) return;
 
   const current = instance.keyedSlots[slot] || { byKey: new Map(), duplicateKeys: new Map() };
   if (!current.duplicateKeys) current.duplicateKeys = new Map();
+  if (
+    current.duplicateKeys.size === 0 &&
+    setCompiledKeyedListUnique(current, parent, marker, items, keyForItem, renderItem, dispatch, stableItemUpdate)
+  ) {
+    instance.keyedSlots[slot] = current;
+    return;
+  }
+
+  setCompiledKeyedListWithDuplicates(current, parent, marker, items, keyForItem, renderItem, dispatch, stableItemUpdate);
+  instance.keyedSlots[slot] = current;
+}
+
+function setCompiledKeyedListUnique(current, parent, marker, items, keyForItem, renderItem, dispatch, stableItemUpdate) {
+  const nextByKey = new Map();
+  const orderedEntries = [];
+  let needsReorder = false;
+  let lastOldIndex = -1;
+
+  let index = 0;
+  for (const item of items) {
+    const key = keyForItem(item, index);
+    if (nextByKey.has(key)) {
+      disposeNewKeyedEntries(orderedEntries);
+      return false;
+    }
+    let entry = current.byKey.get(key);
+    if (!entry) {
+      const component = renderItem(item, index);
+      entry = { key, component, arity: compiledComponentArity(component), item, index, oldIndex: -1 };
+      needsReorder = true;
+    } else {
+      entry.oldIndex = entry.index;
+      if (entry.oldIndex < lastOldIndex) needsReorder = true;
+      lastOldIndex = entry.oldIndex;
+    }
+    if (!canSkipCompiledKeyedEntry(entry, item, index, dispatch, stableItemUpdate)) {
+      updateCompiledKeyedEntry(entry, item, index, dispatch);
+      entry.dispatch = dispatch;
+    }
+    entry.item = item;
+    entry.index = index;
+    nextByKey.set(key, entry);
+    orderedEntries.push(entry);
+    index += 1;
+  }
+
+  if (needsReorder) reorderKeyedEntries(parent, marker, orderedEntries);
+
+  for (const [key, entry] of current.byKey) {
+    if (!nextByKey.has(key)) {
+      if (entry.component.root?.parentNode?.removeChild) {
+        entry.component.root.parentNode.removeChild(entry.component.root);
+      }
+      disposeComponent(entry.component);
+    }
+  }
+
+  current.byKey = nextByKey;
+  current.duplicateKeys = new Map();
+  return true;
+}
+
+function setCompiledKeyedListWithDuplicates(current, parent, marker, items, keyForItem, renderItem, dispatch, stableItemUpdate) {
   const nextByKey = new Map();
   const nextDuplicateKeys = new Map();
   const seenKeys = new Map();
   const orderedEntries = [];
+  let needsReorder = false;
+  let lastOldIndex = -1;
 
   let index = 0;
   for (const item of items) {
@@ -1330,11 +1527,18 @@ export function setCompiledKeyedList(instance, slot, marker, items, keyForItem, 
     const key = occurrence === 0 ? rawKey : duplicateStorageKey(current, nextDuplicateKeys, rawKey, occurrence);
     let entry = current.byKey.get(key);
     if (!entry) {
-      entry = { key, component: renderItem(item, index), item, index, oldIndex: -1 };
+      const component = renderItem(item, index);
+      entry = { key, component, arity: compiledComponentArity(component), item, index, oldIndex: -1 };
+      needsReorder = true;
     } else {
       entry.oldIndex = entry.index;
+      if (entry.oldIndex < lastOldIndex) needsReorder = true;
+      lastOldIndex = entry.oldIndex;
     }
-    updateCompiledKeyedComponent(entry.component, item, index, dispatch);
+    if (!canSkipCompiledKeyedEntry(entry, item, index, dispatch, stableItemUpdate)) {
+      updateCompiledKeyedEntry(entry, item, index, dispatch);
+      entry.dispatch = dispatch;
+    }
     entry.item = item;
     entry.index = index;
     nextByKey.set(key, entry);
@@ -1342,7 +1546,7 @@ export function setCompiledKeyedList(instance, slot, marker, items, keyForItem, 
     index += 1;
   }
 
-  reorderKeyedEntries(parent, marker, orderedEntries);
+  if (needsReorder) reorderKeyedEntries(parent, marker, orderedEntries);
 
   for (const [key, entry] of current.byKey) {
     if (!nextByKey.has(key)) {
@@ -1355,7 +1559,12 @@ export function setCompiledKeyedList(instance, slot, marker, items, keyForItem, 
 
   current.byKey = nextByKey;
   current.duplicateKeys = nextDuplicateKeys;
-  instance.keyedSlots[slot] = current;
+}
+
+function disposeNewKeyedEntries(entries) {
+  for (const entry of entries) {
+    if (entry.oldIndex < 0) disposeComponent(entry.component);
+  }
 }
 
 function reorderKeyedEntries(parent, marker, orderedEntries) {
@@ -1427,11 +1636,24 @@ function updateKeyedComponent(component, item, index, dispatch, updateContext) {
   return component.update(item, dispatch, updateContext);
 }
 
-function updateCompiledKeyedComponent(component, item, index, dispatch) {
-  if (component.update.length >= 4) {
-    return component.update(item, index, dispatch);
+function updateCompiledKeyedEntry(entry, item, index, dispatch) {
+  if (compiledEntryArity(entry) >= 2) {
+    return entry.component.update(item, index, dispatch);
   }
-  return component.update(item, dispatch);
+  return entry.component.update(item, dispatch);
+}
+
+function canSkipCompiledKeyedEntry(entry, item, index, dispatch, stableItemUpdate) {
+  if (!stableItemUpdate || entry.item !== item || entry.dispatch !== dispatch) return false;
+  return compiledEntryArity(entry) < 2 || entry.index === index;
+}
+
+function compiledEntryArity(entry) {
+  return entry.arity ??= compiledComponentArity(entry.component);
+}
+
+function compiledComponentArity(component) {
+  return component?.__closkellArity ?? (component?.update?.length >= 4 ? 2 : 1);
 }
 
 function keyedItemUpdateContext(updateContext, itemName, indexName, previousItem, nextItem, previousIndex, nextIndex) {
@@ -1621,7 +1843,11 @@ function componentUpdateContext(updateContext, params, previousArgs = [], nextAr
 }
 
 function disposeEventSlots(instance) {
-  for (const current of instance.eventSlots) if (current) current.node.removeEventListener(current.eventName, current.listener);
+  for (const current of instance.eventSlots) {
+    if (!current) continue;
+    if (current.delegated) removeDelegatedCompiledEventSlot(current);
+    else current.node.removeEventListener(current.eventName, current.listener);
+  }
   instance.eventSlots = [];
 }
 

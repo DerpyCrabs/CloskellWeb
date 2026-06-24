@@ -6119,6 +6119,7 @@ enum TemplateSlotKind {
         index: Option<String>,
         key: String,
         render: String,
+        stable_item_update: bool,
     },
 }
 
@@ -6421,6 +6422,10 @@ impl TemplateEmitter<'_> {
                 )
             };
         let component_expr = self.owner.emit_template_component(spec.template);
+        let stable_item_update =
+            keyed_item_update_reads(&spec, &self.owner.component_fns, &self.owner.read_summaries)
+                .into_iter()
+                .all(|read| keyed_item_local_read(&read, spec.item, spec.index));
         let arity = if index.is_some() { 2 } else { 1 };
         let bind = format!(
             "({}) => {{ {} = {};{} }}",
@@ -6447,6 +6452,7 @@ impl TemplateEmitter<'_> {
                 index,
                 key,
                 render,
+                stable_item_update,
             },
             expr: format_expr(expr),
         });
@@ -6740,6 +6746,7 @@ impl TemplateEmitter<'_> {
                     index,
                     key,
                     render,
+                    stable_item_update,
                 } => {
                     let key_params = if let Some(index) = index {
                         format!("{}, {}", item, index)
@@ -6747,14 +6754,15 @@ impl TemplateEmitter<'_> {
                         item.clone()
                     };
                     format!(
-                        "{}(i, {}, i.nodes[{}], {}, ({}) => {}, {}, d);",
+                        "{}(i, {}, i.nodes[{}], {}, ({}) => {}, {}, d, {});",
                         SET_KEYED_LIST_ALIAS,
                         slot.id,
                         slot.node_id,
                         collection,
                         key_params,
                         key,
-                        render
+                        render,
+                        stable_item_update
                     )
                 }
             };
@@ -7779,6 +7787,28 @@ fn collect_keyed_reads(
     symbols.into_iter().collect()
 }
 
+fn keyed_item_update_reads(
+    spec: &ForSpec<'_>,
+    components: &BTreeSet<String>,
+    read_summaries: &BTreeMap<String, ReadSummary>,
+) -> Vec<String> {
+    let mut symbols = BTreeSet::new();
+    collect_keyed_item_html_reads(spec.template, &mut symbols, components, read_summaries);
+    symbols.into_iter().collect()
+}
+
+fn keyed_item_local_read(read: &str, item: &str, index: Option<&str>) -> bool {
+    let item_prefix = format!("{}.", item);
+    if read == item || read.starts_with(&item_prefix) {
+        return true;
+    }
+    if let Some(index) = index {
+        let index_prefix = format!("{}.", index);
+        return read == index || read.starts_with(&index_prefix);
+    }
+    false
+}
+
 fn collect_template_branch_reads(
     branch: &TemplateBranch<'_>,
     symbols: &mut BTreeSet<String>,
@@ -7797,6 +7827,42 @@ fn collect_template_branch_reads(
         TemplateBranch::Component { spec, .. } => {
             symbols.extend(component_call_reads(spec, read_summaries));
         }
+    }
+}
+
+fn collect_keyed_item_html_reads(
+    node: &HtmlNode,
+    symbols: &mut BTreeSet<String>,
+    components: &BTreeSet<String>,
+    read_summaries: &BTreeMap<String, ReadSummary>,
+) {
+    match node {
+        HtmlNode::Element(element) => {
+            for attr in &element.attrs {
+                if let HtmlAttrValue::Dynamic { expr, .. } = &attr.value {
+                    collect_template_reads_inner(expr, symbols, read_summaries);
+                }
+            }
+            for child in &element.children {
+                collect_keyed_item_html_reads(child, symbols, components, read_summaries);
+            }
+        }
+        HtmlNode::Expr { expr, .. } => {
+            if let Some(spec) = ForSpec::parse(expr) {
+                symbols.extend(collect_keyed_reads(&spec, components, read_summaries));
+                return;
+            }
+            if let Some(spec) = IfSpec::parse(expr, components) {
+                symbols.extend(collect_conditional_reads(&spec, components, read_summaries));
+                return;
+            }
+            if let Some(spec) = ComponentSpec::parse(expr, components) {
+                symbols.extend(component_call_reads(&spec, read_summaries));
+                return;
+            }
+            collect_template_reads_inner(expr, symbols, read_summaries);
+        }
+        HtmlNode::Text { .. } => {}
     }
 }
 
