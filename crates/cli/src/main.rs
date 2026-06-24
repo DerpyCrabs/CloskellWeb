@@ -199,7 +199,11 @@ fn run(args: Vec<String>) -> Result<(), String> {
 
             if let Some(output) = output {
                 let mut visited = HashSet::new();
-                let options = BuildOptions { source_maps, app };
+                let options = BuildOptions {
+                    source_maps,
+                    app,
+                    emit_options: emit_options_from_env(),
+                };
                 let mut artifacts = Vec::new();
                 if let Err(error) = build_file(
                     &path,
@@ -239,7 +243,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                     );
                 }
             } else {
-                let emitted = build_single_module(&path, &modules)?;
+                let emitted = build_single_module(&path, &modules, &emit_options_from_env())?;
                 print!("{}", emitted);
             }
             Ok(())
@@ -325,13 +329,17 @@ fn run(args: Vec<String>) -> Result<(), String> {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 struct ModuleInfo {
+    input: String,
     exports: HashSet<String>,
     bindings: Vec<typecheck::ExportedBinding>,
     type_declarations: Vec<typecheck::TypeDeclaration>,
     macros: HashMap<String, macro_expand::MacroDef>,
     command_shapes_by_binding: HashMap<String, Vec<CommandShape>>,
+    message_kinds_by_binding: HashMap<String, BTreeSet<String>>,
+    source: SourceFile,
+    expr_types: BTreeMap<usize, String>,
 }
 
 #[derive(Clone, Debug)]
@@ -438,12 +446,14 @@ struct WatchOptions {
     poll_interval: Duration,
     source_maps: bool,
     app: Option<AppOptions>,
+    emit_options: js_backend::EmitOptions,
 }
 
 #[derive(Clone, Debug)]
 struct BuildOptions {
     source_maps: bool,
     app: Option<AppOptions>,
+    emit_options: js_backend::EmitOptions,
 }
 
 #[derive(Clone, Debug)]
@@ -566,6 +576,30 @@ fn parse_app_options(args: &[String]) -> Result<Option<AppOptions>, String> {
     Ok(app)
 }
 
+fn emit_options_from_env() -> js_backend::EmitOptions {
+    js_backend::EmitOptions {
+        env_dev: env::var("CLOSKELL_ENV_DEV")
+            .ok()
+            .and_then(|value| parse_env_bool(&value)),
+        env_mode: env::var("CLOSKELL_ENV_MODE")
+            .ok()
+            .filter(|value| !value.is_empty()),
+        reachable_message_kinds: None,
+        message_field_reads: BTreeMap::new(),
+        static_reads: BTreeMap::new(),
+        direct_call_replacements: BTreeMap::new(),
+        prelude_code: String::new(),
+    }
+}
+
+fn parse_env_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
 fn run_module_tests(path: &Path, json: bool) -> Result<(), String> {
     let suffix = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -598,6 +632,7 @@ fn run_module_tests_in_temp(path: &Path, temp_dir: &Path, json: bool) -> Result<
         &BuildOptions {
             source_maps: false,
             app: None,
+            emit_options: emit_options_from_env(),
         },
         &modules,
         &mut artifacts,
@@ -631,10 +666,14 @@ fn run_node_test_module(output: &Path, json: bool) -> Result<(), String> {
 fn test_runner_script(output: &Path) -> String {
     let module_path = json_string(&output.display().to_string());
     format!(
-        r#"import {{ pathToFileURL }} from "node:url";
+        r#"import {{ dirname, join }} from "node:path";
+import {{ pathToFileURL }} from "node:url";
 
 const modulePath = {module_path};
 const moduleUrl = pathToFileURL(modulePath).href;
+const runtimeUrl = pathToFileURL(join(dirname(modulePath), "node_modules", "@closkell", "runtime", "src", "index.js")).href;
+const {{ render: __closkellPrepareDocument }} = await import(runtimeUrl);
+__closkellPrepareDocument(null);
 const module = await import(moduleUrl);
 {shared}
 
@@ -679,10 +718,14 @@ console.log("ok " + tests.length + " tests");
 fn test_runner_json_script(output: &Path) -> String {
     let module_path = json_string(&output.display().to_string());
     format!(
-        r#"import {{ pathToFileURL }} from "node:url";
+        r#"import {{ dirname, join }} from "node:path";
+import {{ pathToFileURL }} from "node:url";
 
 const modulePath = {module_path};
 const moduleUrl = pathToFileURL(modulePath).href;
+const runtimeUrl = pathToFileURL(join(dirname(modulePath), "node_modules", "@closkell", "runtime", "src", "index.js")).href;
+const {{ render: __closkellPrepareDocument }} = await import(runtimeUrl);
+__closkellPrepareDocument(null);
 const module = await import(moduleUrl);
 {shared}
 
@@ -1129,6 +1172,7 @@ fn parse_watch_options(args: &[String]) -> Result<WatchOptions, String> {
         poll_interval: Duration::from_millis(poll_ms.max(1)),
         source_maps,
         app,
+        emit_options: emit_options_from_env(),
     })
 }
 
@@ -1148,6 +1192,7 @@ fn dev_build_once_with_options(
     let build_options = BuildOptions {
         source_maps: options.source_maps,
         app: options.app.clone(),
+        emit_options: options.emit_options.clone(),
     };
     let mut artifacts = Vec::new();
     build_file(
@@ -1275,6 +1320,7 @@ fn check_file_inner(
     let mut import_type_declarations = Vec::new();
     let mut imported_macros = HashMap::new();
     let mut imported_command_shapes = HashMap::new();
+    let mut imported_message_kinds = HashMap::new();
     for import in &imports {
         if !is_closkell_import_path(&import.path) {
             continue;
@@ -1299,11 +1345,10 @@ fn check_file_inner(
                 ));
                 continue;
             }
-            if let Some(binding) = imported
-                .bindings
-                .iter()
-                .find(|binding| binding.name == name.imported && binding.is_annotated())
-            {
+            if let Some(binding) = imported.bindings.iter().find(|binding| {
+                binding.name == name.imported
+                    && imported_binding_type_is_importable(&imported, binding)
+            }) {
                 let binding = binding.import_as(name.name.clone());
                 if binding.returns_cmd() {
                     if let Some(shapes) = imported.command_shapes_by_binding.get(&name.imported) {
@@ -1311,6 +1356,9 @@ fn check_file_inner(
                     }
                 }
                 import_bindings.push(binding);
+            }
+            if let Some(kinds) = imported.message_kinds_by_binding.get(&name.imported) {
+                imported_message_kinds.insert(name.name.clone(), kinds.clone());
             }
             if let Some(declaration) = imported
                 .type_declarations
@@ -1379,13 +1427,19 @@ fn check_file_inner(
         &command_binding_names,
         &imported_command_shapes,
     );
+    let message_kinds_by_binding =
+        collect_message_kinds_by_binding(&expansion.source, &imported_message_kinds);
 
     Ok(ModuleInfo {
+        input,
         exports,
         bindings: type_result.bindings,
         type_declarations: type_result.type_declarations,
         macros: local_macros,
         command_shapes_by_binding,
+        message_kinds_by_binding,
+        source: expansion.source,
+        expr_types: type_result.expr_types,
     })
 }
 
@@ -1400,14 +1454,20 @@ fn build_file(
 ) -> Result<(), String> {
     let canonical = fs::canonicalize(path)
         .map_err(|err| format!("failed to resolve {}: {}", path.display(), err))?;
-    if !visited.insert(canonical) {
+    if !visited.insert(canonical.clone()) {
         return Ok(());
     }
 
-    let (input, source) = parse_file(path)?;
-    print_parse_diagnostics(&input, &source);
-    if source.has_errors() {
-        return Err(format!("build failed during parsing: {}", path.display()));
+    let module = modules
+        .get(&canonical)
+        .ok_or_else(|| format!("missing checked module: {}", path.display()))?;
+    let input = &module.input;
+    let source = &module.source;
+
+    let mut import_emit_options = options.emit_options.clone();
+    if options.app.is_some() {
+        import_emit_options.message_field_reads =
+            js_backend::collect_message_field_reads(&module.source);
     }
 
     for import in parse_imports(&input, &source)? {
@@ -1427,6 +1487,7 @@ fn build_file(
             &BuildOptions {
                 source_maps: options.source_maps,
                 app: None,
+                emit_options: import_emit_options.clone(),
             },
             modules,
             artifacts,
@@ -1434,12 +1495,26 @@ fn build_file(
         )?;
     }
 
-    let mut emitted = emit_checked_module(path, &input, &source, modules)?;
+    let mut emitted = emit_checked_module_from_checked(
+        path,
+        input,
+        module,
+        modules,
+        &options.emit_options,
+        options.app.is_some(),
+    )?;
     if let Some(app) = &options.app {
         let runtime_registrations =
             collect_app_runtime_registrations(&emitted.runtime_effects, artifacts);
         let init_takes_boot = emitted_init_takes_boot(&emitted.code);
-        wrap_app_module(&mut emitted, app, &runtime_registrations, init_takes_boot);
+        let has_subscriptions = emitted_has_binding(&emitted.code, "subscriptions");
+        wrap_app_module(
+            &mut emitted,
+            app,
+            &runtime_registrations,
+            init_takes_boot,
+            has_subscriptions,
+        );
     }
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)
@@ -1530,33 +1605,58 @@ fn remove_file_if_exists(path: &Path) -> Result<(), String> {
 fn build_single_module(
     path: &Path,
     modules: &HashMap<PathBuf, ModuleInfo>,
+    emit_options: &js_backend::EmitOptions,
 ) -> Result<String, String> {
-    let (input, source) = parse_file(path)?;
-    print_parse_diagnostics(&input, &source);
-    if source.has_errors() {
-        return Err("build failed during parsing".to_string());
-    }
-    emit_checked_module(path, &input, &source, modules).map(|emitted| emitted.code)
+    let canonical = fs::canonicalize(path)
+        .map_err(|err| format!("failed to resolve {}: {}", path.display(), err))?;
+    let module = modules
+        .get(&canonical)
+        .ok_or_else(|| format!("missing checked module: {}", path.display()))?;
+    emit_checked_module_from_checked(path, &module.input, module, modules, emit_options, false)
+        .map(|emitted| emitted.code)
 }
 
-fn emit_checked_module(
+fn emit_checked_module_from_checked(
     path: &Path,
     input: &str,
-    source: &SourceFile,
+    module: &ModuleInfo,
     modules: &HashMap<PathBuf, ModuleInfo>,
+    emit_options: &js_backend::EmitOptions,
+    prune_update_messages: bool,
 ) -> Result<js_backend::EmitResult, String> {
+    let source = &module.source;
     let imports = parse_imports(input, source)?;
-    let imported_macros = imported_macros_from_imports(path, &imports, modules)?;
-    let expansion = macro_expand::expand_source_with_imported_macros(source, &imported_macros);
-    if !expansion.diagnostics.is_empty() {
-        println!("{}", render_diagnostics(input, &expansion.diagnostics));
-        return Err(format!(
-            "build failed during macro expansion: {}",
-            path.display()
-        ));
+    let imported_message_kinds = message_imports_from_imports(path, &imports, modules)?;
+
+    let mut emit_options = emit_options.clone();
+    if prune_update_messages {
+        emit_options.static_reads = collect_app_static_reads(source, &emit_options);
+        emit_options.reachable_message_kinds =
+            collect_reachable_update_message_kinds(source, &imported_message_kinds, &emit_options);
+    }
+    let local_specializations = collect_local_function_specializations(
+        path,
+        &imports,
+        modules,
+        source,
+        &module.expr_types,
+        &emit_options,
+    )?;
+    for specialization in local_specializations {
+        emit_options
+            .direct_call_replacements
+            .insert(specialization.local_name, specialization.specialized_name);
+        emit_options.prelude_code.push_str(&specialization.code);
+        if !emit_options.prelude_code.ends_with('\n') {
+            emit_options.prelude_code.push('\n');
+        }
     }
 
-    let emitted = js_backend::emit_module(&expansion.source);
+    let emitted = js_backend::emit_module_with_types_and_options(
+        source,
+        module.expr_types.clone(),
+        emit_options,
+    );
     if !emitted.diagnostics.is_empty() {
         println!("{}", render_diagnostics(input, &emitted.diagnostics));
         return Err(format!(
@@ -1568,6 +1668,1287 @@ fn emit_checked_module(
     Ok(emitted)
 }
 
+#[derive(Clone, Debug)]
+struct ImportFunctionSpecialization {
+    local_name: String,
+    specialized_name: String,
+    code: String,
+}
+
+#[derive(Clone, Debug)]
+struct ImportedFunctionTarget {
+    imported_name: String,
+    module_path: PathBuf,
+    schema: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CallSignature {
+    arg_types: Option<Vec<String>>,
+    conflict: bool,
+}
+
+fn collect_local_function_specializations(
+    path: &Path,
+    imports: &[ImportSpec],
+    modules: &HashMap<PathBuf, ModuleInfo>,
+    source: &SourceFile,
+    expr_types: &BTreeMap<usize, String>,
+    emit_options: &js_backend::EmitOptions,
+) -> Result<Vec<ImportFunctionSpecialization>, String> {
+    let local_schemas = local_function_schemas(source, expr_types);
+    if local_schemas.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let imported_targets = imported_function_targets(path, imports, modules)?;
+    let interesting_names =
+        interesting_local_function_names(source, &local_schemas, &imported_targets, modules);
+    let local_names = local_schemas.keys().cloned().collect::<HashSet<_>>();
+    let mut root_signatures = BTreeMap::new();
+    let mut bound = HashSet::new();
+    for form in &source.forms {
+        collect_direct_call_signatures(
+            form,
+            &local_names,
+            expr_types,
+            &mut bound,
+            &mut root_signatures,
+        );
+    }
+
+    let mut memo = BTreeMap::new();
+    let mut visiting = HashSet::new();
+    let mut emitted_code = Vec::new();
+    let mut roots = Vec::new();
+    for (local_name, signature) in root_signatures {
+        if !interesting_names.contains(&local_name) {
+            continue;
+        }
+        if signature.conflict {
+            continue;
+        }
+        let Some(arg_types) = signature.arg_types else {
+            continue;
+        };
+        let Some(specialized_name) = emit_recursive_local_specialization(
+            &local_name,
+            &arg_types,
+            source,
+            expr_types,
+            &local_schemas,
+            &imported_targets,
+            modules,
+            emit_options,
+            &interesting_names,
+            &mut memo,
+            &mut visiting,
+            &mut emitted_code,
+        ) else {
+            continue;
+        };
+        roots.push(ImportFunctionSpecialization {
+            local_name,
+            specialized_name,
+            code: String::new(),
+        });
+    }
+
+    if emitted_code.is_empty() {
+        return Ok(Vec::new());
+    }
+    let prelude = emitted_code.join("");
+    for (index, root) in roots.iter_mut().enumerate() {
+        if index == 0 {
+            root.code = prelude.clone();
+        }
+    }
+    Ok(roots)
+}
+
+fn emit_recursive_local_specialization(
+    name: &str,
+    arg_types: &[String],
+    source: &SourceFile,
+    base_expr_types: &BTreeMap<usize, String>,
+    local_schemas: &BTreeMap<String, String>,
+    imported_targets: &BTreeMap<String, ImportedFunctionTarget>,
+    modules: &HashMap<PathBuf, ModuleInfo>,
+    emit_options: &js_backend::EmitOptions,
+    interesting_names: &HashSet<String>,
+    memo: &mut BTreeMap<String, String>,
+    visiting: &mut HashSet<String>,
+    emitted_code: &mut Vec<String>,
+) -> Option<String> {
+    let key = format!("local:{}|{}", name, arg_types.join("|"));
+    if let Some(existing) = memo.get(&key) {
+        return Some(existing.clone());
+    }
+    if !visiting.insert(key.clone()) {
+        return None;
+    }
+
+    let schema = local_schemas.get(name)?;
+    let param_types = type_fn_param_types_for_schema(schema)?;
+    if param_types.len() != arg_types.len() {
+        visiting.remove(&key);
+        return None;
+    }
+    let mut substitutions = BTreeMap::new();
+    if !param_types
+        .iter()
+        .zip(arg_types.iter())
+        .all(|(pattern, concrete)| {
+            collect_type_substitutions(pattern, concrete, &mut substitutions)
+        })
+    {
+        visiting.remove(&key);
+        return None;
+    }
+    let specialized_expr_types = substitute_expr_type_map(base_expr_types, &substitutions);
+    let local_targets = local_schemas.keys().cloned().collect::<HashSet<_>>();
+    let imported_names = imported_targets.keys().cloned().collect::<HashSet<_>>();
+    let mut all_targets = local_targets.clone();
+    all_targets.extend(imported_names.iter().cloned());
+    let defn = find_defn_form(source, name)?;
+    let nested_calls = concrete_calls_in_defn(defn, &all_targets, &specialized_expr_types);
+    let mut replacements = BTreeMap::new();
+    for (callee, callee_types) in nested_calls {
+        if local_targets.contains(&callee) {
+            if !interesting_names.contains(&callee) {
+                continue;
+            }
+            if let Some(specialized) = emit_recursive_local_specialization(
+                &callee,
+                &callee_types,
+                source,
+                base_expr_types,
+                local_schemas,
+                imported_targets,
+                modules,
+                emit_options,
+                interesting_names,
+                memo,
+                visiting,
+                emitted_code,
+            ) {
+                replacements.insert(callee, specialized);
+            }
+        } else if imported_names.contains(&callee) {
+            if let Some(specialized) = emit_imported_function_specialization(
+                &callee,
+                &callee_types,
+                imported_targets,
+                modules,
+                emit_options,
+                memo,
+                emitted_code,
+            ) {
+                replacements.insert(callee, specialized);
+            }
+        }
+    }
+
+    let hash = stable_hash_hex(format!("{}|{}", name, arg_types.join("|")).as_bytes());
+    let specialized_name = format!(
+        "__closkell_specialized_{}_{}",
+        sanitize_js_identifier(name),
+        &hash[..8]
+    );
+    let mut specialization_options = emit_options.clone();
+    specialization_options.direct_call_replacements = replacements;
+    specialization_options.prelude_code.clear();
+    let emitted = js_backend::emit_function_specialization(
+        source,
+        specialized_expr_types,
+        name,
+        &specialized_name,
+        specialization_options,
+    );
+    if emitted.diagnostics.is_empty()
+        && !emitted.code.contains("__closkellValueEqual")
+        && !emitted.code.contains("__closkellCreateTemplate")
+        && !emitted.code.contains("__closkellDecoder")
+    {
+        memo.insert(key.clone(), specialized_name.clone());
+        emitted_code.push(emitted.code);
+        visiting.remove(&key);
+        Some(specialized_name)
+    } else {
+        visiting.remove(&key);
+        None
+    }
+}
+
+fn emit_imported_function_specialization(
+    local_name: &str,
+    arg_types: &[String],
+    imported_targets: &BTreeMap<String, ImportedFunctionTarget>,
+    modules: &HashMap<PathBuf, ModuleInfo>,
+    emit_options: &js_backend::EmitOptions,
+    memo: &mut BTreeMap<String, String>,
+    emitted_code: &mut Vec<String>,
+) -> Option<String> {
+    let target = imported_targets.get(local_name)?;
+    let key = format!(
+        "import:{}:{}|{}",
+        target.module_path.display(),
+        target.imported_name,
+        arg_types.join("|")
+    );
+    if let Some(existing) = memo.get(&key) {
+        return Some(existing.clone());
+    }
+    let module = modules.get(&target.module_path)?;
+    let defn = find_defn_form(&module.source, &target.imported_name)?;
+    if !defn_is_self_contained(defn) {
+        return None;
+    }
+    let param_types = type_fn_param_types_for_schema(&target.schema)?;
+    if param_types.len() != arg_types.len() {
+        return None;
+    }
+    let mut substitutions = BTreeMap::new();
+    if !param_types
+        .iter()
+        .zip(arg_types.iter())
+        .all(|(pattern, concrete)| {
+            collect_type_substitutions(pattern, concrete, &mut substitutions)
+        })
+    {
+        return None;
+    }
+    let specialized_expr_types = substitute_expr_type_map(&module.expr_types, &substitutions);
+    let hash =
+        stable_hash_hex(format!("{}|{}", target.imported_name, arg_types.join("|")).as_bytes());
+    let specialized_name = format!(
+        "__closkell_specialized_{}_{}",
+        sanitize_js_identifier(local_name),
+        &hash[..8]
+    );
+    let mut specialization_options = emit_options.clone();
+    specialization_options.direct_call_replacements.clear();
+    specialization_options.prelude_code.clear();
+    let emitted = js_backend::emit_function_specialization(
+        &module.source,
+        specialized_expr_types,
+        &target.imported_name,
+        &specialized_name,
+        specialization_options,
+    );
+    if emitted.diagnostics.is_empty()
+        && !emitted.code.contains("__closkellValueEqual")
+        && !emitted.code.contains("__closkellCreateTemplate")
+        && !emitted.code.contains("__closkellDecoder")
+    {
+        memo.insert(key, specialized_name.clone());
+        emitted_code.push(emitted.code);
+        Some(specialized_name)
+    } else {
+        None
+    }
+}
+
+fn local_function_schemas(
+    source: &SourceFile,
+    expr_types: &BTreeMap<usize, String>,
+) -> BTreeMap<String, String> {
+    let mut schemas = BTreeMap::new();
+    for form in &source.forms {
+        let ExprKind::List(items) = &form.kind else {
+            continue;
+        };
+        if items.len() < 4 || !matches_symbol(&items[0], "defn") {
+            continue;
+        }
+        let ExprKind::Symbol(name) = &items[1].kind else {
+            continue;
+        };
+        let Some(schema) = expr_types.get(&form.span.start) else {
+            continue;
+        };
+        if schema.trim_start().starts_with("(Fn ") {
+            schemas.insert(name.clone(), schema.clone());
+        }
+    }
+    schemas
+}
+
+fn interesting_local_function_names(
+    source: &SourceFile,
+    local_schemas: &BTreeMap<String, String>,
+    imported_targets: &BTreeMap<String, ImportedFunctionTarget>,
+    modules: &HashMap<PathBuf, ModuleInfo>,
+) -> HashSet<String> {
+    let local_names = local_schemas.keys().cloned().collect::<HashSet<_>>();
+    let imported_equality_names = imported_targets
+        .iter()
+        .filter_map(|(local_name, target)| {
+            let module = modules.get(&target.module_path)?;
+            let defn = find_defn_form(&module.source, &target.imported_name)?;
+            defn_contains_value_equal(defn).then_some(local_name.clone())
+        })
+        .collect::<HashSet<_>>();
+    let mut calls_by_function = BTreeMap::new();
+    let mut interesting = HashSet::new();
+
+    for form in &source.forms {
+        let Some(name) = definition_name(form) else {
+            continue;
+        };
+        if !local_schemas.contains_key(name) {
+            continue;
+        }
+        let local_calls = called_names_in_defn(form, &local_names);
+        let imported_calls = called_names_in_defn(form, &imported_equality_names);
+        if defn_contains_value_equal(form) || !imported_calls.is_empty() {
+            interesting.insert(name.to_string());
+        }
+        calls_by_function.insert(name.to_string(), local_calls);
+    }
+
+    loop {
+        let mut changed = false;
+        for (name, calls) in &calls_by_function {
+            if interesting.contains(name) {
+                continue;
+            }
+            if calls.iter().any(|callee| interesting.contains(callee)) {
+                changed |= interesting.insert(name.clone());
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    interesting
+}
+
+fn called_names_in_defn(defn: &Expr, target_names: &HashSet<String>) -> HashSet<String> {
+    let ExprKind::List(items) = &defn.kind else {
+        return HashSet::new();
+    };
+    if items.len() < 4 {
+        return HashSet::new();
+    }
+    let mut calls = HashSet::new();
+    let mut bound = HashSet::new();
+    collect_specialization_pattern_bindings(&items[2], &mut bound);
+    for body in &items[3..] {
+        collect_called_names(body, target_names, &mut bound, &mut calls);
+    }
+    calls
+}
+
+fn collect_called_names(
+    expr: &Expr,
+    target_names: &HashSet<String>,
+    bound: &mut HashSet<String>,
+    calls: &mut HashSet<String>,
+) {
+    match &expr.kind {
+        ExprKind::List(items) => {
+            let Some((head, args)) = items.split_first() else {
+                return;
+            };
+            if let ExprKind::Symbol(name) = &head.kind {
+                match name.as_str() {
+                    "fn" => {
+                        let mut nested_bound = bound.clone();
+                        if let Some(params) = args.first() {
+                            collect_specialization_pattern_bindings(params, &mut nested_bound);
+                        }
+                        for body in args.iter().skip(1) {
+                            collect_called_names(body, target_names, &mut nested_bound, calls);
+                        }
+                        return;
+                    }
+                    "let" => {
+                        let mut nested_bound = bound.clone();
+                        if let Some(bindings) = args.first() {
+                            if let ExprKind::Vector(items) = &bindings.kind {
+                                for pair in items.chunks(2) {
+                                    if let Some(value) = pair.get(1) {
+                                        collect_called_names(
+                                            value,
+                                            target_names,
+                                            &mut nested_bound,
+                                            calls,
+                                        );
+                                    }
+                                    if let Some(pattern) = pair.first() {
+                                        collect_specialization_pattern_bindings(
+                                            pattern,
+                                            &mut nested_bound,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        for body in args.iter().skip(1) {
+                            collect_called_names(body, target_names, &mut nested_bound, calls);
+                        }
+                        return;
+                    }
+                    _ => {
+                        if target_names.contains(name) && !bound.contains(name) {
+                            calls.insert(name.clone());
+                        }
+                    }
+                }
+            }
+            for item in items {
+                collect_called_names(item, target_names, bound, calls);
+            }
+        }
+        ExprKind::Vector(items) | ExprKind::Set(items) => {
+            for item in items {
+                collect_called_names(item, target_names, bound, calls);
+            }
+        }
+        ExprKind::Map(entries) => {
+            for (key, value) in entries {
+                if !matches!(
+                    key.kind,
+                    ExprKind::Keyword(_) | ExprKind::String(_) | ExprKind::Symbol(_)
+                ) {
+                    collect_called_names(key, target_names, bound, calls);
+                }
+                collect_called_names(value, target_names, bound, calls);
+            }
+        }
+        ExprKind::Quote(inner)
+        | ExprKind::QuasiQuote(inner)
+        | ExprKind::Unquote(inner)
+        | ExprKind::UnquoteSplicing(inner) => {
+            collect_called_names(inner, target_names, bound, calls)
+        }
+        ExprKind::HtmlTemplate(_) => {}
+        ExprKind::Nil
+        | ExprKind::Bool(_)
+        | ExprKind::Number(_)
+        | ExprKind::String(_)
+        | ExprKind::Keyword(_)
+        | ExprKind::Symbol(_) => {}
+    }
+}
+
+fn concrete_calls_in_defn(
+    defn: &Expr,
+    target_names: &HashSet<String>,
+    expr_types: &BTreeMap<usize, String>,
+) -> BTreeMap<String, Vec<String>> {
+    let ExprKind::List(items) = &defn.kind else {
+        return BTreeMap::new();
+    };
+    if items.len() < 4 {
+        return BTreeMap::new();
+    }
+    let mut signatures = BTreeMap::new();
+    let mut bound = HashSet::new();
+    collect_specialization_pattern_bindings(&items[2], &mut bound);
+    for body in &items[3..] {
+        collect_direct_call_signatures(body, target_names, expr_types, &mut bound, &mut signatures);
+    }
+    signatures
+        .into_iter()
+        .filter_map(|(name, signature)| {
+            if signature.conflict {
+                return None;
+            }
+            let arg_types = signature.arg_types?;
+            Some((name, arg_types))
+        })
+        .collect()
+}
+
+fn substitute_expr_type_map(
+    expr_types: &BTreeMap<usize, String>,
+    substitutions: &BTreeMap<String, String>,
+) -> BTreeMap<usize, String> {
+    expr_types
+        .iter()
+        .map(|(offset, schema)| (*offset, substitute_type_variables(schema, substitutions)))
+        .collect()
+}
+
+fn imported_function_targets(
+    path: &Path,
+    imports: &[ImportSpec],
+    modules: &HashMap<PathBuf, ModuleInfo>,
+) -> Result<BTreeMap<String, ImportedFunctionTarget>, String> {
+    let mut targets = BTreeMap::new();
+    for import in imports {
+        if !is_closkell_import_path(&import.path) {
+            continue;
+        }
+        let import_source = resolve_import_source(path, &import.path)?;
+        let canonical = fs::canonicalize(&import_source)
+            .map_err(|err| format!("failed to resolve {}: {}", import_source.display(), err))?;
+        let Some(module) = modules.get(&canonical) else {
+            continue;
+        };
+        for name in &import.names {
+            if name.default || module.macros.contains_key(&name.imported) {
+                continue;
+            }
+            let Some(schema) = module
+                .bindings
+                .iter()
+                .find(|binding| binding.name == name.imported)
+                .map(|binding| binding.schema())
+                .or_else(|| {
+                    find_defn_form(&module.source, &name.imported)
+                        .and_then(|form| module.expr_types.get(&form.span.start).cloned())
+                })
+            else {
+                continue;
+            };
+            if !schema.trim_start().starts_with("(Fn ") {
+                continue;
+            }
+            targets.insert(
+                name.name.clone(),
+                ImportedFunctionTarget {
+                    imported_name: name.imported.clone(),
+                    module_path: canonical.clone(),
+                    schema,
+                },
+            );
+        }
+    }
+    Ok(targets)
+}
+
+fn collect_direct_call_signatures(
+    expr: &Expr,
+    target_names: &HashSet<String>,
+    expr_types: &BTreeMap<usize, String>,
+    bound: &mut HashSet<String>,
+    signatures: &mut BTreeMap<String, CallSignature>,
+) {
+    match &expr.kind {
+        ExprKind::List(items) => {
+            let Some((head, args)) = items.split_first() else {
+                return;
+            };
+            if let ExprKind::Symbol(name) = &head.kind {
+                match name.as_str() {
+                    "fn" => {
+                        let mut nested_bound = bound.clone();
+                        if let Some(params) = args.first() {
+                            collect_specialization_pattern_bindings(params, &mut nested_bound);
+                        }
+                        for body in args.iter().skip(1) {
+                            collect_direct_call_signatures(
+                                body,
+                                target_names,
+                                expr_types,
+                                &mut nested_bound,
+                                signatures,
+                            );
+                        }
+                        return;
+                    }
+                    "let" => {
+                        let mut nested_bound = bound.clone();
+                        if let Some(bindings) = args.first() {
+                            if let ExprKind::Vector(items) = &bindings.kind {
+                                for pair in items.chunks(2) {
+                                    if let Some(value) = pair.get(1) {
+                                        collect_direct_call_signatures(
+                                            value,
+                                            target_names,
+                                            expr_types,
+                                            &mut nested_bound,
+                                            signatures,
+                                        );
+                                    }
+                                    if let Some(pattern) = pair.first() {
+                                        collect_specialization_pattern_bindings(
+                                            pattern,
+                                            &mut nested_bound,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        for body in args.iter().skip(1) {
+                            collect_direct_call_signatures(
+                                body,
+                                target_names,
+                                expr_types,
+                                &mut nested_bound,
+                                signatures,
+                            );
+                        }
+                        return;
+                    }
+                    _ => {}
+                }
+
+                if target_names.contains(name) && !bound.contains(name) {
+                    let arg_types = args
+                        .iter()
+                        .map(|arg| expr_types.get(&arg.span.start).cloned())
+                        .collect::<Option<Vec<_>>>();
+                    let entry = signatures.entry(name.clone()).or_default();
+                    match (&entry.arg_types, arg_types) {
+                        (None, Some(arg_types)) => entry.arg_types = Some(arg_types),
+                        (Some(existing), Some(arg_types)) if existing == &arg_types => {}
+                        _ => entry.conflict = true,
+                    }
+                }
+            }
+            for item in items {
+                collect_direct_call_signatures(item, target_names, expr_types, bound, signatures);
+            }
+        }
+        ExprKind::Vector(items) | ExprKind::Set(items) => {
+            for item in items {
+                collect_direct_call_signatures(item, target_names, expr_types, bound, signatures);
+            }
+        }
+        ExprKind::Map(entries) => {
+            for (key, value) in entries {
+                if !matches!(
+                    key.kind,
+                    ExprKind::Keyword(_) | ExprKind::String(_) | ExprKind::Symbol(_)
+                ) {
+                    collect_direct_call_signatures(
+                        key,
+                        target_names,
+                        expr_types,
+                        bound,
+                        signatures,
+                    );
+                }
+                collect_direct_call_signatures(value, target_names, expr_types, bound, signatures);
+            }
+        }
+        ExprKind::Quote(inner)
+        | ExprKind::QuasiQuote(inner)
+        | ExprKind::Unquote(inner)
+        | ExprKind::UnquoteSplicing(inner) => {
+            collect_direct_call_signatures(inner, target_names, expr_types, bound, signatures);
+        }
+        ExprKind::HtmlTemplate(node) => {
+            collect_html_call_signatures(node, target_names, expr_types, bound, signatures);
+        }
+        ExprKind::Nil
+        | ExprKind::Bool(_)
+        | ExprKind::Number(_)
+        | ExprKind::String(_)
+        | ExprKind::Keyword(_)
+        | ExprKind::Symbol(_) => {}
+    }
+}
+
+fn collect_html_call_signatures(
+    node: &syntax::HtmlNode,
+    target_names: &HashSet<String>,
+    expr_types: &BTreeMap<usize, String>,
+    bound: &mut HashSet<String>,
+    signatures: &mut BTreeMap<String, CallSignature>,
+) {
+    match node {
+        syntax::HtmlNode::Expr { expr, .. } => {
+            collect_direct_call_signatures(expr, target_names, expr_types, bound, signatures);
+        }
+        syntax::HtmlNode::Element(element) => {
+            for attr in &element.attrs {
+                match &attr.value {
+                    syntax::HtmlAttrValue::Dynamic { expr, .. } => {
+                        collect_direct_call_signatures(
+                            expr,
+                            target_names,
+                            expr_types,
+                            bound,
+                            signatures,
+                        );
+                    }
+                    syntax::HtmlAttrValue::Bool(_) | syntax::HtmlAttrValue::Static(_) => {}
+                }
+            }
+            for child in &element.children {
+                collect_html_call_signatures(child, target_names, expr_types, bound, signatures);
+            }
+        }
+        syntax::HtmlNode::Text { .. } => {}
+    }
+}
+
+fn find_defn_form<'a>(source: &'a SourceFile, name: &str) -> Option<&'a Expr> {
+    source.forms.iter().find(|form| {
+        let ExprKind::List(items) = &form.kind else {
+            return false;
+        };
+        items.len() >= 4
+            && matches_symbol(&items[0], "defn")
+            && matches!(&items[1].kind, ExprKind::Symbol(defn_name) if defn_name == name)
+    })
+}
+
+fn imported_binding_type_is_importable(
+    module: &ModuleInfo,
+    binding: &typecheck::ExportedBinding,
+) -> bool {
+    if binding.is_annotated_or_value() {
+        return true;
+    }
+    find_defn_form(&module.source, &binding.name)
+        .is_some_and(|defn| !defn_contains_dynamic_type_flow(defn))
+}
+
+fn defn_contains_dynamic_type_flow(defn: &Expr) -> bool {
+    let ExprKind::List(items) = &defn.kind else {
+        return false;
+    };
+    items.iter().skip(3).any(expr_contains_dynamic_type_flow)
+}
+
+fn expr_contains_dynamic_type_flow(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::List(items) => {
+            if items.first().is_some_and(|head| {
+                matches!(
+                    &head.kind,
+                    ExprKind::Symbol(name)
+                        if matches!(
+                            name.as_str(),
+                            "get"
+                                | "object-get"
+                                | "get-in"
+                                | "number?"
+                                | "string?"
+                                | "bool?"
+                                | "keyword?"
+                                | "object?"
+                                | "list?"
+                                | "vector?"
+                                | "set?"
+                                | "map?"
+                                | "json-parse"
+                                | "json-parse-result"
+                        )
+                )
+            }) {
+                return true;
+            }
+            items.iter().any(expr_contains_dynamic_type_flow)
+        }
+        ExprKind::Vector(items) | ExprKind::Set(items) => {
+            items.iter().any(expr_contains_dynamic_type_flow)
+        }
+        ExprKind::Map(entries) => entries.iter().any(|(key, value)| {
+            expr_contains_dynamic_type_flow(key) || expr_contains_dynamic_type_flow(value)
+        }),
+        ExprKind::Quote(inner)
+        | ExprKind::QuasiQuote(inner)
+        | ExprKind::Unquote(inner)
+        | ExprKind::UnquoteSplicing(inner) => expr_contains_dynamic_type_flow(inner),
+        ExprKind::HtmlTemplate(_) => false,
+        ExprKind::Nil
+        | ExprKind::Bool(_)
+        | ExprKind::Number(_)
+        | ExprKind::String(_)
+        | ExprKind::Keyword(_)
+        | ExprKind::Symbol(_) => false,
+    }
+}
+
+fn defn_contains_value_equal(defn: &Expr) -> bool {
+    let ExprKind::List(items) = &defn.kind else {
+        return false;
+    };
+    items.iter().skip(3).any(expr_contains_value_equal)
+}
+
+fn expr_contains_value_equal(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::List(items) => {
+            items.first().is_some_and(|head| matches_symbol(head, "="))
+                || items.iter().any(expr_contains_value_equal)
+        }
+        ExprKind::Vector(items) | ExprKind::Set(items) => {
+            items.iter().any(expr_contains_value_equal)
+        }
+        ExprKind::Map(entries) => entries
+            .iter()
+            .any(|(key, value)| expr_contains_value_equal(key) || expr_contains_value_equal(value)),
+        ExprKind::Quote(inner)
+        | ExprKind::QuasiQuote(inner)
+        | ExprKind::Unquote(inner)
+        | ExprKind::UnquoteSplicing(inner) => expr_contains_value_equal(inner),
+        ExprKind::HtmlTemplate(_) => false,
+        ExprKind::Nil
+        | ExprKind::Bool(_)
+        | ExprKind::Number(_)
+        | ExprKind::String(_)
+        | ExprKind::Keyword(_)
+        | ExprKind::Symbol(_) => false,
+    }
+}
+
+fn defn_is_self_contained(defn: &Expr) -> bool {
+    let ExprKind::List(items) = &defn.kind else {
+        return false;
+    };
+    if items.len() < 4 {
+        return false;
+    }
+    let mut bound = HashSet::new();
+    collect_specialization_pattern_bindings(&items[2], &mut bound);
+    let mut free = HashSet::new();
+    for body in &items[3..] {
+        collect_free_symbols(body, &mut bound, &mut free);
+    }
+    free.is_empty()
+}
+
+fn collect_free_symbols(expr: &Expr, bound: &mut HashSet<String>, free: &mut HashSet<String>) {
+    match &expr.kind {
+        ExprKind::Symbol(name) => {
+            let root = symbol_root(name);
+            if !bound.contains(root) && !known_compiler_symbol(name) {
+                free.insert(root.to_string());
+            }
+        }
+        ExprKind::List(items) => {
+            let Some((head, args)) = items.split_first() else {
+                return;
+            };
+            if let ExprKind::Symbol(name) = &head.kind {
+                match name.as_str() {
+                    "fn" => {
+                        let mut nested_bound = bound.clone();
+                        if let Some(params) = args.first() {
+                            collect_specialization_pattern_bindings(params, &mut nested_bound);
+                        }
+                        for body in args.iter().skip(1) {
+                            collect_free_symbols(body, &mut nested_bound, free);
+                        }
+                        return;
+                    }
+                    "let" => {
+                        let mut nested_bound = bound.clone();
+                        if let Some(bindings) = args.first() {
+                            if let ExprKind::Vector(items) = &bindings.kind {
+                                for pair in items.chunks(2) {
+                                    if let Some(value) = pair.get(1) {
+                                        collect_free_symbols(value, &mut nested_bound, free);
+                                    }
+                                    if let Some(pattern) = pair.first() {
+                                        collect_specialization_pattern_bindings(
+                                            pattern,
+                                            &mut nested_bound,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        for body in args.iter().skip(1) {
+                            collect_free_symbols(body, &mut nested_bound, free);
+                        }
+                        return;
+                    }
+                    _ if known_compiler_symbol(name) => {
+                        for arg in args {
+                            collect_free_symbols(arg, bound, free);
+                        }
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            collect_free_symbols(head, bound, free);
+            for arg in args {
+                collect_free_symbols(arg, bound, free);
+            }
+        }
+        ExprKind::Vector(items) | ExprKind::Set(items) => {
+            for item in items {
+                collect_free_symbols(item, bound, free);
+            }
+        }
+        ExprKind::Map(entries) => {
+            for (key, value) in entries {
+                if !matches!(
+                    key.kind,
+                    ExprKind::Keyword(_) | ExprKind::String(_) | ExprKind::Symbol(_)
+                ) {
+                    collect_free_symbols(key, bound, free);
+                }
+                collect_free_symbols(value, bound, free);
+            }
+        }
+        ExprKind::Quote(inner)
+        | ExprKind::QuasiQuote(inner)
+        | ExprKind::Unquote(inner)
+        | ExprKind::UnquoteSplicing(inner) => collect_free_symbols(inner, bound, free),
+        ExprKind::HtmlTemplate(_) => {}
+        ExprKind::Nil
+        | ExprKind::Bool(_)
+        | ExprKind::Number(_)
+        | ExprKind::String(_)
+        | ExprKind::Keyword(_) => {}
+    }
+}
+
+fn collect_specialization_pattern_bindings(pattern: &Expr, bindings: &mut HashSet<String>) {
+    match &pattern.kind {
+        ExprKind::Symbol(name) if name != "_" => {
+            bindings.insert(symbol_root(name).to_string());
+        }
+        ExprKind::List(items) if items.first().is_some_and(|head| matches_symbol(head, "as")) => {
+            if let Some(pattern) = items.get(1) {
+                collect_specialization_pattern_bindings(pattern, bindings);
+            }
+            if let Some(alias) = items.get(2) {
+                collect_specialization_pattern_bindings(alias, bindings);
+            }
+        }
+        ExprKind::List(items) | ExprKind::Vector(items) | ExprKind::Set(items) => {
+            for item in items {
+                collect_specialization_pattern_bindings(item, bindings);
+            }
+        }
+        ExprKind::Map(entries) => {
+            for (key, value) in entries {
+                collect_specialization_pattern_bindings(key, bindings);
+                collect_specialization_pattern_bindings(value, bindings);
+            }
+        }
+        ExprKind::Quote(inner)
+        | ExprKind::QuasiQuote(inner)
+        | ExprKind::Unquote(inner)
+        | ExprKind::UnquoteSplicing(inner) => {
+            collect_specialization_pattern_bindings(inner, bindings)
+        }
+        ExprKind::Nil
+        | ExprKind::Bool(_)
+        | ExprKind::Number(_)
+        | ExprKind::String(_)
+        | ExprKind::Keyword(_)
+        | ExprKind::Symbol(_)
+        | ExprKind::HtmlTemplate(_) => {}
+    }
+}
+
+fn known_compiler_symbol(name: &str) -> bool {
+    matches!(
+        name,
+        "fn" | "let"
+            | "if"
+            | "do"
+            | "match"
+            | "unsafe-cast"
+            | "not"
+            | "and"
+            | "or"
+            | "="
+            | "identical?"
+            | "+"
+            | "-"
+            | "*"
+            | "/"
+            | "<"
+            | ">"
+            | "<="
+            | ">="
+            | "%"
+            | "mod"
+            | "max"
+            | "min"
+            | "round"
+            | "floor"
+            | "ceil"
+            | "abs"
+            | "some?"
+            | "nil?"
+            | "number?"
+            | "string?"
+            | "bool?"
+            | "vector?"
+            | "list?"
+            | "set?"
+            | "map?"
+            | "object?"
+            | "count"
+            | "empty?"
+            | "get"
+            | "object-get"
+            | "first"
+            | "second"
+            | "nth"
+            | "last"
+            | "find"
+            | "map"
+            | "map-indexed"
+            | "filter"
+            | "any?"
+            | "every?"
+            | "reduce"
+            | "reduce-indexed"
+            | "conj"
+            | "assoc"
+            | "dissoc"
+            | "merge"
+            | "str"
+            | "list"
+            | "vector"
+            | "set"
+            | "slice"
+            | "range"
+            | "to-number"
+            | "to-fixed"
+            | "lower-case"
+            | "trim"
+            | "split"
+            | "join"
+            | "starts-with?"
+            | "ends-with?"
+            | "includes?"
+            | "contains?"
+            | "json-stringify"
+            | "json-parse"
+    )
+}
+
+fn symbol_root(name: &str) -> &str {
+    name.split_once('.').map(|(root, _)| root).unwrap_or(name)
+}
+
+fn type_fn_param_types_for_schema(schema: &str) -> Option<Vec<String>> {
+    let schema = schema.trim();
+    if !schema.starts_with("(Fn ") {
+        return None;
+    }
+    let open = schema.find('[')?;
+    let close = find_matching_delimiter(schema, open, '[', ']')?;
+    Some(split_top_level_type_terms(&schema[open + 1..close]))
+}
+
+fn collect_type_substitutions(
+    pattern: &str,
+    concrete: &str,
+    substitutions: &mut BTreeMap<String, String>,
+) -> bool {
+    let pattern = pattern.trim();
+    let concrete = concrete.trim();
+    if pattern == concrete {
+        return true;
+    }
+    if is_type_variable_name(pattern) {
+        if type_contains_variables(concrete) {
+            return true;
+        }
+        match substitutions.get(pattern) {
+            Some(existing) => existing == concrete,
+            None => {
+                substitutions.insert(pattern.to_string(), concrete.to_string());
+                true
+            }
+        }
+    } else if let (Some(pattern_fields), Some(concrete_fields)) =
+        (type_record_fields(pattern), type_record_fields(concrete))
+    {
+        pattern_fields.iter().all(|(field, field_type)| {
+            concrete_fields.get(field).is_some_and(|concrete_type| {
+                collect_type_substitutions(field_type, concrete_type, substitutions)
+            })
+        })
+    } else if let (Some((pattern_head, pattern_args)), Some((concrete_head, concrete_args))) =
+        (type_app_parts(pattern), type_app_parts(concrete))
+    {
+        pattern_head == concrete_head
+            && pattern_args.len() == concrete_args.len()
+            && pattern_args
+                .iter()
+                .zip(concrete_args.iter())
+                .all(|(pattern_arg, concrete_arg)| {
+                    collect_type_substitutions(pattern_arg, concrete_arg, substitutions)
+                })
+    } else {
+        !type_contains_variables(pattern)
+    }
+}
+
+fn substitute_type_variables(schema: &str, substitutions: &BTreeMap<String, String>) -> String {
+    let mut output = String::new();
+    let mut token = String::new();
+    for ch in schema.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            token.push(ch);
+        } else {
+            push_substituted_type_token(&mut output, &mut token, substitutions);
+            output.push(ch);
+        }
+    }
+    push_substituted_type_token(&mut output, &mut token, substitutions);
+    output
+}
+
+fn push_substituted_type_token(
+    output: &mut String,
+    token: &mut String,
+    substitutions: &BTreeMap<String, String>,
+) {
+    if token.is_empty() {
+        return;
+    }
+    if let Some(replacement) = substitutions.get(token) {
+        output.push_str(replacement);
+    } else {
+        output.push_str(token);
+    }
+    token.clear();
+}
+
+fn type_contains_variables(schema: &str) -> bool {
+    let mut token = String::new();
+    for ch in schema.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            token.push(ch);
+        } else {
+            if is_type_variable_name(&token) {
+                return true;
+            }
+            token.clear();
+        }
+    }
+    is_type_variable_name(&token)
+}
+
+fn is_type_variable_name(value: &str) -> bool {
+    value
+        .strip_prefix('t')
+        .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|ch| ch.is_ascii_digit()))
+}
+
+fn type_app_parts(schema: &str) -> Option<(String, Vec<String>)> {
+    let schema = schema.trim();
+    let inner = schema.strip_prefix('(')?.strip_suffix(')')?;
+    let terms = split_top_level_type_terms(inner);
+    let (head, args) = terms.split_first()?;
+    Some((head.clone(), args.to_vec()))
+}
+
+fn type_record_fields(schema: &str) -> Option<BTreeMap<String, String>> {
+    let schema = schema.trim();
+    let inner = schema.strip_prefix('{')?.strip_suffix('}')?;
+    let terms = split_top_level_type_terms(inner);
+    if terms.len() % 2 != 0 {
+        return None;
+    }
+    let mut fields = BTreeMap::new();
+    for pair in terms.chunks(2) {
+        fields.insert(pair[0].clone(), pair[1].clone());
+    }
+    Some(fields)
+}
+
+fn split_top_level_type_terms(value: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut start = None;
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    for (index, ch) in value.char_indices() {
+        match ch {
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '{' => brace_depth += 1,
+            '}' => brace_depth = brace_depth.saturating_sub(1),
+            ch if ch.is_whitespace()
+                && paren_depth == 0
+                && bracket_depth == 0
+                && brace_depth == 0 =>
+            {
+                if let Some(term_start) = start.take() {
+                    terms.push(value[term_start..index].to_string());
+                }
+                continue;
+            }
+            _ => {}
+        }
+        if start.is_none() && !ch.is_whitespace() {
+            start = Some(index);
+        }
+    }
+    if let Some(term_start) = start {
+        terms.push(value[term_start..].trim().to_string());
+    }
+    terms.into_iter().filter(|term| !term.is_empty()).collect()
+}
+
+fn find_matching_delimiter(
+    value: &str,
+    open_index: usize,
+    open: char,
+    close: char,
+) -> Option<usize> {
+    let mut depth = 0usize;
+    for (index, ch) in value
+        .char_indices()
+        .skip_while(|(index, _)| *index < open_index)
+    {
+        if ch == open {
+            depth += 1;
+        } else if ch == close {
+            depth = depth.checked_sub(1)?;
+            if depth == 0 {
+                return Some(index);
+            }
+        }
+    }
+    None
+}
+
+fn sanitize_js_identifier(name: &str) -> String {
+    let mut output = String::new();
+    for (index, ch) in name.chars().enumerate() {
+        let valid = ch.is_ascii_alphanumeric() || ch == '_';
+        if index == 0 && ch.is_ascii_digit() {
+            output.push('_');
+        }
+        output.push(if valid { ch } else { '_' });
+    }
+    if output.is_empty() {
+        "_".to_string()
+    } else {
+        output
+    }
+}
+
+fn message_imports_from_imports(
+    path: &Path,
+    imports: &[ImportSpec],
+    modules: &HashMap<PathBuf, ModuleInfo>,
+) -> Result<HashMap<String, BTreeSet<String>>, String> {
+    let mut imported_messages = HashMap::new();
+    for import in imports {
+        if !is_closkell_import_path(&import.path) {
+            continue;
+        }
+        let import_source = resolve_import_source(path, &import.path)?;
+        let canonical = fs::canonicalize(&import_source)
+            .map_err(|err| format!("failed to resolve {}: {}", import_source.display(), err))?;
+        let Some(imported) = modules.get(&canonical) else {
+            continue;
+        };
+        for name in &import.names {
+            if let Some(kinds) = imported.message_kinds_by_binding.get(&name.imported) {
+                imported_messages.insert(name.name.clone(), kinds.clone());
+            }
+        }
+    }
+    Ok(imported_messages)
+}
+
 struct AppRuntimeRegistration {
     import_name: &'static str,
     kinds: &'static [&'static str],
@@ -1575,7 +2956,7 @@ struct AppRuntimeRegistration {
 
 const APP_RUNTIME_REGISTRATIONS: &[AppRuntimeRegistration] = &[
     AppRuntimeRegistration {
-        import_name: "registerAnimationCommandHandlers",
+        import_name: "registerCompiledAnimationCommandHandlers",
         kinds: &["animation/frame", "animation/cancel"],
     },
     AppRuntimeRegistration {
@@ -1584,8 +2965,11 @@ const APP_RUNTIME_REGISTRATIONS: &[AppRuntimeRegistration] = &[
     },
     AppRuntimeRegistration {
         import_name: "registerBluetoothCommandHandlers",
+        kinds: &["bluetooth/request-device"],
+    },
+    AppRuntimeRegistration {
+        import_name: "registerCompiledBluetoothHeartRateCommandHandlers",
         kinds: &[
-            "bluetooth/request-device",
             "bluetooth/connect-heart-rate",
             "bluetooth/disconnect",
             "sub/bluetooth/connect-heart-rate",
@@ -1611,7 +2995,7 @@ const APP_RUNTIME_REGISTRATIONS: &[AppRuntimeRegistration] = &[
         kinds: &["canvas/measure-text"],
     },
     AppRuntimeRegistration {
-        import_name: "registerDomRefCommandHandlers",
+        import_name: "registerCompiledDomRefCommandHandlers",
         kinds: &["dom-ref/focus", "dom-ref/click", "dom-ref/measure"],
     },
     AppRuntimeRegistration {
@@ -1623,11 +3007,15 @@ const APP_RUNTIME_REGISTRATIONS: &[AppRuntimeRegistration] = &[
         ],
     },
     AppRuntimeRegistration {
+        import_name: "registerCompiledDirectDomResizeCommandHandlers",
+        kinds: &["dom-ref/resize-watch/direct"],
+    },
+    AppRuntimeRegistration {
         import_name: "registerDomScrollCommandHandlers",
         kinds: &["dom/scroll-into-view"],
     },
     AppRuntimeRegistration {
-        import_name: "registerFileDownloadCommandHandlers",
+        import_name: "registerCompiledFileDownloadCommandHandlers",
         kinds: &["file/download"],
     },
     AppRuntimeRegistration {
@@ -1635,7 +3023,7 @@ const APP_RUNTIME_REGISTRATIONS: &[AppRuntimeRegistration] = &[
         kinds: &["file/import"],
     },
     AppRuntimeRegistration {
-        import_name: "registerFileReadSelectedCommandHandlers",
+        import_name: "registerCompiledFileReadSelectedCommandHandlers",
         kinds: &["file/read-selected"],
     },
     AppRuntimeRegistration {
@@ -1644,39 +3032,64 @@ const APP_RUNTIME_REGISTRATIONS: &[AppRuntimeRegistration] = &[
     },
     AppRuntimeRegistration {
         import_name: "registerCompiledMediaQueryCommandHandlers",
-        kinds: &["media-query/watch", "media-query/unwatch", "sub/media-query"],
-    },
-    AppRuntimeRegistration {
-        import_name: "registerRandomCommandHandlers",
-        kinds: &["random/number"],
-    },
-    AppRuntimeRegistration {
-        import_name: "registerSimulationCommandHandlers",
         kinds: &[
-            "simulation/heart-rate",
-            "simulation/stop",
-            "sub/simulation/heart-rate",
+            "media-query/watch",
+            "media-query/unwatch",
+            "sub/media-query",
         ],
     },
     AppRuntimeRegistration {
-        import_name: "registerStorageCommandHandlers",
-        kinds: &["storage/get", "storage/set", "storage/remove"],
+        import_name: "registerCompiledDirectMediaQueryCommandHandlers",
+        kinds: &["media-query/watch/direct", "media-query/unwatch/direct"],
+    },
+    AppRuntimeRegistration {
+        import_name: "registerCompiledRandomCommandHandlers",
+        kinds: &["random/number"],
+    },
+    AppRuntimeRegistration {
+        import_name: "registerCompiledSimulationCommandHandlers",
+        kinds: &["simulation/heart-rate", "sub/simulation/heart-rate"],
+    },
+    AppRuntimeRegistration {
+        import_name: "registerCompiledSimulationStopCommandHandlers",
+        kinds: &["simulation/stop"],
+    },
+    AppRuntimeRegistration {
+        import_name: "registerCompiledStorageReadWriteCommandHandlers",
+        kinds: &["storage/get", "storage/set"],
+    },
+    AppRuntimeRegistration {
+        import_name: "registerCompiledStorageRemoveCommandHandlers",
+        kinds: &["storage/remove"],
     },
     AppRuntimeRegistration {
         import_name: "registerTaskCommandHandlers",
         kinds: &["task/perform"],
     },
     AppRuntimeRegistration {
-        import_name: "registerTimerCommandHandlers",
-        kinds: &["timer/after", "timer/every", "timer/cancel", "sub/timer/every"],
+        import_name: "registerCompiledTimerCommandHandlers",
+        kinds: &[
+            "timer/after",
+            "timer/every",
+            "timer/cancel",
+            "sub/timer/every",
+        ],
     },
     AppRuntimeRegistration {
-        import_name: "registerTimeCommandHandlers",
+        import_name: "registerCompiledTimeCommandHandlers",
         kinds: &["time/now"],
     },
     AppRuntimeRegistration {
         import_name: "registerCompiledWindowEventCommandHandlers",
-        kinds: &["window/event-watch", "window/event-unwatch", "sub/window/event"],
+        kinds: &[
+            "window/event-watch",
+            "window/event-unwatch",
+            "sub/window/event",
+        ],
+    },
+    AppRuntimeRegistration {
+        import_name: "registerCompiledDirectWindowEventCommandHandlers",
+        kinds: &["window/event-watch/direct", "window/event-unwatch/direct"],
     },
 ];
 
@@ -1687,7 +3100,13 @@ fn collect_app_runtime_registrations(
     let mut registrations = BTreeSet::new();
     collect_app_runtime_registrations_from_effects(entry_effects, &mut registrations);
     for artifact in artifacts {
-        collect_app_runtime_registrations_from_effects(&artifact.runtime_effects, &mut registrations);
+        collect_app_runtime_registrations_from_effects(
+            &artifact.runtime_effects,
+            &mut registrations,
+        );
+    }
+    if registrations.contains("registerCompiledSimulationCommandHandlers") {
+        registrations.remove("registerCompiledSimulationStopCommandHandlers");
     }
     registrations
 }
@@ -1712,11 +3131,7 @@ fn app_runtime_registration_alias(import_name: &str) -> String {
     let Some(first) = chars.next() else {
         return "__closkellRegister".to_string();
     };
-    format!(
-        "__closkell{}{}",
-        first.to_ascii_uppercase(),
-        chars.as_str()
-    )
+    format!("__closkell{}{}", first.to_ascii_uppercase(), chars.as_str())
 }
 
 fn wrap_app_module(
@@ -1724,32 +3139,44 @@ fn wrap_app_module(
     options: &AppOptions,
     runtime_registrations: &BTreeSet<&'static str>,
     init_takes_boot: bool,
+    has_subscriptions: bool,
 ) {
-    let prelude = app_bootstrap_prelude(options, runtime_registrations, init_takes_boot);
-    let postlude = app_bootstrap_postlude(options, runtime_registrations, init_takes_boot);
+    let prelude = app_bootstrap_prelude(options, runtime_registrations, has_subscriptions);
+    let postlude = app_bootstrap_postlude(
+        options,
+        runtime_registrations,
+        init_takes_boot,
+        has_subscriptions,
+    );
     let inserted_lines = prelude.lines().count();
     for mapping in &mut emitted.source_mappings {
         mapping.generated_line += inserted_lines;
     }
+    strip_app_entry_exports(&mut emitted.code);
     if !emitted.code.ends_with('\n') {
         emitted.code.push('\n');
     }
     emitted.code = format!("{}{}{}", prelude, emitted.code, postlude);
 }
 
+fn strip_app_entry_exports(code: &mut String) {
+    *code = code
+        .replace("export function ", "function ")
+        .replace("export const ", "const ");
+}
+
 fn app_bootstrap_prelude(
     options: &AppOptions,
     runtime_registrations: &BTreeSet<&'static str>,
-    init_takes_boot: bool,
+    has_subscriptions: bool,
 ) -> String {
     let mut code = String::new();
-    let mut imports = vec![
-        "createSelectedCommandHandlers as __closkellCreateSelectedCommandHandlers".to_string(),
-        "startCompiledApp as __closkellStartApp".to_string(),
-    ];
-    if init_takes_boot {
-        imports.push("createBrowserBootInput as __closkellCreateBrowserBootInput".to_string());
-    }
+    let app_runner = if has_subscriptions {
+        "startCompiledApp"
+    } else {
+        "startCompiledAppWithoutSubscriptions"
+    };
+    let mut imports = vec![format!("{} as __closkellStartApp", app_runner)];
     for import_name in runtime_registrations {
         imports.push(format!(
             "{} as {}",
@@ -1757,9 +3184,11 @@ fn app_bootstrap_prelude(
             app_runtime_registration_alias(import_name)
         ));
     }
-    code.push_str("import { ");
-    code.push_str(&imports.join(", "));
-    code.push_str(" } from \"@closkell/runtime\";\n");
+    if !imports.is_empty() {
+        code.push_str("import { ");
+        code.push_str(&imports.join(", "));
+        code.push_str(" } from \"@closkell/runtime\";\n");
+    }
     if let Some(css) = &options.css {
         code.push_str("import ");
         code.push_str(&json_string(css));
@@ -1772,6 +3201,7 @@ fn app_bootstrap_postlude(
     options: &AppOptions,
     runtime_registrations: &BTreeSet<&'static str>,
     init_takes_boot: bool,
+    has_subscriptions: bool,
 ) -> String {
     let mut code = String::new();
     code.push_str("const __closkellRoot = document.getElementById(");
@@ -1785,28 +3215,40 @@ fn app_bootstrap_postlude(
     )));
     code.push_str(");\n");
     code.push_str("}\n");
-    code.push_str("const __closkellHandlers = __closkellCreateSelectedCommandHandlers(undefined, [");
+    code.push_str(
+        "const __closkellHandlerContext = { env: {}, host: globalThis, disposers: [] };\n",
+    );
+    code.push_str("const __closkellHandlers = {};\n");
     let registrations = runtime_registrations
         .iter()
         .map(|import_name| app_runtime_registration_alias(import_name))
-        .collect::<Vec<_>>()
-        .join(", ");
-    code.push_str(&registrations);
-    code.push_str("]);\n");
+        .collect::<Vec<_>>();
+    for registration in registrations {
+        code.push_str(&registration);
+        code.push_str("(__closkellHandlers, __closkellHandlerContext);\n");
+    }
+    code.push_str("Object.defineProperty(__closkellHandlers, \"dispose\", { value() { for (const dispose of __closkellHandlerContext.disposers.splice(0)) dispose(); } });\n");
     code.push_str("export const __closkellApp = __closkellStartApp({\n");
     code.push_str("  root: __closkellRoot,\n");
     code.push_str("  init,\n");
     code.push_str("  update,\n");
     code.push_str("  view,\n");
     if init_takes_boot {
-        code.push_str("  boot: __closkellCreateBrowserBootInput(),\n");
+        code.push_str("  boot: { currentUrl: globalThis.location?.href ?? \"\" },\n");
     }
-    code.push_str(
-        "  subscriptions: typeof subscriptions === \"function\" ? subscriptions : undefined,\n",
-    );
+    if has_subscriptions {
+        code.push_str("  subscriptions,\n");
+    }
     code.push_str("  handlers: __closkellHandlers\n");
     code.push_str("});\n\n");
     code
+}
+
+fn emitted_has_binding(code: &str, name: &str) -> bool {
+    code.contains(&format!("export function {}(", name))
+        || code.contains(&format!("export const {} =", name))
+        || code.contains(&format!("export let {} =", name))
+        || code.contains(&format!("export var {} =", name))
 }
 
 fn emitted_init_takes_boot(code: &str) -> bool {
@@ -1817,7 +3259,9 @@ fn emitted_init_takes_boot(code: &str) -> bool {
     let Some(params_end) = code[params_start..].find(')') else {
         return false;
     };
-    !code[params_start..params_start + params_end].trim().is_empty()
+    !code[params_start..params_start + params_end]
+        .trim()
+        .is_empty()
 }
 
 fn runtime_vendor_root(output: &Path) -> PathBuf {
@@ -3760,6 +5204,899 @@ fn collect_command_shapes_by_binding(
     by_binding
 }
 
+#[derive(Clone, Debug, Default)]
+struct MessageStaticContext {
+    env_dev: Option<bool>,
+    env_mode: Option<String>,
+    static_reads: BTreeMap<String, String>,
+}
+
+fn collect_message_kinds_by_binding(
+    source: &SourceFile,
+    imported_message_kinds: &HashMap<String, BTreeSet<String>>,
+) -> HashMap<String, BTreeSet<String>> {
+    collect_message_kinds_by_binding_with_static(
+        source,
+        imported_message_kinds,
+        &MessageStaticContext::default(),
+    )
+}
+
+fn collect_message_kinds_by_binding_with_static(
+    source: &SourceFile,
+    imported_message_kinds: &HashMap<String, BTreeSet<String>>,
+    static_context: &MessageStaticContext,
+) -> HashMap<String, BTreeSet<String>> {
+    let bodies = collect_definition_bodies(source);
+    let mut summaries = HashMap::<String, BTreeSet<String>>::new();
+
+    loop {
+        let mut changed = false;
+        for (name, body) in &bodies {
+            let mut kinds = BTreeSet::new();
+            collect_message_kinds_expr_with_static(
+                body,
+                imported_message_kinds,
+                &summaries,
+                &mut kinds,
+                static_context,
+            );
+            if summaries.get(name) != Some(&kinds) {
+                summaries.insert(name.clone(), kinds);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    summaries
+}
+
+fn collect_reachable_update_message_kinds(
+    source: &SourceFile,
+    imported_message_kinds: &HashMap<String, BTreeSet<String>>,
+    emit_options: &js_backend::EmitOptions,
+) -> Option<BTreeSet<String>> {
+    let static_context = MessageStaticContext {
+        env_dev: emit_options.env_dev,
+        env_mode: emit_options.env_mode.clone(),
+        static_reads: emit_options.static_reads.clone(),
+    };
+    let summaries = collect_message_kinds_by_binding_with_static(
+        source,
+        imported_message_kinds,
+        &static_context,
+    );
+    let update_body = collect_definition_bodies(source).get("update").copied()?;
+    let arms = update_message_arms(update_body)?;
+
+    let mut reachable = BTreeSet::new();
+    for entry in ["init", "view", "subscriptions"] {
+        if let Some(kinds) = summaries.get(entry) {
+            reachable.extend(kinds.iter().cloned());
+        }
+    }
+
+    loop {
+        let before = reachable.len();
+        for (kind, body) in &arms {
+            if !reachable.contains(kind) {
+                continue;
+            }
+            collect_message_kinds_expr_with_static(
+                body,
+                imported_message_kinds,
+                &summaries,
+                &mut reachable,
+                &static_context,
+            );
+        }
+        if reachable.len() == before {
+            break;
+        }
+    }
+
+    Some(reachable)
+}
+
+fn update_message_arms(expr: &Expr) -> Option<Vec<(String, &Expr)>> {
+    let ExprKind::List(items) = &expr.kind else {
+        return None;
+    };
+    let [head, value, arms @ ..] = items.as_slice() else {
+        return None;
+    };
+    if !matches_symbol(head, "match") || !matches_symbol(value, "msg") || arms.len() < 2 {
+        return None;
+    }
+
+    let mut output = Vec::new();
+    for pair in arms.chunks(2) {
+        let [pattern, body] = pair else {
+            continue;
+        };
+        if let Some(kind) = message_kind_pattern(pattern) {
+            output.push((kind, body));
+        }
+    }
+    Some(output)
+}
+
+fn message_kind_pattern(pattern: &Expr) -> Option<String> {
+    match &pattern.kind {
+        ExprKind::Map(entries) => {
+            kind_literal_from_entries(entries).filter(|kind| is_message_kind(kind))
+        }
+        ExprKind::List(items) if items.len() == 3 && matches_symbol(&items[0], "as") => {
+            message_kind_pattern(&items[1])
+        }
+        _ => None,
+    }
+}
+
+fn collect_app_static_reads(
+    source: &SourceFile,
+    emit_options: &js_backend::EmitOptions,
+) -> BTreeMap<String, String> {
+    let Some(fields) = init_static_state_fields(source, emit_options) else {
+        return BTreeMap::new();
+    };
+    let reassigned = record_keys_outside_defn(source, "init");
+    fields
+        .into_iter()
+        .filter(|(field, _)| !reassigned.contains(field))
+        .map(|(field, value)| (format!("state.{}", field), value))
+        .collect()
+}
+
+fn init_static_state_fields(
+    source: &SourceFile,
+    emit_options: &js_backend::EmitOptions,
+) -> Option<BTreeMap<String, String>> {
+    let ExprKind::List(items) = &source
+        .forms
+        .iter()
+        .find_map(|form| {
+            let ExprKind::List(items) = &form.kind else {
+                return None;
+            };
+            if items.len() >= 4
+                && matches_symbol(&items[0], "defn")
+                && matches_symbol(&items[1], "init")
+            {
+                Some(form)
+            } else {
+                None
+            }
+        })?
+        .kind
+    else {
+        return None;
+    };
+
+    let mut values = BTreeMap::new();
+    let mut state_bindings = BTreeMap::new();
+    init_static_state_fields_from_expr(
+        items.last()?,
+        emit_options,
+        &mut values,
+        &mut state_bindings,
+    )
+}
+
+fn init_static_state_fields_from_expr(
+    expr: &Expr,
+    emit_options: &js_backend::EmitOptions,
+    values: &mut BTreeMap<String, String>,
+    state_bindings: &mut BTreeMap<String, BTreeMap<String, String>>,
+) -> Option<BTreeMap<String, String>> {
+    match &expr.kind {
+        ExprKind::List(items) if items.len() == 3 && matches_symbol(&items[0], "let") => {
+            let ExprKind::Vector(bindings) = &items[1].kind else {
+                return None;
+            };
+            let mut values = values.clone();
+            let mut state_bindings = state_bindings.clone();
+            for pair in bindings.chunks(2) {
+                let [binding, value] = pair else {
+                    continue;
+                };
+                let Some(name) = symbol_name(binding) else {
+                    continue;
+                };
+                if let Some(fields) =
+                    static_state_fields_from_expr(value, emit_options, &values, &state_bindings)
+                {
+                    state_bindings.insert(name.to_string(), fields);
+                }
+                if let Some(value) = static_js_value(value, emit_options, &values) {
+                    values.insert(name.to_string(), value);
+                }
+            }
+            init_static_state_fields_from_expr(
+                &items[2],
+                emit_options,
+                &mut values,
+                &mut state_bindings,
+            )
+        }
+        ExprKind::Vector(items) => {
+            let first = items.first()?;
+            static_state_fields_from_expr(first, emit_options, values, state_bindings)
+        }
+        _ => static_state_fields_from_expr(expr, emit_options, values, state_bindings),
+    }
+}
+
+fn static_state_fields_from_expr(
+    expr: &Expr,
+    emit_options: &js_backend::EmitOptions,
+    values: &BTreeMap<String, String>,
+    state_bindings: &BTreeMap<String, BTreeMap<String, String>>,
+) -> Option<BTreeMap<String, String>> {
+    match &expr.kind {
+        ExprKind::Symbol(name) => state_bindings.get(name).cloned(),
+        ExprKind::Map(entries) => {
+            let mut fields = BTreeMap::new();
+            for (key, value) in entries {
+                let Some(field) = record_key_name(key) else {
+                    continue;
+                };
+                let Some(value) = static_js_value(value, emit_options, values) else {
+                    continue;
+                };
+                fields.insert(field, value);
+            }
+            Some(fields)
+        }
+        ExprKind::List(items) => {
+            let (head, args) = items.split_first()?;
+            if !matches_symbol(head, "merge") {
+                return None;
+            }
+            let mut fields = BTreeMap::new();
+            for arg in args {
+                if let Some(arg_fields) =
+                    static_state_fields_from_expr(arg, emit_options, values, state_bindings)
+                {
+                    fields.extend(arg_fields);
+                }
+            }
+            Some(fields)
+        }
+        _ => None,
+    }
+}
+
+fn static_js_value(
+    expr: &Expr,
+    emit_options: &js_backend::EmitOptions,
+    values: &BTreeMap<String, String>,
+) -> Option<String> {
+    match &expr.kind {
+        ExprKind::Bool(value) => Some(value.to_string()),
+        ExprKind::Number(value) => Some(value.clone()),
+        ExprKind::String(value) | ExprKind::Keyword(value) => Some(json_string(value)),
+        ExprKind::Nil => Some("null".to_string()),
+        ExprKind::Symbol(name) => values.get(name).cloned(),
+        ExprKind::List(items) => {
+            let (head, args) = items.split_first()?;
+            if args.is_empty() && matches_symbol(head, "env-dev?") {
+                return emit_options.env_dev.map(|value| value.to_string());
+            }
+            if args.is_empty() && matches_symbol(head, "env-mode") {
+                return emit_options
+                    .env_mode
+                    .as_ref()
+                    .map(|value| json_string(value));
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn record_keys_outside_defn(source: &SourceFile, skipped_defn: &str) -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+    for form in &source.forms {
+        if let ExprKind::List(items) = &form.kind {
+            if items.first().is_some_and(|head| {
+                matches_symbol(head, "type")
+                    || matches_symbol(head, "ann")
+                    || matches_symbol(head, "foreign")
+                    || matches_symbol(head, "import")
+            }) {
+                continue;
+            }
+            if items.len() >= 4
+                && matches_symbol(&items[0], "defn")
+                && matches_symbol(&items[1], skipped_defn)
+            {
+                continue;
+            }
+        }
+        collect_record_keys_expr(form, &mut keys);
+    }
+    keys
+}
+
+fn collect_record_keys_expr(expr: &Expr, keys: &mut BTreeSet<String>) {
+    match &expr.kind {
+        ExprKind::Map(entries) => {
+            for (key, value) in entries {
+                if let Some(name) = record_key_name(key) {
+                    keys.insert(name);
+                }
+                collect_record_keys_expr(key, keys);
+                collect_record_keys_expr(value, keys);
+            }
+        }
+        ExprKind::List(items) | ExprKind::Vector(items) | ExprKind::Set(items) => {
+            for item in items {
+                collect_record_keys_expr(item, keys);
+            }
+        }
+        ExprKind::Quote(inner)
+        | ExprKind::QuasiQuote(inner)
+        | ExprKind::Unquote(inner)
+        | ExprKind::UnquoteSplicing(inner) => collect_record_keys_expr(inner, keys),
+        ExprKind::HtmlTemplate(node) => collect_record_keys_html_node(node, keys),
+        ExprKind::Symbol(_)
+        | ExprKind::Nil
+        | ExprKind::Bool(_)
+        | ExprKind::Number(_)
+        | ExprKind::String(_)
+        | ExprKind::Keyword(_) => {}
+    }
+}
+
+fn collect_record_keys_html_node(node: &syntax::HtmlNode, keys: &mut BTreeSet<String>) {
+    match node {
+        syntax::HtmlNode::Element(element) => {
+            for attr in &element.attrs {
+                if let syntax::HtmlAttrValue::Dynamic { expr, .. } = &attr.value {
+                    collect_record_keys_expr(expr, keys);
+                }
+            }
+            for child in &element.children {
+                collect_record_keys_html_node(child, keys);
+            }
+        }
+        syntax::HtmlNode::Expr { expr, .. } => collect_record_keys_expr(expr, keys),
+        syntax::HtmlNode::Text { .. } => {}
+    }
+}
+
+fn collect_message_kinds_expr_with_static(
+    expr: &Expr,
+    imported_message_kinds: &HashMap<String, BTreeSet<String>>,
+    summaries: &HashMap<String, BTreeSet<String>>,
+    output: &mut BTreeSet<String>,
+    static_context: &MessageStaticContext,
+) {
+    match &expr.kind {
+        ExprKind::Map(entries) => {
+            if let Some(kind) =
+                kind_literal_from_entries(entries).filter(|kind| is_message_kind(kind))
+            {
+                output.insert(kind);
+            }
+            for (key, value) in entries {
+                collect_message_kinds_expr_with_static(
+                    key,
+                    imported_message_kinds,
+                    summaries,
+                    output,
+                    static_context,
+                );
+                collect_message_kinds_expr_with_static(
+                    value,
+                    imported_message_kinds,
+                    summaries,
+                    output,
+                    static_context,
+                );
+            }
+        }
+        ExprKind::List(items) => {
+            if let [head, condition, then_branch, else_branch] = items.as_slice() {
+                if matches_symbol(head, "if") {
+                    if let Some(value) = message_static_bool(condition, static_context) {
+                        collect_message_kinds_expr_with_static(
+                            if value { then_branch } else { else_branch },
+                            imported_message_kinds,
+                            summaries,
+                            output,
+                            static_context,
+                        );
+                        return;
+                    }
+                }
+            }
+            if let Some(head) = items.first().and_then(symbol_name) {
+                if let Some(kinds) = imported_message_kinds
+                    .get(head)
+                    .or_else(|| summaries.get(head))
+                {
+                    output.extend(kinds.iter().cloned());
+                }
+                collect_message_helper_kinds(
+                    items,
+                    imported_message_kinds,
+                    summaries,
+                    output,
+                    static_context,
+                );
+            }
+            for item in items {
+                collect_message_kinds_expr_with_static(
+                    item,
+                    imported_message_kinds,
+                    summaries,
+                    output,
+                    static_context,
+                );
+            }
+        }
+        ExprKind::Vector(items) | ExprKind::Set(items) => {
+            for item in items {
+                collect_message_kinds_expr_with_static(
+                    item,
+                    imported_message_kinds,
+                    summaries,
+                    output,
+                    static_context,
+                );
+            }
+        }
+        ExprKind::Quote(inner)
+        | ExprKind::QuasiQuote(inner)
+        | ExprKind::Unquote(inner)
+        | ExprKind::UnquoteSplicing(inner) => collect_message_kinds_expr_with_static(
+            inner,
+            imported_message_kinds,
+            summaries,
+            output,
+            static_context,
+        ),
+        ExprKind::HtmlTemplate(node) => collect_message_kinds_html_node_with_static(
+            node,
+            imported_message_kinds,
+            summaries,
+            output,
+            static_context,
+        ),
+        ExprKind::Symbol(_)
+        | ExprKind::Nil
+        | ExprKind::Bool(_)
+        | ExprKind::Number(_)
+        | ExprKind::String(_)
+        | ExprKind::Keyword(_) => {}
+    }
+}
+
+fn collect_message_kinds_html_node_with_static(
+    node: &syntax::HtmlNode,
+    imported_message_kinds: &HashMap<String, BTreeSet<String>>,
+    summaries: &HashMap<String, BTreeSet<String>>,
+    output: &mut BTreeSet<String>,
+    static_context: &MessageStaticContext,
+) {
+    match node {
+        syntax::HtmlNode::Element(element) => {
+            let statically_disabled = html_element_statically_disabled(element, static_context);
+            for attr in &element.attrs {
+                if statically_disabled && attr.name.starts_with("on:") {
+                    continue;
+                }
+                if let syntax::HtmlAttrValue::Dynamic { expr, .. } = &attr.value {
+                    collect_message_kinds_expr_with_static(
+                        expr,
+                        imported_message_kinds,
+                        summaries,
+                        output,
+                        static_context,
+                    );
+                }
+            }
+            for child in &element.children {
+                collect_message_kinds_html_node_with_static(
+                    child,
+                    imported_message_kinds,
+                    summaries,
+                    output,
+                    static_context,
+                );
+            }
+        }
+        syntax::HtmlNode::Expr { expr, .. } => collect_message_kinds_expr_with_static(
+            expr,
+            imported_message_kinds,
+            summaries,
+            output,
+            static_context,
+        ),
+        syntax::HtmlNode::Text { .. } => {}
+    }
+}
+
+fn html_element_statically_disabled(
+    element: &syntax::HtmlElement,
+    static_context: &MessageStaticContext,
+) -> bool {
+    element.attrs.iter().any(|attr| {
+        attr.name == "disabled"
+            && match &attr.value {
+                syntax::HtmlAttrValue::Bool(value) => *value,
+                syntax::HtmlAttrValue::Static(_) => true,
+                syntax::HtmlAttrValue::Dynamic { expr, .. } => {
+                    message_static_bool(expr, static_context).is_some_and(|value| value)
+                }
+            }
+    })
+}
+
+fn collect_message_helper_kinds(
+    items: &[Expr],
+    imported_message_kinds: &HashMap<String, BTreeSet<String>>,
+    summaries: &HashMap<String, BTreeSet<String>>,
+    output: &mut BTreeSet<String>,
+    static_context: &MessageStaticContext,
+) {
+    let Some(head) = items.first().and_then(symbol_name) else {
+        return;
+    };
+    let args = &items[1..];
+    match head {
+        "Msg.of" | "Msg.with" | "Msg.with2" | "Msg.mapper" => {
+            collect_message_value(
+                args.first(),
+                imported_message_kinds,
+                summaries,
+                output,
+                static_context,
+            );
+        }
+        "Cmd.storage/get" => {
+            collect_message_value(
+                args.get(2),
+                imported_message_kinds,
+                summaries,
+                output,
+                static_context,
+            );
+            collect_message_value(
+                args.get(3),
+                imported_message_kinds,
+                summaries,
+                output,
+                static_context,
+            );
+        }
+        "Cmd.storage/set" => {
+            collect_message_value(
+                args.get(2),
+                imported_message_kinds,
+                summaries,
+                output,
+                static_context,
+            );
+            collect_message_value(
+                args.get(3),
+                imported_message_kinds,
+                summaries,
+                output,
+                static_context,
+            );
+        }
+        "Cmd.time/now" => collect_message_value(
+            args.first(),
+            imported_message_kinds,
+            summaries,
+            output,
+            static_context,
+        ),
+        "Cmd.random/number" => {
+            collect_message_value(
+                args.get(2),
+                imported_message_kinds,
+                summaries,
+                output,
+                static_context,
+            );
+        }
+        "Cmd.timer/every" | "Cmd.timer/after" => {
+            collect_message_value(
+                args.get(2),
+                imported_message_kinds,
+                summaries,
+                output,
+                static_context,
+            );
+        }
+        "Cmd.animation/frame" => {
+            collect_message_value(
+                args.get(1),
+                imported_message_kinds,
+                summaries,
+                output,
+                static_context,
+            );
+        }
+        "Cmd.animation/cancel" => {
+            collect_message_value(
+                args.get(1),
+                imported_message_kinds,
+                summaries,
+                output,
+                static_context,
+            );
+        }
+        "Cmd.dom-ref/click" | "Cmd.dom-ref/focus" => {
+            collect_message_value(
+                args.get(1),
+                imported_message_kinds,
+                summaries,
+                output,
+                static_context,
+            );
+            collect_message_value(
+                args.get(2),
+                imported_message_kinds,
+                summaries,
+                output,
+                static_context,
+            );
+        }
+        "Cmd.file/read-selected" => {
+            collect_message_value(
+                args.get(2),
+                imported_message_kinds,
+                summaries,
+                output,
+                static_context,
+            );
+            collect_message_value(
+                args.get(3),
+                imported_message_kinds,
+                summaries,
+                output,
+                static_context,
+            );
+            collect_message_value(
+                args.get(4),
+                imported_message_kinds,
+                summaries,
+                output,
+                static_context,
+            );
+        }
+        "Cmd.file/download" => {
+            collect_message_value(
+                args.get(3),
+                imported_message_kinds,
+                summaries,
+                output,
+                static_context,
+            );
+            collect_message_value(
+                args.get(4),
+                imported_message_kinds,
+                summaries,
+                output,
+                static_context,
+            );
+        }
+        "Cmd.canvas/draw" => collect_message_value(
+            args.get(4),
+            imported_message_kinds,
+            summaries,
+            output,
+            static_context,
+        ),
+        "Cmd.dom-ref/measure" => {
+            collect_message_value(
+                args.get(1),
+                imported_message_kinds,
+                summaries,
+                output,
+                static_context,
+            );
+            collect_message_value(
+                args.get(2),
+                imported_message_kinds,
+                summaries,
+                output,
+                static_context,
+            );
+        }
+        "Cmd.dom-ref/resize-watch" => {
+            collect_message_value(
+                args.get(2),
+                imported_message_kinds,
+                summaries,
+                output,
+                static_context,
+            );
+            collect_message_value(
+                args.get(3),
+                imported_message_kinds,
+                summaries,
+                output,
+                static_context,
+            );
+        }
+        "Cmd.bluetooth/connect-heart-rate" => {
+            for index in 2..=5 {
+                collect_message_value(
+                    args.get(index),
+                    imported_message_kinds,
+                    summaries,
+                    output,
+                    static_context,
+                );
+            }
+        }
+        "Cmd.bluetooth/disconnect" => {
+            collect_message_value(
+                args.get(1),
+                imported_message_kinds,
+                summaries,
+                output,
+                static_context,
+            );
+        }
+        "Cmd.simulation/heart-rate" => {
+            collect_message_value(
+                args.get(2),
+                imported_message_kinds,
+                summaries,
+                output,
+                static_context,
+            );
+            collect_message_value(
+                args.get(3),
+                imported_message_kinds,
+                summaries,
+                output,
+                static_context,
+            );
+            collect_message_value(
+                args.get(4),
+                imported_message_kinds,
+                summaries,
+                output,
+                static_context,
+            );
+            collect_message_value(
+                args.get(5),
+                imported_message_kinds,
+                summaries,
+                output,
+                static_context,
+            );
+        }
+        "Sub.timer/every" => collect_message_value(
+            args.get(2),
+            imported_message_kinds,
+            summaries,
+            output,
+            static_context,
+        ),
+        "Sub.media-query" | "Sub.window/event" | "Sub.window/event-with" | "Sub.dom-ref/resize" => {
+            collect_message_value(
+                args.get(2),
+                imported_message_kinds,
+                summaries,
+                output,
+                static_context,
+            );
+        }
+        _ => {}
+    }
+}
+
+fn collect_message_value(
+    expr: Option<&Expr>,
+    imported_message_kinds: &HashMap<String, BTreeSet<String>>,
+    summaries: &HashMap<String, BTreeSet<String>>,
+    output: &mut BTreeSet<String>,
+    static_context: &MessageStaticContext,
+) {
+    let Some(expr) = expr else {
+        return;
+    };
+    if let Some(kind) = literal_name(expr).filter(|kind| is_message_kind(kind)) {
+        output.insert(kind);
+    } else {
+        collect_message_kinds_expr_with_static(
+            expr,
+            imported_message_kinds,
+            summaries,
+            output,
+            static_context,
+        );
+    }
+}
+
+fn message_static_bool(expr: &Expr, static_context: &MessageStaticContext) -> Option<bool> {
+    match &expr.kind {
+        ExprKind::Bool(value) => Some(*value),
+        ExprKind::Symbol(name) => match static_context.static_reads.get(name).map(String::as_str) {
+            Some("true") => Some(true),
+            Some("false") => Some(false),
+            _ => None,
+        },
+        ExprKind::List(items) => {
+            let (head, args) = items.split_first()?;
+            let head = symbol_name(head)?;
+            match head {
+                "env-dev?" if args.is_empty() => static_context.env_dev,
+                "not" if args.len() == 1 => {
+                    message_static_bool(&args[0], static_context).map(|value| !value)
+                }
+                "and" => {
+                    let mut saw_unknown = false;
+                    for arg in args {
+                        match message_static_bool(arg, static_context) {
+                            Some(false) => return Some(false),
+                            Some(true) => {}
+                            None => saw_unknown = true,
+                        }
+                    }
+                    (!saw_unknown).then_some(true)
+                }
+                "or" => {
+                    let mut saw_unknown = false;
+                    for arg in args {
+                        match message_static_bool(arg, static_context) {
+                            Some(true) => return Some(true),
+                            Some(false) => {}
+                            None => saw_unknown = true,
+                        }
+                    }
+                    (!saw_unknown).then_some(false)
+                }
+                "=" if args.len() == 2 => {
+                    match (
+                        message_static_value(&args[0], static_context),
+                        message_static_value(&args[1], static_context),
+                    ) {
+                        (Some(left), Some(right)) => Some(left == right),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn message_static_value(expr: &Expr, static_context: &MessageStaticContext) -> Option<String> {
+    match &expr.kind {
+        ExprKind::Bool(value) => Some(value.to_string()),
+        ExprKind::Number(value) | ExprKind::String(value) | ExprKind::Keyword(value) => {
+            Some(value.clone())
+        }
+        ExprKind::Symbol(name) => static_context.static_reads.get(name).cloned(),
+        ExprKind::List(items) => {
+            let (head, args) = items.split_first()?;
+            if args.is_empty() && matches_symbol(head, "env-mode") {
+                return static_context.env_mode.clone();
+            }
+            message_static_bool(expr, static_context).map(|value| value.to_string())
+        }
+        _ => None,
+    }
+}
+
+fn is_message_kind(kind: &str) -> bool {
+    !kind.contains('/') && !matches!(kind, "none" | "batch")
+}
+
 fn collect_definition_bodies(source: &SourceFile) -> HashMap<String, &Expr> {
     source
         .forms
@@ -4302,8 +6639,13 @@ fn build_artifacts_json(artifacts: &[BuildArtifact]) -> String {
     let entries = artifacts
         .iter()
         .map(|artifact| {
+            let runtime_effects = artifact
+                .runtime_effects
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>();
             format!(
-                "{{\"kind\":{},\"source\":{},\"output\":{},\"sourceMap\":{},\"bytes\":{}}}",
+                "{{\"kind\":{},\"source\":{},\"output\":{},\"sourceMap\":{},\"bytes\":{},\"runtimeEffects\":{}}}",
                 json_string(&artifact.kind),
                 json_path(&artifact.source),
                 json_path(&artifact.output),
@@ -4312,7 +6654,8 @@ fn build_artifacts_json(artifacts: &[BuildArtifact]) -> String {
                     .as_ref()
                     .map(|path| json_path(path))
                     .unwrap_or_else(|| "null".to_string()),
-                artifact.bytes
+                artifact.bytes,
+                json_string_array(&runtime_effects)
             )
         })
         .collect::<Vec<_>>()
@@ -4736,12 +7079,6 @@ fn read_stdin() -> Result<String, String> {
         .read_to_string(&mut input)
         .map_err(|err| format!("failed to read stdin: {}", err))?;
     Ok(input)
-}
-
-fn print_parse_diagnostics(input: &str, source: &SourceFile) {
-    if !source.diagnostics.is_empty() {
-        println!("{}", render_diagnostics(input, &source.diagnostics));
-    }
 }
 
 fn print_help() {

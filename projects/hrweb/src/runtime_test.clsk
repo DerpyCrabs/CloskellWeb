@@ -1,6 +1,6 @@
 (import "closkell/test" [describe test expect= expect-ok render fire text attr class? messages mount-app commands])
 (import "./domain.clsk" [initial-state])
-(import "./zones.clsk" [default-zone-state zone-label-for-bpm set-zone-boundary boundary-controls])
+(import "./zones.clsk" [default-zone-state load-zone-state zone-label-for-bpm set-zone-boundary boundary-controls])
 (import "./log.clsk" [duration-label exercise-types hide-entry visible-log])
 (import "./app.clsk" [desktop-tab-strip monitor-card init update view])
 
@@ -41,7 +41,9 @@
 (def app-handlers
   {:storage/get (fn [cmd dispatch] nil)
    :media-query/watch (fn [cmd dispatch] nil)
+   :media-query/watch/direct (fn [cmd dispatch] nil)
    :dom-ref/resize-watch (fn [cmd dispatch] nil)
+   :dom-ref/resize-watch/direct (fn [cmd dispatch] nil)
    :canvas/draw (fn [cmd dispatch] nil)})
 
 (describe "hrweb pure functions"
@@ -52,7 +54,14 @@
       (expect= (duration-label 65_000) "1:05")
       (expect= (exercise-types [sample-entry-b sample-entry-a]) ["LISS" "Tempo"])
       (expect= (count (boundary-controls zones)) 4)
-      (expect= (count (visible-log hidden)) 1))))
+      (expect= (count (visible-log hidden)) 1)))
+
+  (test "loads partial stored zone payload without null read crashes"
+    (let [state (load-zone-state {:zones [] :targetZoneId 3})
+          first-zone (nth state.zones 0)]
+      (expect= (count state.zones) 5)
+      (expect= first-zone.min 90)
+      (expect= first-zone.max 110))))
 
 (describe "hrweb components"
   (test "renders monitor state"

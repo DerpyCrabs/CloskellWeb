@@ -5,6 +5,7 @@ import path from "node:path";
 
 const RUNTIME_PACKAGE = "@closkell/runtime";
 const RUNTIME_OPTIMIZED_PREFIX = "@closkell_runtime";
+const MTIME_CACHE_MS = 1000;
 
 function stripQuery(id) {
   const queryIndex = id.indexOf("?");
@@ -212,10 +213,11 @@ async function collectFiles(root, include) {
   return files;
 }
 
-function runCommand(command, args, cwd) {
+function runCommand(command, args, cwd, env = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       cwd,
+      env: { ...process.env, ...env },
       stdio: ["ignore", "pipe", "pipe"]
     });
     let stdout = "";
@@ -267,10 +269,14 @@ export function closkell(options = {}) {
   let sourceRoot;
   let manifestRoot;
   let compilerCommand = null;
+  let compilerCommandPromise = null;
   let entryPath = null;
   let outPath;
   let generatedRoot;
   const inFlight = new Map();
+  const clskMtimeCache = { root: null, checkedAt: 0, promise: null };
+  const rustMtimeCache = { root: null, checkedAt: 0, promise: null };
+  const runtimeEffectsBySource = new Map();
 
   function resolveFromRoot(value) {
     return path.resolve(config.root, value);
@@ -326,11 +332,14 @@ export function closkell(options = {}) {
     return relative;
   }
 
-  async function outputIsFresh(output) {
+  async function outputIsFresh(source, output) {
     if (!existsSync(output)) return false;
     const outputMtime = await statMtimeMs(output);
-    if (outputMtime < (await newestClskMtimeMs(sourceRoot))) return false;
-    if (outputMtime < (await newestRustBuildInputMtimeMs(manifestRoot))) return false;
+    const sourceMtime = entryNeedsVendoredRuntime(source)
+      ? await currentNewestClskMtimeMs()
+      : await statMtimeMs(source);
+    if (outputMtime < sourceMtime) return false;
+    if (outputMtime < (await currentNewestRustBuildInputMtimeMs())) return false;
     if (sourceMap && !existsSync(sourceMapPath(output))) return false;
     if (!sourceMap) {
       const tail = await readFileTail(output, 256);
@@ -363,6 +372,56 @@ export function closkell(options = {}) {
     return vendorRuntime && app && entryPath && samePath(source, entryPath);
   }
 
+  function pathKey(value) {
+    return path.resolve(value).toLowerCase();
+  }
+
+  function parseBuildReport(stdout) {
+    const text = stdout.trim();
+    if (!text) return null;
+    const line = [...text.split(/\r?\n/)].reverse().find((line) => line.trim().startsWith("{"));
+    return line ? JSON.parse(line) : null;
+  }
+
+  function runtimeEffectsSignature(effects = []) {
+    return [...effects].sort().join("\0");
+  }
+
+  function rememberBuildReport(report, { markNewRuntimeEffectsAsChanged = false } = {}) {
+    let changed = false;
+    for (const artifact of report?.artifacts ?? []) {
+      if (!artifact?.source) continue;
+      const key = pathKey(artifact.source);
+      const signature = runtimeEffectsSignature(artifact.runtimeEffects);
+      const previous = runtimeEffectsBySource.get(key);
+      if (
+        (previous === undefined && markNewRuntimeEffectsAsChanged) ||
+        (previous !== undefined && previous !== signature)
+      ) {
+        changed = true;
+      }
+      runtimeEffectsBySource.set(key, signature);
+    }
+    return changed;
+  }
+
+  function reportOutputs(report, fallbackOutput) {
+    const outputs = new Set();
+    if (fallbackOutput) outputs.add(path.resolve(fallbackOutput));
+    for (const artifact of report?.artifacts ?? []) {
+      if (artifact?.output) outputs.add(path.resolve(artifact.output));
+    }
+    return outputs;
+  }
+
+  function invalidateOutputs(server, outputs) {
+    for (const output of outputs) {
+      const modules = server.moduleGraph.getModulesByFile(output);
+      if (!modules) continue;
+      for (const mod of modules) server.moduleGraph.invalidateModule(mod);
+    }
+  }
+
   async function readFileTail(file, bytes) {
     let handle;
     try {
@@ -380,50 +439,99 @@ export function closkell(options = {}) {
     }
   }
 
+  function cachedMtime(cache, root, read) {
+    const resolvedRoot = path.resolve(root);
+    const now = Date.now();
+    if (
+      cache.promise &&
+      cache.root === resolvedRoot &&
+      now - cache.checkedAt < MTIME_CACHE_MS
+    ) {
+      return cache.promise;
+    }
+
+    cache.root = resolvedRoot;
+    cache.checkedAt = now;
+    cache.promise = read(resolvedRoot).catch((error) => {
+      if (cache.promise) cache.promise = null;
+      throw error;
+    });
+    return cache.promise;
+  }
+
+  function currentNewestClskMtimeMs() {
+    return cachedMtime(clskMtimeCache, sourceRoot, newestClskMtimeMs);
+  }
+
+  function currentNewestRustBuildInputMtimeMs() {
+    return cachedMtime(rustMtimeCache, manifestRoot, newestRustBuildInputMtimeMs);
+  }
+
   async function resolveCompilerCommand() {
     if (compilerCommand) return compilerCommand;
+    if (compilerCommandPromise) return compilerCommandPromise;
+    compilerCommandPromise = resolveCompilerCommandUncached().finally(() => {
+      compilerCommandPromise = null;
+    });
+    compilerCommand = await compilerCommandPromise;
+    return compilerCommand;
+  }
+
+  async function resolveCompilerCommandUncached() {
     if (binary) {
-      compilerCommand = { command: binary, args: [] };
-      return compilerCommand;
+      return { command: binary, args: [] };
     }
 
     const envBinary = process.env.CLOSKELL_BIN;
     if (envBinary) {
-      compilerCommand = { command: envBinary, args: [] };
-      return compilerCommand;
+      return { command: envBinary, args: [] };
     }
 
     const exe = process.platform === "win32" ? ".exe" : "";
     const workspaceRoot = manifestRoot;
-    const rustMtime = await newestRustBuildInputMtimeMs(workspaceRoot);
+    const rustMtime = await currentNewestRustBuildInputMtimeMs();
     for (const profile of ["release", "debug"]) {
       const candidate = path.join(workspaceRoot, "target", profile, `closkell${exe}`);
       if (existsSync(candidate) && (await statMtimeMs(candidate)) >= rustMtime) {
-        compilerCommand = { command: candidate, args: [] };
-        return compilerCommand;
+        return { command: candidate, args: [] };
       }
     }
 
-    compilerCommand = {
-      command: "cargo",
-      args: ["run", "-q", "--manifest-path", resolveFromRoot(manifestPath), "-p", packageName, "--"]
-    };
-    return compilerCommand;
+    await runCommand(
+      "cargo",
+      ["build", "-q", "--manifest-path", resolveFromRoot(manifestPath), "-p", packageName],
+      config.root
+    );
+    const candidate = path.join(workspaceRoot, "target", "debug", `closkell${exe}`);
+    if (!existsSync(candidate)) {
+      throw new Error(`Closkell compiler binary was not produced at ${candidate}`);
+    }
+    return { command: candidate, args: [] };
   }
 
-  async function compile(source, { force = false } = {}) {
+  function compilerEnvironment() {
+    return {
+      CLOSKELL_ENV_DEV: config.command === "serve" ? "true" : "false",
+      CLOSKELL_ENV_MODE: config.mode || ""
+    };
+  }
+
+  async function compile(
+    source,
+    { force = false, json = false, markNewRuntimeEffectsAsChanged = false } = {}
+  ) {
     const resolved = path.resolve(source);
     const output = outputForSource(resolved);
-    const key = `${resolved}\0${output}`;
+    const key = `${resolved}\0${output}\0${json ? "json" : "plain"}`;
     if (inFlight.has(key)) return inFlight.get(key);
 
     const task = (async () => {
       if (
         !force &&
-        (await outputIsFresh(output)) &&
+        (await outputIsFresh(resolved, output)) &&
         (!entryNeedsVendoredRuntime(resolved) || (await vendoredRuntimeIsFresh()))
       ) {
-        return output;
+        return json ? { output, report: null, runtimeEffectsChanged: false } : output;
       }
 
       const compiler = await resolveCompilerCommand();
@@ -442,10 +550,17 @@ export function closkell(options = {}) {
         if (cssImport) args.push("--css", cssImport);
         if (vendorRuntime) args.push("--vendor-runtime");
       }
+      if (json) args.push("--json");
 
       config.logger.info(`closkell: ${toPosixPath(path.relative(config.root, resolved))}`);
-      await runCommand(compiler.command, args, config.root);
-      return output;
+      const { stdout } = await runCommand(compiler.command, args, config.root, compilerEnvironment());
+      if (!json) return output;
+
+      const report = parseBuildReport(stdout);
+      const runtimeEffectsChanged = rememberBuildReport(report, {
+        markNewRuntimeEffectsAsChanged
+      });
+      return { output, report, runtimeEffectsChanged };
     })().finally(() => {
       inFlight.delete(key);
     });
@@ -458,7 +573,7 @@ export function closkell(options = {}) {
     const resolved = path.resolve(source);
     const compiler = await resolveCompilerCommand();
     const args = [...compiler.args, "inspect", resolved];
-    const { stdout } = await runCommand(compiler.command, args, config.root);
+    const { stdout } = await runCommand(compiler.command, args, config.root, compilerEnvironment());
     return stdout;
   }
 
@@ -484,12 +599,23 @@ export function closkell(options = {}) {
 
   async function compileAndReload(server, changedFile) {
     try {
-      const source = shouldCompileEntryOnStart() ? entryPath : changedFile;
-      const output = await compile(source, { force: true });
-      const modules = server.moduleGraph.getModulesByFile(output);
-      if (modules) {
-        for (const mod of modules) server.moduleGraph.invalidateModule(mod);
+      const hasEntry = shouldCompileEntryOnStart();
+      const source = hasEntry && samePath(changedFile, entryPath) ? entryPath : changedFile;
+      const result = await compile(source, {
+        force: true,
+        json: true,
+        markNewRuntimeEffectsAsChanged: true
+      });
+      const outputs = reportOutputs(result.report, result.output);
+
+      if (hasEntry && !samePath(source, entryPath) && result.runtimeEffectsChanged) {
+        const entryResult = await compile(entryPath, { force: true, json: true });
+        for (const output of reportOutputs(entryResult.report, entryResult.output)) {
+          outputs.add(output);
+        }
       }
+
+      invalidateOutputs(server, outputs);
       server.ws.send({ type: "full-reload", path: "*" });
     } catch (error) {
       server.config.logger.error(error.message);
@@ -562,7 +688,7 @@ export function closkell(options = {}) {
 
     async buildStart() {
       if (shouldCompileEntryOnStart()) {
-        await compile(entryPath);
+        await compile(entryPath, { force: true, json: true });
       }
     },
 

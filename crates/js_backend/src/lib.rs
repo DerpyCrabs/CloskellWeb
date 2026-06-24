@@ -12,6 +12,17 @@ pub struct EmitResult {
     pub runtime_effects: BTreeSet<String>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EmitOptions {
+    pub env_dev: Option<bool>,
+    pub env_mode: Option<String>,
+    pub reachable_message_kinds: Option<BTreeSet<String>>,
+    pub message_field_reads: BTreeMap<String, MessageFieldReads>,
+    pub static_reads: BTreeMap<String, String>,
+    pub direct_call_replacements: BTreeMap<String, String>,
+    pub prelude_code: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SourceMapping {
     pub generated_line: usize,
@@ -32,19 +43,23 @@ enum ImportName {
 }
 
 pub fn emit_module(source: &SourceFile) -> EmitResult {
-    let mut emitter = Emitter {
-        diagnostics: Vec::new(),
-        needs_html_runtime: false,
-        needs_decoder_runtime: false,
-        needs_value_equal_helper: false,
-        needs_count_helper: false,
-        runtime_effects: BTreeSet::new(),
-        component_fns: collect_template_defns(source),
-        function_defs: collect_function_defs(source),
-        read_summaries: collect_read_summaries(source),
-        next_template_id: 0,
-        next_temp_id: 0,
-    };
+    emit_module_with_types(source, BTreeMap::new())
+}
+
+pub fn emit_module_with_types(
+    source: &SourceFile,
+    expr_types: BTreeMap<usize, String>,
+) -> EmitResult {
+    emit_module_with_types_and_options(source, expr_types, EmitOptions::default())
+}
+
+pub fn emit_module_with_types_and_options(
+    source: &SourceFile,
+    expr_types: BTreeMap<usize, String>,
+    options: EmitOptions,
+) -> EmitResult {
+    let prelude_code = options.prelude_code.clone();
+    let mut emitter = Emitter::new(source, expr_types, options);
     let mut import_lines = Vec::new();
     let mut lines = Vec::new();
 
@@ -105,9 +120,17 @@ pub fn emit_module(source: &SourceFile) -> EmitResult {
     let mut source_mappings = Vec::new();
     let mut generated_line = 0;
     if emitter.needs_html_runtime {
-        code.push_str(
-            "import { createCompiledTemplateComponent as __closkellCreateTemplate, renderToString as __closkellRenderToString, scopeSubscriptions as __closkellScopeSubscriptions, scopeUpdate as __closkellScopeUpdate, scopeView as __closkellScopeView, setAttr as __closkellSetAttr, setCompiledComponent as __closkellSetComponent, setCompiledConditional as __closkellSetConditional, setCompiledKeyedList as __closkellSetKeyedList, setEvent as __closkellSetEvent, setRef as __closkellSetRef, setText as __closkellSetText } from \"@closkell/runtime\";\n\n",
-        );
+        code.push_str(&compiled_template_runtime_import(&emitter));
+        generated_line += 2;
+        code.push_str(&format!(
+            "const {document} = () => globalThis.document, {element} = (tag) => {document}().createElement(tag), {svg_element} = (tag) => {document}().createElementNS(\"http://www.w3.org/2000/svg\", tag), {text} = (value) => {document}().createTextNode(value), {attr} = (node, name, value) => node.setAttribute(name, value), {append} = (parent, child) => parent.appendChild(child);\n\n",
+            document = DOCUMENT_ALIAS,
+            element = CREATE_ELEMENT_ALIAS,
+            svg_element = CREATE_SVG_ELEMENT_ALIAS,
+            text = CREATE_TEXT_ALIAS,
+            attr = SET_STATIC_ATTR_ALIAS,
+            append = APPEND_CHILD_ALIAS
+        ));
         generated_line += 2;
     }
     if emitter.needs_decoder_runtime {
@@ -126,6 +149,13 @@ pub fn emit_module(source: &SourceFile) -> EmitResult {
         code.push('\n');
         generated_line += 1;
     }
+    if !prelude_code.is_empty() {
+        code.push_str(&prelude_code);
+        if !prelude_code.ends_with('\n') {
+            code.push('\n');
+        }
+        generated_line += prelude_code.lines().count().max(1);
+    }
     if emitter.needs_value_equal_helper {
         code.push_str(VALUE_EQUAL_HELPER);
         generated_line += VALUE_EQUAL_HELPER.lines().count();
@@ -134,8 +164,11 @@ pub fn emit_module(source: &SourceFile) -> EmitResult {
         code.push_str(COUNT_HELPER);
         generated_line += COUNT_HELPER.lines().count();
     }
+    if emitter.needs_none_const {
+        code.push_str("const __closkellNone = { kind: \"none\" };\n\n");
+        generated_line += 2;
+    }
     push_emitted_lines(&mut code, &lines, &mut source_mappings, &mut generated_line);
-    code = compact_symbol_for_calls(&code);
     EmitResult {
         code,
         diagnostics: emitter.diagnostics,
@@ -144,43 +177,165 @@ pub fn emit_module(source: &SourceFile) -> EmitResult {
     }
 }
 
-fn compact_symbol_for_calls(code: &str) -> String {
-    let mut output = String::with_capacity(code.len());
-    let mut remaining = code;
-    let needle = "Symbol.for(\"";
-    while let Some(start) = remaining.find(needle) {
-        output.push_str(&remaining[..start]);
-        let literal_start = start + needle.len();
-        let literal = &remaining[literal_start..];
-        let mut end = 0;
-        let mut escaped = false;
-        let mut found = false;
-        for (index, ch) in literal.char_indices() {
-            if escaped {
-                escaped = false;
-                continue;
-            }
-            if ch == '\\' {
-                escaped = true;
-                continue;
-            }
-            if ch == '"' {
-                end = index;
-                found = literal[index..].starts_with("\")");
-                break;
-            }
-        }
-        if !found {
-            output.push_str(&remaining[start..]);
-            return output;
-        }
-        output.push('"');
-        output.push_str(&literal[..end]);
-        output.push('"');
-        remaining = &literal[end + 2..];
+fn compiled_template_runtime_import(emitter: &Emitter) -> String {
+    let mut imports = vec![format!("bindCompiledComponent as {}", BIND_COMPONENT_ALIAS)];
+    if emitter.needs_template_skeleton {
+        imports.push(format!(
+            "createCompiledHtmlTemplateComponent as {}",
+            CREATE_HTML_TEMPLATE_ALIAS
+        ));
     }
-    output.push_str(remaining);
-    output
+    if emitter.needs_render_to_string {
+        imports.push(format!("renderToString as {}", RENDER_TO_STRING_ALIAS));
+    }
+    if emitter.needs_scope_subscriptions {
+        imports.push(format!(
+            "scopeSubscriptions as {}",
+            SCOPE_SUBSCRIPTIONS_ALIAS
+        ));
+    }
+    if emitter.needs_scope_update {
+        imports.push(format!("scopeUpdate as {}", SCOPE_UPDATE_ALIAS));
+    }
+    if emitter.needs_scope_view {
+        imports.push(format!("scopeView as {}", SCOPE_VIEW_ALIAS));
+    }
+    if emitter.needs_template_attr {
+        imports.push(format!("setCompiledAttr as {}", SET_ATTR_ALIAS));
+    }
+    if emitter.needs_template_text_attr {
+        imports.push(format!("setCompiledTextAttr as {}", SET_TEXT_ATTR_ALIAS));
+    }
+    if emitter.needs_template_nullable_text_attr {
+        imports.push(format!(
+            "setCompiledNullableTextAttr as {}",
+            SET_NULLABLE_TEXT_ATTR_ALIAS
+        ));
+    }
+    if emitter.needs_template_text_property {
+        imports.push(format!(
+            "setCompiledTextProperty as {}",
+            SET_TEXT_PROPERTY_ALIAS
+        ));
+    }
+    if emitter.needs_template_nullable_text_property {
+        imports.push(format!(
+            "setCompiledNullableTextProperty as {}",
+            SET_NULLABLE_TEXT_PROPERTY_ALIAS
+        ));
+    }
+    if emitter.needs_template_presence_attr {
+        imports.push(format!(
+            "setCompiledPresenceAttr as {}",
+            SET_PRESENCE_ATTR_ALIAS
+        ));
+    }
+    if emitter.needs_template_boolean_property {
+        imports.push(format!(
+            "setCompiledBooleanProperty as {}",
+            SET_BOOLEAN_PROPERTY_ALIAS
+        ));
+    }
+    if emitter.needs_template_class_name {
+        imports.push(format!("setCompiledClassName as {}", SET_CLASS_NAME_ALIAS));
+    }
+    if emitter.needs_template_class {
+        imports.push(format!("setCompiledClass as {}", SET_CLASS_ALIAS));
+    }
+    if emitter.needs_template_style {
+        imports.push(format!("setCompiledStyle as {}", SET_STYLE_ALIAS));
+    }
+    if emitter.needs_template_style_record {
+        imports.push(format!(
+            "setCompiledStyleRecord as {}",
+            SET_STYLE_RECORD_ALIAS
+        ));
+    }
+    if emitter.needs_template_component {
+        imports.push(format!("setCompiledComponent as {}", SET_COMPONENT_ALIAS));
+    }
+    if emitter.needs_template_conditional {
+        imports.push(format!(
+            "setCompiledConditional as {}",
+            SET_CONDITIONAL_ALIAS
+        ));
+    }
+    if emitter.needs_template_keyed_list {
+        imports.push(format!("setCompiledKeyedList as {}", SET_KEYED_LIST_ALIAS));
+    }
+    if emitter.needs_template_event {
+        imports.push(format!("setCompiledEvent as {}", SET_EVENT_ALIAS));
+    }
+    if emitter.needs_template_ref {
+        imports.push(format!("setCompiledRef as {}", SET_REF_ALIAS));
+    }
+    if emitter.needs_template_text {
+        imports.push(format!("setText as {}", SET_TEXT_ALIAS));
+    }
+    format!(
+        "import {{ {} }} from \"@closkell/runtime\";\n\n",
+        imports.join(", ")
+    )
+}
+
+pub fn emit_function_specialization(
+    source: &SourceFile,
+    expr_types: BTreeMap<usize, String>,
+    original_name: &str,
+    specialized_name: &str,
+    options: EmitOptions,
+) -> EmitResult {
+    let mut emitter = Emitter::new(source, expr_types, options);
+    let mut code = String::new();
+    let mut source_mappings = Vec::new();
+    let mut generated_line = 0;
+    let mut found = false;
+
+    for form in &source.forms {
+        let ExprKind::List(items) = &form.kind else {
+            continue;
+        };
+        if items.len() < 4 || !matches_symbol(&items[0], "defn") {
+            continue;
+        }
+        let ExprKind::Symbol(name) = &items[1].kind else {
+            continue;
+        };
+        if name != original_name {
+            continue;
+        }
+
+        found = true;
+        let line = emitter
+            .emit_defn(specialized_name, form, &items[2..])
+            .replacen("export function ", "function ", 1);
+        if emitter.needs_value_equal_helper {
+            code.push_str(VALUE_EQUAL_HELPER);
+            generated_line += VALUE_EQUAL_HELPER.lines().count();
+        }
+        source_mappings.push(SourceMapping {
+            generated_line,
+            generated_column: 0,
+            source_offset: form.span.start,
+        });
+        code.push_str(&line);
+        code.push('\n');
+        break;
+    }
+
+    if !found {
+        emitter.diagnostics.push(Diagnostic::error(
+            syntax::Span::new(0, 0),
+            format!("cannot specialize missing function `{}`", original_name),
+        ));
+    }
+
+    EmitResult {
+        code,
+        diagnostics: emitter.diagnostics,
+        source_mappings,
+        runtime_effects: emitter.runtime_effects,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -379,17 +534,429 @@ struct Emitter {
     needs_decoder_runtime: bool,
     needs_value_equal_helper: bool,
     needs_count_helper: bool,
+    needs_none_const: bool,
+    needs_render_to_string: bool,
+    needs_scope_update: bool,
+    needs_scope_subscriptions: bool,
+    needs_scope_view: bool,
+    needs_template_attr: bool,
+    needs_template_text_attr: bool,
+    needs_template_nullable_text_attr: bool,
+    needs_template_text_property: bool,
+    needs_template_nullable_text_property: bool,
+    needs_template_presence_attr: bool,
+    needs_template_boolean_property: bool,
+    needs_template_class_name: bool,
+    needs_template_class: bool,
+    needs_template_style: bool,
+    needs_template_style_record: bool,
+    needs_template_component: bool,
+    needs_template_conditional: bool,
+    needs_template_keyed_list: bool,
+    needs_template_event: bool,
+    needs_template_ref: bool,
+    needs_template_text: bool,
+    needs_template_skeleton: bool,
     runtime_effects: BTreeSet<String>,
+    expr_types: BTreeMap<usize, String>,
+    local_types: Vec<BTreeMap<String, String>>,
+    env_dev: Option<bool>,
+    env_mode: Option<String>,
+    reachable_message_kinds: Option<BTreeSet<String>>,
+    static_reads: BTreeMap<String, String>,
+    direct_call_replacements: BTreeMap<String, String>,
+    current_update_message_param: Option<String>,
     component_fns: BTreeSet<String>,
     function_defs: BTreeMap<String, FunctionDef>,
     read_summaries: BTreeMap<String, ReadSummary>,
+    message_field_reads: BTreeMap<String, MessageFieldReads>,
     next_template_id: usize,
     next_temp_id: usize,
 }
 
-const VALUE_EQUAL_HELPER: &str = "const __closkellValueEqual = (...__values) => { const __symbolKey = (__value) => Symbol.keyFor(__value) ?? __value.description ?? \"\"; const __plain = (__value) => __value !== null && typeof __value === \"object\" && !Array.isArray(__value) && !(__value instanceof Map) && !(__value instanceof Set); const __eq = (__left, __right) => { if (Object.is(__left, __right)) return true; if (typeof __left === \"symbol\" || typeof __right === \"symbol\") return typeof __left === \"symbol\" && typeof __right === \"symbol\" && __symbolKey(__left) === __symbolKey(__right); if (Array.isArray(__left) || Array.isArray(__right)) return Array.isArray(__left) && Array.isArray(__right) && __left.length === __right.length && __left.every((__value, __index) => __eq(__value, __right[__index])); if (__left instanceof Set || __right instanceof Set) { if (!(__left instanceof Set) || !(__right instanceof Set) || __left.size !== __right.size) return false; const __remaining = Array.from(__right); return Array.from(__left).every((__item) => { const __match = __remaining.findIndex((__candidate) => __eq(__item, __candidate)); if (__match < 0) return false; __remaining.splice(__match, 1); return true; }); } if (__left instanceof Map || __right instanceof Map) { if (!(__left instanceof Map) || !(__right instanceof Map) || __left.size !== __right.size) return false; const __remaining = Array.from(__right); return Array.from(__left).every(([__key, __value]) => { const __match = __remaining.findIndex(([__rightKey, __rightValue]) => __eq(__key, __rightKey) && __eq(__value, __rightValue)); if (__match < 0) return false; __remaining.splice(__match, 1); return true; }); } if (__plain(__left) || __plain(__right)) { if (!__plain(__left) || !__plain(__right)) return false; const __leftKeys = Object.keys(__left).sort(); const __rightKeys = Object.keys(__right).sort(); return __eq(__leftKeys, __rightKeys) && __leftKeys.every((__key) => __eq(__left[__key], __right[__key])); } return false; }; for (let __index = 1; __index < __values.length; __index += 1) if (!__eq(__values[__index - 1], __values[__index])) return false; return true; };\n\n";
+impl Emitter {
+    fn new(source: &SourceFile, expr_types: BTreeMap<usize, String>, options: EmitOptions) -> Self {
+        Self {
+            diagnostics: Vec::new(),
+            needs_html_runtime: false,
+            needs_decoder_runtime: false,
+            needs_value_equal_helper: false,
+            needs_count_helper: false,
+            needs_none_const: false,
+            needs_render_to_string: false,
+            needs_scope_update: false,
+            needs_scope_subscriptions: false,
+            needs_scope_view: false,
+            needs_template_attr: false,
+            needs_template_text_attr: false,
+            needs_template_nullable_text_attr: false,
+            needs_template_text_property: false,
+            needs_template_nullable_text_property: false,
+            needs_template_presence_attr: false,
+            needs_template_boolean_property: false,
+            needs_template_class_name: false,
+            needs_template_class: false,
+            needs_template_style: false,
+            needs_template_style_record: false,
+            needs_template_component: false,
+            needs_template_conditional: false,
+            needs_template_keyed_list: false,
+            needs_template_event: false,
+            needs_template_ref: false,
+            needs_template_text: false,
+            needs_template_skeleton: false,
+            runtime_effects: BTreeSet::new(),
+            expr_types,
+            local_types: Vec::new(),
+            env_dev: options.env_dev,
+            env_mode: options.env_mode,
+            reachable_message_kinds: options.reachable_message_kinds,
+            static_reads: options.static_reads,
+            direct_call_replacements: options.direct_call_replacements,
+            current_update_message_param: None,
+            component_fns: collect_template_defns(source),
+            function_defs: collect_function_defs(source),
+            read_summaries: collect_read_summaries(source),
+            message_field_reads: merged_message_field_reads(
+                options.message_field_reads,
+                collect_message_field_reads(source),
+            ),
+            next_template_id: 0,
+            next_temp_id: 0,
+        }
+    }
+}
+
+const VALUE_EQUAL_HELPER: &str = "const __closkellValueEqual = (__left, __right) => { const __plain = (__value) => __value !== null && typeof __value === \"object\" && !Array.isArray(__value) && !(__value instanceof Map) && !(__value instanceof Set); const __eq = (__left, __right) => { if (Object.is(__left, __right)) return true; if (Array.isArray(__left) || Array.isArray(__right)) return Array.isArray(__left) && Array.isArray(__right) && __left.length === __right.length && __left.every((__value, __index) => __eq(__value, __right[__index])); if (__left instanceof Set || __right instanceof Set) { if (!(__left instanceof Set) || !(__right instanceof Set) || __left.size !== __right.size) return false; const __remaining = Array.from(__right); return Array.from(__left).every((__item) => { const __match = __remaining.findIndex((__candidate) => __eq(__item, __candidate)); if (__match < 0) return false; __remaining.splice(__match, 1); return true; }); } if (__left instanceof Map || __right instanceof Map) { if (!(__left instanceof Map) || !(__right instanceof Map) || __left.size !== __right.size) return false; const __remaining = Array.from(__right); return Array.from(__left).every(([__key, __value]) => { const __match = __remaining.findIndex(([__rightKey, __rightValue]) => __eq(__key, __rightKey) && __eq(__value, __rightValue)); if (__match < 0) return false; __remaining.splice(__match, 1); return true; }); } if (__plain(__left) || __plain(__right)) { if (!__plain(__left) || !__plain(__right)) return false; const __leftKeys = Object.keys(__left).sort(); const __rightKeys = Object.keys(__right).sort(); return __eq(__leftKeys, __rightKeys) && __leftKeys.every((__key) => __eq(__left[__key], __right[__key])); } return false; }; return __eq(__left, __right); };\n\n";
 
 const COUNT_HELPER: &str = "const __closkellCount = (__collection) => __collection instanceof Set || __collection instanceof Map ? __collection.size : (Array.isArray(__collection) || typeof __collection === \"string\" ? __collection.length : (__collection == null ? 0 : Object.keys(__collection).length));\n\n";
+const DOCUMENT_ALIAS: &str = "__closkellDocument";
+const CREATE_ELEMENT_ALIAS: &str = "__closkellCreateElement";
+const CREATE_SVG_ELEMENT_ALIAS: &str = "__closkellCreateSvgElement";
+const CREATE_TEXT_ALIAS: &str = "__closkellCreateText";
+const SET_STATIC_ATTR_ALIAS: &str = "__closkellSetStaticAttr";
+const APPEND_CHILD_ALIAS: &str = "__closkellAppendChild";
+const BIND_COMPONENT_ALIAS: &str = "__closkellBindComponent";
+const CREATE_HTML_TEMPLATE_ALIAS: &str = "__closkellCreateHtmlTemplate";
+const RENDER_TO_STRING_ALIAS: &str = "__closkellRenderToString";
+const SCOPE_SUBSCRIPTIONS_ALIAS: &str = "__closkellScopeSubscriptions";
+const SCOPE_UPDATE_ALIAS: &str = "__closkellScopeUpdate";
+const SCOPE_VIEW_ALIAS: &str = "__closkellScopeView";
+const SET_TEXT_ALIAS: &str = "__closkellSetText";
+const SET_ATTR_ALIAS: &str = "__closkellSetAttr";
+const SET_TEXT_ATTR_ALIAS: &str = "__closkellSetTextAttr";
+const SET_NULLABLE_TEXT_ATTR_ALIAS: &str = "__closkellSetNullableTextAttr";
+const SET_TEXT_PROPERTY_ALIAS: &str = "__closkellSetTextProperty";
+const SET_NULLABLE_TEXT_PROPERTY_ALIAS: &str = "__closkellSetNullableTextProperty";
+const SET_PRESENCE_ATTR_ALIAS: &str = "__closkellSetPresenceAttr";
+const SET_BOOLEAN_PROPERTY_ALIAS: &str = "__closkellSetBooleanProperty";
+const SET_CLASS_NAME_ALIAS: &str = "__closkellSetClassName";
+const SET_CLASS_ALIAS: &str = "__closkellSetClass";
+const SET_STYLE_ALIAS: &str = "__closkellSetStyle";
+const SET_STYLE_RECORD_ALIAS: &str = "__closkellSetStyleRecord";
+const SET_COMPONENT_ALIAS: &str = "__closkellSetComponent";
+const SET_CONDITIONAL_ALIAS: &str = "__closkellSetConditional";
+const SET_KEYED_LIST_ALIAS: &str = "__closkellSetKeyedList";
+const SET_EVENT_ALIAS: &str = "__closkellSetEvent";
+const SET_REF_ALIAS: &str = "__closkellSetRef";
+
+struct PrimitiveEqualityLiteral {
+    code: String,
+}
+
+fn primitive_equality_literal(expr: &Expr) -> Option<PrimitiveEqualityLiteral> {
+    let code = match &expr.kind {
+        ExprKind::Nil => "null".to_string(),
+        ExprKind::Bool(value) => value.to_string(),
+        ExprKind::Number(value) => value.clone(),
+        ExprKind::String(value) => format!("\"{}\"", escape_js(value)),
+        ExprKind::Keyword(name) => format!("\"{}\"", escape_js(name)),
+        _ => return None,
+    };
+    Some(PrimitiveEqualityLiteral { code })
+}
+
+fn literal_string_value(expr: &Expr) -> Option<&str> {
+    match &expr.kind {
+        ExprKind::String(value) | ExprKind::Keyword(value) => Some(value),
+        _ => None,
+    }
+}
+
+fn is_strict_comparable_type(ty: &str) -> bool {
+    if let Some(inner) = ty
+        .strip_prefix("(Option ")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        return is_strict_comparable_type(inner);
+    }
+    ty == "Number" || ty == "String" || ty == "Bool" || ty == "Nil" || ty.starts_with(':')
+}
+
+fn is_simple_attr_value_type(ty: &str) -> bool {
+    if let Some(inner) = ty
+        .strip_prefix("(Option ")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        return is_simple_attr_value_type(inner);
+    }
+    is_strict_comparable_type(ty)
+}
+
+fn attr_type_inner(ty: &str) -> (&str, bool) {
+    if let Some(inner) = type_option_inner(ty) {
+        (inner, true)
+    } else {
+        (ty, false)
+    }
+}
+
+fn is_text_attr_type(ty: &str) -> bool {
+    ty == "String" || ty == "Number" || type_is_keyword(ty)
+}
+
+fn is_html_text_property_attr(name: &str) -> bool {
+    matches!(name, "value")
+}
+
+fn is_html_boolean_property_attr(name: &str) -> bool {
+    matches!(
+        name,
+        "checked" | "disabled" | "hidden" | "multiple" | "readonly" | "required" | "selected"
+    )
+}
+
+fn type_counts_by_length(ty: &str) -> bool {
+    ty == "String" || type_is_vector_like(ty)
+}
+
+fn type_counts_by_size(ty: &str) -> bool {
+    type_is_set(ty) || type_is_map(ty)
+}
+
+fn type_is_vector_like(ty: &str) -> bool {
+    ty.starts_with("(Vector ") || ty.starts_with("(List ") || ty.starts_with('[')
+}
+
+fn type_is_set(ty: &str) -> bool {
+    ty.starts_with("(Set ")
+}
+
+fn type_is_map(ty: &str) -> bool {
+    ty.starts_with("(Map ")
+}
+
+fn type_is_record(ty: &str) -> bool {
+    ty.starts_with('{')
+}
+
+fn type_is_keyword(ty: &str) -> bool {
+    ty == "Keyword" || ty.starts_with(':')
+}
+
+fn split_top_level_terms(input: &str) -> Vec<&str> {
+    let mut terms = Vec::new();
+    let mut depth = 0i32;
+    let mut start = None;
+
+    for (index, ch) in input.char_indices() {
+        if ch.is_whitespace() && depth == 0 {
+            if let Some(term_start) = start.take() {
+                if term_start < index {
+                    terms.push(&input[term_start..index]);
+                }
+            }
+            continue;
+        }
+
+        if start.is_none() {
+            start = Some(index);
+        }
+
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            _ => {}
+        }
+    }
+
+    if let Some(term_start) = start {
+        if term_start < input.len() {
+            terms.push(&input[term_start..]);
+        }
+    }
+
+    terms
+}
+
+fn type_app_args<'a>(ty: &'a str, name: &str) -> Option<Vec<&'a str>> {
+    let prefix = format!("({} ", name);
+    if !ty.starts_with(&prefix) || !ty.ends_with(')') {
+        return None;
+    }
+    Some(split_top_level_terms(&ty[prefix.len()..ty.len() - 1]))
+}
+
+fn type_option_inner(ty: &str) -> Option<&str> {
+    type_app_args(ty, "Option").and_then(|args| args.first().copied())
+}
+
+fn type_result_parts(ty: &str) -> Option<(&str, &str)> {
+    let args = type_app_args(ty, "Result")?;
+    match args.as_slice() {
+        [ok, err] => Some((ok, err)),
+        _ => None,
+    }
+}
+
+fn type_sequence_element(ty: &str) -> Option<&str> {
+    type_app_args(ty, "Vector")
+        .or_else(|| type_app_args(ty, "List"))
+        .and_then(|args| args.first().copied())
+}
+
+fn type_tuple_items(ty: &str) -> Option<Vec<&str>> {
+    if !ty.starts_with('[') || !ty.ends_with(']') {
+        return None;
+    }
+    Some(split_top_level_terms(&ty[1..ty.len() - 1]))
+}
+
+fn type_vector_item_type(ty: &str, index: usize) -> Option<&str> {
+    type_tuple_items(ty)
+        .and_then(|items| items.get(index).copied())
+        .or_else(|| type_sequence_element(ty))
+}
+
+fn type_record_field_type<'a>(ty: &'a str, key: &str) -> Option<&'a str> {
+    if !ty.starts_with('{') || !ty.ends_with('}') {
+        return None;
+    }
+    let terms = split_top_level_terms(&ty[1..ty.len() - 1]);
+    let field = format!(":{}", key);
+    let mut iter = terms.chunks_exact(2);
+    iter.find_map(|pair| {
+        if pair[0] == field {
+            Some(pair[1])
+        } else {
+            None
+        }
+    })
+}
+
+fn type_has_required_record_field(ty: &str, key: &str) -> bool {
+    type_record_field_type(ty, key).is_some()
+}
+
+fn type_union_variants(ty: &str) -> Option<Vec<&str>> {
+    type_app_args(ty, "Union")
+}
+
+fn type_has_kind_property(ty: &str) -> bool {
+    if type_record_field_type(ty, "kind").is_some() {
+        return true;
+    }
+    type_union_variants(ty).is_some_and(|variants| {
+        !variants.is_empty()
+            && variants
+                .iter()
+                .all(|variant| type_record_field_type(variant, "kind").is_some())
+    })
+}
+
+fn type_fn_param_types(ty: &str) -> Option<Vec<&str>> {
+    let args = type_app_args(ty, "Fn")?;
+    let params = args.first()?;
+    if !params.starts_with('[') || !params.ends_with(']') {
+        return None;
+    }
+    Some(split_top_level_terms(&params[1..params.len() - 1]))
+}
+
+fn type_is_nullable_or_union_or_var(ty: &str) -> bool {
+    ty.starts_with("(Option ")
+        || ty.starts_with("(Union ")
+        || ty.chars().next().is_some_and(|ch| ch.is_ascii_lowercase())
+}
+
+fn type_has_known_runtime_shape(ty: &str) -> bool {
+    ty == "Number"
+        || ty == "String"
+        || ty == "Bool"
+        || ty == "Nil"
+        || type_is_keyword(ty)
+        || type_is_vector_like(ty)
+        || type_is_set(ty)
+        || type_is_map(ty)
+        || type_is_record(ty)
+}
+
+fn join_pattern_tests(tests: Vec<String>) -> String {
+    let tests = tests
+        .into_iter()
+        .filter(|test| test != "true")
+        .collect::<Vec<_>>();
+    if tests.is_empty() {
+        "true".to_string()
+    } else {
+        tests.join(" && ")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeTypePredicate {
+    Nil,
+    Number,
+    String,
+    Bool,
+    Keyword,
+    Vector,
+    Set,
+    Map,
+    Object,
+}
+
+fn runtime_type_predicate_for_type(ty: &str, predicate: RuntimeTypePredicate) -> Option<bool> {
+    if type_is_nullable_or_union_or_var(ty) || !type_has_known_runtime_shape(ty) {
+        return None;
+    }
+
+    match predicate {
+        RuntimeTypePredicate::Nil if ty == "Nil" => Some(true),
+        RuntimeTypePredicate::Nil => None,
+        RuntimeTypePredicate::Number if ty == "Number" => Some(true),
+        RuntimeTypePredicate::Number => Some(false),
+        RuntimeTypePredicate::String => Some(ty == "String"),
+        RuntimeTypePredicate::Bool => Some(ty == "Bool"),
+        RuntimeTypePredicate::Keyword => Some(type_is_keyword(ty)),
+        RuntimeTypePredicate::Vector => Some(type_is_vector_like(ty)),
+        RuntimeTypePredicate::Set => Some(type_is_set(ty)),
+        RuntimeTypePredicate::Map => Some(type_is_map(ty)),
+        RuntimeTypePredicate::Object => Some(type_is_record(ty)),
+    }
+}
+
+fn date_format_options(style: &str) -> Option<&'static str> {
+    match style {
+        "month-year" => Some("{ month: \"short\", year: \"2-digit\" }"),
+        "month-day-time" => {
+            Some("{ month: \"short\", day: \"numeric\", hour: \"2-digit\", minute: \"2-digit\" }")
+        }
+        "month-day" => Some("{ month: \"short\", day: \"numeric\" }"),
+        "month" => Some("{ month: \"short\" }"),
+        "day" => Some("{ day: \"numeric\" }"),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CollectionShape {
+    VectorLike,
+    Set,
+    Map,
+    String,
+    Unknown,
+}
 
 struct TailEmission {
     code: String,
@@ -410,13 +977,150 @@ impl Emitter {
         self.runtime_effects.insert(kind.to_string());
     }
 
+    fn mark_template_slot_runtime(&mut self, kind: &TemplateSlotKind) {
+        match kind {
+            TemplateSlotKind::Text => self.needs_template_text = true,
+            TemplateSlotKind::Attr { setter, .. } => match setter {
+                TemplateAttrSetter::Simple => self.needs_template_attr = true,
+                TemplateAttrSetter::Text => self.needs_template_text_attr = true,
+                TemplateAttrSetter::NullableText => self.needs_template_nullable_text_attr = true,
+                TemplateAttrSetter::TextProperty => self.needs_template_text_property = true,
+                TemplateAttrSetter::NullableTextProperty => {
+                    self.needs_template_nullable_text_property = true
+                }
+                TemplateAttrSetter::Presence => self.needs_template_presence_attr = true,
+                TemplateAttrSetter::BooleanProperty => self.needs_template_boolean_property = true,
+                TemplateAttrSetter::ClassName => self.needs_template_class_name = true,
+                TemplateAttrSetter::Class => self.needs_template_class = true,
+                TemplateAttrSetter::Style => self.needs_template_style = true,
+                TemplateAttrSetter::StyleRecord => self.needs_template_style_record = true,
+            },
+            TemplateSlotKind::Event(_) => self.needs_template_event = true,
+            TemplateSlotKind::Ref => self.needs_template_ref = true,
+            TemplateSlotKind::Conditional { .. } => self.needs_template_conditional = true,
+            TemplateSlotKind::Component { .. } => self.needs_template_component = true,
+            TemplateSlotKind::KeyedList { .. } => self.needs_template_keyed_list = true,
+        }
+    }
+
+    fn expr_type(&self, expr: &Expr) -> Option<&str> {
+        if let Some(ty) = self.expr_types.get(&expr.span.start) {
+            return Some(ty);
+        }
+        if let ExprKind::Symbol(name) = &expr.kind {
+            return self.local_type(name);
+        }
+        None
+    }
+
+    fn local_type(&self, name: &str) -> Option<&str> {
+        self.local_types
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name).map(String::as_str))
+    }
+
+    fn expr_is_strict_comparable(&self, expr: &Expr) -> bool {
+        self.expr_type(expr).is_some_and(is_strict_comparable_type)
+    }
+
+    fn expr_is_countable_by_length(&self, expr: &Expr) -> bool {
+        self.expr_type(expr).is_some_and(type_counts_by_length)
+    }
+
+    fn expr_is_countable_by_size(&self, expr: &Expr) -> bool {
+        self.expr_type(expr).is_some_and(type_counts_by_size)
+    }
+
+    fn expr_is_vector_like(&self, expr: &Expr) -> bool {
+        self.expr_type(expr).is_some_and(type_is_vector_like)
+    }
+
+    fn expr_is_set(&self, expr: &Expr) -> bool {
+        self.expr_type(expr).is_some_and(type_is_set)
+    }
+
+    fn expr_is_map(&self, expr: &Expr) -> bool {
+        self.expr_type(expr).is_some_and(type_is_map)
+    }
+
+    fn expr_is_record(&self, expr: &Expr) -> bool {
+        self.expr_type(expr).is_some_and(type_is_record)
+    }
+
+    fn expr_runtime_type_predicate(
+        &self,
+        expr: &Expr,
+        predicate: RuntimeTypePredicate,
+    ) -> Option<bool> {
+        if let Some(result) = self.literal_runtime_type_predicate(expr, predicate) {
+            return Some(result);
+        }
+        self.expr_type(expr)
+            .and_then(|ty| runtime_type_predicate_for_type(ty, predicate))
+    }
+
+    fn literal_runtime_type_predicate(
+        &self,
+        expr: &Expr,
+        predicate: RuntimeTypePredicate,
+    ) -> Option<bool> {
+        let actual = match &expr.kind {
+            ExprKind::Nil => RuntimeTypePredicate::Nil,
+            ExprKind::Bool(_) => RuntimeTypePredicate::Bool,
+            ExprKind::Number(_) => RuntimeTypePredicate::Number,
+            ExprKind::String(_) => RuntimeTypePredicate::String,
+            ExprKind::Keyword(_) => RuntimeTypePredicate::Keyword,
+            ExprKind::Vector(_) => RuntimeTypePredicate::Vector,
+            ExprKind::Set(_) => RuntimeTypePredicate::Set,
+            _ => return None,
+        };
+        Some(actual == predicate)
+    }
+
+    fn expr_is_str_raw_string(&self, expr: &Expr) -> bool {
+        matches!(expr.kind, ExprKind::String(_) | ExprKind::Keyword(_))
+            || self
+                .expr_type(expr)
+                .is_some_and(|ty| ty == "String" || type_is_keyword(ty))
+    }
+
+    fn expr_is_str_concat_safe(&self, expr: &Expr) -> bool {
+        if self.expr_is_str_raw_string(expr) {
+            return true;
+        }
+        matches!(
+            expr.kind,
+            ExprKind::Nil | ExprKind::Bool(_) | ExprKind::Number(_)
+        ) || self
+            .expr_type(expr)
+            .is_some_and(|ty| ty == "Number" || ty == "Bool" || ty == "Nil")
+    }
+
+    fn expr_collection_shape(&self, expr: &Expr) -> CollectionShape {
+        let Some(ty) = self.expr_type(expr) else {
+            return CollectionShape::Unknown;
+        };
+        if type_is_vector_like(ty) {
+            CollectionShape::VectorLike
+        } else if type_is_set(ty) {
+            CollectionShape::Set
+        } else if type_is_map(ty) {
+            CollectionShape::Map
+        } else if ty == "String" {
+            CollectionShape::String
+        } else {
+            CollectionShape::Unknown
+        }
+    }
+
     fn emit_expr(&mut self, expr: &Expr) -> String {
         match &expr.kind {
             ExprKind::Nil => "null".to_string(),
             ExprKind::Bool(value) => value.to_string(),
             ExprKind::Number(value) => value.clone(),
             ExprKind::String(value) => format!("\"{}\"", escape_js(value)),
-            ExprKind::Keyword(name) => format!("Symbol.for(\"{}\")", escape_js(name)),
+            ExprKind::Keyword(name) => format!("\"{}\"", escape_js(name)),
             ExprKind::Symbol(name) => self.emit_symbol_read(name),
             ExprKind::Vector(items) => self.emit_array(items),
             ExprKind::Set(items) => format!("new Set({})", self.emit_array(items)),
@@ -447,6 +1151,13 @@ impl Emitter {
     }
 
     fn emit_symbol_read(&mut self, name: &str) -> String {
+        if name == "Cmd.none" || name == "Sub.none" {
+            self.needs_none_const = true;
+            return "__closkellNone".to_string();
+        }
+        if let Some(value) = self.static_reads.get(name) {
+            return value.clone();
+        }
         if let Some(property) = primitive_decoder_runtime_property(name) {
             self.needs_decoder_runtime = true;
             return format!("__closkellDecoder.{}", property);
@@ -514,13 +1225,16 @@ impl Emitter {
                 "render-to-string" => return self.emit_render_to_string(args),
                 "Sub.batch" => return self.emit_sub_batch(args),
                 "Sub.timer/every" => return self.emit_sub_timer_every(args),
-                "Sub.media-query" => {
-                    return self.emit_sub_change(args, "sub/media-query", "query");
-                }
+                "Sub.media-query" => return self.emit_sub_media_query(args),
                 "Sub.window/event" => return self.emit_sub_window_event(args),
                 "Sub.window/event-with" => return self.emit_sub_window_event_with(args),
                 "Sub.dom-ref/resize" => {
-                    return self.emit_sub_change(args, "sub/dom-ref/resize", "ref");
+                    return self.emit_sub_change(
+                        args,
+                        "dom-ref/resize-watch",
+                        "ref",
+                        "dom-ref/resize-unwatch",
+                    );
                 }
                 "+" | "-" | "*" | "/" | "<" | ">" | "<=" | ">=" => {
                     return self.emit_infix(name, args);
@@ -660,8 +1374,8 @@ impl Emitter {
                 "env-dev?" => return self.emit_env_dev(args),
                 "env-mode" => return self.emit_env_mode(args),
                 "not" => return self.emit_prefix("!", args),
-                "and" => return self.emit_infix("&&", args),
-                "or" => return self.emit_infix("||", args),
+                "and" => return self.emit_logical(args, true),
+                "or" => return self.emit_logical(args, false),
                 "ok" => return self.emit_result_constructor("value", true, args),
                 "err" => return self.emit_result_constructor("error", false, args),
                 "ok?" => return self.emit_result_predicate(true, args),
@@ -682,29 +1396,52 @@ impl Emitter {
                 "merge" => return self.emit_merge(args),
                 "dissoc" => return self.emit_dissoc(expr, args),
                 "update-in" => return self.emit_update_in(expr, args),
-                "str" => {
-                    if args.len() == 1 {
-                        return format!("String({})", self.emit_expr(&args[0]));
-                    }
-                    return args
-                        .iter()
-                        .map(|arg| format!("String({})", self.emit_expr(arg)))
-                        .collect::<Vec<_>>()
-                        .join(" + ");
-                }
+                "str" => return self.emit_str(args),
                 "list" | "vector" => return self.emit_array(args),
                 "set" => return format!("new Set({})", self.emit_array(args)),
                 _ => {}
             }
         }
 
-        let callee = self.emit_expr(head);
+        let callee = if let ExprKind::Symbol(name) = &head.kind {
+            self.direct_call_replacements
+                .get(name)
+                .map(|replacement| sanitize_identifier(replacement))
+                .unwrap_or_else(|| self.emit_expr(head))
+        } else {
+            self.emit_expr(head)
+        };
         let args = args
             .iter()
             .map(|arg| self.emit_expr(arg))
             .collect::<Vec<_>>()
             .join(", ");
         format!("{}({})", callee, args)
+    }
+
+    fn emit_str(&mut self, args: &[Expr]) -> String {
+        if args.is_empty() {
+            return "\"\"".to_string();
+        }
+        if args.len() == 1 {
+            return self.emit_str_part(&args[0], true);
+        }
+        args.iter()
+            .enumerate()
+            .map(|(index, arg)| self.emit_str_part(arg, index == 0))
+            .collect::<Vec<_>>()
+            .join(" + ")
+    }
+
+    fn emit_str_part(&mut self, expr: &Expr, first: bool) -> String {
+        let code = self.emit_expr(expr);
+        if matches!(expr.kind, ExprKind::String(_) | ExprKind::Keyword(_)) {
+            return code;
+        }
+        if self.expr_is_str_raw_string(expr) || (!first && self.expr_is_str_concat_safe(expr)) {
+            return parenthesize_expression(code);
+        }
+        format!("String({})", code)
     }
 
     fn emit_unsafe_cast(&mut self, args: &[Expr]) -> String {
@@ -724,7 +1461,7 @@ impl Emitter {
             return "undefined".to_string();
         }
         format!(
-            "{{ __closkellEvent: true, preventDefault: {}, stopPropagation: {}, message: {} }}",
+            "{{ __ce: 1, p: {}, s: {}, m: {} }}",
             prevent_default,
             stop_propagation,
             self.emit_expr(&args[0])
@@ -733,30 +1470,30 @@ impl Emitter {
 
     fn emit_task_succeed(&mut self, args: &[Expr]) -> String {
         if args.len() != 1 {
-            return "{ kind: Symbol.for(\"task/succeed\"), value: undefined }".to_string();
+            return "{ kind: \"task/succeed\", value: undefined }".to_string();
         }
         format!(
-            "{{ kind: Symbol.for(\"task/succeed\"), value: {} }}",
+            "{{ kind: \"task/succeed\", value: {} }}",
             self.emit_expr(&args[0])
         )
     }
 
     fn emit_task_fail(&mut self, args: &[Expr]) -> String {
         if args.len() != 1 {
-            return "{ kind: Symbol.for(\"task/fail\"), error: undefined }".to_string();
+            return "{ kind: \"task/fail\", error: undefined }".to_string();
         }
         format!(
-            "{{ kind: Symbol.for(\"task/fail\"), error: {} }}",
+            "{{ kind: \"task/fail\", error: {} }}",
             self.emit_expr(&args[0])
         )
     }
 
     fn emit_task_combinator(&mut self, args: &[Expr], kind: &str, fn_field: &str) -> String {
         if args.len() != 2 {
-            return "{ kind: Symbol.for(\"task/fail\"), error: \"invalid task\" }".to_string();
+            return "{ kind: \"task/fail\", error: \"invalid task\" }".to_string();
         }
         format!(
-            "{{ kind: Symbol.for(\"{}\"), task: {}, {}: {} }}",
+            "{{ kind: \"{}\", task: {}, {}: {} }}",
             kind,
             self.emit_expr(&args[0]),
             fn_field,
@@ -768,28 +1505,28 @@ impl Emitter {
         self.add_runtime_effect("task/perform");
         match args.len() {
             3 => format!(
-                "{{ kind: Symbol.for(\"task/perform\"), task: {}, onSuccess: {}, onError: {} }}",
+                "{{ kind: \"task/perform\", task: {}, onSuccess: {}, onError: {} }}",
                 self.emit_expr(&args[0]),
                 self.emit_expr(&args[1]),
                 self.emit_expr(&args[2])
             ),
             4 => format!(
-                "{{ kind: Symbol.for(\"task/perform\"), task: {}({}), onSuccess: {}, onError: {} }}",
+                "{{ kind: \"task/perform\", task: {}({}), onSuccess: {}, onError: {} }}",
                 self.emit_expr(&args[0]),
                 self.emit_expr(&args[1]),
                 self.emit_expr(&args[2]),
                 self.emit_expr(&args[3])
             ),
-            _ => "{ kind: Symbol.for(\"none\") }".to_string(),
+            _ => "{ kind: \"none\" }".to_string(),
         }
     }
 
     fn emit_http_task(&mut self, args: &[Expr], kind: &str) -> String {
         if args.len() != 1 {
-            return "{ kind: Symbol.for(\"task/fail\"), error: \"invalid HTTP task\" }".to_string();
+            return "{ kind: \"task/fail\", error: \"invalid HTTP task\" }".to_string();
         }
         format!(
-            "{{ kind: Symbol.for(\"{}\"), url: {} }}",
+            "{{ kind: \"{}\", url: {} }}",
             kind,
             self.emit_expr(&args[0])
         )
@@ -797,10 +1534,10 @@ impl Emitter {
 
     fn emit_cmd_batch(&mut self, args: &[Expr]) -> String {
         if args.len() != 1 {
-            return "{ kind: Symbol.for(\"none\") }".to_string();
+            return "{ kind: \"none\" }".to_string();
         }
         format!(
-            "{{ kind: Symbol.for(\"batch\"), commands: {} }}",
+            "{{ kind: \"batch\", commands: {} }}",
             self.emit_expr(&args[0])
         )
     }
@@ -808,10 +1545,10 @@ impl Emitter {
     fn emit_cmd_storage_get(&mut self, args: &[Expr]) -> String {
         self.add_runtime_effect("storage/get");
         if args.len() != 4 {
-            return "{ kind: Symbol.for(\"none\") }".to_string();
+            return "{ kind: \"none\" }".to_string();
         }
         format!(
-            "{{ kind: Symbol.for(\"storage/get\"), key: {}, format: {}, toMessage: {}, onError: {} }}",
+            "{{ kind: \"storage/get\", key: {}, format: {}, toMessage: {}, onError: {} }}",
             self.emit_expr(&args[0]),
             self.emit_expr(&args[1]),
             self.emit_expr(&args[2]),
@@ -822,14 +1559,14 @@ impl Emitter {
     fn emit_cmd_storage_set(&mut self, args: &[Expr]) -> String {
         self.add_runtime_effect("storage/set");
         if args.len() != 3 && args.len() != 4 {
-            return "{ kind: Symbol.for(\"none\") }".to_string();
+            return "{ kind: \"none\" }".to_string();
         }
         let on_error = args
             .get(3)
             .map(|arg| format!(", onError: {}", self.emit_expr(arg)))
             .unwrap_or_default();
         format!(
-            "{{ kind: Symbol.for(\"storage/set\"), key: {}, value: {}, msg: {}{} }}",
+            "{{ kind: \"storage/set\", key: {}, value: {}, msg: {}{} }}",
             self.emit_expr(&args[0]),
             self.emit_expr(&args[1]),
             self.emit_expr(&args[2]),
@@ -840,10 +1577,10 @@ impl Emitter {
     fn emit_cmd_storage_set_silent(&mut self, args: &[Expr]) -> String {
         self.add_runtime_effect("storage/set");
         if args.len() != 3 {
-            return "{ kind: Symbol.for(\"none\") }".to_string();
+            return "{ kind: \"none\" }".to_string();
         }
         format!(
-            "{{ kind: Symbol.for(\"storage/set\"), key: {}, value: {}, onError: {} }}",
+            "{{ kind: \"storage/set\", key: {}, value: {}, onError: {} }}",
             self.emit_expr(&args[0]),
             self.emit_expr(&args[1]),
             self.emit_expr(&args[2])
@@ -853,10 +1590,10 @@ impl Emitter {
     fn emit_cmd_time_now(&mut self, args: &[Expr]) -> String {
         self.add_runtime_effect("time/now");
         if args.len() != 1 {
-            return "{ kind: Symbol.for(\"none\") }".to_string();
+            return "{ kind: \"none\" }".to_string();
         }
         format!(
-            "{{ kind: Symbol.for(\"time/now\"), toMessage: {} }}",
+            "{{ kind: \"time/now\", toMessage: {} }}",
             self.emit_expr(&args[0])
         )
     }
@@ -864,10 +1601,10 @@ impl Emitter {
     fn emit_cmd_random_number(&mut self, args: &[Expr]) -> String {
         self.add_runtime_effect("random/number");
         if args.len() != 3 {
-            return "{ kind: Symbol.for(\"none\") }".to_string();
+            return "{ kind: \"none\" }".to_string();
         }
         format!(
-            "{{ kind: Symbol.for(\"random/number\"), min: {}, max: {}, toMessage: {} }}",
+            "{{ kind: \"random/number\", min: {}, max: {}, toMessage: {} }}",
             self.emit_expr(&args[0]),
             self.emit_expr(&args[1]),
             self.emit_expr(&args[2])
@@ -877,10 +1614,10 @@ impl Emitter {
     fn emit_cmd_timer(&mut self, args: &[Expr], kind: &str) -> String {
         self.add_runtime_effect(kind);
         if args.len() != 3 {
-            return "{ kind: Symbol.for(\"none\") }".to_string();
+            return "{ kind: \"none\" }".to_string();
         }
         format!(
-            "{{ kind: Symbol.for(\"{}\"), id: {}, ms: {}, msg: {} }}",
+            "{{ kind: \"{}\", id: {}, ms: {}, msg: {} }}",
             kind,
             self.emit_expr(&args[0]),
             self.emit_expr(&args[1]),
@@ -891,10 +1628,10 @@ impl Emitter {
     fn emit_cmd_timer_cancel(&mut self, args: &[Expr]) -> String {
         self.add_runtime_effect("timer/cancel");
         if args.len() != 1 {
-            return "{ kind: Symbol.for(\"none\") }".to_string();
+            return "{ kind: \"none\" }".to_string();
         }
         format!(
-            "{{ kind: Symbol.for(\"timer/cancel\"), id: {} }}",
+            "{{ kind: \"timer/cancel\", id: {} }}",
             self.emit_expr(&args[0])
         )
     }
@@ -902,10 +1639,10 @@ impl Emitter {
     fn emit_cmd_animation_frame(&mut self, args: &[Expr]) -> String {
         self.add_runtime_effect("animation/frame");
         if args.len() != 2 {
-            return "{ kind: Symbol.for(\"none\") }".to_string();
+            return "{ kind: \"none\" }".to_string();
         }
         format!(
-            "{{ kind: Symbol.for(\"animation/frame\"), id: {}, onFrame: {} }}",
+            "{{ kind: \"animation/frame\", id: {}, onFrame: {} }}",
             self.emit_expr(&args[0]),
             self.emit_expr(&args[1])
         )
@@ -914,10 +1651,10 @@ impl Emitter {
     fn emit_cmd_animation_cancel(&mut self, args: &[Expr]) -> String {
         self.add_runtime_effect("animation/cancel");
         if args.len() != 2 {
-            return "{ kind: Symbol.for(\"none\") }".to_string();
+            return "{ kind: \"none\" }".to_string();
         }
         format!(
-            "{{ kind: Symbol.for(\"animation/cancel\"), id: {}, msg: {} }}",
+            "{{ kind: \"animation/cancel\", id: {}, msg: {} }}",
             self.emit_expr(&args[0]),
             self.emit_expr(&args[1])
         )
@@ -926,14 +1663,14 @@ impl Emitter {
     fn emit_cmd_dom_ref_action(&mut self, args: &[Expr], kind: &str) -> String {
         self.add_runtime_effect(kind);
         if args.len() != 2 && args.len() != 3 {
-            return "{ kind: Symbol.for(\"none\") }".to_string();
+            return "{ kind: \"none\" }".to_string();
         }
         let on_error = args
             .get(2)
             .map(|arg| format!(", onError: {}", self.emit_expr(arg)))
             .unwrap_or_default();
         format!(
-            "{{ kind: Symbol.for(\"{}\"), ref: {}, msg: {}{} }}",
+            "{{ kind: \"{}\", ref: {}, msg: {}{} }}",
             kind,
             self.emit_expr(&args[0]),
             self.emit_expr(&args[1]),
@@ -944,10 +1681,10 @@ impl Emitter {
     fn emit_cmd_file_read_selected(&mut self, args: &[Expr]) -> String {
         self.add_runtime_effect("file/read-selected");
         if args.len() != 5 {
-            return "{ kind: Symbol.for(\"none\") }".to_string();
+            return "{ kind: \"none\" }".to_string();
         }
         format!(
-            "{{ kind: Symbol.for(\"file/read-selected\"), ref: {}, format: {}, toMessage: {}, onError: {}, onCancel: {} }}",
+            "{{ kind: \"file/read-selected\", ref: {}, format: {}, toMessage: {}, onError: {}, onCancel: {} }}",
             self.emit_expr(&args[0]),
             self.emit_expr(&args[1]),
             self.emit_expr(&args[2]),
@@ -959,10 +1696,10 @@ impl Emitter {
     fn emit_cmd_file_download(&mut self, args: &[Expr]) -> String {
         self.add_runtime_effect("file/download");
         if args.len() != 5 {
-            return "{ kind: Symbol.for(\"none\") }".to_string();
+            return "{ kind: \"none\" }".to_string();
         }
         format!(
-            "{{ kind: Symbol.for(\"file/download\"), name: {}, content: {}, mime: {}, msg: {}, onError: {} }}",
+            "{{ kind: \"file/download\", name: {}, content: {}, mime: {}, msg: {}, onError: {} }}",
             self.emit_expr(&args[0]),
             self.emit_expr(&args[1]),
             self.emit_expr(&args[2]),
@@ -974,10 +1711,10 @@ impl Emitter {
     fn emit_cmd_canvas_draw(&mut self, args: &[Expr]) -> String {
         self.add_runtime_effect("canvas/draw");
         if args.len() != 5 {
-            return "{ kind: Symbol.for(\"none\") }".to_string();
+            return "{ kind: \"none\" }".to_string();
         }
         format!(
-            "{{ kind: Symbol.for(\"canvas/draw\"), ref: {}, cssWidth: {}, cssHeight: {}, devicePixelRatio: true, ops: {}, onError: {} }}",
+            "{{ kind: \"canvas/draw\", ref: {}, cssWidth: {}, cssHeight: {}, devicePixelRatio: true, ops: {}, onError: {} }}",
             self.emit_expr(&args[0]),
             self.emit_expr(&args[1]),
             self.emit_expr(&args[2]),
@@ -987,12 +1724,24 @@ impl Emitter {
     }
 
     fn emit_cmd_resize_watch(&mut self, args: &[Expr]) -> String {
+        if args.len() == 4 {
+            if let Some(to_message) = self.emit_resize_to_message(&args[2]) {
+                self.add_runtime_effect("dom-ref/resize-watch/direct");
+                return format!(
+                    "{{ kind: \"dom-ref/resize-watch/direct\", id: {}, ref: {}, m: {}, onError: {} }}",
+                    self.emit_expr(&args[0]),
+                    self.emit_expr(&args[1]),
+                    to_message,
+                    self.emit_expr(&args[3])
+                );
+            }
+        }
         self.add_runtime_effect("dom-ref/resize-watch");
         if args.len() != 4 {
-            return "{ kind: Symbol.for(\"none\") }".to_string();
+            return "{ kind: \"none\" }".to_string();
         }
         format!(
-            "{{ kind: Symbol.for(\"dom-ref/resize-watch\"), id: {}, ref: {}, onChange: {}, onError: {} }}",
+            "{{ kind: \"dom-ref/resize-watch\", id: {}, ref: {}, onChange: {}, onError: {} }}",
             self.emit_expr(&args[0]),
             self.emit_expr(&args[1]),
             self.emit_expr(&args[2]),
@@ -1003,10 +1752,10 @@ impl Emitter {
     fn emit_cmd_dom_ref_measure(&mut self, args: &[Expr]) -> String {
         self.add_runtime_effect("dom-ref/measure");
         if args.len() != 3 {
-            return "{ kind: Symbol.for(\"none\") }".to_string();
+            return "{ kind: \"none\" }".to_string();
         }
         format!(
-            "{{ kind: Symbol.for(\"dom-ref/measure\"), ref: {}, toMessage: {}, onError: {} }}",
+            "{{ kind: \"dom-ref/measure\", ref: {}, toMessage: {}, onError: {} }}",
             self.emit_expr(&args[0]),
             self.emit_expr(&args[1]),
             self.emit_expr(&args[2])
@@ -1016,10 +1765,10 @@ impl Emitter {
     fn emit_cmd_bluetooth_connect_heart_rate(&mut self, args: &[Expr]) -> String {
         self.add_runtime_effect("bluetooth/connect-heart-rate");
         if args.len() != 6 {
-            return "{ kind: Symbol.for(\"none\") }".to_string();
+            return "{ kind: \"none\" }".to_string();
         }
         format!(
-            "{{ kind: Symbol.for(\"bluetooth/connect-heart-rate\"), id: {}, ...{}, toMessage: {}, onReading: {}, onDisconnected: {}, onError: {} }}",
+            "{{ kind: \"bluetooth/connect-heart-rate\", id: {}, ...{}, toMessage: {}, onReading: {}, onDisconnected: {}, onError: {} }}",
             self.emit_expr(&args[0]),
             self.emit_expr(&args[1]),
             self.emit_expr(&args[2]),
@@ -1032,10 +1781,10 @@ impl Emitter {
     fn emit_cmd_bluetooth_disconnect(&mut self, args: &[Expr]) -> String {
         self.add_runtime_effect("bluetooth/disconnect");
         if args.len() != 2 {
-            return "{ kind: Symbol.for(\"none\") }".to_string();
+            return "{ kind: \"none\" }".to_string();
         }
         format!(
-            "{{ kind: Symbol.for(\"bluetooth/disconnect\"), id: {}, msg: {} }}",
+            "{{ kind: \"bluetooth/disconnect\", id: {}, msg: {} }}",
             self.emit_expr(&args[0]),
             self.emit_expr(&args[1])
         )
@@ -1044,7 +1793,7 @@ impl Emitter {
     fn emit_cmd_simulation_heart_rate(&mut self, args: &[Expr]) -> String {
         self.add_runtime_effect("simulation/heart-rate");
         if args.len() != 5 && args.len() != 6 {
-            return "{ kind: Symbol.for(\"none\") }".to_string();
+            return "{ kind: \"none\" }".to_string();
         }
         let on_disconnected = if args.len() == 6 {
             format!(", onDisconnected: {}", self.emit_expr(&args[4]))
@@ -1053,7 +1802,7 @@ impl Emitter {
         };
         let error_arg = if args.len() == 6 { &args[5] } else { &args[4] };
         format!(
-            "{{ kind: Symbol.for(\"simulation/heart-rate\"), id: {}, ...{}, toMessage: {}, onReading: {}{}, onError: {} }}",
+            "{{ kind: \"simulation/heart-rate\", id: {}, ...{}, toMessage: {}, onReading: {}{}, onError: {} }}",
             self.emit_expr(&args[0]),
             self.emit_expr(&args[1]),
             self.emit_expr(&args[2]),
@@ -1066,10 +1815,10 @@ impl Emitter {
     fn emit_cmd_simulation_stop(&mut self, args: &[Expr]) -> String {
         self.add_runtime_effect("simulation/stop");
         if args.len() != 1 {
-            return "{ kind: Symbol.for(\"none\") }".to_string();
+            return "{ kind: \"none\" }".to_string();
         }
         format!(
-            "{{ kind: Symbol.for(\"simulation/stop\"), id: {} }}",
+            "{{ kind: \"simulation/stop\", id: {} }}",
             self.emit_expr(&args[0])
         )
     }
@@ -1124,11 +1873,13 @@ impl Emitter {
 
     fn emit_scope_update(&mut self, args: &[Expr]) -> String {
         self.needs_html_runtime = true;
+        self.needs_scope_update = true;
         if args.len() != 5 {
-            return "[undefined, { kind: Symbol.for(\"none\") }]".to_string();
+            return "[undefined, { kind: \"none\" }]".to_string();
         }
         format!(
-            "__closkellScopeUpdate({}, {}, {}, {}, {})",
+            "{}({}, {}, {}, {}, {})",
+            SCOPE_UPDATE_ALIAS,
             self.emit_expr(&args[0]),
             self.emit_expr(&args[1]),
             self.emit_expr(&args[2]),
@@ -1139,11 +1890,13 @@ impl Emitter {
 
     fn emit_scope_subscriptions(&mut self, args: &[Expr]) -> String {
         self.needs_html_runtime = true;
+        self.needs_scope_subscriptions = true;
         if args.len() != 3 {
-            return "{ kind: Symbol.for(\"none\") }".to_string();
+            return "{ kind: \"none\" }".to_string();
         }
         format!(
-            "__closkellScopeSubscriptions({}, {}, {})",
+            "{}({}, {}, {})",
+            SCOPE_SUBSCRIPTIONS_ALIAS,
             self.emit_expr(&args[0]),
             self.emit_expr(&args[1]),
             self.emit_expr(&args[2])
@@ -1152,11 +1905,16 @@ impl Emitter {
 
     fn emit_scope_view(&mut self, args: &[Expr]) -> String {
         self.needs_html_runtime = true;
+        self.needs_scope_view = true;
         if args.len() != 3 {
-            return "__closkellScopeView(Symbol.for(\"scope\"), () => ({ mount() {}, update() {}, dispose() {}, root: null }), undefined)".to_string();
+            return format!(
+                "{}(\"scope\", () => ({{ mount() {{}}, update() {{}}, dispose() {{}}, root: null }}), undefined)",
+                SCOPE_VIEW_ALIAS
+            );
         }
         format!(
-            "__closkellScopeView({}, {}, {})",
+            "{}({}, {}, {})",
+            SCOPE_VIEW_ALIAS,
             self.emit_expr(&args[0]),
             self.emit_expr(&args[1]),
             self.emit_expr(&args[2])
@@ -1165,48 +1923,75 @@ impl Emitter {
 
     fn emit_render_to_string(&mut self, args: &[Expr]) -> String {
         self.needs_html_runtime = true;
+        self.needs_render_to_string = true;
         match args.len() {
-            1 => format!("__closkellRenderToString({})", self.emit_expr(&args[0])),
+            1 => format!("{}({})", RENDER_TO_STRING_ALIAS, self.emit_expr(&args[0])),
             2 => format!(
-                "__closkellRenderToString({}, {})",
+                "{}({}, {})",
+                RENDER_TO_STRING_ALIAS,
                 self.emit_expr(&args[0]),
                 self.emit_expr(&args[1])
             ),
-            _ => "__closkellRenderToString(null)".to_string(),
+            _ => format!("{}(null)", RENDER_TO_STRING_ALIAS),
         }
     }
 
     fn emit_sub_batch(&mut self, args: &[Expr]) -> String {
         if args.len() != 1 {
-            return "{ kind: Symbol.for(\"batch\"), subscriptions: [] }".to_string();
+            return "{ kind: \"batch\", subscriptions: [] }".to_string();
         }
         format!(
-            "{{ kind: Symbol.for(\"batch\"), subscriptions: {} }}",
+            "{{ kind: \"batch\", subscriptions: {} }}",
             self.emit_expr(&args[0])
         )
     }
 
     fn emit_sub_timer_every(&mut self, args: &[Expr]) -> String {
-        self.add_runtime_effect("sub/timer/every");
+        self.add_runtime_effect("timer/every");
+        self.add_runtime_effect("timer/cancel");
         if args.len() != 3 {
-            return "{ kind: Symbol.for(\"none\") }".to_string();
+            return "{ kind: \"none\" }".to_string();
         }
         format!(
-            "{{ kind: Symbol.for(\"sub/timer/every\"), id: {}, ms: {}, msg: {} }}",
+            "{{ kind: \"timer/every\", s: \"timer/cancel\", id: {}, ms: {}, msg: {} }}",
             self.emit_expr(&args[0]),
             self.emit_expr(&args[1]),
             self.emit_expr(&args[2])
         )
     }
 
-    fn emit_sub_change(&mut self, args: &[Expr], kind: &str, target_field: &str) -> String {
+    fn emit_sub_media_query(&mut self, args: &[Expr]) -> String {
+        if args.len() == 3 {
+            if let Some(to_message) = self.emit_media_query_to_message(&args[2]) {
+                self.add_runtime_effect("media-query/watch/direct");
+                self.add_runtime_effect("media-query/unwatch/direct");
+                return format!(
+                    "{{ kind: \"media-query/watch/direct\", s: \"media-query/unwatch/direct\", id: {}, query: {}, m: {} }}",
+                    self.emit_expr(&args[0]),
+                    self.emit_expr(&args[1]),
+                    to_message
+                );
+            }
+        }
+        self.emit_sub_change(args, "media-query/watch", "query", "media-query/unwatch")
+    }
+
+    fn emit_sub_change(
+        &mut self,
+        args: &[Expr],
+        kind: &str,
+        target_field: &str,
+        stop_kind: &str,
+    ) -> String {
         self.add_runtime_effect(kind);
+        self.add_runtime_effect(stop_kind);
         if args.len() != 3 {
-            return "{ kind: Symbol.for(\"none\") }".to_string();
+            return "{ kind: \"none\" }".to_string();
         }
         format!(
-            "{{ kind: Symbol.for(\"{}\"), id: {}, {}: {}, onChange: {} }}",
+            "{{ kind: \"{}\", s: \"{}\", id: {}, {}: {}, onChange: {} }}",
             kind,
+            stop_kind,
             self.emit_expr(&args[0]),
             target_field,
             self.emit_expr(&args[1]),
@@ -1215,16 +2000,24 @@ impl Emitter {
     }
 
     fn emit_sub_window_event(&mut self, args: &[Expr]) -> String {
-        self.add_runtime_effect("sub/window/event");
+        if args.len() == 3 {
+            if let Some(to_message) = self.emit_window_event_to_message(&args[2]) {
+                return self.emit_direct_window_event_subscription(
+                    &args[0], &args[1], to_message, None, false, false,
+                );
+            }
+        }
+        self.add_runtime_effect("window/event-watch");
+        self.add_runtime_effect("window/event-unwatch");
         if args.len() != 3 && args.len() != 4 {
-            return "{ kind: Symbol.for(\"none\") }".to_string();
+            return "{ kind: \"none\" }".to_string();
         }
         let options = args
             .get(3)
             .map(|arg| format!(", options: {}", self.emit_expr(arg)))
             .unwrap_or_default();
         format!(
-            "{{ kind: Symbol.for(\"sub/window/event\"), id: {}, type: {}, onEvent: {}{} }}",
+            "{{ kind: \"window/event-watch\", s: \"window/event-unwatch\", id: {}, type: {}, onEvent: {}{} }}",
             self.emit_expr(&args[0]),
             self.emit_expr(&args[1]),
             self.emit_expr(&args[2]),
@@ -1233,17 +2026,153 @@ impl Emitter {
     }
 
     fn emit_sub_window_event_with(&mut self, args: &[Expr]) -> String {
-        self.add_runtime_effect("sub/window/event");
+        if args.len() == 4 {
+            if let (Some(to_message), Some(options)) = (
+                self.emit_window_event_to_message(&args[2]),
+                static_window_event_options(&args[3]),
+            ) {
+                return self.emit_direct_window_event_subscription(
+                    &args[0],
+                    &args[1],
+                    to_message,
+                    options.options,
+                    options.prevent_default,
+                    options.stop_propagation,
+                );
+            }
+        }
+        self.add_runtime_effect("window/event-watch");
+        self.add_runtime_effect("window/event-unwatch");
         if args.len() != 4 {
-            return "{ kind: Symbol.for(\"none\") }".to_string();
+            return "{ kind: \"none\" }".to_string();
         }
         format!(
-            "{{ kind: Symbol.for(\"sub/window/event\"), id: {}, type: {}, onEvent: {}, ...{} }}",
+            "{{ ...{}, kind: \"window/event-watch\", s: \"window/event-unwatch\", id: {}, type: {}, onEvent: {} }}",
+            self.emit_expr(&args[3]),
             self.emit_expr(&args[0]),
             self.emit_expr(&args[1]),
-            self.emit_expr(&args[2]),
-            self.emit_expr(&args[3])
+            self.emit_expr(&args[2])
         )
+    }
+
+    fn emit_direct_window_event_subscription(
+        &mut self,
+        id: &Expr,
+        event_type: &Expr,
+        to_message: String,
+        options: Option<&Expr>,
+        prevent_default: bool,
+        stop_propagation: bool,
+    ) -> String {
+        self.add_runtime_effect("window/event-watch/direct");
+        self.add_runtime_effect("window/event-unwatch/direct");
+        let options = options
+            .map(|expr| format!(", options: {}", self.emit_expr(expr)))
+            .unwrap_or_default();
+        let prevent_default = if prevent_default { ", p: true" } else { "" };
+        let stop_propagation = if stop_propagation { ", q: true" } else { "" };
+        format!(
+            "{{ kind: \"window/event-watch/direct\", s: \"window/event-unwatch/direct\", id: {}, type: {}, m: {}{}{}{} }}",
+            self.emit_expr(id),
+            self.emit_expr(event_type),
+            to_message,
+            options,
+            prevent_default,
+            stop_propagation
+        )
+    }
+
+    fn emit_window_event_to_message(&mut self, message: &Expr) -> Option<String> {
+        let kind = literal_string_value(message)?;
+        let reads = self.message_field_reads.get(kind)?;
+        if reads.value_escapes || reads.top_fields.contains("id") {
+            return None;
+        }
+        let body = self.emit_window_event_message_object(kind, reads)?;
+        Some(format!("(event) => ({})", body))
+    }
+
+    fn emit_window_event_message_object(
+        &self,
+        kind: &str,
+        reads: &MessageFieldReads,
+    ) -> Option<String> {
+        let mut fields = vec![format!("kind: \"{}\"", escape_js(kind))];
+        for field in &reads.top_fields {
+            if field == "id" {
+                fields.push("id".to_string());
+            } else {
+                fields.push(format!(
+                    "{}: {}",
+                    property_key(field),
+                    window_event_field_expr(field)?
+                ));
+            }
+        }
+        if !reads.value_fields.is_empty() {
+            let mut value_fields = Vec::new();
+            for field in &reads.value_fields {
+                value_fields.push(format!(
+                    "{}: {}",
+                    property_key(field),
+                    window_event_field_expr(field)?
+                ));
+            }
+            fields.push(format!("value: {{ {} }}", value_fields.join(", ")));
+        }
+        Some(format!("{{ {} }}", fields.join(", ")))
+    }
+
+    fn emit_media_query_to_message(&mut self, message: &Expr) -> Option<String> {
+        let kind = literal_string_value(message)?;
+        let reads = self.message_field_reads.get(kind)?;
+        if reads.value_escapes || !reads.value_fields.is_empty() || reads.top_fields.contains("id")
+        {
+            return None;
+        }
+        let mut fields = vec![format!("kind: \"{}\"", escape_js(kind))];
+        for field in &reads.top_fields {
+            let value = match field.as_str() {
+                "media" => "mediaQuery.media",
+                "matches" => "mediaQuery.matches",
+                _ => return None,
+            };
+            fields.push(format!("{}: {}", property_key(field), value));
+        }
+        Some(format!("(mediaQuery) => ({{ {} }})", fields.join(", ")))
+    }
+
+    fn emit_resize_to_message(&mut self, message: &Expr) -> Option<String> {
+        let kind = literal_string_value(message)?;
+        let reads = self.message_field_reads.get(kind)?;
+        if reads.value_escapes {
+            return None;
+        }
+        let mut fields = vec![format!("kind: \"{}\"", escape_js(kind))];
+        for field in &reads.top_fields {
+            let value = match field.as_str() {
+                "id" => "id",
+                _ => resize_field_expr(field)?,
+            };
+            fields.push(format!("{}: {}", property_key(field), value));
+        }
+        if !reads.value_fields.is_empty() {
+            let mut value_fields = Vec::new();
+            for field in &reads.value_fields {
+                value_fields.push(format!(
+                    "{}: {}",
+                    property_key(field),
+                    resize_field_expr(field)?
+                ));
+            }
+            fields.push(format!("value: {{ {} }}", value_fields.join(", ")));
+        }
+        let params = if reads.top_fields.contains("id") {
+            "entry, node, id"
+        } else {
+            "entry, node"
+        };
+        Some(format!("({}) => ({{ {} }})", params, fields.join(", ")))
     }
 
     fn emit_defn(&mut self, name: &str, expr: &Expr, args: &[Expr]) -> String {
@@ -1254,11 +2183,22 @@ impl Emitter {
             ));
             return format!("export const {} = undefined;", sanitize_identifier(name));
         };
+        let param_types = self
+            .expr_type(expr)
+            .and_then(type_fn_param_types)
+            .map(|types| types.into_iter().map(str::to_string).collect::<Vec<_>>())
+            .unwrap_or_default();
 
         if let [template] = &args[1..] {
             if let ExprKind::HtmlTemplate(node) = &template.kind {
                 let (param_names, param_idents) = self.emit_defn_symbol_params(params);
-                return self.emit_template_defn(name, &param_idents, &param_names, node);
+                return self.emit_template_defn(
+                    name,
+                    &param_idents,
+                    &param_names,
+                    &param_types,
+                    node,
+                );
             }
             if let Some((bindings, node)) = let_template_parts(template) {
                 let (param_names, param_idents) = self.emit_defn_symbol_params(params);
@@ -1266,6 +2206,7 @@ impl Emitter {
                     name,
                     &param_idents,
                     &param_names,
+                    &param_types,
                     bindings,
                     node,
                 );
@@ -1276,20 +2217,27 @@ impl Emitter {
         let mut simple_param_idents = Vec::new();
         let mut pattern_statements = Vec::new();
         let mut has_pattern_params = false;
-        for param in params {
+        let mut local_type_bindings = BTreeMap::new();
+        for (index, param) in params.iter().enumerate() {
             match &param.kind {
                 ExprKind::Symbol(name) if name != "_" => {
                     let ident = sanitize_identifier(name);
                     js_params.push(ident.clone());
                     simple_param_idents.push(ident);
+                    if let Some(param_type) = param_types.get(index) {
+                        local_type_bindings.insert(name.clone(), param_type.clone());
+                    }
                 }
                 _ => {
                     has_pattern_params = true;
                     let value_name = self.next_temp("__closkell_arg");
                     js_params.push(value_name.clone());
+                    let param_type = param_types.get(index).map(String::as_str);
+                    collect_pattern_type_bindings(param, param_type, &mut local_type_bindings);
                     self.emit_pattern_value_statement(
                         param,
                         &value_name,
+                        param_type,
                         "defn parameter pattern did not match",
                         &mut pattern_statements,
                     );
@@ -1297,8 +2245,14 @@ impl Emitter {
             }
         }
 
-        let mut body = if has_pattern_params {
-            let function_body = self.emit_function_body(expr, &args[1..]);
+        let previous_update_message_param = self.current_update_message_param.clone();
+        if name == "update" {
+            self.current_update_message_param = simple_param_idents.get(1).cloned();
+        }
+
+        self.local_types.push(local_type_bindings);
+        let body = if has_pattern_params {
+            let function_body = self.emit_function_body(&args[1..]);
             [pattern_statements.join(" "), function_body]
                 .into_iter()
                 .filter(|part| !part.is_empty())
@@ -1306,18 +2260,18 @@ impl Emitter {
                 .join(" ")
         } else {
             self.emit_tail_recursive_function_body(name, &simple_param_idents, &args[1..])
-                .unwrap_or_else(|| self.emit_function_body(expr, &args[1..]))
+                .unwrap_or_else(|| self.emit_function_body(&args[1..]))
         };
-        if !has_pattern_params && contains_reduce_call(&args[1..]) {
-            body = self.emit_memoized_function_body(name, &simple_param_idents, body);
-        }
+        self.local_types.pop();
         let params = js_params.join(", ");
-        format!(
+        let result = format!(
             "export function {}({}) {{ {} }}",
             sanitize_identifier(name),
             params,
             body
-        )
+        );
+        self.current_update_message_param = previous_update_message_param;
+        result
     }
 
     fn emit_defn_symbol_params(&mut self, params: &[Expr]) -> (Vec<String>, Vec<String>) {
@@ -1345,66 +2299,47 @@ impl Emitter {
         (param_names, param_idents)
     }
 
-    fn emit_memoized_function_body(
-        &mut self,
-        name: &str,
-        params: &[String],
-        body: String,
-    ) -> String {
-        let memo_name = self.next_temp("__closkell_memo");
-        let entry_name = self.next_temp("__closkell_memo_entry");
-        let value_name = self.next_temp("__closkell_memo_value");
-        let function_name = sanitize_identifier(name);
-        let args = params.join(", ");
-        let checks = params
-            .iter()
-            .enumerate()
-            .map(|(index, param)| format!("Object.is({}.args[{}], {})", entry_name, index, param))
-            .collect::<Vec<_>>()
-            .join(" && ");
-        let checks = if checks.is_empty() {
-            "true".to_string()
-        } else {
-            checks
-        };
-        format!(
-            "const {memo_name} = {function_name}.__closkellMemo ??= []; for (const {entry_name} of {memo_name}) {{ if ({entry_name}.args.length === {arity} && {checks}) return {entry_name}.value; }} const {value_name} = (() => {{ {body} }})(); {memo_name}.unshift({{ args: [{args}], value: {value_name} }}); if ({memo_name}.length > 16) {memo_name}.pop(); return {value_name};",
-            arity = params.len()
-        )
-    }
-
     fn emit_template_defn(
         &mut self,
         name: &str,
         params: &[String],
-        _param_names: &[String],
+        param_names: &[String],
+        param_types: &[String],
         node: &HtmlNode,
     ) -> String {
         let param_list = params.join(", ");
+        let local_type_bindings = param_names
+            .iter()
+            .zip(param_types.iter())
+            .map(|(name, ty)| (name.clone(), ty.clone()))
+            .collect::<BTreeMap<_, _>>();
+        self.local_types.push(local_type_bindings);
         let component_expr = self.emit_template_component(node);
+        self.local_types.pop();
         let update_params = params
             .iter()
             .map(|param| format!("next_{}", param))
             .collect::<Vec<_>>();
-        let update_signature = if update_params.is_empty() {
-            "dispatch".to_string()
-        } else {
-            format!("{}, dispatch", update_params.join(", "))
-        };
         let reassign = params
             .iter()
             .zip(update_params.iter())
             .map(|(param, update_param)| format!("{} = {};", param, update_param))
             .collect::<Vec<_>>()
             .join(" ");
+        let bind = if update_params.is_empty() {
+            "null".to_string()
+        } else {
+            format!("({}) => {{ {} }}", update_params.join(", "), reassign)
+        };
 
         format!(
-            "export function {}({}) {{ const __closkellComponent = {}; return {{ mount(parent, dispatch) {{ return __closkellComponent.mount(parent, dispatch); }}, update({}) {{ {} return __closkellComponent.update(dispatch); }}, dispose() {{ __closkellComponent.dispose(); }}, get root() {{ return __closkellComponent.root; }} }}; }}",
+            "export function {}({}) {{ const __closkellComponent = {}; return {}(__closkellComponent, {}, {}); }}",
             sanitize_identifier(name),
             param_list,
             component_expr,
-            update_signature,
-            reassign
+            BIND_COMPONENT_ALIAS,
+            params.len(),
+            bind
         )
     }
 
@@ -1412,7 +2347,8 @@ impl Emitter {
         &mut self,
         name: &str,
         params: &[String],
-        _param_names: &[String],
+        param_names: &[String],
+        param_types: &[String],
         bindings: &[Expr],
         node: &HtmlNode,
     ) -> String {
@@ -1420,6 +2356,12 @@ impl Emitter {
         let mut locals = BTreeSet::new();
         let mut refresh_lines = Vec::new();
         let mut read_aliases = ReadAliases::new();
+        let local_type_bindings = param_names
+            .iter()
+            .zip(param_types.iter())
+            .map(|(name, ty)| (name.clone(), ty.clone()))
+            .collect::<BTreeMap<_, _>>();
+        self.local_types.push(local_type_bindings);
 
         for pair in bindings.chunks(2) {
             let [binding, value] = pair else {
@@ -1436,6 +2378,7 @@ impl Emitter {
             let can_project = can_project_read_alias(value, &read_aliases);
             collect_pattern_read_aliases(binding, &value_reads, can_project, &mut read_aliases);
             collect_pattern_symbols(binding, &mut locals);
+            let value_type = self.expr_type(value).map(str::to_string);
 
             match &binding.kind {
                 ExprKind::Symbol(name) if name == "_" => {
@@ -1458,10 +2401,14 @@ impl Emitter {
                     self.emit_pattern_assignment_statement(
                         binding,
                         &value_name,
+                        value_type.as_deref(),
                         "let pattern did not match",
                         &mut refresh_lines,
                     );
                 }
+            }
+            if let Some(scope) = self.local_types.last_mut() {
+                collect_pattern_type_bindings(binding, value_type.as_deref(), scope);
             }
         }
 
@@ -1472,31 +2419,37 @@ impl Emitter {
             .join(" ");
         let refresh_body = refresh_lines.join(" ");
         let component_expr = self.emit_template_component_with_read_aliases(node, &read_aliases);
+        self.local_types.pop();
         let update_params = params
             .iter()
             .map(|param| format!("next_{}", param))
             .collect::<Vec<_>>();
-        let update_signature = if update_params.is_empty() {
-            "dispatch".to_string()
-        } else {
-            format!("{}, dispatch", update_params.join(", "))
-        };
         let reassign = params
             .iter()
             .zip(update_params.iter())
             .map(|(param, update_param)| format!("{} = {};", param, update_param))
             .collect::<Vec<_>>()
             .join(" ");
+        let bind = if update_params.is_empty() {
+            format!("() => {{ __closkellRefresh(); }}")
+        } else {
+            format!(
+                "({}) => {{ {} __closkellRefresh(); }}",
+                update_params.join(", "),
+                reassign
+            )
+        };
 
         format!(
-            "export function {}({}) {{ {} const __closkellRefresh = () => {{ {} }}; __closkellRefresh(); const __closkellComponent = {}; return {{ mount(parent, dispatch) {{ return __closkellComponent.mount(parent, dispatch); }}, update({}) {{ {} __closkellRefresh(); return __closkellComponent.update(dispatch); }}, dispose() {{ __closkellComponent.dispose(); }}, get root() {{ return __closkellComponent.root; }} }}; }}",
+            "export function {}({}) {{ {} const __closkellRefresh = () => {{ {} }}; __closkellRefresh(); const __closkellComponent = {}; return {}(__closkellComponent, {}, {}); }}",
             sanitize_identifier(name),
             param_list,
             declarations,
             refresh_body,
             component_expr,
-            update_signature,
-            reassign
+            BIND_COMPONENT_ALIAS,
+            params.len(),
+            bind
         )
     }
 
@@ -1520,18 +2473,30 @@ impl Emitter {
         let mut js_params = Vec::new();
         let mut statements = Vec::new();
         let mut needs_block = false;
-        for param in params {
+        let mut local_type_bindings = BTreeMap::new();
+        let param_types = self
+            .expr_type(expr)
+            .and_then(type_fn_param_types)
+            .map(|types| types.into_iter().map(str::to_string).collect::<Vec<_>>())
+            .unwrap_or_default();
+        for (index, param) in params.iter().enumerate() {
             match &param.kind {
                 ExprKind::Symbol(name) if name != "_" => {
                     js_params.push(sanitize_identifier(name));
+                    if let Some(param_type) = param_types.get(index) {
+                        local_type_bindings.insert(name.clone(), param_type.clone());
+                    }
                 }
                 _ => {
                     needs_block = true;
                     let value_name = self.next_temp("__closkell_arg");
                     js_params.push(value_name.clone());
+                    let param_type = param_types.get(index).map(String::as_str);
+                    collect_pattern_type_bindings(param, param_type, &mut local_type_bindings);
                     self.emit_pattern_value_statement(
                         param,
                         &value_name,
+                        param_type,
                         "fn parameter pattern did not match",
                         &mut statements,
                     );
@@ -1539,7 +2504,9 @@ impl Emitter {
             }
         }
         let params = js_params.join(", ");
+        self.local_types.push(local_type_bindings);
         let body = self.emit_do(&args[1..]);
+        self.local_types.pop();
         if needs_block {
             statements.push(format!("return {};", body));
             return format!("(({}) => {{ {} }})", params, statements.join(" "));
@@ -1565,6 +2532,7 @@ impl Emitter {
         };
 
         let mut statements = Vec::new();
+        self.local_types.push(BTreeMap::new());
         for pair in bindings.chunks(2) {
             let [pattern, value] = pair else {
                 self.diagnostics.push(Diagnostic::error(
@@ -1573,9 +2541,14 @@ impl Emitter {
                 ));
                 continue;
             };
+            let value_type = self.expr_type(value).map(str::to_string);
             self.emit_let_pattern_statement(pattern, value, &mut statements);
+            if let Some(scope) = self.local_types.last_mut() {
+                collect_pattern_type_bindings(pattern, value_type.as_deref(), scope);
+            }
         }
         statements.push(format!("return {};", self.emit_do(&args[1..])));
+        self.local_types.pop();
         format!("(() => {{ {} }})()", statements.join(" "))
     }
 
@@ -1600,9 +2573,11 @@ impl Emitter {
 
         let value_name = self.next_temp("__closkell_let");
         statements.push(format!("const {} = {};", value_name, self.emit_expr(value)));
+        let value_type = self.expr_type(value).map(str::to_string);
         self.emit_pattern_value_statement(
             pattern,
             &value_name,
+            value_type.as_deref(),
             "let pattern did not match",
             statements,
         );
@@ -1612,10 +2587,11 @@ impl Emitter {
         &mut self,
         pattern: &Expr,
         value_name: &str,
+        value_type: Option<&str>,
         error_message: &str,
         statements: &mut Vec<String>,
     ) {
-        let compiled = self.emit_pattern(pattern, value_name);
+        let compiled = self.emit_pattern(pattern, value_name, value_type);
         if compiled.test != "true" {
             statements.push(format!(
                 "if (!({})) throw new Error(\"{}\");",
@@ -1632,10 +2608,11 @@ impl Emitter {
         &mut self,
         pattern: &Expr,
         value_name: &str,
+        value_type: Option<&str>,
         error_message: &str,
         statements: &mut Vec<String>,
     ) {
-        let compiled = self.emit_pattern(pattern, value_name);
+        let compiled = self.emit_pattern(pattern, value_name, value_type);
         if compiled.test != "true" {
             statements.push(format!(
                 "if (!({})) throw new Error(\"{}\");",
@@ -1656,6 +2633,9 @@ impl Emitter {
                 "if emission expects 3 arguments",
             ));
             return "undefined".to_string();
+        }
+        if let Some(condition) = self.static_bool(&args[0]) {
+            return self.emit_expr(if condition { &args[1] } else { &args[2] });
         }
         format!(
             "({} ? {} : {})",
@@ -1678,6 +2658,7 @@ impl Emitter {
         }
 
         let value_name = self.next_temp("__closkell_match");
+        let value_type = self.expr_type(&args[0]).map(str::to_string);
         let value = self.emit_expr(&args[0]);
         let mut lines = vec![format!("const {} = {};", value_name, value)];
 
@@ -1685,7 +2666,7 @@ impl Emitter {
             let [pattern, body] = arm else {
                 continue;
             };
-            let compiled = self.emit_pattern(pattern, &value_name);
+            let compiled = self.emit_pattern(pattern, &value_name, value_type.as_deref());
             let body = self.emit_expr(body);
             let keyword = if index == 0 { "if" } else { "else if" };
             lines.push(format!(
@@ -1703,16 +2684,26 @@ impl Emitter {
         let value_name = self.next_temp("__closkell_match");
         let kind_name = self.next_temp("__closkell_kind");
         let value = self.emit_expr(&args[0]);
+        let value_type = self.expr_type(&args[0]).map(str::to_string);
+        let kind_read = if value_type.as_deref().is_some_and(type_has_kind_property) {
+            format!("{}.kind", value_name)
+        } else {
+            format!("{}?.kind", value_name)
+        };
+        let reachable_update_messages = self.reachable_update_messages_for_match(&args[0]).cloned();
         let mut lines = vec![
             format!("const {} = {};", value_name, value),
-            format!(
-                "const {} = typeof {}?.kind === \"symbol\" ? Symbol.keyFor({}.kind) ?? {}.kind.description : {}?.kind;",
-                kind_name, value_name, value_name, value_name, value_name
-            ),
+            format!("const {} = {};", kind_name, kind_read),
             format!("switch ({}) {{", kind_name),
         ];
 
         for arm in &plan.arms {
+            if reachable_update_messages
+                .as_ref()
+                .is_some_and(|reachable| !reachable.contains(&arm.kind))
+            {
+                continue;
+            }
             let bindings = self.emit_kind_pattern_bindings(arm.pattern, &value_name)?;
             let body = self.emit_expr(arm.body);
             lines.push(format!(
@@ -1724,7 +2715,7 @@ impl Emitter {
         }
 
         if let Some(default) = &plan.default {
-            let compiled = self.emit_pattern(default.pattern, &value_name);
+            let compiled = self.emit_pattern(default.pattern, &value_name, value_type.as_deref());
             if compiled.test != "true" {
                 return None;
             }
@@ -1738,6 +2729,18 @@ impl Emitter {
         lines.push("}".to_string());
         lines.push("throw new Error(\"non-exhaustive match\");".to_string());
         Some(format!("(() => {{ {} }})()", lines.join(" ")))
+    }
+
+    fn reachable_update_messages_for_match(&self, value: &Expr) -> Option<&BTreeSet<String>> {
+        let message_param = self.current_update_message_param.as_ref()?;
+        let ExprKind::Symbol(name) = &value.kind else {
+            return None;
+        };
+        if name == message_param {
+            self.reachable_message_kinds.as_ref()
+        } else {
+            None
+        }
     }
 
     fn emit_do(&mut self, args: &[Expr]) -> String {
@@ -1765,17 +2768,81 @@ impl Emitter {
             .join(&format!(" {} ", op))
     }
 
+    fn emit_logical(&mut self, args: &[Expr], is_and: bool) -> String {
+        if args.is_empty() {
+            return if is_and { "true" } else { "false" }.to_string();
+        }
+        let mut parts = Vec::new();
+        for arg in args {
+            match self.static_bool(arg) {
+                Some(value) if value == is_and => {}
+                Some(value) => return value.to_string(),
+                None => parts.push(parenthesize_expression(self.emit_expr(arg))),
+            }
+        }
+        if parts.is_empty() {
+            return if is_and { "true" } else { "false" }.to_string();
+        }
+        let op = if is_and { " && " } else { " || " };
+        parts.join(op)
+    }
+
     fn emit_value_equal(&mut self, args: &[Expr]) -> String {
         if args.len() < 2 {
             return "undefined".to_string();
         }
+        if let Some(code) = self.emit_primitive_value_equal(args) {
+            return code;
+        }
+        if args.len() == 2
+            && self.expr_is_strict_comparable(&args[0])
+            && self.expr_is_strict_comparable(&args[1])
+        {
+            return format!(
+                "{} === {}",
+                parenthesize_expression(self.emit_expr(&args[0])),
+                parenthesize_expression(self.emit_expr(&args[1]))
+            );
+        }
         self.needs_value_equal_helper = true;
+        if args.len() == 2 {
+            return format!(
+                "__closkellValueEqual({}, {})",
+                self.emit_expr(&args[0]),
+                self.emit_expr(&args[1])
+            );
+        }
         let values = args
             .iter()
             .map(|arg| self.emit_expr(arg))
             .collect::<Vec<_>>()
             .join(", ");
-        format!("__closkellValueEqual({})", values)
+        format!(
+            "((__values) => {{ for (let __index = 1; __index < __values.length; __index += 1) if (!__closkellValueEqual(__values[__index - 1], __values[__index])) return false; return true; }})([{}])",
+            values
+        )
+    }
+
+    fn emit_primitive_value_equal(&mut self, args: &[Expr]) -> Option<String> {
+        if args.len() != 2 {
+            return None;
+        }
+        let left_literal = primitive_equality_literal(&args[0]);
+        let right_literal = primitive_equality_literal(&args[1]);
+        match (left_literal, right_literal) {
+            (Some(left), Some(right)) => Some(format!("{} === {}", left.code, right.code)),
+            (Some(left), None) => Some(format!(
+                "{} === {}",
+                parenthesize_expression(self.emit_expr(&args[1])),
+                left.code
+            )),
+            (None, Some(right)) => Some(format!(
+                "{} === {}",
+                parenthesize_expression(self.emit_expr(&args[0])),
+                right.code
+            )),
+            (None, None) => None,
+        }
     }
 
     fn emit_identical(&mut self, args: &[Expr]) -> String {
@@ -1979,7 +3046,7 @@ impl Emitter {
             return "undefined".to_string();
         }
         format!(
-            "((__value) => {{ try {{ return Number(__value); }} catch {{ return Number.NaN; }} }})({})",
+            "((__value) => {{ try {{ const __number = Number(__value); return Number.isFinite(__number) ? __number : 0; }} catch {{ return 0; }} }})({})",
             self.emit_expr(&args[0])
         )
     }
@@ -1988,8 +3055,21 @@ impl Emitter {
         if args.len() != 2 {
             return "undefined".to_string();
         }
+        if let Some(style) = literal_string_value(&args[1]) {
+            let timestamp = self.emit_expr(&args[0]);
+            if style == "iso-date" {
+                return format!("new Date({}).toISOString().slice(0, 10)", timestamp);
+            }
+            return match date_format_options(style) {
+                Some(options) => format!(
+                    "new Intl.DateTimeFormat(undefined, {}).format({})",
+                    options, timestamp
+                ),
+                None => format!("new Intl.DateTimeFormat(undefined).format({})", timestamp),
+            };
+        }
         format!(
-            "((__timestamp, __style) => {{ const __date = new Date(__timestamp); const __key = Symbol.keyFor(__style) ?? __style; const __options = __key === \"month-year\" ? {{ month: \"short\", year: \"2-digit\" }} : __key === \"month-day-time\" ? {{ month: \"short\", day: \"numeric\", hour: \"2-digit\", minute: \"2-digit\" }} : __key === \"month-day\" ? {{ month: \"short\", day: \"numeric\" }} : __key === \"month\" ? {{ month: \"short\" }} : __key === \"day\" ? {{ day: \"numeric\" }} : undefined; return __key === \"iso-date\" ? __date.toISOString().slice(0, 10) : new Intl.DateTimeFormat(undefined, __options).format(__date); }})({}, {})",
+            "((__timestamp, __key) => {{ const __date = new Date(__timestamp); const __options = __key === \"month-year\" ? {{ month: \"short\", year: \"2-digit\" }} : __key === \"month-day-time\" ? {{ month: \"short\", day: \"numeric\", hour: \"2-digit\", minute: \"2-digit\" }} : __key === \"month-day\" ? {{ month: \"short\", day: \"numeric\" }} : __key === \"month\" ? {{ month: \"short\" }} : __key === \"day\" ? {{ day: \"numeric\" }} : undefined; return __key === \"iso-date\" ? __date.toISOString().slice(0, 10) : new Intl.DateTimeFormat(undefined, __options).format(__timestamp); }})({}, {})",
             self.emit_expr(&args[0]),
             self.emit_expr(&args[1])
         )
@@ -1999,6 +3079,9 @@ impl Emitter {
         if !args.is_empty() {
             return "undefined".to_string();
         }
+        if let Some(dev) = self.env_dev {
+            return dev.to_string();
+        }
         "Boolean(import.meta.env && import.meta.env.DEV)".to_string()
     }
 
@@ -2006,13 +3089,106 @@ impl Emitter {
         if !args.is_empty() {
             return "undefined".to_string();
         }
+        if let Some(mode) = &self.env_mode {
+            return format!("\"{}\"", escape_js(mode));
+        }
         "String(globalThis.__CLOSKELL_ENV__?.MODE ?? (import.meta.env && import.meta.env.MODE) ?? \"\")"
             .to_string()
+    }
+
+    fn static_bool(&self, expr: &Expr) -> Option<bool> {
+        match &expr.kind {
+            ExprKind::Bool(value) => Some(*value),
+            ExprKind::Symbol(name) => match self.static_reads.get(name).map(String::as_str) {
+                Some("true") => Some(true),
+                Some("false") => Some(false),
+                _ => None,
+            },
+            ExprKind::List(items) => {
+                let (head, args) = items.split_first()?;
+                let ExprKind::Symbol(name) = &head.kind else {
+                    return None;
+                };
+                match name.as_str() {
+                    "env-dev?" if args.is_empty() => self.env_dev,
+                    "some?" if args.len() == 1 => self
+                        .expr_runtime_type_predicate(&args[0], RuntimeTypePredicate::Nil)
+                        .map(|value| !value),
+                    "nil?" if args.len() == 1 => {
+                        self.expr_runtime_type_predicate(&args[0], RuntimeTypePredicate::Nil)
+                    }
+                    "number?" if args.len() == 1 => {
+                        self.expr_runtime_type_predicate(&args[0], RuntimeTypePredicate::Number)
+                    }
+                    "string?" if args.len() == 1 => {
+                        self.expr_runtime_type_predicate(&args[0], RuntimeTypePredicate::String)
+                    }
+                    "bool?" if args.len() == 1 => {
+                        self.expr_runtime_type_predicate(&args[0], RuntimeTypePredicate::Bool)
+                    }
+                    "keyword?" if args.len() == 1 => {
+                        self.expr_runtime_type_predicate(&args[0], RuntimeTypePredicate::Keyword)
+                    }
+                    "list?" | "vector?" if args.len() == 1 => {
+                        self.expr_runtime_type_predicate(&args[0], RuntimeTypePredicate::Vector)
+                    }
+                    "set?" if args.len() == 1 => {
+                        self.expr_runtime_type_predicate(&args[0], RuntimeTypePredicate::Set)
+                    }
+                    "map?" if args.len() == 1 => {
+                        self.expr_runtime_type_predicate(&args[0], RuntimeTypePredicate::Map)
+                    }
+                    "object?" if args.len() == 1 => {
+                        self.expr_runtime_type_predicate(&args[0], RuntimeTypePredicate::Object)
+                    }
+                    "not" if args.len() == 1 => self.static_bool(&args[0]).map(|value| !value),
+                    "and" => {
+                        let mut all_true = true;
+                        for arg in args {
+                            match self.static_bool(arg) {
+                                Some(false) => return Some(false),
+                                Some(true) => {}
+                                None => all_true = false,
+                            }
+                        }
+                        all_true.then_some(true)
+                    }
+                    "or" => {
+                        let mut all_false = true;
+                        for arg in args {
+                            match self.static_bool(arg) {
+                                Some(true) => return Some(true),
+                                Some(false) => {}
+                                None => all_false = false,
+                            }
+                        }
+                        all_false.then_some(false)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
     }
 
     fn emit_count(&mut self, args: &[Expr]) -> String {
         if args.len() != 1 {
             return "undefined".to_string();
+        }
+        if self.expr_is_countable_by_length(&args[0]) {
+            return format!(
+                "{}.length",
+                parenthesize_member_base(self.emit_expr(&args[0]))
+            );
+        }
+        if self.expr_is_countable_by_size(&args[0]) {
+            return format!(
+                "{}.size",
+                parenthesize_member_base(self.emit_expr(&args[0]))
+            );
+        }
+        if self.expr_is_record(&args[0]) {
+            return format!("Object.keys({}).length", self.emit_expr(&args[0]));
         }
         self.needs_count_helper = true;
         format!("__closkellCount({})", self.emit_expr(&args[0]))
@@ -2022,6 +3198,21 @@ impl Emitter {
         if args.len() != 1 {
             return "undefined".to_string();
         }
+        if self.expr_is_countable_by_length(&args[0]) {
+            return format!(
+                "{}.length === 0",
+                parenthesize_member_base(self.emit_expr(&args[0]))
+            );
+        }
+        if self.expr_is_countable_by_size(&args[0]) {
+            return format!(
+                "{}.size === 0",
+                parenthesize_member_base(self.emit_expr(&args[0]))
+            );
+        }
+        if self.expr_is_record(&args[0]) {
+            return format!("Object.keys({}).length === 0", self.emit_expr(&args[0]));
+        }
         self.needs_count_helper = true;
         format!("__closkellCount({}) === 0", self.emit_expr(&args[0]))
     }
@@ -2030,6 +3221,10 @@ impl Emitter {
         if args.len() != 1 {
             return "undefined".to_string();
         }
+        if let Some(result) = self.expr_runtime_type_predicate(&args[0], RuntimeTypePredicate::Nil)
+        {
+            return (!result).to_string();
+        }
         format!("{} != null", self.emit_expr(&args[0]))
     }
 
@@ -2037,12 +3232,26 @@ impl Emitter {
         if args.len() != 1 {
             return "undefined".to_string();
         }
+        if let Some(result) = self.expr_runtime_type_predicate(&args[0], RuntimeTypePredicate::Nil)
+        {
+            return result.to_string();
+        }
         format!("({}) == null", self.emit_expr(&args[0]))
     }
 
     fn emit_type_predicate(&mut self, js_type: &str, args: &[Expr]) -> String {
         if args.len() != 1 {
             return "undefined".to_string();
+        }
+        let predicate = match js_type {
+            "number" => RuntimeTypePredicate::Number,
+            "string" => RuntimeTypePredicate::String,
+            "boolean" => RuntimeTypePredicate::Bool,
+            "symbol" => RuntimeTypePredicate::Keyword,
+            _ => return "undefined".to_string(),
+        };
+        if let Some(result) = self.expr_runtime_type_predicate(&args[0], predicate) {
+            return result.to_string();
         }
         let value = self.emit_expr(&args[0]);
         if js_type == "number" {
@@ -2055,12 +3264,21 @@ impl Emitter {
         if args.len() != 1 {
             return "undefined".to_string();
         }
+        if let Some(result) =
+            self.expr_runtime_type_predicate(&args[0], RuntimeTypePredicate::Vector)
+        {
+            return result.to_string();
+        }
         format!("Array.isArray({})", self.emit_expr(&args[0]))
     }
 
     fn emit_set_predicate(&mut self, args: &[Expr]) -> String {
         if args.len() != 1 {
             return "undefined".to_string();
+        }
+        if let Some(result) = self.expr_runtime_type_predicate(&args[0], RuntimeTypePredicate::Set)
+        {
+            return result.to_string();
         }
         format!("{} instanceof Set", self.emit_expr(&args[0]))
     }
@@ -2069,12 +3287,21 @@ impl Emitter {
         if args.len() != 1 {
             return "undefined".to_string();
         }
+        if let Some(result) = self.expr_runtime_type_predicate(&args[0], RuntimeTypePredicate::Map)
+        {
+            return result.to_string();
+        }
         format!("{} instanceof Map", self.emit_expr(&args[0]))
     }
 
     fn emit_object_predicate(&mut self, args: &[Expr]) -> String {
         if args.len() != 1 {
             return "undefined".to_string();
+        }
+        if let Some(result) =
+            self.expr_runtime_type_predicate(&args[0], RuntimeTypePredicate::Object)
+        {
+            return result.to_string();
         }
         format!(
             "((__value) => __value != null && typeof __value === \"object\" && !Array.isArray(__value) && !(__value instanceof Map) && !(__value instanceof Set))({})",
@@ -2089,6 +3316,12 @@ impl Emitter {
         let base = parenthesize_member_base(self.emit_expr(&args[0]));
         match &args[1].kind {
             ExprKind::Keyword(name) | ExprKind::Symbol(name) | ExprKind::String(name) => {
+                if self
+                    .expr_type(&args[0])
+                    .is_some_and(|ty| type_has_required_record_field(ty, name))
+                {
+                    return format!("{}{}", base, property_access(name));
+                }
                 format!("({}{} ?? null)", base, optional_property_access(name))
             }
             _ => format!("({}?.[{}] ?? null)", base, self.emit_expr(&args[1])),
@@ -2421,6 +3654,19 @@ impl Emitter {
             .map(|item| self.emit_expr(item))
             .collect::<Vec<_>>()
             .join(", ");
+        match self.expr_collection_shape(&args[0]) {
+            CollectionShape::Set => {
+                return format!(
+                    "new Set([...{}, {}])",
+                    parenthesize_expression(collection),
+                    items
+                );
+            }
+            CollectionShape::VectorLike => {
+                return format!("[...{}, {}]", parenthesize_expression(collection), items);
+            }
+            _ => {}
+        }
         format!(
             "((__collection, ...__items) => {{ if (__collection instanceof Set) return new Set([...__collection, ...__items]); const __next = Array.isArray(__collection) ? __collection.slice() : Array.from(__collection); __next.push(...__items); return __next; }})({}, {})",
             collection, items
@@ -2536,6 +3782,11 @@ impl Emitter {
         let acc_name = self.next_temp("__closkell_reduce_acc");
         let index_name = self.next_temp("__closkell_reduce_index");
         let item_name = self.next_temp("__closkell_reduce_item");
+        let items_binding = self.emit_reduce_items_binding(
+            &items_name,
+            &collection_name,
+            self.expr_collection_shape(&args[0]),
+        );
         let call = if indexed {
             format!(
                 "{}({}, {}, {})",
@@ -2545,14 +3796,11 @@ impl Emitter {
             format!("{}({}, {})", reducer_name, acc_name, item_name)
         };
         format!(
-            "(({}, {}, {}) => {{ const {} = Array.isArray({}) ? {} : Array.from({}); let {} = {}; for (let {} = 0; {} < {}.length; {} += 1) {{ const {} = {}[{}]; {} = {}; }} return {}; }})({}, {}, {})",
+            "(({}, {}, {}) => {{ {} let {} = {}; for (let {} = 0; {} < {}.length; {} += 1) {{ const {} = {}[{}]; {} = {}; }} return {}; }})({}, {}, {})",
             collection_name,
             initial_name,
             reducer_name,
-            items_name,
-            collection_name,
-            collection_name,
-            collection_name,
+            items_binding,
             acc_name,
             initial_name,
             index_name,
@@ -2575,14 +3823,14 @@ impl Emitter {
         let reducer = AppendReducer::parse(&args[2], indexed)?;
         let collection = self.emit_expr(&args[0]);
         let initial = self.emit_expr(&args[1]);
+        let collection_shape = self.expr_collection_shape(&args[0]);
+        let initial_shape = self.expr_collection_shape(&args[1]);
         let collection_name = self.next_temp("__closkell_reduce_collection");
         let initial_name = self.next_temp("__closkell_reduce_initial");
         let items_name = self.next_temp("__closkell_reduce_items");
         let acc_name = self.next_temp("__closkell_reduce_acc");
         let index_name = self.next_temp("__closkell_reduce_index");
         let item_name = self.next_temp("__closkell_reduce_item");
-        let append_name = self.next_temp("__closkell_append_items");
-        let append_value_name = self.next_temp("__closkell_append_value");
 
         let mut body = Vec::new();
         body.push(format!(
@@ -2621,9 +3869,11 @@ impl Emitter {
                 _ => {
                     let value_name = self.next_temp("__closkell_reduce_let");
                     body.push(format!("const {} = {};", value_name, self.emit_expr(value)));
+                    let value_type = self.expr_type(value).map(str::to_string);
                     self.emit_pattern_assignment_statement(
                         binding,
                         &value_name,
+                        value_type.as_deref(),
                         "reduce append let pattern did not match",
                         &mut body,
                     );
@@ -2631,36 +3881,17 @@ impl Emitter {
             }
         }
 
-        let append_items = reducer
-            .items
-            .iter()
-            .map(|item| self.emit_expr(item))
-            .collect::<Vec<_>>()
-            .join(", ");
-        body.push(format!("const {} = [{}];", append_name, append_items));
-        body.push(format!(
-            "if ({} instanceof Set) {{ for (const {} of {}) {}.add({}); }} else {{ {}.push(...{}); }}",
-            acc_name,
-            append_value_name,
-            append_name,
-            acc_name,
-            append_value_name,
-            acc_name,
-            append_name
-        ));
+        self.push_append_items(&mut body, &acc_name, reducer.items, initial_shape);
 
+        let items_binding =
+            self.emit_reduce_items_binding(&items_name, &collection_name, collection_shape);
+        let acc_binding = self.emit_reduce_acc_binding(&acc_name, &initial_name, initial_shape);
         Some(format!(
-            "(({}, {}) => {{ const {} = Array.isArray({}) ? {} : Array.from({}); const {} = {} instanceof Set ? new Set({}) : Array.from({}); for (let {} = 0; {} < {}.length; {} += 1) {{ const {} = {}[{}]; {} }} return {}; }})({}, {})",
+            "(({}, {}) => {{ {} {} for (let {} = 0; {} < {}.length; {} += 1) {{ const {} = {}[{}]; {} }} return {}; }})({}, {})",
             collection_name,
             initial_name,
-            items_name,
-            collection_name,
-            collection_name,
-            collection_name,
-            acc_name,
-            initial_name,
-            initial_name,
-            initial_name,
+            items_binding,
+            acc_binding,
             index_name,
             index_name,
             items_name,
@@ -2687,6 +3918,9 @@ impl Emitter {
         let ExprKind::Symbol(helper_name) = &helper_head.kind else {
             return None;
         };
+        if self.direct_call_replacements.contains_key(helper_name) {
+            return None;
+        }
         let helper = self.function_defs.get(helper_name)?.clone();
         if helper.params.len() != helper_args.len() || helper.params.is_empty() {
             return None;
@@ -2702,6 +3936,8 @@ impl Emitter {
 
         let collection = self.emit_expr(&args[0]);
         let initial = self.emit_expr(&args[1]);
+        let collection_shape = self.expr_collection_shape(&args[0]);
+        let initial_shape = self.expr_collection_shape(&args[1]);
         let collection_name = self.next_temp("__closkell_reduce_collection");
         let initial_name = self.next_temp("__closkell_reduce_initial");
         let items_name = self.next_temp("__closkell_reduce_items");
@@ -2722,24 +3958,22 @@ impl Emitter {
             .map(|arg| self.emit_expr(arg))
             .collect::<Vec<_>>()
             .join(", ");
-        let helper_statements = self.emit_append_helper_statements(&append_body, helper_acc);
+        let helper_statements =
+            self.emit_append_helper_statements(&append_body, helper_acc, initial_shape);
         body.push(format!(
             "(({}) => {{ {} }})({});",
             helper_params, helper_statements, helper_call_args
         ));
 
+        let items_binding =
+            self.emit_reduce_items_binding(&items_name, &collection_name, collection_shape);
+        let acc_binding = self.emit_reduce_acc_binding(&acc_name, &initial_name, initial_shape);
         Some(format!(
-            "(({}, {}) => {{ const {} = Array.isArray({}) ? {} : Array.from({}); const {} = {} instanceof Set ? new Set({}) : Array.from({}); for (let {} = 0; {} < {}.length; {} += 1) {{ const {} = {}[{}]; {} }} return {}; }})({}, {})",
+            "(({}, {}) => {{ {} {} for (let {} = 0; {} < {}.length; {} += 1) {{ const {} = {}[{}]; {} }} return {}; }})({}, {})",
             collection_name,
             initial_name,
-            items_name,
-            collection_name,
-            collection_name,
-            collection_name,
-            acc_name,
-            initial_name,
-            initial_name,
-            initial_name,
+            items_binding,
+            acc_binding,
             index_name,
             index_name,
             items_name,
@@ -2758,6 +3992,7 @@ impl Emitter {
         let reducer = InlineReducer::parse(&args[2], indexed)?;
         let collection = self.emit_expr(&args[0]);
         let initial = self.emit_expr(&args[1]);
+        let collection_shape = self.expr_collection_shape(&args[0]);
         let collection_name = self.next_temp("__closkell_reduce_collection");
         let initial_name = self.next_temp("__closkell_reduce_initial");
         let items_name = self.next_temp("__closkell_reduce_items");
@@ -2769,14 +4004,13 @@ impl Emitter {
             self.emit_reduce_iteration_bindings(&reducer, &acc_name, &item_name, &index_name);
         body.push(format!("{} = {};", acc_name, self.emit_do(reducer.body)));
 
+        let items_binding =
+            self.emit_reduce_items_binding(&items_name, &collection_name, collection_shape);
         Some(format!(
-            "(({}, {}) => {{ const {} = Array.isArray({}) ? {} : Array.from({}); let {} = {}; for (let {} = 0; {} < {}.length; {} += 1) {{ const {} = {}[{}]; {} }} return {}; }})({}, {})",
+            "(({}, {}) => {{ {} let {} = {}; for (let {} = 0; {} < {}.length; {} += 1) {{ const {} = {}[{}]; {} }} return {}; }})({}, {})",
             collection_name,
             initial_name,
-            items_name,
-            collection_name,
-            collection_name,
-            collection_name,
+            items_binding,
             acc_name,
             initial_name,
             index_name,
@@ -2827,10 +4061,49 @@ impl Emitter {
         body
     }
 
+    fn emit_reduce_items_binding(
+        &self,
+        items_name: &str,
+        collection_name: &str,
+        shape: CollectionShape,
+    ) -> String {
+        match shape {
+            CollectionShape::VectorLike => {
+                format!("const {} = {};", items_name, collection_name)
+            }
+            CollectionShape::Set | CollectionShape::Map | CollectionShape::String => {
+                format!("const {} = Array.from({});", items_name, collection_name)
+            }
+            CollectionShape::Unknown => format!(
+                "const {} = Array.isArray({}) ? {} : Array.from({});",
+                items_name, collection_name, collection_name, collection_name
+            ),
+        }
+    }
+
+    fn emit_reduce_acc_binding(
+        &self,
+        acc_name: &str,
+        initial_name: &str,
+        shape: CollectionShape,
+    ) -> String {
+        match shape {
+            CollectionShape::VectorLike => {
+                format!("const {} = {}.slice();", acc_name, initial_name)
+            }
+            CollectionShape::Set => format!("const {} = new Set({});", acc_name, initial_name),
+            _ => format!(
+                "const {} = {} instanceof Set ? new Set({}) : Array.from({});",
+                acc_name, initial_name, initial_name, initial_name
+            ),
+        }
+    }
+
     fn emit_append_helper_statements(
         &mut self,
         append_body: &AppendHelperBody<'_>,
         acc: &str,
+        target_shape: CollectionShape,
     ) -> String {
         let mut append_statements = Vec::new();
         self.push_append_statements(
@@ -2838,6 +4111,7 @@ impl Emitter {
             &sanitize_identifier(acc),
             &append_body.bindings,
             append_body.items,
+            target_shape,
         );
         let append_code = append_statements.join(" ");
         match append_body.condition {
@@ -2861,6 +4135,7 @@ impl Emitter {
         acc_name: &str,
         bindings: &[(&Expr, &Expr)],
         items: &[Expr],
+        target_shape: CollectionShape,
     ) {
         for (binding, value) in bindings {
             match &binding.kind {
@@ -2877,9 +4152,11 @@ impl Emitter {
                 _ => {
                     let value_name = self.next_temp("__closkell_reduce_let");
                     body.push(format!("const {} = {};", value_name, self.emit_expr(value)));
+                    let value_type = self.expr_type(value).map(str::to_string);
                     self.emit_pattern_assignment_statement(
                         binding,
                         &value_name,
+                        value_type.as_deref(),
                         "reduce append let pattern did not match",
                         body,
                     );
@@ -2887,15 +4164,43 @@ impl Emitter {
             }
         }
 
-        let append_name = self.next_temp("__closkell_append_items");
-        let append_value_name = self.next_temp("__closkell_append_value");
-        let append_items = items
-            .iter()
-            .map(|item| self.emit_expr(item))
-            .collect::<Vec<_>>()
-            .join(", ");
-        body.push(format!("const {} = [{}];", append_name, append_items));
-        body.push(format!(
+        self.push_append_items(body, acc_name, items, target_shape);
+    }
+
+    fn push_append_items(
+        &mut self,
+        body: &mut Vec<String>,
+        acc_name: &str,
+        items: &[Expr],
+        target_shape: CollectionShape,
+    ) {
+        if items.is_empty() {
+            return;
+        }
+        match target_shape {
+            CollectionShape::VectorLike => {
+                let append_items = items
+                    .iter()
+                    .map(|item| self.emit_expr(item))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                body.push(format!("{}.push({});", acc_name, append_items));
+            }
+            CollectionShape::Set => {
+                for item in items {
+                    body.push(format!("{}.add({});", acc_name, self.emit_expr(item)));
+                }
+            }
+            _ => {
+                let append_name = self.next_temp("__closkell_append_items");
+                let append_value_name = self.next_temp("__closkell_append_value");
+                let append_items = items
+                    .iter()
+                    .map(|item| self.emit_expr(item))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                body.push(format!("const {} = [{}];", append_name, append_items));
+                body.push(format!(
             "if ({} instanceof Set) {{ for (const {} of {}) {}.add({}); }} else {{ {}.push(...{}); }}",
             acc_name,
             append_value_name,
@@ -2905,6 +4210,8 @@ impl Emitter {
             acc_name,
             append_name
         ));
+            }
+        }
     }
 
     fn emit_string_method(&mut self, method: &str, args: &[Expr]) -> String {
@@ -3018,10 +4325,29 @@ impl Emitter {
         if args.len() != 2 {
             return "undefined".to_string();
         }
+        let collection = self.emit_expr(&args[0]);
+        let value = self.emit_expr(&args[1]);
+        if self.expr_is_set(&args[0]) || self.expr_is_map(&args[0]) {
+            return format!("{}.has({})", parenthesize_member_base(collection), value);
+        }
+        if self.expr_is_vector_like(&args[0])
+            || self.expr_type(&args[0]).is_some_and(|ty| ty == "String")
+        {
+            return format!(
+                "{}.includes({})",
+                parenthesize_member_base(collection),
+                value
+            );
+        }
+        if self.expr_is_record(&args[0]) {
+            return format!(
+                "Object.prototype.hasOwnProperty.call({}, {})",
+                collection, value
+            );
+        }
         format!(
             "((__collection, __value) => {{ if (__collection instanceof Set || __collection instanceof Map) return __collection.has(__value); if (Array.isArray(__collection) || typeof __collection === \"string\") return __collection.includes(__value); return __collection != null && Object.prototype.hasOwnProperty.call(__collection, __value); }})({}, {})",
-            self.emit_expr(&args[0]),
-            self.emit_expr(&args[1])
+            collection, value
         )
     }
 
@@ -3646,10 +4972,16 @@ impl Emitter {
         }
         let args = args
             .iter()
-            .map(|arg| self.emit_expr(arg))
+            .map(|arg| match &arg.kind {
+                ExprKind::Map(entries) => self
+                    .emit_record_literal_fields(entries)
+                    .unwrap_or_else(|| format!("...{}", self.emit_expr(arg))),
+                _ => format!("...{}", self.emit_expr(arg)),
+            })
+            .filter(|part| !part.is_empty())
             .collect::<Vec<_>>()
             .join(", ");
-        format!("Object.assign({{}}, {})", args)
+        format!("({{ {} }})", args)
     }
 
     fn emit_dissoc(&mut self, expr: &Expr, args: &[Expr]) -> String {
@@ -3710,22 +5042,9 @@ impl Emitter {
     }
 
     fn emit_map_or_record(&mut self, entries: &[(Expr, Expr)]) -> String {
-        for (key, value) in entries {
-            if object_key_name(key).is_some_and(|name| name == "kind") {
-                if let Some(kind) = runtime_effect_kind_name(value) {
-                    self.add_runtime_effect(kind);
-                }
-            }
-        }
+        self.record_map_runtime_effects(entries);
 
-        if entries.iter().all(|(key, _)| object_key(key).is_some()) {
-            let fields = entries
-                .iter()
-                .filter_map(|(key, value)| {
-                    object_key(key).map(|key| format!("{}: {}", key, self.emit_expr(value)))
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
+        if let Some(fields) = self.emit_record_literal_fields(entries) {
             return format!("{{ {} }}", fields);
         }
 
@@ -3737,7 +5056,27 @@ impl Emitter {
         format!("new Map([{}])", entries)
     }
 
-    fn emit_function_body(&mut self, _expr: &Expr, body: &[Expr]) -> String {
+    fn emit_record_literal_fields(&mut self, entries: &[(Expr, Expr)]) -> Option<String> {
+        self.record_map_runtime_effects(entries);
+        let mut fields = Vec::new();
+        for (key, value) in entries {
+            let key = object_key(key)?;
+            fields.push(format!("{}: {}", key, self.emit_expr(value)));
+        }
+        Some(fields.join(", "))
+    }
+
+    fn record_map_runtime_effects(&mut self, entries: &[(Expr, Expr)]) {
+        for (key, value) in entries {
+            if object_key_name(key).is_some_and(|name| name == "kind") {
+                if let Some(kind) = runtime_effect_kind_name(value) {
+                    self.add_runtime_effect(kind);
+                }
+            }
+        }
+    }
+
+    fn emit_function_body(&mut self, body: &[Expr]) -> String {
         match body {
             [] => "return null;".to_string(),
             [single] => format!("return {};", self.emit_expr(single)),
@@ -3912,6 +5251,7 @@ impl Emitter {
         };
 
         let mut statements = Vec::new();
+        self.local_types.push(BTreeMap::new());
         for pair in bindings.chunks(2) {
             let [pattern, value] = pair else {
                 self.diagnostics.push(Diagnostic::error(
@@ -3920,10 +5260,15 @@ impl Emitter {
                 ));
                 continue;
             };
+            let value_type = self.expr_type(value).map(str::to_string);
             self.emit_let_pattern_statement(pattern, value, &mut statements);
+            if let Some(scope) = self.local_types.last_mut() {
+                collect_pattern_type_bindings(pattern, value_type.as_deref(), scope);
+            }
         }
 
         let tail = self.emit_tail_sequence(self_name, params, &args[1..]);
+        self.local_types.pop();
         statements.push(tail.code);
         TailEmission {
             code: format!("{{ {} }}", statements.join(" ")),
@@ -3950,6 +5295,7 @@ impl Emitter {
         }
 
         let value_name = self.next_temp("__closkell_match");
+        let value_type = self.expr_type(&args[0]).map(str::to_string);
         let mut lines = vec![format!(
             "const {} = {};",
             value_name,
@@ -3960,7 +5306,7 @@ impl Emitter {
             let [pattern, body] = arm else {
                 continue;
             };
-            let compiled = self.emit_pattern(pattern, &value_name);
+            let compiled = self.emit_pattern(pattern, &value_name, value_type.as_deref());
             let body = self.emit_tail_expr(self_name, params, body);
             has_tail_call |= body.has_tail_call;
             let keyword = if index == 0 { "if" } else { "else if" };
@@ -3985,12 +5331,15 @@ impl Emitter {
         let plan = kind_match_plan(args)?;
         let value_name = self.next_temp("__closkell_match");
         let kind_name = self.next_temp("__closkell_kind");
+        let value_type = self.expr_type(&args[0]).map(str::to_string);
+        let kind_read = if value_type.as_deref().is_some_and(type_has_kind_property) {
+            format!("{}.kind", value_name)
+        } else {
+            format!("{}?.kind", value_name)
+        };
         let mut lines = vec![
             format!("const {} = {};", value_name, self.emit_expr(&args[0])),
-            format!(
-                "const {} = typeof {}?.kind === \"symbol\" ? Symbol.keyFor({}.kind) ?? {}.kind.description : {}?.kind;",
-                kind_name, value_name, value_name, value_name, value_name
-            ),
+            format!("const {} = {};", kind_name, kind_read),
             format!("switch ({}) {{", kind_name),
         ];
         let mut has_tail_call = false;
@@ -4008,13 +5357,16 @@ impl Emitter {
         }
 
         if let Some(default) = &plan.default {
-            let compiled = self.emit_pattern(default.pattern, &value_name);
+            let compiled = self.emit_pattern(default.pattern, &value_name, value_type.as_deref());
             if compiled.test != "true" {
                 return None;
             }
             let body = self.emit_tail_expr(self_name, params, default.body);
             has_tail_call |= body.has_tail_call;
-            lines.push(format!("default: {{ {} {} }}", compiled.bindings, body.code));
+            lines.push(format!(
+                "default: {{ {} {} }}",
+                compiled.bindings, body.code
+            ));
         }
 
         lines.push("}".to_string());
@@ -4031,7 +5383,12 @@ impl Emitter {
         format!("{}_{}", prefix, id)
     }
 
-    fn emit_pattern(&mut self, pattern: &Expr, value: &str) -> CompiledPattern {
+    fn emit_pattern(
+        &mut self,
+        pattern: &Expr,
+        value: &str,
+        value_type: Option<&str>,
+    ) -> CompiledPattern {
         match &pattern.kind {
             ExprKind::Symbol(name) if name == "_" => CompiledPattern::always(),
             ExprKind::Symbol(name) => CompiledPattern {
@@ -4041,7 +5398,7 @@ impl Emitter {
             ExprKind::List(items)
                 if items.first().is_some_and(|head| matches_symbol(head, "as")) =>
             {
-                self.emit_as_pattern(pattern, items, value)
+                self.emit_as_pattern(pattern, items, value, value_type)
             }
             ExprKind::List(items)
                 if items
@@ -4049,10 +5406,10 @@ impl Emitter {
                     .and_then(symbol_name)
                     .is_some_and(is_data_constructor_pattern) =>
             {
-                self.emit_data_constructor_pattern(pattern, items, value)
+                self.emit_data_constructor_pattern(pattern, items, value, value_type)
             }
             ExprKind::Keyword(name) => CompiledPattern {
-                test: format!("{} === Symbol.for(\"{}\")", value, escape_js(name)),
+                test: format!("{} === \"{}\"", value, escape_js(name)),
                 bindings: String::new(),
             },
             ExprKind::String(value_pattern) => CompiledPattern {
@@ -4071,8 +5428,8 @@ impl Emitter {
                 test: format!("{} == null", value),
                 bindings: String::new(),
             },
-            ExprKind::Map(entries) => self.emit_record_pattern(entries, value),
-            ExprKind::Vector(items) => self.emit_vector_pattern(items, value),
+            ExprKind::Map(entries) => self.emit_record_pattern(entries, value, value_type),
+            ExprKind::Vector(items) => self.emit_vector_pattern(items, value, value_type),
             _ => {
                 self.diagnostics.push(Diagnostic::error(
                     pattern.span,
@@ -4116,6 +5473,7 @@ impl Emitter {
         pattern: &Expr,
         items: &[Expr],
         value: &str,
+        value_type: Option<&str>,
     ) -> CompiledPattern {
         let Some(name) = items.first().and_then(symbol_name) else {
             return CompiledPattern {
@@ -4124,10 +5482,10 @@ impl Emitter {
             };
         };
         if name == "list" {
-            return self.emit_vector_pattern(&items[1..], value);
+            return self.emit_vector_pattern(&items[1..], value, value_type);
         }
         if name == "cons" {
-            return self.emit_cons_pattern(pattern, &items[1..], value);
+            return self.emit_cons_pattern(pattern, &items[1..], value, value_type);
         }
         if items.len() != 2 {
             self.diagnostics.push(Diagnostic::error(
@@ -4142,9 +5500,10 @@ impl Emitter {
 
         match name {
             "some" => {
-                let inner = self.emit_pattern(&items[1], value);
+                let inner_type = value_type.and_then(type_option_inner);
+                let inner = self.emit_pattern(&items[1], value, inner_type);
                 CompiledPattern {
-                    test: format!("{} != null && ({})", value, inner.test),
+                    test: join_pattern_tests(vec![format!("{} != null", value), inner.test]),
                     bindings: inner.bindings,
                 }
             }
@@ -4152,12 +5511,21 @@ impl Emitter {
                 let expected = if name == "ok" { "true" } else { "false" };
                 let field = if name == "ok" { "value" } else { "error" };
                 let field_value = format!("{}{}", value, property_access(field));
-                let inner = self.emit_pattern(&items[1], &field_value);
+                let inner_type = value_type
+                    .and_then(type_result_parts)
+                    .map(|(ok, err)| if name == "ok" { ok } else { err });
+                let inner = self.emit_pattern(&items[1], &field_value, inner_type);
+                let mut tests = Vec::new();
+                if !value_type.is_some_and(|ty| type_result_parts(ty).is_some()) {
+                    tests.push(format!(
+                        "{} !== null && typeof {} === \"object\"",
+                        value, value
+                    ));
+                }
+                tests.push(format!("{}.ok === {}", value, expected));
+                tests.push(inner.test);
                 CompiledPattern {
-                    test: format!(
-                        "{} !== null && typeof {} === \"object\" && {}.ok === {} && ({})",
-                        value, value, value, expected, inner.test
-                    ),
+                    test: join_pattern_tests(tests),
                     bindings: inner.bindings,
                 }
             }
@@ -4173,6 +5541,7 @@ impl Emitter {
         pattern: &Expr,
         items: &[Expr],
         value: &str,
+        value_type: Option<&str>,
     ) -> CompiledPattern {
         if items.len() != 2 {
             self.diagnostics.push(Diagnostic::error(
@@ -4187,26 +5556,34 @@ impl Emitter {
 
         let head_value = format!("{}[0]", value);
         let tail_value = format!("{}.slice(1)", value);
-        let head = self.emit_pattern(&items[0], &head_value);
-        let tail = self.emit_pattern(&items[1], &tail_value);
+        let head_type = value_type.and_then(type_sequence_element);
+        let head = self.emit_pattern(&items[0], &head_value, head_type);
+        let tail = self.emit_pattern(&items[1], &tail_value, value_type);
         let bindings = [head.bindings, tail.bindings]
             .into_iter()
             .filter(|binding| !binding.is_empty())
             .collect::<Vec<_>>()
             .join(" ");
+        let mut tests = Vec::new();
+        if !value_type.is_some_and(type_is_vector_like) {
+            tests.push(format!("Array.isArray({})", value));
+        }
+        tests.push(format!("{}.length > 0", value));
+        tests.push(head.test);
+        tests.push(tail.test);
         CompiledPattern {
-            test: [
-                format!("Array.isArray({})", value),
-                format!("{}.length > 0", value),
-                head.test,
-                tail.test,
-            ]
-            .join(" && "),
+            test: join_pattern_tests(tests),
             bindings,
         }
     }
 
-    fn emit_as_pattern(&mut self, pattern: &Expr, items: &[Expr], value: &str) -> CompiledPattern {
+    fn emit_as_pattern(
+        &mut self,
+        pattern: &Expr,
+        items: &[Expr],
+        value: &str,
+        value_type: Option<&str>,
+    ) -> CompiledPattern {
         if items.len() != 3 {
             self.diagnostics.push(Diagnostic::error(
                 pattern.span,
@@ -4227,7 +5604,7 @@ impl Emitter {
                 bindings: String::new(),
             };
         };
-        let inner = self.emit_pattern(&items[1], value);
+        let inner = self.emit_pattern(&items[1], value, value_type);
         let alias = if name == "_" {
             String::new()
         } else {
@@ -4243,11 +5620,19 @@ impl Emitter {
         }
     }
 
-    fn emit_record_pattern(&mut self, entries: &[(Expr, Expr)], value: &str) -> CompiledPattern {
-        let mut tests = vec![format!(
-            "{} !== null && typeof {} === \"object\"",
-            value, value
-        )];
+    fn emit_record_pattern(
+        &mut self,
+        entries: &[(Expr, Expr)],
+        value: &str,
+        value_type: Option<&str>,
+    ) -> CompiledPattern {
+        let mut tests = Vec::new();
+        if !value_type.is_some_and(type_is_record) {
+            tests.push(format!(
+                "{} !== null && typeof {} === \"object\"",
+                value, value
+            ));
+        }
         let mut bindings = Vec::new();
 
         for (key, pattern) in entries {
@@ -4259,7 +5644,8 @@ impl Emitter {
                 continue;
             };
             let field = format!("{}{}", value, property_access(&key));
-            let compiled = self.emit_pattern(pattern, &field);
+            let field_type = value_type.and_then(|ty| type_record_field_type(ty, &key));
+            let compiled = self.emit_pattern(pattern, &field, field_type);
             tests.push(compiled.test);
             if !compiled.bindings.is_empty() {
                 bindings.push(compiled.bindings);
@@ -4267,27 +5653,39 @@ impl Emitter {
         }
 
         CompiledPattern {
-            test: tests.join(" && "),
+            test: join_pattern_tests(tests),
             bindings: bindings.join(" "),
         }
     }
 
-    fn emit_vector_pattern(&mut self, items: &[Expr], value: &str) -> CompiledPattern {
-        let mut tests = vec![
-            format!("Array.isArray({})", value),
-            format!("{}.length === {}", value, items.len()),
-        ];
+    fn emit_vector_pattern(
+        &mut self,
+        items: &[Expr],
+        value: &str,
+        value_type: Option<&str>,
+    ) -> CompiledPattern {
+        let mut tests = Vec::new();
+        if !value_type.is_some_and(type_is_vector_like) {
+            tests.push(format!("Array.isArray({})", value));
+        }
+        let tuple_len_matches = value_type
+            .and_then(type_tuple_items)
+            .is_some_and(|tuple_items| tuple_items.len() == items.len());
+        if !tuple_len_matches {
+            tests.push(format!("{}.length === {}", value, items.len()));
+        }
         let mut bindings = Vec::new();
         for (index, item) in items.iter().enumerate() {
             let field = format!("{}[{}]", value, index);
-            let compiled = self.emit_pattern(item, &field);
+            let item_type = value_type.and_then(|ty| type_vector_item_type(ty, index));
+            let compiled = self.emit_pattern(item, &field, item_type);
             tests.push(compiled.test);
             if !compiled.bindings.is_empty() {
                 bindings.push(compiled.bindings);
             }
         }
         CompiledPattern {
-            test: tests.join(" && "),
+            test: join_pattern_tests(tests),
             bindings: bindings.join(" "),
         }
     }
@@ -4312,37 +5710,52 @@ impl Emitter {
             slots: Vec::new(),
             create_lines: Vec::new(),
         };
-        let root_var = template.emit_node(root);
+        template.emit_node(root);
+        let skeleton = build_template_skeleton(root, template.owner);
         let mut used_node_ids = BTreeSet::new();
         for slot in &template.slots {
             used_node_ids.insert(slot.node_id);
         }
         let mut node_id_remap = BTreeMap::new();
-        let node_vars = used_node_ids
+        for (next_id, old_id) in used_node_ids.iter().enumerate() {
+            node_id_remap.insert(*old_id, next_id);
+        }
+        let skeleton_paths = used_node_ids
             .iter()
-            .enumerate()
-            .map(|(next_id, old_id)| {
-                node_id_remap.insert(*old_id, next_id);
-                template.nodes[*old_id].clone()
+            .map(|old_id| {
+                skeleton_path_token(
+                    skeleton
+                        .node_paths
+                        .get(*old_id)
+                        .expect("skeleton path should exist for emitted node"),
+                )
             })
             .collect::<Vec<_>>()
-            .join(", ");
+            .join(";");
         for slot in &mut template.slots {
             slot.node_id = *node_id_remap
                 .get(&slot.node_id)
                 .expect("slot node should be retained in compact node table");
         }
-        template.create_lines.push(format!(
-            "return {{ root: {}, nodes: [{}] }};",
-            root_var, node_vars
-        ));
-        let create_body = template.create_lines.join(" ");
+        let slot_kinds = template
+            .slots
+            .iter()
+            .map(|slot| slot.kind.clone())
+            .collect::<Vec<_>>();
+        for kind in &slot_kinds {
+            template.owner.mark_template_slot_runtime(kind);
+        }
         let update_body = template.emit_update_body();
 
-        format!(
-            "__closkellCreateTemplate({{ create() {{ {} }}, update(instance, dispatch, updateContext) {{ {} }} }})",
-            create_body, update_body
-        )
+        let skeleton_expr = format!(
+            "{}(\"{}\", \"{}\", (i, d) => {{ {} }})",
+            CREATE_HTML_TEMPLATE_ALIAS,
+            escape_js(&skeleton.html),
+            escape_js(&skeleton_paths),
+            update_body
+        );
+        template.owner.needs_template_skeleton = true;
+        skeleton_expr
     }
 }
 
@@ -4684,7 +6097,10 @@ struct TemplateSlot {
 #[derive(Clone, Debug)]
 enum TemplateSlotKind {
     Text,
-    Attr(String),
+    Attr {
+        name: String,
+        setter: TemplateAttrSetter,
+    },
     Event(String),
     Ref,
     Conditional {
@@ -4706,6 +6122,128 @@ enum TemplateSlotKind {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TemplateAttrSetter {
+    Simple,
+    Text,
+    NullableText,
+    TextProperty,
+    NullableTextProperty,
+    Presence,
+    BooleanProperty,
+    ClassName,
+    Class,
+    Style,
+    StyleRecord,
+}
+
+struct TemplateSkeleton {
+    html: String,
+    node_paths: Vec<Vec<usize>>,
+}
+
+fn build_template_skeleton(root: &HtmlNode, owner: &Emitter) -> TemplateSkeleton {
+    let mut skeleton = TemplateSkeleton {
+        html: String::new(),
+        node_paths: Vec::new(),
+    };
+    emit_skeleton_node(root, owner, &mut Vec::new(), &mut skeleton);
+    skeleton
+}
+
+fn emit_skeleton_node(
+    node: &HtmlNode,
+    owner: &Emitter,
+    path: &mut Vec<usize>,
+    skeleton: &mut TemplateSkeleton,
+) {
+    skeleton.node_paths.push(path.clone());
+    match node {
+        HtmlNode::Element(element) => {
+            skeleton.html.push('<');
+            skeleton.html.push_str(&element.tag);
+            for attr in &element.attrs {
+                match &attr.value {
+                    HtmlAttrValue::Bool(true) if attr.name != "ref" => {
+                        skeleton.html.push(' ');
+                        skeleton.html.push_str(&attr.name);
+                    }
+                    HtmlAttrValue::Static(value) if attr.name != "ref" => {
+                        skeleton.html.push(' ');
+                        skeleton.html.push_str(&attr.name);
+                        skeleton.html.push_str("=\"");
+                        skeleton.html.push_str(&escape_html_attr(value));
+                        skeleton.html.push('"');
+                    }
+                    HtmlAttrValue::Dynamic { expr, .. }
+                        if attr.name != "ref" && owner.static_bool(expr) == Some(true) =>
+                    {
+                        skeleton.html.push(' ');
+                        skeleton.html.push_str(&attr.name);
+                    }
+                    _ => {}
+                }
+            }
+            skeleton.html.push('>');
+
+            let mut child_index = 0usize;
+            for child in &element.children {
+                if is_indentation_text_node(child) {
+                    continue;
+                }
+                path.push(child_index);
+                emit_skeleton_node(child, owner, path, skeleton);
+                path.pop();
+                child_index += 1;
+            }
+
+            skeleton.html.push_str("</");
+            skeleton.html.push_str(&element.tag);
+            skeleton.html.push('>');
+        }
+        HtmlNode::Text { text, .. } => {
+            skeleton.html.push_str(&escape_html_text(text));
+        }
+        HtmlNode::Expr { expr, .. } => {
+            if template_expr_uses_structural_marker(expr, &owner.component_fns) {
+                skeleton.html.push_str("<!---->");
+            } else {
+                skeleton.html.push(' ');
+            }
+        }
+    }
+}
+
+fn template_expr_uses_structural_marker(expr: &Expr, component_fns: &BTreeSet<String>) -> bool {
+    ForSpec::parse(expr).is_some()
+        || IfSpec::parse(expr, component_fns).is_some()
+        || ComponentSpec::parse(expr, component_fns).is_some()
+}
+
+fn escape_html_text(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn escape_html_attr(value: &str) -> String {
+    escape_html_text(value).replace('"', "&quot;")
+}
+
+fn skeleton_path_token(path: &[usize]) -> String {
+    if path.is_empty() {
+        return "-".to_string();
+    }
+    let mut encoded = String::new();
+    for index in path {
+        encoded.push(
+            char::from_digit(*index as u32, 36).expect("template child index should fit in base36"),
+        );
+    }
+    encoded
+}
+
 impl TemplateEmitter<'_> {
     fn emit_node(&mut self, node: &HtmlNode) -> String {
         match node {
@@ -4713,8 +6251,9 @@ impl TemplateEmitter<'_> {
             HtmlNode::Text { text, .. } => {
                 let var = self.next_node_var();
                 self.create_lines.push(format!(
-                    "const {} = document.createTextNode(\"{}\");",
+                    "const {} = {}(\"{}\");",
                     var,
+                    CREATE_TEXT_ALIAS,
                     escape_js(text)
                 ));
                 var
@@ -4732,7 +6271,7 @@ impl TemplateEmitter<'_> {
 
                 let var = self.next_node_var();
                 self.create_lines
-                    .push(format!("const {} = document.createTextNode(\"\");", var));
+                    .push(format!("const {} = {}(\"\");", var, CREATE_TEXT_ALIAS));
                 self.push_slot(self.node_id_for_var(&var), TemplateSlotKind::Text, expr);
                 var
             }
@@ -4746,18 +6285,21 @@ impl TemplateEmitter<'_> {
         let in_svg_tree = self.svg_depth > 0 || is_svg_element;
         if in_svg_tree {
             self.create_lines.push(format!(
-                "const {} = document.createElementNS(\"http://www.w3.org/2000/svg\", \"{}\");",
+                "const {} = {}(\"{}\");",
                 var,
+                CREATE_SVG_ELEMENT_ALIAS,
                 escape_js(&element.tag)
             ));
         } else {
             self.create_lines.push(format!(
-                "const {} = document.createElement(\"{}\");",
+                "const {} = {}(\"{}\");",
                 var,
+                CREATE_ELEMENT_ALIAS,
                 escape_js(&element.tag)
             ));
         }
 
+        let statically_disabled = self.element_statically_disabled(element);
         for attr in &element.attrs {
             if attr.name == "ref" {
                 match &attr.value {
@@ -4778,22 +6320,41 @@ impl TemplateEmitter<'_> {
 
             match &attr.value {
                 HtmlAttrValue::Bool(true) => self.create_lines.push(format!(
-                    "{}.setAttribute(\"{}\", \"\");",
+                    "{}({}, \"{}\", \"\");",
+                    SET_STATIC_ATTR_ALIAS,
                     var,
                     escape_js(&attr.name)
                 )),
                 HtmlAttrValue::Bool(false) => {}
                 HtmlAttrValue::Static(value) => self.create_lines.push(format!(
-                    "{}.setAttribute(\"{}\", \"{}\");",
+                    "{}({}, \"{}\", \"{}\");",
+                    SET_STATIC_ATTR_ALIAS,
                     var,
                     escape_js(&attr.name),
                     escape_js(value)
                 )),
                 HtmlAttrValue::Dynamic { expr, .. } => {
+                    if let Some(value) = self.owner.static_bool(expr) {
+                        if value {
+                            self.create_lines.push(format!(
+                                "{}({}, \"{}\", \"\");",
+                                SET_STATIC_ATTR_ALIAS,
+                                var,
+                                escape_js(&attr.name)
+                            ));
+                        }
+                        continue;
+                    }
+                    if statically_disabled && attr.name.starts_with("on:") {
+                        continue;
+                    }
                     let kind = if let Some(event) = attr.name.strip_prefix("on:") {
                         TemplateSlotKind::Event(event.to_string())
                     } else {
-                        TemplateSlotKind::Attr(attr.name.clone())
+                        TemplateSlotKind::Attr {
+                            setter: self.attr_setter(&attr.name, expr, in_svg_tree),
+                            name: attr.name.clone(),
+                        }
                     };
                     self.push_slot(node_id, kind, expr);
                 }
@@ -4809,7 +6370,7 @@ impl TemplateEmitter<'_> {
             }
             let child_var = self.emit_node(child);
             self.create_lines
-                .push(format!("{}.appendChild({});", var, child_var));
+                .push(format!("{}({}, {});", APPEND_CHILD_ALIAS, var, child_var));
         }
         if in_svg_tree {
             self.svg_depth -= 1;
@@ -4817,10 +6378,23 @@ impl TemplateEmitter<'_> {
         var
     }
 
+    fn element_statically_disabled(&self, element: &HtmlElement) -> bool {
+        element.attrs.iter().any(|attr| {
+            attr.name == "disabled"
+                && match &attr.value {
+                    HtmlAttrValue::Bool(value) => *value,
+                    HtmlAttrValue::Static(_) => true,
+                    HtmlAttrValue::Dynamic { expr, .. } => {
+                        self.owner.static_bool(expr).is_some_and(|value| value)
+                    }
+                }
+        })
+    }
+
     fn emit_keyed_for(&mut self, expr: &Expr, spec: ForSpec<'_>) -> String {
         let var = self.next_node_var();
         self.create_lines
-            .push(format!("const {} = document.createTextNode(\"\");", var));
+            .push(format!("const {} = {}(\"\");", var, CREATE_TEXT_ALIAS));
 
         let collection = self.owner.emit_expr(spec.collection);
         let key = self.owner.emit_expr(spec.key);
@@ -4847,17 +6421,21 @@ impl TemplateEmitter<'_> {
                 )
             };
         let component_expr = self.owner.emit_template_component(spec.template);
+        let arity = if index.is_some() { 2 } else { 1 };
+        let bind = format!(
+            "({}) => {{ {} = {};{} }}",
+            update_params, item, item_update_param, index_update
+        );
         let render = format!(
-            "({}) => {{ let {} = {};{} const __closkellItemComponent = {}; return {{ mount(parent, dispatch) {{ return __closkellItemComponent.mount(parent, dispatch); }}, update({}, dispatch) {{ {} = {};{} return __closkellItemComponent.update(dispatch); }}, dispose() {{ __closkellItemComponent.dispose(); }}, get root() {{ return __closkellItemComponent.root; }} }}; }}",
+            "({}) => {{ let {} = {};{} const __closkellItemComponent = {}; return {}(__closkellItemComponent, {}, {}); }}",
             render_params,
             item,
             item_param,
             index_binding,
             component_expr,
-            update_params,
-            item,
-            item_update_param,
-            index_update
+            BIND_COMPONENT_ALIAS,
+            arity,
+            bind
         );
         let id = self.slots.len();
         self.slots.push(TemplateSlot {
@@ -4878,7 +6456,7 @@ impl TemplateEmitter<'_> {
     fn emit_conditional(&mut self, expr: &Expr, spec: IfSpec<'_>) -> String {
         let var = self.next_node_var();
         self.create_lines
-            .push(format!("const {} = document.createTextNode(\"\");", var));
+            .push(format!("const {} = {}(\"\");", var, CREATE_TEXT_ALIAS));
 
         let condition = self.owner.emit_expr(spec.condition);
         let then_component = self.emit_branch_component(&spec.then_branch);
@@ -4936,14 +6514,15 @@ impl TemplateEmitter<'_> {
         let else_component = self.emit_branch_component(&spec.else_branch);
 
         format!(
-            "(() => {{ let {branch} = null; let {component} = null; const {placeholder} = document.createTextNode(\"\"); const __closkellDispose = () => {{ if ({component}?.root?.parentNode) {component}.root.parentNode.removeChild({component}.root); {component}?.dispose?.(); }}; return {{ update(dispatch) {{ const __closkellCondition = {condition}; const __closkellNextBranch = __closkellCondition ? \"then\" : \"else\"; if ({branch} !== __closkellNextBranch) {{ __closkellDispose(); {component} = __closkellCondition ? {then_component} : {else_component}; {branch} = __closkellNextBranch; }} {component}?.update?.(dispatch); return {component}?.root ?? {placeholder}; }}, get root() {{ return {component}?.root ?? {placeholder}; }}, dispose() {{ __closkellDispose(); {component} = null; {branch} = null; }} }}; }})()"
+            "(() => {{ let {branch} = null; let {component} = null; const {placeholder} = {text}(\"\"); const __closkellDispose = () => {{ if ({component}?.root?.parentNode) {component}.root.parentNode.removeChild({component}.root); {component}?.dispose?.(); }}; return {{ update(dispatch) {{ const __closkellCondition = {condition}; const __closkellNextBranch = __closkellCondition ? \"then\" : \"else\"; if ({branch} !== __closkellNextBranch) {{ __closkellDispose(); {component} = __closkellCondition ? {then_component} : {else_component}; {branch} = __closkellNextBranch; }} {component}?.update?.(dispatch); return {component}?.root ?? {placeholder}; }}, get root() {{ return {component}?.root ?? {placeholder}; }}, dispose() {{ __closkellDispose(); {component} = null; {branch} = null; }} }}; }})()",
+            text = CREATE_TEXT_ALIAS
         )
     }
 
     fn emit_component_call(&mut self, expr: &Expr, spec: ComponentSpec<'_>) -> String {
         let var = self.next_node_var();
         self.create_lines
-            .push(format!("const {} = document.createTextNode(\"\");", var));
+            .push(format!("const {} = {}(\"\");", var, CREATE_TEXT_ALIAS));
 
         let render = self.owner.emit_expr(expr);
         let args = spec
@@ -5001,42 +6580,154 @@ impl TemplateEmitter<'_> {
         });
     }
 
+    fn attr_setter(&self, name: &str, expr: &Expr, in_svg_tree: bool) -> TemplateAttrSetter {
+        let expr_type = self.owner.expr_type(expr);
+        if let Some(ty) = expr_type {
+            let (inner, nullable) = attr_type_inner(ty);
+            if name == "class" && !in_svg_tree && is_text_attr_type(inner) {
+                return if nullable {
+                    TemplateAttrSetter::Class
+                } else {
+                    TemplateAttrSetter::ClassName
+                };
+            }
+            if inner == "Bool" {
+                return if !in_svg_tree && is_html_boolean_property_attr(name) {
+                    TemplateAttrSetter::BooleanProperty
+                } else {
+                    TemplateAttrSetter::Presence
+                };
+            }
+            if is_text_attr_type(inner) {
+                return match (!in_svg_tree && is_html_text_property_attr(name), nullable) {
+                    (true, true) => TemplateAttrSetter::NullableTextProperty,
+                    (true, false) => TemplateAttrSetter::TextProperty,
+                    (false, true) => TemplateAttrSetter::NullableText,
+                    (false, false) => TemplateAttrSetter::Text,
+                };
+            }
+        }
+        match name {
+            "style" if self.owner.expr_is_record(expr) => TemplateAttrSetter::StyleRecord,
+            "style" => TemplateAttrSetter::Style,
+            "class" if expr_type.is_some_and(is_simple_attr_value_type) => {
+                TemplateAttrSetter::Simple
+            }
+            "class" => TemplateAttrSetter::Class,
+            _ => TemplateAttrSetter::Simple,
+        }
+    }
+
     fn emit_update_body(&self) -> String {
         let mut lines = Vec::new();
         for slot in &self.slots {
             let update = match &slot.kind {
                 TemplateSlotKind::Text => format!(
-                    "__closkellSetText(instance, {}, instance.nodes[{}], {});",
-                    slot.id, slot.node_id, slot.expr
+                    "{}(i, {}, i.nodes[{}], {});",
+                    SET_TEXT_ALIAS, slot.id, slot.node_id, slot.expr
                 ),
-                TemplateSlotKind::Attr(name) => format!(
-                    "__closkellSetAttr(instance, {}, instance.nodes[{}], \"{}\", {});",
-                    slot.id,
-                    slot.node_id,
-                    escape_js(name),
-                    slot.expr
-                ),
+                TemplateSlotKind::Attr { name, setter } => match setter {
+                    TemplateAttrSetter::Simple => format!(
+                        "{}(i, {}, i.nodes[{}], \"{}\", {});",
+                        SET_ATTR_ALIAS,
+                        slot.id,
+                        slot.node_id,
+                        escape_js(name),
+                        slot.expr
+                    ),
+                    TemplateAttrSetter::Text => format!(
+                        "{}(i, {}, i.nodes[{}], \"{}\", {});",
+                        SET_TEXT_ATTR_ALIAS,
+                        slot.id,
+                        slot.node_id,
+                        escape_js(name),
+                        slot.expr
+                    ),
+                    TemplateAttrSetter::NullableText => format!(
+                        "{}(i, {}, i.nodes[{}], \"{}\", {});",
+                        SET_NULLABLE_TEXT_ATTR_ALIAS,
+                        slot.id,
+                        slot.node_id,
+                        escape_js(name),
+                        slot.expr
+                    ),
+                    TemplateAttrSetter::TextProperty => format!(
+                        "{}(i, {}, i.nodes[{}], \"{}\", {});",
+                        SET_TEXT_PROPERTY_ALIAS,
+                        slot.id,
+                        slot.node_id,
+                        escape_js(name),
+                        slot.expr
+                    ),
+                    TemplateAttrSetter::NullableTextProperty => format!(
+                        "{}(i, {}, i.nodes[{}], \"{}\", {});",
+                        SET_NULLABLE_TEXT_PROPERTY_ALIAS,
+                        slot.id,
+                        slot.node_id,
+                        escape_js(name),
+                        slot.expr
+                    ),
+                    TemplateAttrSetter::Presence => format!(
+                        "{}(i, {}, i.nodes[{}], \"{}\", {});",
+                        SET_PRESENCE_ATTR_ALIAS,
+                        slot.id,
+                        slot.node_id,
+                        escape_js(name),
+                        slot.expr
+                    ),
+                    TemplateAttrSetter::BooleanProperty => format!(
+                        "{}(i, {}, i.nodes[{}], \"{}\", {});",
+                        SET_BOOLEAN_PROPERTY_ALIAS,
+                        slot.id,
+                        slot.node_id,
+                        escape_js(name),
+                        slot.expr
+                    ),
+                    TemplateAttrSetter::ClassName => format!(
+                        "{}(i, {}, i.nodes[{}], {});",
+                        SET_CLASS_NAME_ALIAS, slot.id, slot.node_id, slot.expr
+                    ),
+                    TemplateAttrSetter::Class => format!(
+                        "{}(i, {}, i.nodes[{}], {});",
+                        SET_CLASS_ALIAS, slot.id, slot.node_id, slot.expr
+                    ),
+                    TemplateAttrSetter::Style => format!(
+                        "{}(i, {}, i.nodes[{}], {});",
+                        SET_STYLE_ALIAS, slot.id, slot.node_id, slot.expr
+                    ),
+                    TemplateAttrSetter::StyleRecord => format!(
+                        "{}(i, {}, i.nodes[{}], {});",
+                        SET_STYLE_RECORD_ALIAS, slot.id, slot.node_id, slot.expr
+                    ),
+                },
                 TemplateSlotKind::Event(event) => format!(
-                    "__closkellSetEvent(instance, {}, instance.nodes[{}], \"{}\", (event) => {}, dispatch);",
+                    "{}(i, {}, i.nodes[{}], \"{}\", (event) => {}, d);",
+                    SET_EVENT_ALIAS,
                     slot.id,
                     slot.node_id,
                     escape_js(event),
                     parenthesize_arrow_body(&slot.expr)
                 ),
                 TemplateSlotKind::Ref => format!(
-                    "__closkellSetRef(instance, {}, instance.nodes[{}], {}, dispatch);",
-                    slot.id, slot.node_id, slot.expr
+                    "{}(i, {}, i.nodes[{}], {}, d);",
+                    SET_REF_ALIAS, slot.id, slot.node_id, slot.expr
                 ),
                 TemplateSlotKind::Conditional {
                     condition,
                     render_then,
                     render_else,
                 } => format!(
-                    "__closkellSetConditional(instance, {}, instance.nodes[{}], {}, {}, {}, dispatch);",
-                    slot.id, slot.node_id, condition, render_then, render_else
+                    "{}(i, {}, i.nodes[{}], {}, {}, {}, d);",
+                    SET_CONDITIONAL_ALIAS,
+                    slot.id,
+                    slot.node_id,
+                    condition,
+                    render_then,
+                    render_else
                 ),
                 TemplateSlotKind::Component { name, render, args } => format!(
-                    "__closkellSetComponent(instance, {}, instance.nodes[{}], () => {}, {}, dispatch, \"{}\");",
+                    "{}(i, {}, i.nodes[{}], () => {}, {}, d, \"{}\");",
+                    SET_COMPONENT_ALIAS,
                     slot.id,
                     slot.node_id,
                     render,
@@ -5056,7 +6747,8 @@ impl TemplateEmitter<'_> {
                         item.clone()
                     };
                     format!(
-                        "__closkellSetKeyedList(instance, {}, instance.nodes[{}], {}, ({}) => {}, {}, dispatch);",
+                        "{}(i, {}, i.nodes[{}], {}, ({}) => {}, {}, d);",
+                        SET_KEYED_LIST_ALIAS,
                         slot.id,
                         slot.node_id,
                         collection,
@@ -5230,50 +6922,6 @@ fn map_call_parts(expr: &Expr) -> Option<(&Expr, &Expr, bool)> {
     }
 }
 
-fn contains_reduce_call(exprs: &[Expr]) -> bool {
-    exprs.iter().any(expr_contains_reduce_call)
-}
-
-fn expr_contains_reduce_call(expr: &Expr) -> bool {
-    match &expr.kind {
-        ExprKind::List(items) => {
-            items.first().is_some_and(|head| {
-                matches_symbol(head, "reduce") || matches_symbol(head, "reduce-indexed")
-            }) || items.iter().any(expr_contains_reduce_call)
-        }
-        ExprKind::Vector(items) | ExprKind::Set(items) => {
-            items.iter().any(expr_contains_reduce_call)
-        }
-        ExprKind::Map(entries) => entries
-            .iter()
-            .any(|(key, value)| expr_contains_reduce_call(key) || expr_contains_reduce_call(value)),
-        ExprKind::HtmlTemplate(node) => html_node_contains_reduce_call(node),
-        ExprKind::Nil
-        | ExprKind::Bool(_)
-        | ExprKind::Number(_)
-        | ExprKind::String(_)
-        | ExprKind::Keyword(_)
-        | ExprKind::Symbol(_)
-        | ExprKind::Quote(_)
-        | ExprKind::QuasiQuote(_)
-        | ExprKind::Unquote(_)
-        | ExprKind::UnquoteSplicing(_) => false,
-    }
-}
-
-fn html_node_contains_reduce_call(node: &HtmlNode) -> bool {
-    match node {
-        HtmlNode::Element(element) => {
-            element.attrs.iter().any(|attr| match &attr.value {
-                HtmlAttrValue::Dynamic { expr, .. } => expr_contains_reduce_call(expr),
-                HtmlAttrValue::Bool(_) | HtmlAttrValue::Static(_) => false,
-            }) || element.children.iter().any(html_node_contains_reduce_call)
-        }
-        HtmlNode::Expr { expr, .. } => expr_contains_reduce_call(expr),
-        HtmlNode::Text { .. } => false,
-    }
-}
-
 fn is_data_constructor_pattern(name: &str) -> bool {
     matches!(name, "some" | "ok" | "err" | "list" | "cons")
 }
@@ -5392,6 +7040,13 @@ struct ReadSummary {
     reads: Vec<String>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MessageFieldReads {
+    pub top_fields: BTreeSet<String>,
+    pub value_fields: BTreeSet<String>,
+    pub value_escapes: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ReadAlias {
     reads: Vec<String>,
@@ -5450,6 +7105,211 @@ fn collect_read_summaries(source: &SourceFile) -> BTreeMap<String, ReadSummary> 
     }
 
     summaries
+}
+
+pub fn collect_message_field_reads(source: &SourceFile) -> BTreeMap<String, MessageFieldReads> {
+    let mut reads = BTreeMap::new();
+    for form in &source.forms {
+        let ExprKind::List(items) = &form.kind else {
+            continue;
+        };
+        if items.len() < 4 || !matches_symbol(&items[0], "defn") {
+            continue;
+        }
+        if !matches_symbol(&items[1], "update") {
+            continue;
+        }
+        let ExprKind::Vector(params) = &items[2].kind else {
+            continue;
+        };
+        let Some(message_param) = params.get(1).and_then(symbol_name) else {
+            continue;
+        };
+        for body in &items[3..] {
+            collect_message_field_reads_expr(body, message_param, &mut reads);
+        }
+    }
+    reads
+}
+
+fn merged_message_field_reads(
+    mut base: BTreeMap<String, MessageFieldReads>,
+    local: BTreeMap<String, MessageFieldReads>,
+) -> BTreeMap<String, MessageFieldReads> {
+    for (kind, reads) in local {
+        let entry = base.entry(kind).or_default();
+        entry.top_fields.extend(reads.top_fields);
+        entry.value_fields.extend(reads.value_fields);
+        entry.value_escapes |= reads.value_escapes;
+    }
+    base
+}
+
+fn collect_message_field_reads_expr(
+    expr: &Expr,
+    message_param: &str,
+    reads: &mut BTreeMap<String, MessageFieldReads>,
+) {
+    match &expr.kind {
+        ExprKind::List(items) => {
+            if items.len() >= 3
+                && matches_symbol(&items[0], "match")
+                && matches_symbol(&items[1], message_param)
+            {
+                for arm in items[2..].chunks(2) {
+                    let [pattern, body] = arm else {
+                        continue;
+                    };
+                    let Some(info) = kind_pattern_info(pattern) else {
+                        collect_message_field_reads_expr(body, message_param, reads);
+                        continue;
+                    };
+                    let entry = reads.entry(info.kind).or_default();
+                    let mut value_aliases = BTreeSet::new();
+                    collect_message_pattern_reads(info.entries, entry, &mut value_aliases);
+                    collect_message_value_alias_reads(body, &value_aliases, entry);
+                    collect_message_field_reads_expr(body, message_param, reads);
+                }
+                return;
+            }
+            for item in items {
+                collect_message_field_reads_expr(item, message_param, reads);
+            }
+        }
+        ExprKind::Vector(items) | ExprKind::Set(items) => {
+            for item in items {
+                collect_message_field_reads_expr(item, message_param, reads);
+            }
+        }
+        ExprKind::Map(entries) => {
+            for (key, value) in entries {
+                collect_message_field_reads_expr(key, message_param, reads);
+                collect_message_field_reads_expr(value, message_param, reads);
+            }
+        }
+        ExprKind::Quote(inner)
+        | ExprKind::QuasiQuote(inner)
+        | ExprKind::Unquote(inner)
+        | ExprKind::UnquoteSplicing(inner) => {
+            collect_message_field_reads_expr(inner, message_param, reads)
+        }
+        ExprKind::HtmlTemplate(_)
+        | ExprKind::Symbol(_)
+        | ExprKind::Nil
+        | ExprKind::Bool(_)
+        | ExprKind::Number(_)
+        | ExprKind::String(_)
+        | ExprKind::Keyword(_) => {}
+    }
+}
+
+fn collect_message_pattern_reads(
+    entries: &[(Expr, Expr)],
+    reads: &mut MessageFieldReads,
+    value_aliases: &mut BTreeSet<String>,
+) {
+    for (key, pattern) in entries {
+        let Some(key) = object_key_name(key) else {
+            reads.value_escapes = true;
+            continue;
+        };
+        if key == "kind" {
+            continue;
+        }
+        if key == "value" {
+            collect_message_value_pattern_reads(pattern, reads, value_aliases);
+        } else if !matches!(pattern.kind, ExprKind::Symbol(ref name) if name == "_") {
+            reads.top_fields.insert(key);
+        }
+    }
+}
+
+fn collect_message_value_pattern_reads(
+    pattern: &Expr,
+    reads: &mut MessageFieldReads,
+    value_aliases: &mut BTreeSet<String>,
+) {
+    match &pattern.kind {
+        ExprKind::Symbol(name) if name == "_" => {}
+        ExprKind::Symbol(name) => {
+            value_aliases.insert(name.clone());
+        }
+        ExprKind::Map(entries) => {
+            for (key, _) in entries {
+                let Some(key) = object_key_name(key) else {
+                    reads.value_escapes = true;
+                    continue;
+                };
+                reads.value_fields.insert(key);
+            }
+        }
+        _ => reads.value_escapes = true,
+    }
+}
+
+fn collect_message_value_alias_reads(
+    expr: &Expr,
+    value_aliases: &BTreeSet<String>,
+    reads: &mut MessageFieldReads,
+) {
+    match &expr.kind {
+        ExprKind::Symbol(name) => {
+            for alias in value_aliases {
+                if name == alias {
+                    reads.value_escapes = true;
+                    continue;
+                }
+                let Some(suffix) = name.strip_prefix(&format!("{}.", alias)) else {
+                    continue;
+                };
+                if let Some(field) = suffix.split('.').next().filter(|field| !field.is_empty()) {
+                    reads.value_fields.insert(field.to_string());
+                }
+            }
+        }
+        ExprKind::List(items) => {
+            if matches_symbol(items.first().unwrap_or(expr), "fn") {
+                if let Some(params) = items.get(1).and_then(|params| match &params.kind {
+                    ExprKind::Vector(params) => Some(params),
+                    _ => None,
+                }) {
+                    let shadows_alias = params
+                        .iter()
+                        .filter_map(symbol_name)
+                        .any(|name| value_aliases.contains(name));
+                    if shadows_alias {
+                        return;
+                    }
+                }
+            }
+            for item in items {
+                collect_message_value_alias_reads(item, value_aliases, reads);
+            }
+        }
+        ExprKind::Vector(items) | ExprKind::Set(items) => {
+            for item in items {
+                collect_message_value_alias_reads(item, value_aliases, reads);
+            }
+        }
+        ExprKind::Map(entries) => {
+            for (key, value) in entries {
+                collect_message_value_alias_reads(key, value_aliases, reads);
+                collect_message_value_alias_reads(value, value_aliases, reads);
+            }
+        }
+        ExprKind::Quote(inner)
+        | ExprKind::QuasiQuote(inner)
+        | ExprKind::Unquote(inner)
+        | ExprKind::UnquoteSplicing(inner) => {
+            collect_message_value_alias_reads(inner, value_aliases, reads)
+        }
+        ExprKind::HtmlTemplate(_)
+        | ExprKind::Nil
+        | ExprKind::Bool(_)
+        | ExprKind::Number(_)
+        | ExprKind::String(_)
+        | ExprKind::Keyword(_) => {}
+    }
 }
 
 fn params_from_vector(expr: &Expr) -> Option<Vec<String>> {
@@ -5799,6 +7659,79 @@ fn collect_pattern_symbols(pattern: &Expr, symbols: &mut BTreeSet<String>) {
     }
 }
 
+fn collect_pattern_type_bindings(
+    pattern: &Expr,
+    value_type: Option<&str>,
+    bindings: &mut BTreeMap<String, String>,
+) {
+    match &pattern.kind {
+        ExprKind::Symbol(name) if name == "_" => {}
+        ExprKind::Symbol(name) => {
+            if let Some(ty) = value_type {
+                bindings.insert(name.clone(), ty.to_string());
+            }
+        }
+        ExprKind::List(items) => {
+            let Some(name) = items.first().and_then(symbol_name) else {
+                return;
+            };
+            match name {
+                "list" => {
+                    for (index, item) in items[1..].iter().enumerate() {
+                        let item_type = value_type.and_then(|ty| type_vector_item_type(ty, index));
+                        collect_pattern_type_bindings(item, item_type, bindings);
+                    }
+                }
+                "cons" if items.len() == 3 => {
+                    let head_type = value_type.and_then(type_sequence_element);
+                    collect_pattern_type_bindings(&items[1], head_type, bindings);
+                    collect_pattern_type_bindings(&items[2], value_type, bindings);
+                }
+                "some" if items.len() == 2 => {
+                    collect_pattern_type_bindings(
+                        &items[1],
+                        value_type.and_then(type_option_inner),
+                        bindings,
+                    );
+                }
+                "ok" | "err" if items.len() == 2 => {
+                    let inner_type = value_type
+                        .and_then(type_result_parts)
+                        .map(|(ok, err)| if name == "ok" { ok } else { err });
+                    collect_pattern_type_bindings(&items[1], inner_type, bindings);
+                }
+                "as" if items.len() == 3 => {
+                    collect_pattern_type_bindings(&items[1], value_type, bindings);
+                    if let ExprKind::Symbol(name) = &items[2].kind {
+                        if name != "_" {
+                            if let Some(ty) = value_type {
+                                bindings.insert(name.clone(), ty.to_string());
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        ExprKind::Map(entries) => {
+            for (key, value) in entries {
+                let Some(key) = object_key_name(key) else {
+                    continue;
+                };
+                let field_type = value_type.and_then(|ty| type_record_field_type(ty, &key));
+                collect_pattern_type_bindings(value, field_type, bindings);
+            }
+        }
+        ExprKind::Vector(items) => {
+            for (index, item) in items.iter().enumerate() {
+                let item_type = value_type.and_then(|ty| type_vector_item_type(ty, index));
+                collect_pattern_type_bindings(item, item_type, bindings);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn const_bindings_to_assignments(bindings: &str) -> String {
     bindings
         .split(';')
@@ -6091,11 +8024,11 @@ fn sanitize_identifier(name: &str) -> String {
 
 fn emit_symbol_read(name: &str) -> String {
     if name == "Cmd.none" {
-        return "{ kind: Symbol.for(\"none\") }".to_string();
+        return "{ kind: \"none\" }".to_string();
     }
 
     if name == "Sub.none" {
-        return "{ kind: Symbol.for(\"none\") }".to_string();
+        return "{ kind: \"none\" }".to_string();
     }
 
     let parts = name.split('.').collect::<Vec<_>>();
@@ -6134,6 +8067,93 @@ fn object_key_name(expr: &Expr) -> Option<String> {
         ExprKind::Keyword(name) | ExprKind::Symbol(name) | ExprKind::String(name) => {
             Some(name.clone())
         }
+        _ => None,
+    }
+}
+
+struct StaticWindowEventOptions<'a> {
+    options: Option<&'a Expr>,
+    prevent_default: bool,
+    stop_propagation: bool,
+}
+
+fn static_window_event_options(expr: &Expr) -> Option<StaticWindowEventOptions<'_>> {
+    let ExprKind::Map(entries) = &expr.kind else {
+        return None;
+    };
+    let mut options = None;
+    let mut prevent_default = false;
+    let mut stop_propagation = false;
+    for (key, value) in entries {
+        let key = object_key_name(key)?;
+        match key.as_str() {
+            "options" => options = Some(value),
+            "preventDefault" => {
+                let ExprKind::Bool(value) = &value.kind else {
+                    return None;
+                };
+                prevent_default = *value;
+            }
+            "stopPropagation" => {
+                let ExprKind::Bool(value) = &value.kind else {
+                    return None;
+                };
+                stop_propagation = *value;
+            }
+            _ => return None,
+        }
+    }
+    Some(StaticWindowEventOptions {
+        options,
+        prevent_default,
+        stop_propagation,
+    })
+}
+
+fn window_event_field_expr(field: &str) -> Option<&'static str> {
+    match field {
+        "type" => Some("event.type || \"\""),
+        "clientX" => Some("event.clientX || 0"),
+        "clientY" => Some("event.clientY || 0"),
+        "pageX" => Some("event.pageX || 0"),
+        "pageY" => Some("event.pageY || 0"),
+        "screenX" => Some("event.screenX || 0"),
+        "screenY" => Some("event.screenY || 0"),
+        "movementX" => Some("event.movementX || 0"),
+        "movementY" => Some("event.movementY || 0"),
+        "button" => Some("event.button || 0"),
+        "buttons" => Some("event.buttons || 0"),
+        "pointerId" => Some("event.pointerId || 0"),
+        "pointerType" => Some("event.pointerType || \"\""),
+        "isPrimary" => Some("!!event.isPrimary"),
+        "key" => Some("event.key || \"\""),
+        "code" => Some("event.code || \"\""),
+        "altKey" => Some("!!event.altKey"),
+        "ctrlKey" => Some("!!event.ctrlKey"),
+        "metaKey" => Some("!!event.metaKey"),
+        "shiftKey" => Some("!!event.shiftKey"),
+        _ => None,
+    }
+}
+
+fn resize_field_expr(field: &str) -> Option<&'static str> {
+    match field {
+        "x" => Some("entry?.contentRect?.x ?? 0"),
+        "y" => Some("entry?.contentRect?.y ?? 0"),
+        "width" => Some(
+            "entry?.contentRect?.width ?? node.clientWidth ?? node.offsetWidth ?? node.width ?? 0",
+        ),
+        "height" => Some(
+            "entry?.contentRect?.height ?? node.clientHeight ?? node.offsetHeight ?? node.height ?? 0",
+        ),
+        "top" => Some("entry?.contentRect?.top ?? entry?.contentRect?.y ?? 0"),
+        "left" => Some("entry?.contentRect?.left ?? entry?.contentRect?.x ?? 0"),
+        "right" => Some(
+            "entry?.contentRect?.right ?? ((entry?.contentRect?.x ?? 0) + (entry?.contentRect?.width ?? node.clientWidth ?? node.offsetWidth ?? node.width ?? 0))",
+        ),
+        "bottom" => Some(
+            "entry?.contentRect?.bottom ?? ((entry?.contentRect?.y ?? 0) + (entry?.contentRect?.height ?? node.clientHeight ?? node.offsetHeight ?? node.height ?? 0))",
+        ),
         _ => None,
     }
 }
@@ -6227,6 +8247,51 @@ fn escape_js(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn first_call_span(expr: &Expr, name: &str) -> usize {
+        if let ExprKind::List(items) = &expr.kind {
+            if items.first().is_some_and(|head| matches_symbol(head, name)) {
+                return expr.span.start;
+            }
+            for item in items {
+                if let Some(span) = find_call_span(item, name) {
+                    return span;
+                }
+            }
+        }
+        if let Some(span) = find_call_span(expr, name) {
+            return span;
+        }
+        panic!("missing `{}` call", name);
+    }
+
+    fn find_call_span(expr: &Expr, name: &str) -> Option<usize> {
+        match &expr.kind {
+            ExprKind::List(items) => {
+                if items.first().is_some_and(|head| matches_symbol(head, name)) {
+                    return Some(expr.span.start);
+                }
+                items.iter().find_map(|item| find_call_span(item, name))
+            }
+            ExprKind::Vector(items) | ExprKind::Set(items) => {
+                items.iter().find_map(|item| find_call_span(item, name))
+            }
+            ExprKind::Map(entries) => entries.iter().find_map(|(key, value)| {
+                find_call_span(key, name).or_else(|| find_call_span(value, name))
+            }),
+            ExprKind::Quote(inner)
+            | ExprKind::QuasiQuote(inner)
+            | ExprKind::Unquote(inner)
+            | ExprKind::UnquoteSplicing(inner) => find_call_span(inner, name),
+            ExprKind::HtmlTemplate(_) => None,
+            ExprKind::Symbol(_)
+            | ExprKind::Nil
+            | ExprKind::Bool(_)
+            | ExprKind::Number(_)
+            | ExprKind::String(_)
+            | ExprKind::Keyword(_) => None,
+        }
+    }
 
     #[test]
     fn emits_definitions_as_esm_exports() {
@@ -6560,7 +8625,7 @@ mod tests {
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains("export function status_view(state)"));
-        assert!(emitted.code.contains("document.createElement(\"button\")"));
+        assert!(emitted.code.contains("__closkellCreateElement(\"button\")"));
         assert!(emitted.code.contains("__closkellSetAttr(instance, 0"));
         assert!(emitted.code.contains("__closkellSetAttr(instance, 1"));
         assert!(emitted.code.contains("__closkellSetEvent(instance, 2"));
@@ -6578,16 +8643,12 @@ mod tests {
         let emitted = emit_module(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
-        assert!(emitted.code.contains("document.createElement(\"span\")"));
+        assert!(emitted.code.contains("__closkellCreateElement(\"span\")"));
+        assert!(emitted.code.contains("__closkellCreateSvgElement(\"svg\")"));
         assert!(
             emitted
                 .code
-                .contains("document.createElementNS(\"http://www.w3.org/2000/svg\", \"svg\")")
-        );
-        assert!(
-            emitted
-                .code
-                .contains("document.createElementNS(\"http://www.w3.org/2000/svg\", \"path\")")
+                .contains("__closkellCreateSvgElement(\"path\")")
         );
     }
 
@@ -7210,6 +9271,93 @@ mod tests {
     }
 
     #[test]
+    fn emits_direct_get_for_typed_record_fields() {
+        let source = syntax::parse_source("(defn entries [state] (get state :entries))");
+        let mut expr_types = BTreeMap::new();
+        expr_types.insert(
+            source.forms[0].span.start,
+            "(Fn [{:entries (Vector Number)}] (Vector Number))".to_string(),
+        );
+        let emitted = emit_module_with_types(&source, expr_types);
+
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        assert!(emitted.code.contains("return state.entries;"));
+        assert!(!emitted.code.contains("state?.entries ?? null"));
+    }
+
+    #[test]
+    fn keeps_some_check_for_typed_nullable_sequence_access() {
+        let source = syntax::parse_source(
+            "(defn next-max [items]\n\
+               (let [previous (last items)]\n\
+                 (if (some? previous)\n\
+                     (+ previous.max 1)\n\
+                     0)))",
+        );
+        let mut expr_types = BTreeMap::new();
+        expr_types.insert(
+            source.forms[0].span.start,
+            "(Fn [(Vector {:max Number})] Number)".to_string(),
+        );
+        expr_types.insert(
+            first_call_span(&source.forms[0], "last"),
+            "{:max Number}".to_string(),
+        );
+        let emitted = emit_module_with_types(&source, expr_types);
+
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        assert!(
+            emitted.code.contains("previous != null"),
+            "{}",
+            emitted.code
+        );
+        assert!(
+            emitted.code.contains("previous.max + 1"),
+            "{}",
+            emitted.code
+        );
+        assert!(emitted.code.contains(": 0"), "{}", emitted.code);
+    }
+
+    #[test]
+    fn emits_safe_get_for_optional_record_fields() {
+        let source = syntax::parse_source("(defn maybe-max [zone] (get zone :max))");
+        let mut expr_types = BTreeMap::new();
+        expr_types.insert(
+            source.forms[0].span.start,
+            "(Fn [(Option {:max Number})] (Option Number))".to_string(),
+        );
+        let emitted = emit_module_with_types(&source, expr_types);
+
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        assert!(emitted.code.contains("return (zone?.max ?? null);"));
+        assert!(!emitted.code.contains("return zone.max;"));
+    }
+
+    #[test]
+    fn folds_number_predicates_for_number_typed_values() {
+        let source = syntax::parse_source(
+            "(defn already-number? [value] (number? value))\n\
+             (defn guarded-inc [value]\n  (if (number? value) (+ value 1) 0))\n\
+             (defn nonzero-number? [value]\n  (and (number? value) (not (= value 0))))",
+        );
+        let mut expr_types = BTreeMap::new();
+        expr_types.insert(source.forms[0].span.start, "(Fn [Number] Bool)".to_string());
+        expr_types.insert(
+            source.forms[1].span.start,
+            "(Fn [Number] Number)".to_string(),
+        );
+        expr_types.insert(source.forms[2].span.start, "(Fn [Number] Bool)".to_string());
+        let emitted = emit_module_with_types(&source, expr_types);
+
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        assert!(emitted.code.contains("return true;"));
+        assert!(emitted.code.contains("return value + 1;"));
+        assert!(!emitted.code.contains("true &&"));
+        assert!(!emitted.code.contains("Number.isFinite(value)"));
+    }
+
+    #[test]
     fn emits_date_helpers() {
         let source = syntax::parse_source(
             "(defn label [timestamp]\n  (let [start (date-start-of-week timestamp)]\n    (date-format start :month-day)))\n\
@@ -7346,6 +9494,42 @@ mod tests {
         assert!(
             !emitted.code.contains(".reduce((__acc"),
             "helper append reducer should not emit native reduce:\n{}",
+            emitted.code
+        );
+    }
+
+    #[test]
+    fn specialized_helper_append_reduce_keeps_replacement_call() {
+        let source = syntax::parse_source(
+            "(defn append-segment [ops items item index]\n\
+               (if (= index 0)\n\
+                   ops\n\
+                   (let [previous (nth items (- index 1))]\n\
+                     (conj ops previous item))))\n\
+             (defn append-all [items]\n\
+               (reduce-indexed items []\n\
+                 (fn [ops item index]\n\
+                   (append-segment ops items item index))))",
+        );
+        let mut options = EmitOptions::default();
+        options.direct_call_replacements.insert(
+            "append-segment".to_string(),
+            "append_segment_fast".to_string(),
+        );
+        let emitted = emit_module_with_types_and_options(&source, BTreeMap::new(), options);
+
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        assert!(emitted.code.contains("for (let __closkell_reduce_index"));
+        assert!(
+            emitted
+                .code
+                .contains("append_segment_fast(ops, items, item, index)"),
+            "specialized reducer should call the replacement helper:\n{}",
+            emitted.code
+        );
+        assert!(
+            !emitted.code.contains(".push(...__closkell_append_items"),
+            "specialized reducer must not inline the stale generic helper body:\n{}",
             emitted.code
         );
     }
@@ -7742,7 +9926,8 @@ mod tests {
         assert!(emitted.code.contains("((value + 1) % 60)"));
         assert!(emitted.code.contains("Math.abs("));
         assert!(emitted.code.contains("(minutes).toFixed(1)"));
-        assert!(emitted.code.contains("return Number(__value);"));
+        assert!(emitted.code.contains("Number.isFinite(__number)"));
+        assert!(emitted.code.contains("catch { return 0; }"));
         assert!(emitted.code.contains("export const recovery_ms = 60_000;"));
     }
 }

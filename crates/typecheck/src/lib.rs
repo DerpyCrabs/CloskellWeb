@@ -11,6 +11,7 @@ pub struct TypedForm {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckResult {
     pub forms: Vec<TypedForm>,
+    pub expr_types: BTreeMap<usize, String>,
     pub type_declarations: Vec<TypeDeclaration>,
     pub type_annotations: Vec<TypeAnnotation>,
     pub foreign_declarations: Vec<ForeignDeclaration>,
@@ -106,6 +107,10 @@ impl ExportedBinding {
         self.annotated
     }
 
+    pub fn is_annotated_or_value(&self) -> bool {
+        self.annotated || !matches!(self.ty, Type::Fn(_, _))
+    }
+
     pub fn schema(&self) -> String {
         format_type_inner(&self.ty)
     }
@@ -156,6 +161,7 @@ struct Inferencer {
     subst: HashMap<u32, Type>,
     type_aliases: HashMap<String, TypeAlias>,
     html_event_msg: Option<Type>,
+    expr_types: BTreeMap<usize, Type>,
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -326,8 +332,19 @@ pub fn check_source_with_module_imports(
         }
     }
 
+    let expr_type_entries = inferencer
+        .expr_types
+        .iter()
+        .map(|(offset, ty)| (*offset, ty.clone()))
+        .collect::<Vec<_>>();
+    let expr_types = expr_type_entries
+        .iter()
+        .map(|(offset, ty)| (*offset, inferencer.format_type(ty)))
+        .collect();
+
     CheckResult {
         forms,
+        expr_types,
         type_declarations: type_report.declarations,
         type_annotations: annotation_report.annotations,
         foreign_declarations: foreign_report.declarations,
@@ -518,7 +535,7 @@ impl Inferencer {
     }
 
     fn infer_expr(&mut self, expr: &Expr, env: &mut HashMap<String, Type>) -> Type {
-        match &expr.kind {
+        let ty = match &expr.kind {
             ExprKind::Nil => Type::Nil,
             ExprKind::Bool(_) => Type::Bool,
             ExprKind::Number(_) => Type::Number,
@@ -534,7 +551,9 @@ impl Inferencer {
             | ExprKind::UnquoteSplicing(_) => Type::Syntax,
             ExprKind::HtmlTemplate(node) => self.infer_html_template(node, env),
             ExprKind::List(items) => self.infer_list(expr.span, items, env),
-        }
+        };
+        self.expr_types.insert(expr.span.start, ty.clone());
+        ty
     }
 
     fn infer_list(&mut self, span: Span, items: &[Expr], env: &mut HashMap<String, Type>) -> Type {
@@ -3423,6 +3442,25 @@ impl Inferencer {
         }
     }
 
+    fn command_payload_type_from_format_expr(
+        &mut self,
+        expr: &Expr,
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        let ty = self.infer_expr(expr, env);
+        match self.resolve(ty) {
+            Type::Keyword(Some(name)) => command_payload_type_from_format_name(Some(&name)),
+            Type::String => match expr {
+                Expr {
+                    kind: ExprKind::String(name),
+                    ..
+                } => command_payload_type_from_format_name(Some(name)),
+                _ => Type::Js,
+            },
+            _ => Type::Js,
+        }
+    }
+
     fn infer_cmd_payload_mapper(
         &mut self,
         name: &str,
@@ -3467,9 +3505,8 @@ impl Inferencer {
             return Type::Cmd(Box::new(self.fresh()));
         }
         self.require_string_arg(&args[0], env);
-        self.infer_expr(&args[1], env);
+        let payload = self.command_payload_type_from_format_expr(&args[1], env);
         let ok = self.infer_expr(&args[2], env);
-        let payload = self.fresh();
         let ok_msg = self.infer_command_mapper_message(
             "storage/get",
             ok,
@@ -3680,9 +3717,8 @@ impl Inferencer {
             return Type::Cmd(Box::new(self.fresh()));
         }
         self.require_string_arg(&args[0], env);
-        self.infer_expr(&args[1], env);
+        let payload = self.command_payload_type_from_format_expr(&args[1], env);
         let ok = self.infer_expr(&args[2], env);
-        let payload = self.fresh();
         let ok_msg = self.infer_command_mapper_message(
             "file/read-selected",
             ok,
@@ -6620,6 +6656,7 @@ impl Inferencer {
             }
             (Type::Syntax, Type::Syntax) => Type::Syntax,
             (Type::Js, Type::Js) => Type::Js,
+            (Type::Js, ty) | (ty, Type::Js) => ty,
             (Type::Html, Type::Html) => Type::Html,
             (Type::TrustedHtml, Type::TrustedHtml) => Type::TrustedHtml,
             (Type::Nil, Type::Option(inner)) | (Type::Option(inner), Type::Nil) => {
@@ -6645,6 +6682,14 @@ impl Inferencer {
             (Type::Vector(a), Type::Vector(b)) => {
                 let element = self.unify(*a, *b, span);
                 Type::Vector(Box::new(element))
+            }
+            (Type::Tuple(items), Type::Vector(element))
+            | (Type::Vector(element), Type::Tuple(items)) => {
+                let mut element = *element;
+                for item in items {
+                    element = self.unify(item, element, span);
+                }
+                Type::Vector(Box::new(self.resolve(element)))
             }
             (Type::Tuple(a), Type::Tuple(b)) => {
                 if a.len() != b.len() {
@@ -8731,10 +8776,10 @@ impl Inferencer {
                 .get("value")
                 .cloned()
                 .or_else(|| Some(self.fresh())),
-            Some("storage/get")
-            | Some("file/import")
-            | Some("file/read-selected")
-            | Some("bluetooth/request-device") => Some(self.fresh()),
+            Some("storage/get") | Some("file/import") | Some("file/read-selected") => {
+                Some(command_payload_type_from_command_fields(command_fields))
+            }
+            Some("bluetooth/request-device") => Some(self.fresh()),
             Some("browser/theme-load") | Some("browser/theme-apply") => Some(Type::String),
             Some("auth-storage/load") => Some(Type::Js),
             Some("storage/remove") => Some(Type::Record(BTreeMap::from([(
@@ -10209,6 +10254,22 @@ fn keyword_literal_name(ty: &Type) -> Option<&str> {
         Type::Keyword(Some(name)) => Some(name),
         _ => None,
     }
+}
+
+fn command_payload_type_from_format_name(name: Option<&str>) -> Type {
+    match name {
+        Some("text" | "string" | "raw") => Type::String,
+        Some("json") | Some("auto") | None => Type::Js,
+        Some(_) => Type::Js,
+    }
+}
+
+fn command_payload_type_from_command_fields(fields: &BTreeMap<String, Type>) -> Type {
+    let format = fields
+        .get("format")
+        .or_else(|| fields.get("parse"))
+        .and_then(keyword_literal_name);
+    command_payload_type_from_format_name(format)
 }
 
 fn tagged_record_literal(ty: &Type) -> Option<&str> {
