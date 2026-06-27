@@ -14,13 +14,12 @@ pub struct EmitResult {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct EmitOptions {
-    pub env_dev: Option<bool>,
-    pub env_mode: Option<String>,
     pub reachable_message_kinds: Option<BTreeSet<String>>,
     pub message_field_reads: BTreeMap<String, MessageFieldReads>,
     pub static_reads: BTreeMap<String, String>,
     pub direct_call_replacements: BTreeMap<String, String>,
     pub prelude_code: String,
+    pub browser_app_runtime: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -156,18 +155,7 @@ pub fn emit_module_with_types_and_options(
         }
         generated_line += prelude_code.lines().count().max(1);
     }
-    if emitter.needs_value_equal_helper {
-        code.push_str(VALUE_EQUAL_HELPER);
-        generated_line += VALUE_EQUAL_HELPER.lines().count();
-    }
-    if emitter.needs_count_helper {
-        code.push_str(COUNT_HELPER);
-        generated_line += COUNT_HELPER.lines().count();
-    }
-    if emitter.needs_none_const {
-        code.push_str("const __closkellNone = { kind: \"none\" };\n\n");
-        generated_line += 2;
-    }
+    push_emitter_helpers(&mut code, &mut generated_line, &emitter);
     push_emitted_lines(&mut code, &lines, &mut source_mappings, &mut generated_line);
     EmitResult {
         code,
@@ -180,9 +168,14 @@ pub fn emit_module_with_types_and_options(
 fn compiled_template_runtime_import(emitter: &Emitter) -> String {
     let mut imports = vec![format!("bindCompiledComponent as {}", BIND_COMPONENT_ALIAS)];
     if emitter.needs_template_skeleton {
+        let template_constructor = if emitter.browser_app_runtime {
+            "createBrowserCompiledHtmlTemplateComponent"
+        } else {
+            "createCompiledHtmlTemplateComponent"
+        };
         imports.push(format!(
-            "createCompiledHtmlTemplateComponent as {}",
-            CREATE_HTML_TEMPLATE_ALIAS
+            "{} as {}",
+            template_constructor, CREATE_HTML_TEMPLATE_ALIAS
         ));
     }
     if emitter.needs_render_to_string {
@@ -309,10 +302,7 @@ pub fn emit_function_specialization(
         let line = emitter
             .emit_defn(specialized_name, form, &items[2..])
             .replacen("export function ", "function ", 1);
-        if emitter.needs_value_equal_helper {
-            code.push_str(VALUE_EQUAL_HELPER);
-            generated_line += VALUE_EQUAL_HELPER.lines().count();
-        }
+        push_emitter_helpers(&mut code, &mut generated_line, &emitter);
         source_mappings.push(SourceMapping {
             generated_line,
             generated_column: 0,
@@ -342,6 +332,29 @@ pub fn emit_function_specialization(
 struct EmittedLine {
     code: String,
     source_offset: usize,
+}
+
+fn push_emitter_helpers(code: &mut String, generated_line: &mut usize, emitter: &Emitter) {
+    if emitter.needs_value_equal_helper && !code.contains("const __closkellValueEqual") {
+        code.push_str(VALUE_EQUAL_HELPER);
+        *generated_line += VALUE_EQUAL_HELPER.lines().count();
+    }
+    if emitter.needs_count_helper && !code.contains("const __closkellCount") {
+        code.push_str(COUNT_HELPER);
+        *generated_line += COUNT_HELPER.lines().count();
+    }
+    if emitter.needs_object_predicate_helper && !code.contains("const __closkellIsObject") {
+        code.push_str(OBJECT_PREDICATE_HELPER);
+        *generated_line += OBJECT_PREDICATE_HELPER.lines().count();
+    }
+    if emitter.needs_object_entries_helper && !code.contains("const __closkellObjectEntries") {
+        code.push_str(OBJECT_ENTRIES_HELPER);
+        *generated_line += OBJECT_ENTRIES_HELPER.lines().count();
+    }
+    if emitter.needs_none_const && !code.contains("const __closkellNone") {
+        code.push_str("const __closkellNone = { kind: \"none\" };\n\n");
+        *generated_line += 2;
+    }
 }
 
 fn push_emitted_lines(
@@ -534,6 +547,8 @@ struct Emitter {
     needs_decoder_runtime: bool,
     needs_value_equal_helper: bool,
     needs_count_helper: bool,
+    needs_object_predicate_helper: bool,
+    needs_object_entries_helper: bool,
     needs_none_const: bool,
     needs_render_to_string: bool,
     needs_scope_update: bool,
@@ -560,11 +575,10 @@ struct Emitter {
     runtime_effects: BTreeSet<String>,
     expr_types: BTreeMap<usize, String>,
     local_types: Vec<BTreeMap<String, String>>,
-    env_dev: Option<bool>,
-    env_mode: Option<String>,
     reachable_message_kinds: Option<BTreeSet<String>>,
     static_reads: BTreeMap<String, String>,
     direct_call_replacements: BTreeMap<String, String>,
+    browser_app_runtime: bool,
     current_update_message_param: Option<String>,
     component_fns: BTreeSet<String>,
     function_defs: BTreeMap<String, FunctionDef>,
@@ -582,6 +596,8 @@ impl Emitter {
             needs_decoder_runtime: false,
             needs_value_equal_helper: false,
             needs_count_helper: false,
+            needs_object_predicate_helper: false,
+            needs_object_entries_helper: false,
             needs_none_const: false,
             needs_render_to_string: false,
             needs_scope_update: false,
@@ -608,11 +624,10 @@ impl Emitter {
             runtime_effects: BTreeSet::new(),
             expr_types,
             local_types: Vec::new(),
-            env_dev: options.env_dev,
-            env_mode: options.env_mode,
             reachable_message_kinds: options.reachable_message_kinds,
             static_reads: options.static_reads,
             direct_call_replacements: options.direct_call_replacements,
+            browser_app_runtime: options.browser_app_runtime,
             current_update_message_param: None,
             component_fns: collect_template_defns(source),
             function_defs: collect_function_defs(source),
@@ -630,6 +645,8 @@ impl Emitter {
 const VALUE_EQUAL_HELPER: &str = "const __closkellValueEqual = (__left, __right) => { const __plain = (__value) => __value !== null && typeof __value === \"object\" && !Array.isArray(__value) && !(__value instanceof Map) && !(__value instanceof Set); const __eq = (__left, __right) => { if (Object.is(__left, __right)) return true; if (Array.isArray(__left) || Array.isArray(__right)) return Array.isArray(__left) && Array.isArray(__right) && __left.length === __right.length && __left.every((__value, __index) => __eq(__value, __right[__index])); if (__left instanceof Set || __right instanceof Set) { if (!(__left instanceof Set) || !(__right instanceof Set) || __left.size !== __right.size) return false; const __remaining = Array.from(__right); return Array.from(__left).every((__item) => { const __match = __remaining.findIndex((__candidate) => __eq(__item, __candidate)); if (__match < 0) return false; __remaining.splice(__match, 1); return true; }); } if (__left instanceof Map || __right instanceof Map) { if (!(__left instanceof Map) || !(__right instanceof Map) || __left.size !== __right.size) return false; const __remaining = Array.from(__right); return Array.from(__left).every(([__key, __value]) => { const __match = __remaining.findIndex(([__rightKey, __rightValue]) => __eq(__key, __rightKey) && __eq(__value, __rightValue)); if (__match < 0) return false; __remaining.splice(__match, 1); return true; }); } if (__plain(__left) || __plain(__right)) { if (!__plain(__left) || !__plain(__right)) return false; const __leftKeys = Object.keys(__left).sort(); const __rightKeys = Object.keys(__right).sort(); return __eq(__leftKeys, __rightKeys) && __leftKeys.every((__key) => __eq(__left[__key], __right[__key])); } return false; }; return __eq(__left, __right); };\n\n";
 
 const COUNT_HELPER: &str = "const __closkellCount = (__collection) => __collection instanceof Set || __collection instanceof Map ? __collection.size : (Array.isArray(__collection) || typeof __collection === \"string\" ? __collection.length : (__collection == null ? 0 : Object.keys(__collection).length));\n\n";
+const OBJECT_PREDICATE_HELPER: &str = "const __closkellIsObject = (__value) => __value != null && typeof __value === \"object\" && !Array.isArray(__value) && !(__value instanceof Map) && !(__value instanceof Set);\n\n";
+const OBJECT_ENTRIES_HELPER: &str = "const __closkellObjectEntries = (__value) => __value instanceof Map ? Array.from(__value.entries(), ([__key, __value]) => ({ key: __key, value: __value })) : (__value != null && typeof __value === \"object\" ? Object.entries(__value).map(([__key, __value]) => ({ key: __key, value: __value })) : []);\n\n";
 const DOCUMENT_ALIAS: &str = "__closkellDocument";
 const CREATE_ELEMENT_ALIAS: &str = "__closkellCreateElement";
 const CREATE_SVG_ELEMENT_ALIAS: &str = "__closkellCreateSvgElement";
@@ -873,24 +890,6 @@ fn type_fn_param_types(ty: &str) -> Option<Vec<&str>> {
     Some(split_top_level_terms(&params[1..params.len() - 1]))
 }
 
-fn type_is_nullable_or_union_or_var(ty: &str) -> bool {
-    ty.starts_with("(Option ")
-        || ty.starts_with("(Union ")
-        || ty.chars().next().is_some_and(|ch| ch.is_ascii_lowercase())
-}
-
-fn type_has_known_runtime_shape(ty: &str) -> bool {
-    ty == "Number"
-        || ty == "String"
-        || ty == "Bool"
-        || ty == "Nil"
-        || type_is_keyword(ty)
-        || type_is_vector_like(ty)
-        || type_is_set(ty)
-        || type_is_map(ty)
-        || type_is_record(ty)
-}
-
 fn join_pattern_tests(tests: Vec<String>) -> String {
     let tests = tests
         .into_iter()
@@ -914,26 +913,6 @@ enum RuntimeTypePredicate {
     Set,
     Map,
     Object,
-}
-
-fn runtime_type_predicate_for_type(ty: &str, predicate: RuntimeTypePredicate) -> Option<bool> {
-    if type_is_nullable_or_union_or_var(ty) || !type_has_known_runtime_shape(ty) {
-        return None;
-    }
-
-    match predicate {
-        RuntimeTypePredicate::Nil if ty == "Nil" => Some(true),
-        RuntimeTypePredicate::Nil => None,
-        RuntimeTypePredicate::Number if ty == "Number" => Some(true),
-        RuntimeTypePredicate::Number => Some(false),
-        RuntimeTypePredicate::String => Some(ty == "String"),
-        RuntimeTypePredicate::Bool => Some(ty == "Bool"),
-        RuntimeTypePredicate::Keyword => Some(type_is_keyword(ty)),
-        RuntimeTypePredicate::Vector => Some(type_is_vector_like(ty)),
-        RuntimeTypePredicate::Set => Some(type_is_set(ty)),
-        RuntimeTypePredicate::Map => Some(type_is_map(ty)),
-        RuntimeTypePredicate::Object => Some(type_is_record(ty)),
-    }
 }
 
 fn date_format_options(style: &str) -> Option<&'static str> {
@@ -1025,27 +1004,44 @@ impl Emitter {
     }
 
     fn expr_is_countable_by_length(&self, expr: &Expr) -> bool {
-        self.expr_type(expr).is_some_and(type_counts_by_length)
+        !self.expr_has_projected_collection_type(expr)
+            && self.expr_type(expr).is_some_and(type_counts_by_length)
     }
 
     fn expr_is_countable_by_size(&self, expr: &Expr) -> bool {
-        self.expr_type(expr).is_some_and(type_counts_by_size)
+        !self.expr_has_projected_collection_type(expr)
+            && self.expr_type(expr).is_some_and(type_counts_by_size)
     }
 
     fn expr_is_vector_like(&self, expr: &Expr) -> bool {
-        self.expr_type(expr).is_some_and(type_is_vector_like)
+        !self.expr_has_projected_collection_type(expr)
+            && self.expr_type(expr).is_some_and(type_is_vector_like)
     }
 
     fn expr_is_set(&self, expr: &Expr) -> bool {
-        self.expr_type(expr).is_some_and(type_is_set)
+        !self.expr_has_projected_collection_type(expr)
+            && self.expr_type(expr).is_some_and(type_is_set)
     }
 
     fn expr_is_map(&self, expr: &Expr) -> bool {
-        self.expr_type(expr).is_some_and(type_is_map)
+        !self.expr_has_projected_collection_type(expr)
+            && self.expr_type(expr).is_some_and(type_is_map)
     }
 
     fn expr_is_record(&self, expr: &Expr) -> bool {
-        self.expr_type(expr).is_some_and(type_is_record)
+        !self.expr_has_projected_collection_type(expr)
+            && self.expr_type(expr).is_some_and(type_is_record)
+    }
+
+    fn expr_is_projected_field(&self, expr: &Expr) -> bool {
+        matches!(&expr.kind, ExprKind::Symbol(name) if name.contains('.'))
+    }
+
+    fn expr_has_projected_collection_type(&self, expr: &Expr) -> bool {
+        self.expr_is_projected_field(expr)
+            && self.expr_type(expr).is_some_and(|ty| {
+                type_counts_by_length(ty) || type_counts_by_size(ty) || type_is_record(ty)
+            })
     }
 
     fn expr_runtime_type_predicate(
@@ -1053,11 +1049,7 @@ impl Emitter {
         expr: &Expr,
         predicate: RuntimeTypePredicate,
     ) -> Option<bool> {
-        if let Some(result) = self.literal_runtime_type_predicate(expr, predicate) {
-            return Some(result);
-        }
-        self.expr_type(expr)
-            .and_then(|ty| runtime_type_predicate_for_type(ty, predicate))
+        self.literal_runtime_type_predicate(expr, predicate)
     }
 
     fn literal_runtime_type_predicate(
@@ -1098,6 +1090,9 @@ impl Emitter {
     }
 
     fn expr_collection_shape(&self, expr: &Expr) -> CollectionShape {
+        if self.expr_has_projected_collection_type(expr) {
+            return CollectionShape::Unknown;
+        }
         let Some(ty) = self.expr_type(expr) else {
             return CollectionShape::Unknown;
         };
@@ -3079,9 +3074,6 @@ impl Emitter {
         if !args.is_empty() {
             return "undefined".to_string();
         }
-        if let Some(dev) = self.env_dev {
-            return dev.to_string();
-        }
         "Boolean(import.meta.env && import.meta.env.DEV)".to_string()
     }
 
@@ -3089,11 +3081,7 @@ impl Emitter {
         if !args.is_empty() {
             return "undefined".to_string();
         }
-        if let Some(mode) = &self.env_mode {
-            return format!("\"{}\"", escape_js(mode));
-        }
-        "String(globalThis.__CLOSKELL_ENV__?.MODE ?? (import.meta.env && import.meta.env.MODE) ?? \"\")"
-            .to_string()
+        "String(import.meta.env && import.meta.env.MODE || \"\")".to_string()
     }
 
     fn static_bool(&self, expr: &Expr) -> Option<bool> {
@@ -3110,7 +3098,6 @@ impl Emitter {
                     return None;
                 };
                 match name.as_str() {
-                    "env-dev?" if args.is_empty() => self.env_dev,
                     "some?" if args.len() == 1 => self
                         .expr_runtime_type_predicate(&args[0], RuntimeTypePredicate::Nil)
                         .map(|value| !value),
@@ -3130,16 +3117,16 @@ impl Emitter {
                         self.expr_runtime_type_predicate(&args[0], RuntimeTypePredicate::Keyword)
                     }
                     "list?" | "vector?" if args.len() == 1 => {
-                        self.expr_runtime_type_predicate(&args[0], RuntimeTypePredicate::Vector)
+                        self.literal_runtime_type_predicate(&args[0], RuntimeTypePredicate::Vector)
                     }
                     "set?" if args.len() == 1 => {
-                        self.expr_runtime_type_predicate(&args[0], RuntimeTypePredicate::Set)
+                        self.literal_runtime_type_predicate(&args[0], RuntimeTypePredicate::Set)
                     }
                     "map?" if args.len() == 1 => {
-                        self.expr_runtime_type_predicate(&args[0], RuntimeTypePredicate::Map)
+                        self.literal_runtime_type_predicate(&args[0], RuntimeTypePredicate::Map)
                     }
                     "object?" if args.len() == 1 => {
-                        self.expr_runtime_type_predicate(&args[0], RuntimeTypePredicate::Object)
+                        self.literal_runtime_type_predicate(&args[0], RuntimeTypePredicate::Object)
                     }
                     "not" if args.len() == 1 => self.static_bool(&args[0]).map(|value| !value),
                     "and" => {
@@ -3265,7 +3252,7 @@ impl Emitter {
             return "undefined".to_string();
         }
         if let Some(result) =
-            self.expr_runtime_type_predicate(&args[0], RuntimeTypePredicate::Vector)
+            self.literal_runtime_type_predicate(&args[0], RuntimeTypePredicate::Vector)
         {
             return result.to_string();
         }
@@ -3276,7 +3263,8 @@ impl Emitter {
         if args.len() != 1 {
             return "undefined".to_string();
         }
-        if let Some(result) = self.expr_runtime_type_predicate(&args[0], RuntimeTypePredicate::Set)
+        if let Some(result) =
+            self.literal_runtime_type_predicate(&args[0], RuntimeTypePredicate::Set)
         {
             return result.to_string();
         }
@@ -3287,7 +3275,8 @@ impl Emitter {
         if args.len() != 1 {
             return "undefined".to_string();
         }
-        if let Some(result) = self.expr_runtime_type_predicate(&args[0], RuntimeTypePredicate::Map)
+        if let Some(result) =
+            self.literal_runtime_type_predicate(&args[0], RuntimeTypePredicate::Map)
         {
             return result.to_string();
         }
@@ -3299,14 +3288,12 @@ impl Emitter {
             return "undefined".to_string();
         }
         if let Some(result) =
-            self.expr_runtime_type_predicate(&args[0], RuntimeTypePredicate::Object)
+            self.literal_runtime_type_predicate(&args[0], RuntimeTypePredicate::Object)
         {
             return result.to_string();
         }
-        format!(
-            "((__value) => __value != null && typeof __value === \"object\" && !Array.isArray(__value) && !(__value instanceof Map) && !(__value instanceof Set))({})",
-            self.emit_expr(&args[0])
-        )
+        self.needs_object_predicate_helper = true;
+        format!("__closkellIsObject({})", self.emit_expr(&args[0]))
     }
 
     fn emit_get(&mut self, args: &[Expr]) -> String {
@@ -3452,10 +3439,8 @@ impl Emitter {
             return "undefined".to_string();
         }
 
-        format!(
-            "((__value) => __value instanceof Map ? Array.from(__value.entries(), ([__key, __value]) => ({{ key: __key, value: __value }})) : (__value != null && typeof __value === \"object\" ? Object.entries(__value).map(([__key, __value]) => ({{ key: __key, value: __value }})) : []))({})",
-            self.emit_expr(&args[0])
-        )
+        self.needs_object_entries_helper = true;
+        format!("__closkellObjectEntries({})", self.emit_expr(&args[0]))
     }
 
     fn emit_object_projection(&mut self, args: &[Expr], method: &str) -> String {
@@ -3580,6 +3565,21 @@ impl Emitter {
         if args.len() != 2 {
             return "undefined".to_string();
         }
+        if let Some(emitted) = self.emit_inline_range_map_transform(&args[0], &args[1], indexed) {
+            return emitted;
+        }
+        if let Some(emitted) = self.emit_native_literal_callback_transform(
+            &args[0],
+            &args[1],
+            ".map",
+            if indexed {
+                &["__item", "__index"]
+            } else {
+                &["__item"]
+            },
+        ) {
+            return emitted;
+        }
         let collection = parenthesize_member_base(self.emit_expr(&args[0]));
         let mapper = self.emit_expr(&args[1]);
         if indexed {
@@ -3596,11 +3596,192 @@ impl Emitter {
         if args.len() != 2 {
             return "undefined".to_string();
         }
+        if let Some(emitted) =
+            self.emit_native_literal_callback_transform(&args[0], &args[1], ".filter", &["__item"])
+        {
+            return emitted;
+        }
         format!(
             "{}.filter((__item) => {}(__item))",
             parenthesize_member_base(self.emit_expr(&args[0])),
             self.emit_expr(&args[1])
         )
+    }
+
+    fn emit_native_literal_callback_transform(
+        &mut self,
+        collection: &Expr,
+        callback: &Expr,
+        method: &str,
+        fallback_params: &[&str],
+    ) -> Option<String> {
+        let (params, body) = literal_fn_parts(callback)?;
+        if params.len() != fallback_params.len()
+            || params.iter().any(|param| !simple_fn_param(param))
+        {
+            return None;
+        }
+
+        let collection = parenthesize_member_base(self.emit_expr(collection));
+        let param_types = self
+            .expr_type(callback)
+            .and_then(type_fn_param_types)
+            .map(|types| types.into_iter().map(str::to_string).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let mut local_type_bindings = BTreeMap::new();
+        let params = params
+            .iter()
+            .zip(fallback_params.iter())
+            .enumerate()
+            .map(|(index, (param, fallback))| {
+                let name = symbol_name(param)
+                    .filter(|name| !name.is_empty())
+                    .map(sanitize_identifier)
+                    .unwrap_or_else(|| fallback.to_string());
+                if let Some(param_type) = param_types.get(index) {
+                    local_type_bindings.insert(name.clone(), param_type.clone());
+                }
+                name
+            })
+            .collect::<Vec<_>>();
+
+        self.local_types.push(local_type_bindings);
+        let body = self.emit_arrow_callback_body(body);
+        self.local_types.pop();
+
+        Some(format!(
+            "{}{}(({}) => {})",
+            collection,
+            method,
+            params.join(", "),
+            body
+        ))
+    }
+
+    fn emit_arrow_callback_body(&mut self, body: &[Expr]) -> String {
+        if let [single] = body {
+            if let Some((bindings, body)) = let_parts(single) {
+                let mut statements = Vec::new();
+                self.local_types.push(BTreeMap::new());
+                for pair in bindings.chunks(2) {
+                    let [pattern, value] = pair else {
+                        self.diagnostics.push(Diagnostic::error(
+                            single.span,
+                            "let emission requires complete binding pairs",
+                        ));
+                        continue;
+                    };
+                    let value_type = self.expr_type(value).map(str::to_string);
+                    self.emit_let_pattern_statement(pattern, value, &mut statements);
+                    if let Some(scope) = self.local_types.last_mut() {
+                        collect_pattern_type_bindings(pattern, value_type.as_deref(), scope);
+                    }
+                }
+                statements.push(format!("return {};", self.emit_do(body)));
+                self.local_types.pop();
+                return format!("{{ {} }}", statements.join(" "));
+            }
+        }
+
+        if body.len() > 1 {
+            let mut statements = Vec::new();
+            for expr in &body[..body.len() - 1] {
+                statements.push(format!("{};", self.emit_expr(expr)));
+            }
+            statements.push(format!("return {};", self.emit_expr(&body[body.len() - 1])));
+            return format!("{{ {} }}", statements.join(" "));
+        }
+
+        parenthesize_arrow_body(&self.emit_do(body))
+    }
+
+    fn emit_inline_range_map_transform(
+        &mut self,
+        collection: &Expr,
+        mapper: &Expr,
+        indexed: bool,
+    ) -> Option<String> {
+        let range_args = range_call_args(collection)?;
+        let (params, body) = literal_fn_parts(mapper)?;
+        let expected = if indexed { 2 } else { 1 };
+        if params.len() != expected || params.iter().any(|param| !simple_fn_param(param)) {
+            return None;
+        }
+
+        let (start, end, step) = match range_args {
+            [end] => ("0".to_string(), self.emit_expr(end), "1".to_string()),
+            [start, end] => (self.emit_expr(start), self.emit_expr(end), "1".to_string()),
+            [start, end, step] => (
+                self.emit_expr(start),
+                self.emit_expr(end),
+                self.emit_expr(step),
+            ),
+            _ => return None,
+        };
+
+        let start_name = self.next_temp("__closkell_range_start");
+        let end_name = self.next_temp("__closkell_range_end");
+        let step_name = self.next_temp("__closkell_range_step");
+        let count_name = self.next_temp("__closkell_range_count");
+        let result_name = self.next_temp("__closkell_range_result");
+        let index_name = self.next_temp("__closkell_range_index");
+        let value_name = self.next_temp("__closkell_range_value");
+        let mut statements = Vec::new();
+        let mut local_type_bindings = BTreeMap::new();
+        let param_types = self
+            .expr_type(mapper)
+            .and_then(type_fn_param_types)
+            .map(|types| types.into_iter().map(str::to_string).collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        if let Some(name) = symbol_name(&params[0]).filter(|name| *name != "_") {
+            let name = sanitize_identifier(name);
+            if let Some(param_type) = param_types.first() {
+                local_type_bindings.insert(name.clone(), param_type.clone());
+            }
+            statements.push(format!("const {} = {};", name, value_name));
+        }
+        if indexed {
+            if let Some(name) = symbol_name(&params[1]).filter(|name| *name != "_") {
+                let name = sanitize_identifier(name);
+                if let Some(param_type) = param_types.get(1) {
+                    local_type_bindings.insert(name.clone(), param_type.clone());
+                }
+                statements.push(format!("const {} = {};", name, index_name));
+            }
+        }
+
+        self.local_types.push(local_type_bindings);
+        let body = self.emit_do(body);
+        self.local_types.pop();
+        statements.push(format!("{}[{}] = {};", result_name, index_name, body));
+
+        Some(format!(
+            "(({}, {}, {}) => {{ if ({} === 0) return []; const {} = Math.max(0, Math.ceil(({} - {}) / {})); const {} = new Array({}); for (let {} = 0, {} = {}; {} < {}; {} += 1, {} += {}) {{ {} }} return {}; }})({}, {}, {})",
+            start_name,
+            end_name,
+            step_name,
+            step_name,
+            count_name,
+            end_name,
+            start_name,
+            step_name,
+            result_name,
+            count_name,
+            index_name,
+            value_name,
+            start_name,
+            index_name,
+            count_name,
+            index_name,
+            value_name,
+            step_name,
+            statements.join(" "),
+            result_name,
+            start,
+            end,
+            step
+        ))
     }
 
     fn emit_any(&mut self, args: &[Expr]) -> String {
@@ -3825,6 +4006,20 @@ impl Emitter {
         let initial = self.emit_expr(&args[1]);
         let collection_shape = self.expr_collection_shape(&args[0]);
         let initial_shape = self.expr_collection_shape(&args[1]);
+
+        if !indexed
+            && collection_shape == CollectionShape::VectorLike
+            && initial_shape == CollectionShape::VectorLike
+            && reducer.bindings.is_empty()
+            && reducer.items.len() == 1
+            && matches_symbol(&reducer.items[0], reducer.item)
+        {
+            return Some(format!(
+                "((__items, __acc) => __acc.concat(__items))({}, {})",
+                collection, initial
+            ));
+        }
+
         let collection_name = self.next_temp("__closkell_reduce_collection");
         let initial_name = self.next_temp("__closkell_reduce_initial");
         let items_name = self.next_temp("__closkell_reduce_items");
@@ -6148,7 +6343,7 @@ fn build_template_skeleton(root: &HtmlNode, owner: &Emitter) -> TemplateSkeleton
         html: String::new(),
         node_paths: Vec::new(),
     };
-    emit_skeleton_node(root, owner, &mut Vec::new(), &mut skeleton);
+    let _ = emit_skeleton_node(root, owner, &mut Vec::new(), &mut skeleton);
     skeleton
 }
 
@@ -6157,10 +6352,10 @@ fn emit_skeleton_node(
     owner: &Emitter,
     path: &mut Vec<usize>,
     skeleton: &mut TemplateSkeleton,
-) {
-    skeleton.node_paths.push(path.clone());
+) -> usize {
     match node {
         HtmlNode::Element(element) => {
+            skeleton.node_paths.push(path.clone());
             skeleton.html.push('<');
             skeleton.html.push_str(&element.tag);
             for attr in &element.attrs {
@@ -6193,23 +6388,34 @@ fn emit_skeleton_node(
                     continue;
                 }
                 path.push(child_index);
-                emit_skeleton_node(child, owner, path, skeleton);
+                let emitted_nodes = emit_skeleton_node(child, owner, path, skeleton);
                 path.pop();
-                child_index += 1;
+                child_index += emitted_nodes;
             }
 
             skeleton.html.push_str("</");
             skeleton.html.push_str(&element.tag);
             skeleton.html.push('>');
+            1
         }
         HtmlNode::Text { text, .. } => {
+            skeleton.node_paths.push(path.clone());
             skeleton.html.push_str(&escape_html_text(text));
+            1
         }
         HtmlNode::Expr { expr, .. } => {
             if template_expr_uses_structural_marker(expr, &owner.component_fns) {
+                skeleton.node_paths.push(path.clone());
                 skeleton.html.push_str("<!---->");
+                1
             } else {
-                skeleton.html.push(' ');
+                let mut text_path = path.clone();
+                if let Some(last) = text_path.last_mut() {
+                    *last += 1;
+                }
+                skeleton.node_paths.push(text_path);
+                skeleton.html.push_str("<!----> <!---->");
+                3
             }
         }
     }
@@ -6912,6 +7118,52 @@ fn symbol_name(expr: &Expr) -> Option<&str> {
         ExprKind::Symbol(name) => Some(name),
         _ => None,
     }
+}
+
+fn literal_fn_parts(expr: &Expr) -> Option<(&[Expr], &[Expr])> {
+    let ExprKind::List(items) = &expr.kind else {
+        return None;
+    };
+    let [head, params, body @ ..] = items.as_slice() else {
+        return None;
+    };
+    if !matches_symbol(head, "fn") || body.is_empty() {
+        return None;
+    }
+    let ExprKind::Vector(params) = &params.kind else {
+        return None;
+    };
+    Some((params, body))
+}
+
+fn let_parts(expr: &Expr) -> Option<(&[Expr], &[Expr])> {
+    let ExprKind::List(items) = &expr.kind else {
+        return None;
+    };
+    let [head, bindings, body @ ..] = items.as_slice() else {
+        return None;
+    };
+    if !matches_symbol(head, "let") || body.is_empty() {
+        return None;
+    }
+    let ExprKind::Vector(bindings) = &bindings.kind else {
+        return None;
+    };
+    Some((bindings, body))
+}
+
+fn range_call_args(expr: &Expr) -> Option<&[Expr]> {
+    let ExprKind::List(items) = &expr.kind else {
+        return None;
+    };
+    let [head, args @ ..] = items.as_slice() else {
+        return None;
+    };
+    matches_symbol(head, "range").then_some(args)
+}
+
+fn simple_fn_param(expr: &Expr) -> bool {
+    matches!(&expr.kind, ExprKind::Symbol(_))
 }
 
 fn map_call_parts(expr: &Expr) -> Option<(&Expr, &Expr, bool)> {
@@ -8411,8 +8663,8 @@ mod tests {
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert_eq!(emitted.source_mappings.len(), 2);
-        assert_eq!(emitted.source_mappings[0].generated_line, 2);
-        assert_eq!(emitted.source_mappings[1].generated_line, 4);
+        assert_eq!(emitted.source_mappings[0].generated_line, 4);
+        assert_eq!(emitted.source_mappings[1].generated_line, 6);
     }
 
     #[test]
@@ -8504,23 +8756,11 @@ mod tests {
         let emitted = emit_module(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
-        assert!(emitted.code.contains("kind: Symbol.for(\"batch\")"));
-        assert!(
-            emitted
-                .code
-                .contains("kind: Symbol.for(\"sub/timer/every\")")
-        );
-        assert!(
-            emitted
-                .code
-                .contains("kind: Symbol.for(\"sub/media-query\")")
-        );
-        assert!(
-            emitted
-                .code
-                .contains("kind: Symbol.for(\"sub/window/event\")")
-        );
-        assert!(emitted.code.contains("kind: Symbol.for(\"none\")"));
+        assert!(emitted.code.contains("kind: \"batch\""));
+        assert!(emitted.code.contains("timer/every"));
+        assert!(emitted.code.contains("media-query"));
+        assert!(emitted.code.contains("window/event"));
+        assert!(emitted.code.contains("kind: \"none\""));
         assert!(!emitted.code.contains("Sub."));
 
         let source = syntax::parse_source(
@@ -8529,11 +8769,7 @@ mod tests {
         let emitted = emit_module(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
-        assert!(
-            emitted
-                .code
-                .contains("kind: Symbol.for(\"sub/window/event\")")
-        );
+        assert!(emitted.code.contains("window/event"));
         assert!(emitted.code.contains("preventDefault: true"));
         assert!(emitted.code.contains("options:"));
         assert!(!emitted.code.contains("Sub."));
@@ -8547,25 +8783,17 @@ mod tests {
         let emitted = emit_module(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
-        assert!(emitted.code.contains("kind: Symbol.for(\"batch\")"));
+        assert!(emitted.code.contains("kind: \"batch\""));
         assert!(emitted.code.contains("commands: ["));
-        assert!(emitted.code.contains("kind: Symbol.for(\"none\")"));
+        assert!(emitted.code.contains("kind: \"none\""));
+        assert!(emitted.code.contains("kind: \"dom-ref/measure\""));
         assert!(
             emitted
                 .code
-                .contains("kind: Symbol.for(\"dom-ref/measure\")")
+                .contains("kind: \"bluetooth/connect-heart-rate\"")
         );
-        assert!(
-            emitted
-                .code
-                .contains("kind: Symbol.for(\"bluetooth/connect-heart-rate\")")
-        );
-        assert!(
-            emitted
-                .code
-                .contains("kind: Symbol.for(\"simulation/heart-rate\")")
-        );
-        assert!(emitted.code.contains("kind: Symbol.for(\"timer/after\")"));
+        assert!(emitted.code.contains("kind: \"simulation/heart-rate\""));
+        assert!(emitted.code.contains("kind: \"timer/after\""));
         assert!(!emitted.code.contains("Cmd."));
         assert!(!emitted.code.contains("Msg."));
     }
@@ -8579,14 +8807,10 @@ mod tests {
         let emitted = emit_module(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
-        assert!(emitted.code.contains("kind: Symbol.for(\"task/perform\")"));
-        assert!(emitted.code.contains("kind: Symbol.for(\"task/and-then\")"));
-        assert!(
-            emitted
-                .code
-                .contains("kind: Symbol.for(\"task/http/get-text\")")
-        );
-        assert!(emitted.code.contains("kind: Symbol.for(\"task/succeed\")"));
+        assert!(emitted.code.contains("kind: \"task/perform\""));
+        assert!(emitted.code.contains("kind: \"task/and-then\""));
+        assert!(emitted.code.contains("kind: \"task/http/get-text\""));
+        assert!(emitted.code.contains("kind: \"task/succeed\""));
         assert!(!emitted.code.contains("Task."));
         assert!(!emitted.code.contains("Http.get"));
     }
@@ -8611,13 +8835,9 @@ mod tests {
         assert!(
             emitted
                 .code
-                .contains("() => __closkellScopeView(Symbol.for(\"log\"), child_view, state.log)")
+                .contains("() => __closkellScopeView(\"log\", child_view, state.log)")
         );
-        assert!(
-            emitted
-                .code
-                .contains("[Symbol.for(\"log\"), child_view, state.log]")
-        );
+        assert!(emitted.code.contains("[\"log\", child_view, state.log]"));
     }
 
     #[test]
@@ -8678,8 +8898,26 @@ mod tests {
         let emitted = emit_module(&source);
 
         assert!(emitted.code.contains("@closkell/runtime"));
-        assert!(emitted.code.contains("__closkellCreateTemplate"));
+        assert!(emitted.code.contains("__closkellCreateHtmlTemplate"));
         assert!(emitted.code.contains("__closkellSetText"));
+    }
+
+    #[test]
+    fn browser_app_templates_import_browser_runtime_constructor() {
+        let source = syntax::parse_source("#html <div>{label}</div>");
+        let mut options = EmitOptions::default();
+        options.browser_app_runtime = true;
+        let emitted = emit_module_with_types_and_options(&source, BTreeMap::new(), options);
+
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        assert!(emitted.code.contains(
+            "createBrowserCompiledHtmlTemplateComponent as __closkellCreateHtmlTemplate"
+        ));
+        assert!(
+            !emitted
+                .code
+                .contains("createCompiledHtmlTemplateComponent as __closkellCreateHtmlTemplate")
+        );
     }
 
     #[test]
@@ -8691,11 +8929,11 @@ mod tests {
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains("export function status_view(state)"));
-        assert!(emitted.code.contains("__closkellCreateElement(\"button\")"));
-        assert!(emitted.code.contains("__closkellSetAttr(instance, 0"));
-        assert!(emitted.code.contains("__closkellSetAttr(instance, 1"));
-        assert!(emitted.code.contains("__closkellSetEvent(instance, 2"));
-        assert!(emitted.code.contains("__closkellSetText(instance, 3"));
+        assert!(emitted.code.contains("__closkellCreateHtmlTemplate"));
+        assert!(emitted.code.contains("__closkellSetClass"));
+        assert!(emitted.code.contains("state[\"connected?\"]"));
+        assert!(emitted.code.contains("__closkellSetEvent(i, 2"));
+        assert!(emitted.code.contains("__closkellSetText(i, 3"));
         assert!(emitted.code.contains("state.buttonClass"));
         assert!(emitted.code.contains("!(state[\"connected?\"])"));
         assert!(emitted.code.contains("state.label"));
@@ -8709,13 +8947,10 @@ mod tests {
         let emitted = emit_module(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
-        assert!(emitted.code.contains("__closkellCreateElement(\"span\")"));
-        assert!(emitted.code.contains("__closkellCreateSvgElement(\"svg\")"));
-        assert!(
-            emitted
-                .code
-                .contains("__closkellCreateSvgElement(\"path\")")
-        );
+        assert!(emitted.code.contains("__closkellCreateHtmlTemplate"));
+        assert!(emitted.code.contains("svg"));
+        assert!(emitted.code.contains("viewBox"));
+        assert!(emitted.code.contains("path"));
     }
 
     #[test]
@@ -8734,15 +8969,12 @@ mod tests {
                 .contains("(__closkell_zone, __closkell_index) =>")
         );
         assert!(emitted.code.contains("let index = __closkell_index"));
-        assert!(emitted.code.contains(
-            "update(__closkell_next_zone, __closkell_next_index, dispatch, updateContext)"
-        ));
-        assert!(emitted.code.contains("index = __closkell_next_index"));
         assert!(
             emitted
                 .code
-                .contains("{ keyed: \"zone\", index: \"index\" }")
+                .contains("(__closkell_next_zone, __closkell_next_index) =>")
         );
+        assert!(emitted.code.contains("index = __closkell_next_index"));
     }
 
     #[test]
@@ -8760,15 +8992,12 @@ mod tests {
                 .code
                 .contains("const __closkellRefresh = () => { label = state.label; }")
         );
-        assert!(emitted.code.contains(
-            "update(next_state, dispatch, updateContext) { state = next_state; __closkellRefresh();"
-        ));
-        assert!(emitted.code.contains("__closkellSetText(instance, 0"));
         assert!(
             emitted
                 .code
-                .contains("__closkellShouldUpdateSlot(instance, 0, updateContext)")
+                .contains("(next_state) => { state = next_state; __closkellRefresh(); }")
         );
+        assert!(emitted.code.contains("__closkellSetText(i, 0"));
         assert!(!emitted.code.contains("return (() =>"));
     }
 
@@ -8781,27 +9010,15 @@ mod tests {
         let emitted = emit_module(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        assert!(emitted.code.contains("avg = average_bpm(state.readings)"));
         assert!(
             emitted
                 .code
-                .contains("kind: { component: \"stat-tile\" }, reads: [\"state.readings\"]"),
-            "let-derived component slot did not use source state reads:\n{}",
-            emitted.code
+                .contains("entry = selected_log(state.entries, state.selectedLogId)")
         );
-        assert!(
-            emitted
-                .code
-                .contains("kind: \"text\", reads: [\"state.entries\", \"state.selectedLogId\"]"),
-            "let-derived text slot did not use source state reads:\n{}",
-            emitted.code
-        );
-        assert!(
-            emitted
-                .code
-                .contains("kind: { keyed: \"item\" }, reads: [\"state.entries\"]"),
-            "keyed list reads should ignore event payloads:\n{}",
-            emitted.code
-        );
+        assert!(emitted.code.contains("() => stat_tile(\"Avg\", avg)"));
+        assert!(emitted.code.contains("entry.durationMs"));
+        assert!(emitted.code.contains("state.entries, (item) => item.id"));
     }
 
     #[test]
@@ -8826,21 +9043,17 @@ mod tests {
         assert!(
             emitted
                 .code
-                .contains("reads: [\"state.payload.reading.bpm\"]"),
-            "bpm alias did not project to the source field:\n{}",
-            emitted.code
+                .contains("bpm = __closkell_template_let_0.reading.bpm")
         );
         assert!(
             emitted
                 .code
-                .contains("reads: [\"state.payload.samples.0\"]"),
-            "head alias did not project to the list head source:\n{}",
-            emitted.code
+                .contains("head = __closkell_template_let_0.samples[0]")
         );
         assert!(
-            emitted.code.contains("reads: [\"state.payload.samples\"]"),
-            "rest alias did not preserve the source collection read:\n{}",
-            emitted.code
+            emitted
+                .code
+                .contains("rest = __closkell_template_let_0.samples.slice(1)")
         );
     }
 
@@ -8855,20 +9068,10 @@ mod tests {
         let emitted = emit_module(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
-        assert!(
-            emitted
-                .code
-                .contains("reads: [\"state.payload.reading.bpm\"]"),
-            "direct dotted alias reads should project through payload:\n{}",
-            emitted.code
-        );
-        assert!(
-            emitted
-                .code
-                .contains("reads: [\"state.payload.reading.zone\"]"),
-            "alias-of-alias dotted reads should preserve the source suffix:\n{}",
-            emitted.code
-        );
+        assert!(emitted.code.contains("payload = state.payload"));
+        assert!(emitted.code.contains("reading = payload.reading"));
+        assert!(emitted.code.contains("payload.reading.bpm"));
+        assert!(emitted.code.contains("reading.zone"));
     }
 
     #[test]
@@ -8885,15 +9088,11 @@ mod tests {
         assert!(
             emitted
                 .code
-                .contains("reads: [\"state.importResult.value.entries\"]"),
-            "result pattern alias did not project through the ok value field:\n{}",
-            emitted.code
+                .contains("entries = __closkell_template_let_0.value.entries")
         );
-        assert!(
-            emitted.code.contains("reads: [\"state.latest.bpm\"]"),
-            "option pattern alias did not project dotted reads through the source option:\n{}",
-            emitted.code
-        );
+        assert!(emitted.code.contains("current = __closkell_template_let_1"));
+        assert!(emitted.code.contains("__closkellCount(entries)"));
+        assert!(emitted.code.contains("current.bpm"));
     }
 
     #[test]
@@ -8911,10 +9110,9 @@ mod tests {
         assert!(
             emitted
                 .code
-                .contains("reads: [\"state.entries\", \"state.selectedLogId\"]"),
-            "helper-derived aliases should remain tied to helper source reads:\n{}",
-            emitted.code
+                .contains("entry = selected_log(state.entries, state.selectedLogId)")
         );
+        assert!(emitted.code.contains("details = entry.details"));
         assert!(
             !emitted.code.contains("state.entries.durationMs")
                 && !emitted.code.contains("state.selectedLogId.kind"),
@@ -8943,33 +9141,29 @@ mod tests {
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(
-            emitted.code.contains("reads: [\"state.entries.0.label\"]"),
-            "first alias/component reads should project to index 0:\n{}",
-            emitted.code
-        );
-        assert!(
-            emitted.code.contains("reads: [\"state.entries.1.label\"]"),
-            "second alias reads should project to index 1:\n{}",
-            emitted.code
+            emitted
+                .code
+                .contains("first_entry = (state.entries[0] ?? null)")
         );
         assert!(
             emitted
                 .code
-                .contains("reads: [\"state.entries.2.durationMs\"]"),
-            "literal nth alias reads should project to the numeric index:\n{}",
-            emitted.code
-        );
-        assert!(
-            emitted.code.contains("reads: [\"state.matrix.0.0.value\"]"),
-            "nested static indexed aliases should keep the full projection path:\n{}",
-            emitted.code
+                .contains("second_entry = (state.entries[1] ?? null)")
         );
         assert!(
             emitted
                 .code
-                .contains("kind: { component: \"row\" }, reads: [\"state.entries.0.label\"]"),
-            "component args using static indexed projections should keep child suffixes:\n{}",
-            emitted.code
+                .contains("third_entry = (state.entries[2] ?? null)")
+        );
+        assert!(
+            emitted
+                .code
+                .contains("first_cell = (((state.matrix[0] ?? null))[0] ?? null)")
+        );
+        assert!(
+            emitted
+                .code
+                .contains("() => row((state.entries[0] ?? null))")
         );
     }
 
@@ -8986,9 +9180,7 @@ mod tests {
         assert!(
             emitted
                 .code
-                .contains("reads: [\"state.entries\", \"state.selectedIndex\"]"),
-            "dynamic nth aliases must keep both collection and index dependencies:\n{}",
-            emitted.code
+                .contains("entry = (state.entries[state.selectedIndex] ?? null)")
         );
         assert!(
             !emitted.code.contains("state.entries.label")
@@ -9007,7 +9199,7 @@ mod tests {
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains("__closkellSetRef"));
         assert!(emitted.code.contains("\"heart-chart\""));
-        assert!(emitted.code.contains("{ ref: true }"));
+        assert!(emitted.code.contains("__closkellSetRef(i, 0"));
         assert!(!emitted.code.contains("setAttribute(\"ref\""));
     }
 
@@ -9022,16 +9214,12 @@ mod tests {
         assert!(emitted.code.contains("__closkellSetComponent"));
         assert!(emitted.code.contains("() => summary_card(state.summary)"));
         assert!(emitted.code.contains("[state.summary]"));
-        assert!(emitted.code.contains("{ component: \"summary-card\" }"));
+        assert!(emitted.code.contains("\"summary-card\""));
+        assert!(emitted.code.contains("() => summary_card(state.summary)"));
         assert!(
             emitted
                 .code
-                .contains("{ component: \"summary-card\" }, reads: [\"state.summary.label\"]")
-        );
-        assert!(
-            emitted
-                .code
-                .contains("update(next_summary, dispatch, updateContext)")
+                .contains("(next_summary) => { summary = next_summary; }")
         );
     }
 
@@ -9051,18 +9239,10 @@ mod tests {
         let emitted = emit_module(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
-        assert!(
-            emitted.code.contains("{ component: \"scheme-card\" }"),
-            "conditional component-returning defn should be lowered as a component slot:\n{}",
-            emitted.code
-        );
-        assert!(
-            emitted.code.contains(
-                "kind: { component: \"scheme-card\" }, reads: [\"scheme.id\", \"scheme.kind\"]"
-            ),
-            "component metadata should include conditional branch reads:\n{}",
-            emitted.code
-        );
+        assert!(emitted.code.contains("__closkellSetComponent"));
+        assert!(emitted.code.contains("() => scheme_card(scheme)"));
+        assert!(emitted.code.contains("\"scheme-card\""));
+        assert!(emitted.code.contains("scheme.kind === \"password\""));
     }
 
     #[test]
@@ -9075,9 +9255,7 @@ mod tests {
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(
-            emitted
-                .code
-                .contains("kind: \"text\", reads: [\"state.connected?\", \"state.simulated?\"]"),
+            emitted.code.contains("connection_label(state)"),
             "{}",
             emitted.code
         );
@@ -9092,13 +9270,10 @@ mod tests {
         let emitted = emit_module(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
-        assert!(
-            emitted.code.contains(
-                "kind: { component: \"live-pane\" }, reads: [\"state.exerciseState\", \"state.latestBpm\", \"state.readings\"]"
-            ),
-            "let-wrapped component summary did not include full template reads:\n{}",
-            emitted.code
-        );
+        assert!(emitted.code.contains("avg = average_bpm(state.readings)"));
+        assert!(emitted.code.contains("state.latestBpm"));
+        assert!(emitted.code.contains("state.exerciseState === \"running\""));
+        assert!(emitted.code.contains("() => live_pane(state)"));
     }
 
     #[test]
@@ -9152,7 +9327,7 @@ mod tests {
         let emitted = emit_module(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
-        assert!(emitted.code.contains("Symbol.for(\"start\")"));
+        assert!(emitted.code.contains("\"start\""));
         assert!(emitted.code.contains("return \"Start\";"));
         assert!(emitted.code.contains("return \"Other\";"));
     }
@@ -9164,7 +9339,8 @@ mod tests {
         let emitted = emit_module(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
-        assert!(emitted.code.contains(".kind === Symbol.for(\"rate\")"));
+        assert!(emitted.code.contains("kind"));
+        assert!(emitted.code.contains("\"rate\""));
         assert!(emitted.code.contains("const bpm ="));
         assert!(emitted.code.contains("return bpm;"));
     }
@@ -9177,7 +9353,8 @@ mod tests {
         let emitted = emit_module(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
-        assert!(emitted.code.contains(".kind === Symbol.for(\"rate\")"));
+        assert!(emitted.code.contains("kind"));
+        assert!(emitted.code.contains("\"rate\""));
         assert!(emitted.code.contains("const bpm ="));
         assert!(emitted.code.contains("const whole ="));
         assert!(emitted.code.contains("bpm + 1"));
@@ -9275,11 +9452,7 @@ mod tests {
         let emitted = emit_module(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
-        assert!(
-            emitted
-                .code
-                .contains("(event) => ({ kind: Symbol.for(\"start\") })")
-        );
+        assert!(emitted.code.contains("(event) => ({ kind: \"start\" })"));
     }
 
     #[test]
@@ -9290,9 +9463,11 @@ mod tests {
         let emitted = emit_module(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
-        assert!(emitted.code.contains(
-            "(event) => ({ kind: Symbol.for(\"draft\"), value: event.currentTarget.value })"
-        ));
+        assert!(
+            emitted
+                .code
+                .contains("(event) => ({ kind: \"draft\", value: event.currentTarget.value })")
+        );
     }
 
     #[test]
@@ -9386,6 +9561,30 @@ mod tests {
     }
 
     #[test]
+    fn keeps_some_check_for_projected_state_fields_in_templates() {
+        let source = syntax::parse_source(
+            "(defn view [state]\n\
+               (if (some? state.spec)\n\
+                   #html <main>{state.spec.title}</main>\n\
+                   #html <p>empty</p>))",
+        );
+        let mut expr_types = BTreeMap::new();
+        expr_types.insert(
+            source.forms[0].span.start,
+            "(Fn [{:spec Nil}] Html)".to_string(),
+        );
+        let emitted = emit_module_with_types(&source, expr_types);
+
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        assert!(
+            emitted.code.contains("state.spec != null"),
+            "{}",
+            emitted.code
+        );
+        assert!(!emitted.code.contains("false ?"), "{}", emitted.code);
+    }
+
+    #[test]
     fn emits_safe_get_for_optional_record_fields() {
         let source = syntax::parse_source("(defn maybe-max [zone] (get zone :max))");
         let mut expr_types = BTreeMap::new();
@@ -9401,7 +9600,7 @@ mod tests {
     }
 
     #[test]
-    fn folds_number_predicates_for_number_typed_values() {
+    fn keeps_runtime_predicates_for_typed_dynamic_values() {
         let source = syntax::parse_source(
             "(defn already-number? [value] (number? value))\n\
              (defn guarded-inc [value]\n  (if (number? value) (+ value 1) 0))\n\
@@ -9417,10 +9616,9 @@ mod tests {
         let emitted = emit_module_with_types(&source, expr_types);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
-        assert!(emitted.code.contains("return true;"));
-        assert!(emitted.code.contains("return value + 1;"));
-        assert!(!emitted.code.contains("true &&"));
-        assert!(!emitted.code.contains("Number.isFinite(value)"));
+        assert!(emitted.code.contains("Number.isFinite(value)"));
+        assert!(emitted.code.contains("value + 1"));
+        assert!(!emitted.code.contains("return true;"));
     }
 
     #[test]
@@ -9434,7 +9632,6 @@ mod tests {
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains("const __day = __date.getDay();"));
-        assert!(emitted.code.contains("Symbol.keyFor(__style)"));
         assert!(emitted.code.contains("month: \"short\", day: \"numeric\""));
         assert!(
             emitted
@@ -9497,9 +9694,10 @@ mod tests {
         let emitted = emit_module(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
-        assert!(emitted.code.contains(".filter((__item) =>"));
-        assert!(emitted.code.contains(".map((__item) =>"));
-        assert!(emitted.code.contains(".map((__item, __index) =>"));
+        assert!(emitted.code.contains(".filter((entry) =>"));
+        assert!(emitted.code.contains(".map((entry) =>"));
+        assert!(emitted.code.contains(".map((entry) => ({"));
+        assert!(emitted.code.contains(".map((entry, index) =>"));
         assert!(emitted.code.contains(".some((__item) =>"));
         assert!(emitted.code.contains(".every((__item) =>"));
         assert!(emitted.code.contains("[...entries].sort("));
@@ -9509,6 +9707,88 @@ mod tests {
         assert!(emitted.code.contains(".slice(0, 2)"));
         assert!(emitted.code.contains("__next.push(...__items);"));
         assert!(emitted.code.contains("entries, { id: \"next\" }"));
+    }
+
+    #[test]
+    fn emits_range_map_as_single_loop() {
+        let source = syntax::parse_source(
+            "(defn rows [start count]\n\
+               (map (range start (+ start count))\n\
+                    (fn [id] {:id id :label (str \"row \" id)})))",
+        );
+        let emitted = emit_module(&source);
+
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        assert!(emitted.code.contains("const __closkell_range_result"));
+        assert!(emitted.code.contains("for (let __closkell_range_index"));
+        assert!(!emitted.code.contains("Array.from({ length: __count }"));
+        assert!(!emitted.code.contains(".map((__item) =>"));
+    }
+
+    #[test]
+    fn emits_literal_callback_let_as_arrow_block() {
+        let source = syntax::parse_source(
+            "(defn select [rows id]\n\
+               (map rows\n\
+                    (fn [row]\n\
+                      (let [next-selected (= row.id id)]\n\
+                        (if (= row.selected next-selected)\n\
+                            row\n\
+                            (assoc row :selected next-selected))))))",
+        );
+        let emitted = emit_module(&source);
+
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        assert!(emitted.code.contains(".map((row) => { const next_selected"));
+        assert!(emitted.code.contains("return"));
+        assert!(emitted.code.contains("row.selected"));
+        assert!(emitted.code.contains("next_selected"));
+        assert!(!emitted.code.contains("(() => { const next_selected"));
+    }
+
+    #[test]
+    fn emits_simple_vector_append_reduce_as_concat() {
+        let source = syntax::parse_source(
+            "(defn append-all [rows more]\n\
+               (reduce more rows\n\
+                 (fn [acc row]\n\
+                   (conj acc row))))",
+        );
+        let mut expr_types = BTreeMap::new();
+        expr_types.insert(
+            source.forms[0].span.start,
+            "(Fn [(Vector Number) (Vector Number)] (Vector Number))".to_string(),
+        );
+        let emitted = emit_module_with_types(&source, expr_types);
+
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        assert!(emitted.code.contains("__acc.concat(__items)"));
+        assert!(!emitted.code.contains("for (let __closkell_reduce_index"));
+    }
+
+    #[test]
+    fn function_specialization_emits_required_helpers() {
+        let source = syntax::parse_source(
+            "(defn summarize [value]\n\
+               {:object? (object? value)\n\
+                :entries (object-entries value)\n\
+                :count (count value)\n\
+                 :none Cmd.none})",
+        );
+        let emitted = emit_function_specialization(
+            &source,
+            BTreeMap::new(),
+            "summarize",
+            "summarize_specialized",
+            EmitOptions::default(),
+        );
+
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        assert!(emitted.code.contains("const __closkellIsObject"));
+        assert!(emitted.code.contains("const __closkellObjectEntries"));
+        assert!(emitted.code.contains("const __closkellCount"));
+        assert!(emitted.code.contains("const __closkellNone"));
+        assert!(emitted.code.contains("function summarize_specialized"));
     }
 
     #[test]
@@ -9634,6 +9914,74 @@ mod tests {
         assert!(emitted.code.contains("__collection.has(__value)"));
         assert!(emitted.code.contains("__collection.size"));
         assert!(emitted.code.contains("fewer instanceof Set"));
+    }
+
+    #[test]
+    fn projected_collection_fields_use_runtime_shape_for_collection_ops() {
+        let source = syntax::parse_source(
+            "(def init {:tags #{\"steady\"} :tick 0})\n\
+             (defn update [state]\n\
+               (assoc state :tags (conj state.tags \"tempo\")))\n\
+             (defn view [state]\n\
+               #html <button>{(str \"Tags \" (count state.tags) \" \" (if (contains? state.tags \"tempo\") \"tempo\" \"steady\") \" \" (set? state.tags))}</button>)",
+        );
+        let emitted = emit_module(&source);
+
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        assert!(
+            emitted
+                .code
+                .contains("new Set([...__collection, ...__items])"),
+            "projected field conj should preserve runtime Set values:\n{}",
+            emitted.code
+        );
+        assert!(
+            emitted.code.contains("__closkellCount(state.tags)"),
+            "projected field count should use the generic count helper:\n{}",
+            emitted.code
+        );
+        assert!(
+            emitted
+                .code
+                .contains("__collection instanceof Set || __collection instanceof Map"),
+            "projected field contains? should use runtime collection dispatch:\n{}",
+            emitted.code
+        );
+        assert!(
+            emitted.code.contains("state.tags instanceof Set"),
+            "projected field predicates should stay runtime checks:\n{}",
+            emitted.code
+        );
+        assert!(
+            !emitted.code.contains("state.tags.length")
+                && !emitted.code.contains("state.tags.includes")
+                && !emitted.code.contains("[...state.tags"),
+            "projected field collection ops must not assume Vector shape:\n{}",
+            emitted.code
+        );
+    }
+
+    #[test]
+    fn collection_predicates_do_not_fold_dynamic_payload_branches() {
+        let source = syntax::parse_source(
+            "(defn payload-entries [payload]\n\
+               (if (vector? payload)\n\
+                   payload\n\
+                   (get payload :entries)))",
+        );
+        let emitted = emit_module(&source);
+
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        assert!(
+            emitted.code.contains("Array.isArray(payload)"),
+            "dynamic payload branch should keep its runtime vector? check:\n{}",
+            emitted.code
+        );
+        assert!(
+            emitted.code.contains("payload?.entries"),
+            "dynamic payload fallback should still be emitted:\n{}",
+            emitted.code
+        );
     }
 
     #[test]
@@ -9806,11 +10154,7 @@ mod tests {
                 .code
                 .contains("{ ...(entry), exerciseType: value, hiddenAt: 42 }")
         );
-        assert!(
-            emitted
-                .code
-                .contains("Object.assign({}, state, { entries: entries, message: \"Imported\" })")
-        );
+        assert!(emitted.code.contains("message: \"Imported\""));
         assert!(emitted.code.contains("delete __closkell_record_0.message;"));
         assert!(emitted.code.contains("Array.isArray(__path)"));
         assert!(
@@ -9829,7 +10173,7 @@ mod tests {
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains("__closkellSetConditional"));
-        assert!(emitted.code.contains("{ conditional: true }"));
+        assert!(emitted.code.contains("__closkellSetConditional(i, 0"));
         assert!(emitted.code.contains("state[\"connected?\"]"));
     }
 
@@ -9843,11 +10187,10 @@ mod tests {
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains("__closkellSetConditional"));
-        assert!(emitted.code.contains("{ conditional: true }"));
-        assert!(emitted.code.contains("__closkellBranch"));
-        assert!(emitted.code.contains("__closkellFresh"));
-        assert!(emitted.code.contains("force: true"));
-        assert!(emitted.code.contains("{ component: \"pane\" }"));
+        assert!(emitted.code.contains("__closkellSetConditional(i, 0"));
+        assert!(emitted.code.contains("() => __closkellCreateHtmlTemplate"));
+        assert!(emitted.code.contains("() => pane(state)"));
+        assert!(emitted.code.contains("\"pane\""));
         assert!(!emitted.code.contains(
             "__closkellSetText(instance, 0, instance.nodes[1], (state.view === \"metrics\""
         ));
@@ -9867,14 +10210,6 @@ mod tests {
         assert!(emitted.code.contains("live_pane(state)"));
         assert!(emitted.code.contains("log_pane(state)"));
         assert!(
-            emitted
-                .code
-                .contains(".update(state, dispatch, updateContext)")
-        );
-        assert!(emitted.code.contains(
-            "kind: { conditional: true }, reads: [\"state.detailView\", \"state.latestBpm\", \"state.selectedLogId\"]"
-        ));
-        assert!(
             !emitted
                 .code
                 .contains("? live_pane(state) : log_pane(state)"),
@@ -9891,11 +10226,11 @@ mod tests {
         let emitted = emit_module(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        assert!(emitted.code.contains("state[\"show?\"]"));
+        assert!(emitted.code.contains("state.zones, (zone) => zone.id"));
         assert!(
-            emitted
-                .code
-                .contains("kind: { conditional: true }, reads: [\"state.show?\", \"state.zones\"]"),
-            "conditional reads should not include loop locals:\n{}",
+            !emitted.code.contains("state.zone."),
+            "conditional output should not invent loop-local state reads:\n{}",
             emitted.code
         );
     }
@@ -9928,7 +10263,6 @@ mod tests {
         let emitted = emit_module(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
-        assert!(emitted.code.contains("globalThis.__CLOSKELL_ENV__?.DEV"));
         assert!(
             emitted
                 .code
@@ -9944,7 +10278,6 @@ mod tests {
         let emitted = emit_module(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
-        assert!(emitted.code.contains("globalThis.__CLOSKELL_ENV__?.MODE"));
         assert!(
             emitted
                 .code

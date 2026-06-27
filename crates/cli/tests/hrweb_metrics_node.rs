@@ -1471,7 +1471,6 @@ fn compiled_hrweb_zone_boot_app_loads_stored_zones_and_persists_target() {
         String::from_utf8_lossy(&build.stdout),
         String::from_utf8_lossy(&build.stderr)
     );
-
     let runtime = temp_dir
         .join("node_modules")
         .join("@closkell")
@@ -2105,7 +2104,6 @@ fn compiled_hrweb_heart_chart_app_draws_zones_axis_and_readings() {
         String::from_utf8_lossy(&build.stdout),
         String::from_utf8_lossy(&build.stderr)
     );
-
     let runtime = temp_dir
         .join("node_modules")
         .join("@closkell")
@@ -2392,7 +2390,6 @@ fn compiled_hrweb_metrics_chart_app_draws_trend_and_bar_canvases() {
         String::from_utf8_lossy(&build.stdout),
         String::from_utf8_lossy(&build.stderr)
     );
-
     let runtime = temp_dir
         .join("node_modules")
         .join("@closkell")
@@ -4103,8 +4100,6 @@ globalThis.document = {{
   }}
 }};
 
-globalThis.__CLOSKELL_ENV__ = {{ DEV: false }};
-
 const intervals = new Map();
 const cleared = [];
 let nextHandle = 0;
@@ -5132,6 +5127,19 @@ fn compiled_hrweb_simulated_monitor_routes_simulation_command() {
         String::from_utf8_lossy(&build.stdout),
         String::from_utf8_lossy(&build.stderr)
     );
+    let source = fs::read_to_string(&output).expect("generated simulator app should be readable");
+    let prod_output = temp_dir.join("sim-app.prod.mjs");
+    let dev_output = temp_dir.join("sim-app.dev.mjs");
+    fs::write(
+        &prod_output,
+        source.replace("import.meta.env && import.meta.env.DEV", "false"),
+    )
+    .expect("production simulator app should be written");
+    fs::write(
+        &dev_output,
+        source.replace("import.meta.env && import.meta.env.DEV", "true"),
+    )
+    .expect("dev simulator app should be written");
 
     let runtime = temp_dir
         .join("node_modules")
@@ -5219,17 +5227,28 @@ function random() {{
   return randoms.shift();
 }}
 
-const mod = await import(fileUrl({modulePath}));
+const prodMod = await import(fileUrl({prodModulePath}));
+const devMod = await import(fileUrl({devModulePath}));
 const runtime = await import(fileUrl({runtimePath}));
-const host = new Element("main");
-const app = runtime.startApp({{
+delete globalThis.document;
+runtime.htmlTemplate("");
+const documentRef = globalThis.document;
+
+function start(mod) {{
+  const host = documentRef.createElement("main");
+  const app = runtime.startApp({{
   root: host,
   init: mod.init,
   update: mod.update,
   view: mod.view,
   handlers: runtime.createCommandHandlers({{ random, timers }})
-}});
+  }});
+  return {{ app, host }};
+}}
 
+const prod = start(prodMod);
+const host = prod.host;
+const app = prod.app;
 const section = host.children[0];
 const buttons = section.children.filter((node) => node.tagName === "button");
 const simulateButton = buttons[0];
@@ -5248,63 +5267,75 @@ if (app.commands.length !== 0) throw new Error("production simulator click shoul
 if (app.state["connected?"] !== false) throw new Error("production simulator click should leave state disconnected");
 if (statusText.nodeValue !== "Idle" || bpmText.nodeValue !== "0") throw new Error("production simulator click should not update DOM text");
 if (section.hasAttribute("data-connected")) throw new Error("production simulator click should not set connected attr");
+app.dispose();
 
-globalThis.__CLOSKELL_ENV__ = {{ DEV: true }};
+const dev = start(devMod);
+const devHost = dev.host;
+const devApp = dev.app;
+const devSection = devHost.children[0];
+const devButtons = devSection.children.filter((node) => node.tagName === "button");
+const devSimulateButton = devButtons[0];
+const devStopButton = devButtons[1];
+const devStatusSpan = devSection.children.find((node) => node.tagName === "span");
+const devBpmStrong = devSection.children.find((node) => node.tagName === "strong");
+const devStatusText = devStatusSpan.children.find((node) => "nodeValue" in node);
+const devBpmText = devBpmStrong.children.find((node) => "nodeValue" in node);
 
-simulateButton.click();
-if (host.children[0] !== section) throw new Error("simulator section was replaced");
-if (statusSpan.children.find((node) => "nodeValue" in node) !== statusText) throw new Error("status text node was replaced");
-if (bpmStrong.children.find((node) => "nodeValue" in node) !== bpmText) throw new Error("bpm text node was replaced");
-if (app.commands.map((entry) => entry.kind).join(",") !== "random/number,random/number,simulation/heart-rate") {{
+devSimulateButton.click();
+if (devHost.children[0] !== devSection) throw new Error("simulator section was replaced");
+if (devStatusSpan.children.find((node) => "nodeValue" in node) !== devStatusText) throw new Error("status text node was replaced");
+if (devBpmStrong.children.find((node) => "nodeValue" in node) !== devBpmText) throw new Error("bpm text node was replaced");
+if (devApp.commands.map((entry) => entry.kind).join(",") !== "random/number,random/number,simulation/heart-rate") {{
   throw new Error("simulator did not chain random commands into the simulation effect");
 }}
-if (app.commands[0].command.min !== 0 || app.commands[0].command.max !== 2) throw new Error("zone random range was wrong");
-if (app.commands[1].command.min !== 131 || app.commands[1].command.max !== 150) throw new Error("bpm random range was wrong");
-if (app.commands[2].command.id !== "simulated-monitor" || app.commands[2].command.ms !== 1000) throw new Error("simulator command timing was wrong");
-if (app.commands[2].command.start !== 136 || app.commands[2].command.min !== 111 || app.commands[2].command.max !== 150 || app.commands[2].command.jitter !== 3.5) {{
+if (devApp.commands[0].command.min !== 0 || devApp.commands[0].command.max !== 2) throw new Error("zone random range was wrong");
+if (devApp.commands[1].command.min !== 131 || devApp.commands[1].command.max !== 150) throw new Error("bpm random range was wrong");
+if (devApp.commands[2].command.id !== "simulated-monitor" || devApp.commands[2].command.ms !== 1000) throw new Error("simulator command timing was wrong");
+if (devApp.commands[2].command.start !== 136 || devApp.commands[2].command.min !== 111 || devApp.commands[2].command.max !== 150 || devApp.commands[2].command.jitter !== 3.5) {{
   throw new Error("simulator command bounds were wrong");
 }}
-if (app.commands[2].command.onReading !== Symbol.for("heart-rate")) throw new Error("simulator command did not route readings");
-if (app.state["connected?"] !== true) throw new Error("simulator did not connect");
-if (app.state.targetZoneId !== 3) throw new Error("simulator picked the wrong zone");
-if (app.state.latestBpm !== 136) throw new Error("simulator rounded the first bpm incorrectly");
-if (app.state.readings.length !== 1 || app.state.readings[0].bpm !== 136 || app.state.readings[0].time !== 0) {{
+if (devApp.commands[2].command.onReading !== "heart-rate") throw new Error("simulator command did not route readings");
+if (devApp.state["connected?"] !== true) throw new Error("simulator did not connect");
+if (devApp.state.targetZoneId !== 3) throw new Error("simulator picked the wrong zone");
+if (devApp.state.latestBpm !== 136) throw new Error("simulator rounded the first bpm incorrectly");
+if (devApp.state.readings.length !== 1 || devApp.state.readings[0].bpm !== 136 || devApp.state.readings[0].time !== 0) {{
   throw new Error("simulator did not append the first reading");
 }}
-if (statusText.nodeValue !== "Simulated monitor") throw new Error("simulator status text did not update");
-if (bpmText.nodeValue !== "136") throw new Error("simulator bpm text did not update");
-if (section.attributes["data-connected"] !== "") throw new Error("connected attr was not set");
-if (section.attributes["data-bpm"] !== "136") throw new Error("connected bpm attr was wrong");
+if (devStatusText.nodeValue !== "Simulated monitor") throw new Error("simulator status text did not update");
+if (devBpmText.nodeValue !== "136") throw new Error("simulator bpm text did not update");
+if (devSection.attributes["data-connected"] !== "") throw new Error("connected attr was not set");
+if (devSection.attributes["data-bpm"] !== "136") throw new Error("connected bpm attr was wrong");
 
 const handle = [...intervals.keys()][0];
 if (!handle || intervals.get(handle).ms !== 1000) throw new Error("simulator interval was not registered");
-simulateButton.click();
-if (app.commands.length !== 3) throw new Error("connected simulator click should not emit duplicate commands");
+devSimulateButton.click();
+if (devApp.commands.length !== 3) throw new Error("connected simulator click should not emit duplicate commands");
 if (intervals.size !== 1) throw new Error("connected simulator click should not create a duplicate interval");
 
 runInterval(handle);
-if (app.commands.length !== 3) throw new Error("simulation tick should not emit extra command records");
-if (app.state.latestBpm !== 139 || app.state.elapsedMs !== 1000) throw new Error("jitter did not update bpm and elapsed time");
-if (app.state.readings.length !== 2 || app.state.readings[1].bpm !== 139 || app.state.readings[1].time !== 1000) {{
+if (devApp.commands.length !== 3) throw new Error("simulation tick should not emit extra command records");
+if (devApp.state.latestBpm !== 139 || devApp.state.elapsedMs !== 1000) throw new Error("jitter did not update bpm and elapsed time");
+if (devApp.state.readings.length !== 2 || devApp.state.readings[1].bpm !== 139 || devApp.state.readings[1].time !== 1000) {{
   throw new Error("jitter did not append the second reading");
 }}
-if (bpmText.nodeValue !== "139" || section.attributes["data-bpm"] !== "139") throw new Error("jitter did not update the DOM");
+if (devBpmText.nodeValue !== "139" || devSection.attributes["data-bpm"] !== "139") throw new Error("jitter did not update the DOM");
 
-stopButton.click();
-if (app.commands.length !== 4 || app.commands[3].kind !== "simulation/stop") throw new Error("stop did not cancel simulator");
+devStopButton.click();
+if (devApp.commands.length !== 4 || devApp.commands[3].kind !== "simulation/stop") throw new Error("stop did not cancel simulator");
 if (cleared[0] !== handle) throw new Error("timer cancel did not clear the simulator interval");
-if (app.state["connected?"] !== false) throw new Error("simulator did not disconnect");
-if (statusText.nodeValue !== "Disconnected") throw new Error("disconnect status did not render");
-if (section.hasAttribute("data-connected")) throw new Error("connected attr was not removed");
+if (devApp.state["connected?"] !== false) throw new Error("simulator did not disconnect");
+if (devStatusText.nodeValue !== "Disconnected") throw new Error("disconnect status did not render");
+if (devSection.hasAttribute("data-connected")) throw new Error("connected attr was not removed");
 
 runInterval(handle);
-if (app.state.readings.length !== 2) throw new Error("cleared simulator interval still dispatched");
+if (devApp.state.readings.length !== 2) throw new Error("cleared simulator interval still dispatched");
 
 function fileUrl(path) {{
   return "file:///" + path.replace(/\\/g, "/").replace(/^([A-Za-z]):/, "$1:");
 }}
 "#,
-        modulePath = js_string(&output),
+        prodModulePath = js_string(&prod_output),
+        devModulePath = js_string(&dev_output),
         runtimePath = js_string(&runtime)
     );
 
@@ -6109,6 +6140,19 @@ fn compiled_hrweb_dev_hotkey_app_gates_window_listener_by_env() {
         String::from_utf8_lossy(&build.stdout),
         String::from_utf8_lossy(&build.stderr)
     );
+    let source = fs::read_to_string(&output).expect("generated dev hotkey app should be readable");
+    let prod_output = temp_dir.join("dev-hotkey.prod.mjs");
+    let dev_output = temp_dir.join("dev-hotkey.dev.mjs");
+    fs::write(
+        &prod_output,
+        source.replace("import.meta.env && import.meta.env.DEV", "false"),
+    )
+    .expect("production dev hotkey app should be written");
+    fs::write(
+        &dev_output,
+        source.replace("import.meta.env && import.meta.env.DEV", "true"),
+    )
+    .expect("dev hotkey app should be written");
 
     let runtime = temp_dir
         .join("node_modules")
@@ -6231,12 +6275,15 @@ function textOf(node) {{
   return (node.children || []).map((child) => "nodeValue" in child ? child.nodeValue : textOf(child)).join("");
 }}
 
-const mod = await import(fileUrl({modulePath}));
+const prodMod = await import(fileUrl({prodModulePath}));
+const devMod = await import(fileUrl({devModulePath}));
 const runtime = await import(fileUrl({runtimePath}));
+delete globalThis.document;
+runtime.htmlTemplate("");
+const documentRef = globalThis.document;
 
-function startWithDev(dev, eventTarget) {{
-  globalThis.__CLOSKELL_ENV__ = {{ DEV: dev }};
-  const host = new Element("main");
+function start(mod, eventTarget) {{
+  const host = documentRef.createElement("main");
   const handlers = runtime.createCommandHandlers({{ eventTarget }});
   const app = runtime.startApp({{
     root: host,
@@ -6249,7 +6296,7 @@ function startWithDev(dev, eventTarget) {{
 }}
 
 const prodEvents = createEventTarget();
-const prod = startWithDev(false, prodEvents);
+const prod = start(prodMod, prodEvents);
 const prodSection = prod.host.children[0];
 const prodStatus = descendants(prodSection, "span")[0];
 if (prod.app.state["dev?"] !== false) throw new Error("production init did not read env-dev? as false");
@@ -6262,10 +6309,16 @@ if (prodSection.attributes["data-opens"] !== "0" || textOf(prodStatus) !== "Prod
 prod.app.dispose();
 
 const devEvents = createEventTarget();
-const dev = startWithDev(true, devEvents);
+const dev = start(devMod, devEvents);
 const devSection = dev.host.children[0];
 const devButton = descendants(devSection, "button")[0];
 const devStatus = descendants(devSection, "span")[0];
+let devButtonClicks = 0;
+const originalDevButtonClick = devButton.click.bind(devButton);
+devButton.click = () => {{
+  devButtonClicks += 1;
+  return originalDevButtonClick();
+}};
 if (dev.app.state["dev?"] !== true) throw new Error("dev init did not read env-dev? as true");
 if (dev.app.commands.length !== 1 || dev.app.commands[0].kind !== "window/event-watch") {{
   throw new Error("dev init should log one window/event-watch command");
@@ -6298,7 +6351,7 @@ if (!hotkey.defaultPrevented) throw new Error("matching dev hotkey should preven
 if (dev.app.commands.length !== 2 || dev.app.commands[1].kind !== "dom-ref/click") {{
   throw new Error("dev hotkey should emit a dom-ref/click command");
 }}
-if (devButton.clicks !== 1) throw new Error("dev hotkey did not click the simulator button");
+if (devButtonClicks !== 1) throw new Error("dev hotkey did not click the simulator button");
 if (dev.app.state.opens !== 1 || devSection.attributes["data-opens"] !== "1") {{
   throw new Error("dev hotkey did not record the simulator open");
 }}
@@ -6313,7 +6366,8 @@ function fileUrl(path) {{
   return "file:///" + path.replace(/\\/g, "/").replace(/^([A-Za-z]):/, "$1:");
 }}
 "#,
-        modulePath = js_string(&output),
+        prodModulePath = js_string(&prod_output),
+        devModulePath = js_string(&dev_output),
         runtimePath = js_string(&runtime)
     );
 

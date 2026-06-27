@@ -188,8 +188,7 @@ import surface.
 
 `(env-dev?)` is a zero-argument Bool primitive for Vite-style development
 gates such as HRWeb's simulator hotkeys. Generated ESM reads
-`import.meta.env.DEV`, with `globalThis.__CLOSKELL_ENV__.DEV` available as a
-test or embedding override.
+`import.meta.env.DEV`.
 
 Module-level `(type Name schema)` declarations are checked, erased from emitted
 JS, and included in `inspect` output. Schemas support records, tuples,
@@ -291,8 +290,8 @@ Command log schema includes concrete command records reached through imported
 `Cmd` helpers, so entry reports expose browser effects hidden behind modules
 such as HRWeb's chart drawing helpers.
 By default the plugin lets Vite import `/src/app.clsk` directly, emits cache ESM
-under Vite's `node_modules/.vite/closkell/` cache, treats `css: "src/styles.css"` as a Vite-root
-path, and can also be used from plain JavaScript imports such as
+under the project root's `.closkell/vite/` cache, treats `css: "src/styles.css"` as a
+Vite-root path, and can also be used from plain JavaScript imports such as
 `import { summary } from "./math.clsk"` without a separate generated source
 directory. The plugin also excludes the vendored `@closkell/runtime` package
 from Vite dependency prebundling, so dev servers use the current runtime module

@@ -2,10 +2,11 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const RUNTIME_PACKAGE = "@closkell/runtime";
 const RUNTIME_OPTIMIZED_PREFIX = "@closkell_runtime";
-const MTIME_CACHE_MS = 1000;
+const PLUGIN_PATH = fileURLToPath(import.meta.url);
 
 function stripQuery(id) {
   const queryIndex = id.indexOf("?");
@@ -274,18 +275,10 @@ export function closkell(options = {}) {
   let outPath;
   let generatedRoot;
   const inFlight = new Map();
-  const clskMtimeCache = { root: null, checkedAt: 0, promise: null };
-  const rustMtimeCache = { root: null, checkedAt: 0, promise: null };
   const runtimeEffectsBySource = new Map();
 
   function resolveFromRoot(value) {
     return path.resolve(config.root, value);
-  }
-
-  function resolveCacheDir() {
-    return path.isAbsolute(config.cacheDir)
-      ? config.cacheDir
-      : path.resolve(config.root, config.cacheDir);
   }
 
   function resolveClskId(source, importer) {
@@ -332,7 +325,48 @@ export function closkell(options = {}) {
     return relative;
   }
 
-  async function outputIsFresh(source, output) {
+  function outputMetadataPath(output) {
+    return `${output}.closkell-meta.json`;
+  }
+
+  async function readOutputMetadata(output) {
+    try {
+      return JSON.parse(await fs.readFile(outputMetadataPath(output), "utf8"));
+    } catch (error) {
+      if (error?.code === "ENOENT") return null;
+      return null;
+    }
+  }
+
+  async function writeOutputMetadata(output, fingerprint) {
+    await fs.writeFile(outputMetadataPath(output), `${JSON.stringify(fingerprint, null, 2)}\n`);
+  }
+
+  async function outputFingerprint(source, output) {
+    const compiler = await resolveCompilerCommand();
+    return {
+      source: path.resolve(source),
+      output: path.resolve(output),
+      app: Boolean(app && entryPath && samePath(path.resolve(source), entryPath)),
+      rootId,
+      css: cssImportForOutput(css, output) || "",
+      sourceMap: Boolean(sourceMap),
+      vendorRuntime: Boolean(vendorRuntime),
+      vitest: Boolean(vitest),
+      compilerCommand: path.resolve(compiler.command),
+      compilerArgs: compiler.args,
+      compilerMtime: await statMtimeMs(compiler.command),
+      rustInputMtime: await currentNewestRustBuildInputMtimeMs(),
+      runtimeMtime: await statMtimeMs(workspaceRuntimeSourcePath()),
+      pluginMtime: await statMtimeMs(PLUGIN_PATH)
+    };
+  }
+
+  function sameFingerprint(first, second) {
+    return JSON.stringify(first) === JSON.stringify(second);
+  }
+
+  async function outputIsFresh(source, output, fingerprint) {
     if (!existsSync(output)) return false;
     const outputMtime = await statMtimeMs(output);
     const sourceMtime = entryNeedsVendoredRuntime(source)
@@ -345,6 +379,7 @@ export function closkell(options = {}) {
       const tail = await readFileTail(output, 256);
       if (tail.includes("sourceMappingURL=")) return false;
     }
+    if (!sameFingerprint(await readOutputMetadata(output), fingerprint)) return false;
     return true;
   }
 
@@ -439,32 +474,12 @@ export function closkell(options = {}) {
     }
   }
 
-  function cachedMtime(cache, root, read) {
-    const resolvedRoot = path.resolve(root);
-    const now = Date.now();
-    if (
-      cache.promise &&
-      cache.root === resolvedRoot &&
-      now - cache.checkedAt < MTIME_CACHE_MS
-    ) {
-      return cache.promise;
-    }
-
-    cache.root = resolvedRoot;
-    cache.checkedAt = now;
-    cache.promise = read(resolvedRoot).catch((error) => {
-      if (cache.promise) cache.promise = null;
-      throw error;
-    });
-    return cache.promise;
-  }
-
   function currentNewestClskMtimeMs() {
-    return cachedMtime(clskMtimeCache, sourceRoot, newestClskMtimeMs);
+    return newestClskMtimeMs(sourceRoot);
   }
 
   function currentNewestRustBuildInputMtimeMs() {
-    return cachedMtime(rustMtimeCache, manifestRoot, newestRustBuildInputMtimeMs);
+    return newestRustBuildInputMtimeMs(manifestRoot);
   }
 
   async function resolveCompilerCommand() {
@@ -509,13 +524,6 @@ export function closkell(options = {}) {
     return { command: candidate, args: [] };
   }
 
-  function compilerEnvironment() {
-    return {
-      CLOSKELL_ENV_DEV: config.command === "serve" ? "true" : "false",
-      CLOSKELL_ENV_MODE: config.mode || ""
-    };
-  }
-
   async function compile(
     source,
     { force = false, json = false, markNewRuntimeEffectsAsChanged = false } = {}
@@ -526,9 +534,10 @@ export function closkell(options = {}) {
     if (inFlight.has(key)) return inFlight.get(key);
 
     const task = (async () => {
+      const fingerprint = await outputFingerprint(resolved, output);
       if (
         !force &&
-        (await outputIsFresh(resolved, output)) &&
+        (await outputIsFresh(resolved, output, fingerprint)) &&
         (!entryNeedsVendoredRuntime(resolved) || (await vendoredRuntimeIsFresh()))
       ) {
         return json ? { output, report: null, runtimeEffectsChanged: false } : output;
@@ -553,7 +562,8 @@ export function closkell(options = {}) {
       if (json) args.push("--json");
 
       config.logger.info(`closkell: ${toPosixPath(path.relative(config.root, resolved))}`);
-      const { stdout } = await runCommand(compiler.command, args, config.root, compilerEnvironment());
+      const { stdout } = await runCommand(compiler.command, args, config.root);
+      await writeOutputMetadata(output, fingerprint);
       if (!json) return output;
 
       const report = parseBuildReport(stdout);
@@ -573,7 +583,7 @@ export function closkell(options = {}) {
     const resolved = path.resolve(source);
     const compiler = await resolveCompilerCommand();
     const args = [...compiler.args, "inspect", resolved];
-    const { stdout } = await runCommand(compiler.command, args, config.root, compilerEnvironment());
+    const { stdout } = await runCommand(compiler.command, args, config.root);
     return stdout;
   }
 
@@ -668,7 +678,7 @@ export function closkell(options = {}) {
       config = resolvedConfig;
       manifestRoot = path.dirname(resolveFromRoot(manifestPath));
       entryPath = entry ? resolveFromRoot(entry) : null;
-      generatedRoot = outDir ? resolveFromRoot(outDir) : path.join(resolveCacheDir(), "closkell");
+      generatedRoot = outDir ? resolveFromRoot(outDir) : path.join(config.root, ".closkell", "vite");
       outPath = out ? resolveFromRoot(out) : path.join(generatedRoot, "main.mjs");
       sourceRoot = sourceRootOption
         ? resolveFromRoot(sourceRootOption)

@@ -793,8 +793,11 @@ fn cli_check_json_reports_expected_actual_for_type_mismatch() {
 fn cli_check_json_uses_persistent_cache_for_unchanged_module_graph() {
     let temp_dir = temp_dir("closkell-cli-check-cache-hit");
     let _ = fs::remove_dir_all(&temp_dir);
-    fs::create_dir_all(&temp_dir).expect("temp dir should be created");
-    let source = temp_dir.join("app.clsk");
+    let src_dir = temp_dir.join("src");
+    fs::create_dir_all(&src_dir).expect("src dir should be created");
+    fs::write(temp_dir.join("package.json"), "{\"name\":\"cache-hit\"}\n")
+        .expect("package marker should be written");
+    let source = src_dir.join("app.clsk");
     fs::write(&source, "(def answer 42)\n").expect("source module should be written");
 
     let first = Command::new(env!("CARGO_BIN_EXE_closkell"))
@@ -815,6 +818,33 @@ fn cli_check_json_uses_persistent_cache_for_unchanged_module_graph() {
             && String::from_utf8_lossy(&first.stderr).contains("closkell cache write"),
         "first check did not report miss/write:\n{}",
         String::from_utf8_lossy(&first.stderr)
+    );
+    let root_cache = temp_dir.join(".closkell").join("cache").join("check");
+    let nested_cache = src_dir.join(".closkell");
+    assert!(
+        root_cache.is_dir(),
+        "check cache was not written under the project root"
+    );
+    assert!(
+        !nested_cache.exists(),
+        "check cache was scattered under the source folder"
+    );
+    let cache_files = fs::read_dir(&root_cache)
+        .expect("root cache should be readable")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("root cache entries should be readable");
+    assert_eq!(cache_files.len(), 1, "unexpected check cache files");
+    let cache_text =
+        fs::read_to_string(cache_files[0].path()).expect("check cache file should be readable");
+    assert!(
+        cache_text.starts_with("key=")
+            && !cache_text
+                .lines()
+                .next()
+                .unwrap_or("")
+                .starts_with("closkell-"),
+        "check cache still contains manual version header:\n{}",
+        cache_text
     );
 
     let second = Command::new(env!("CARGO_BIN_EXE_closkell"))
@@ -1314,7 +1344,7 @@ const mod = await import(fileUrl({module_path}));
 if (mod.reading_summary.bpm !== 142) throw new Error("imported gensym macro did not expand reading bpm");
 if (mod.reading_summary.label !== "HR 142") throw new Error("imported gensym macro did not reuse the fresh binding");
 const [, command] = mod.update({{}}, Symbol.for("noop"));
-if (command.kind !== Symbol.for("none")) throw new Error("imported cmd-none macro did not expand");
+if (command.kind !== "none") throw new Error("imported cmd-none macro did not expand");
 
 function fileUrl(path) {{
   return "file:///" + path.replace(/\\/g, "/").replace(/^([A-Za-z]):/, "$1:");
@@ -1484,33 +1514,21 @@ fn cli_build_app_writes_vite_entry_bootstrap() {
     );
 
     let app_js = fs::read_to_string(&output).expect("app entry JS should be readable");
-    assert!(
-        app_js.starts_with(
-            "import { createBrowserBootInput as __closkellCreateBrowserBootInput, createCommandHandlers as __closkellCreateCommandHandlers, createSubscriptionHandlers as __closkellCreateSubscriptionHandlers, createDevtoolsOverlay as __closkellCreateDevtoolsOverlay, startApp as __closkellStartApp } from \"@closkell/runtime\";"
-        ),
-        "app bootstrap did not import the runtime first:\n{}",
-        app_js
-    );
     assert!(app_js.contains("import \"./styles.css\";"));
+    assert!(app_js.contains("from \"@closkell/runtime\";"));
+    assert!(app_js.contains("startCompiledAppWithoutSubscriptions as __closkellStartApp"));
+    assert!(app_js.contains("createCompiledHtmlTemplateComponent as __closkellCreateHtmlTemplate"));
+    assert!(!app_js.contains("function startCompiledAppWithoutSubscriptions(options = {})"));
+    assert!(!app_js.contains("__closkellRuntime_"));
     assert!(app_js.contains("document.getElementById(\"app\")"));
     assert!(app_js.contains("export const __closkellApp = __closkellStartApp({"));
-    assert!(app_js.contains("const __closkellHandlers = __closkellCreateCommandHandlers();"));
-    assert!(app_js.contains("boot: __closkellCreateBrowserBootInput()"));
+    assert!(app_js.contains("const __closkellHandlers = {};"));
     assert!(app_js.contains("handlers: __closkellHandlers"));
-    assert!(app_js.contains(
-        "subscriptions: typeof subscriptions === \"function\" ? subscriptions : undefined"
-    ));
-    assert!(app_js.contains(
-        "subscriptionHandlers: __closkellCreateSubscriptionHandlers({ commandHandlers: __closkellHandlers })"
-    ));
-    assert!(
-        app_js.contains("__closkellCreateDevtoolsOverlay(globalThis.__closkellDevtoolsOverlay)")
-    );
-    assert!(app_js.contains("globalThis.__closkellDevtoolsOverlayInstance = __closkellDevtools"));
-    assert!(app_js.contains("devtools: __closkellDevtools"));
+    assert!(!app_js.contains("boot:"));
+    assert!(!app_js.contains("subscriptions,"));
     assert!(app_js.contains("//# sourceMappingURL=main.mjs.map"));
     let card_class_index = app_js
-        .find("export const card_class")
+        .find("const card_class")
         .expect("class constant should be emitted");
     let app_start_index = app_js
         .find("export const __closkellApp")
@@ -1533,6 +1551,15 @@ fn cli_build_app_writes_vite_entry_bootstrap() {
         fs::read_to_string(&runtime_package).expect("runtime package should be readable");
     assert!(runtime_package.contains("\"name\": \"@closkell/runtime\""));
     assert!(runtime_entry.is_file(), "runtime entry was not vendored");
+    let runtime_entry =
+        fs::read_to_string(&runtime_entry).expect("runtime entry should be readable");
+    assert!(runtime_entry.contains("export function startCompiledAppWithoutSubscriptions"));
+    assert!(runtime_entry.contains("export function setCompiledClassName"));
+    assert!(runtime_entry.contains("export function setCompiledEvent"));
+    assert!(
+        !runtime_entry.contains("export function createDevtoolsOverlay"),
+        "vendored app runtime should omit unused devtools helpers"
+    );
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
@@ -1836,8 +1863,14 @@ fn cli_inspect_reports_changed_path_summaries_for_update_forms() {
 fn cli_inspect_uses_persistent_cache_for_unchanged_module_graph() {
     let temp_dir = temp_dir("closkell-cli-inspect-cache-hit");
     let _ = fs::remove_dir_all(&temp_dir);
-    fs::create_dir_all(&temp_dir).expect("temp dir should be created");
-    let source = temp_dir.join("app.clsk");
+    let src_dir = temp_dir.join("src");
+    fs::create_dir_all(&src_dir).expect("src dir should be created");
+    fs::write(
+        temp_dir.join("package.json"),
+        "{\"name\":\"inspect-cache-hit\"}\n",
+    )
+    .expect("package marker should be written");
+    let source = src_dir.join("app.clsk");
     fs::write(
         &source,
         "(type Box a {:value a})\n\
@@ -1864,6 +1897,33 @@ fn cli_inspect_uses_persistent_cache_for_unchanged_module_graph() {
             && first_stderr.contains("closkell cache write"),
         "first inspect did not report miss/write:\n{}",
         first_stderr
+    );
+    let root_cache = temp_dir.join(".closkell").join("cache").join("inspect");
+    let nested_cache = src_dir.join(".closkell");
+    assert!(
+        root_cache.is_dir(),
+        "inspect cache was not written under the project root"
+    );
+    assert!(
+        !nested_cache.exists(),
+        "inspect cache was scattered under the source folder"
+    );
+    let cache_files = fs::read_dir(&root_cache)
+        .expect("root inspect cache should be readable")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("root inspect cache entries should be readable");
+    assert_eq!(cache_files.len(), 1, "unexpected inspect cache files");
+    let cache_text =
+        fs::read_to_string(cache_files[0].path()).expect("inspect cache file should be readable");
+    assert!(
+        cache_text.starts_with("key=")
+            && !cache_text
+                .lines()
+                .next()
+                .unwrap_or("")
+                .starts_with("closkell-"),
+        "inspect cache still contains manual version header:\n{}",
+        cache_text
     );
     let first_stdout = String::from_utf8_lossy(&first.stdout);
     assert!(

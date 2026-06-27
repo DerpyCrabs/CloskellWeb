@@ -135,7 +135,7 @@ try {{
     throw new Error(`stale optimized runtime URL failed with ${{staleRuntimeResponse.status}}`);
   }}
   const staleRuntimeJs = await staleRuntimeResponse.text();
-  if (!staleRuntimeJs.includes("export function createDevtoolsOverlay")) {{
+  if (!staleRuntimeJs.includes("export function createBrowserCompiledHtmlTemplateComponent")) {{
     throw new Error(`stale optimized runtime URL did not serve the current runtime source:\n${{staleRuntimeJs.slice(0, 500)}}`);
   }}
 
@@ -152,7 +152,7 @@ try {{
     throw new Error(`inspect endpoint did not report the command schema: ${{JSON.stringify(report.commandLogSchema)}}`);
   }}
 
-  const generated = path.join(server.config.cacheDir, "closkell", "main.mjs");
+  const generated = path.join(root, ".closkell", "vite", "main.mjs");
   const runtime = path.join(root, "node_modules", "@closkell", "runtime", "src", "index.js");
   if (!existsSync(generated)) throw new Error("Vite plugin did not emit the generated app module");
   if (!existsSync(`${{generated}}.map`)) throw new Error("Vite plugin did not emit a source map");
@@ -261,7 +261,7 @@ try {{
     throw new Error(`unexpected Closkell module exports: ${{JSON.stringify({{ answer: mod.answer, next: mod.next, label: mod.label }})}}`);
   }}
 
-  const generated = path.join(server.config.cacheDir, "closkell", "math.mjs");
+  const generated = path.join(root, ".closkell", "vite", "math.mjs");
   if (!existsSync(generated)) throw new Error("plain JS import did not emit the generated Closkell module");
   if (!existsSync(`${{generated}}.map`)) throw new Error("plain JS import did not emit a source map");
 }} finally {{

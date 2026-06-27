@@ -126,6 +126,10 @@ class CloskellTestElement {
     event.target ||= this;
     event.currentTarget = this;
     for (const listener of [...(this.listeners[event.type] || [])]) listener(event);
+    if (event.bubbles !== false && !event.propagationStopped) {
+      const nextTarget = this.parentNode?.dispatchEvent ? this.parentNode : this.ownerDocument;
+      if (nextTarget?.dispatchEvent && nextTarget !== this) nextTarget.dispatchEvent(event);
+    }
     return !event.defaultPrevented;
   }
 
@@ -231,10 +235,16 @@ function parseTestHtmlFragment(value, documentRef) {
   const fragment = new CloskellTestDocumentFragment(documentRef);
   const stack = [fragment];
   const tokens = String(value ?? "").match(/<!--[\s\S]*?-->|<\/?[A-Za-z][^>]*>|[^<]+/g) || [];
-  for (const token of tokens) {
+  for (let tokenIndex = 0; tokenIndex < tokens.length; tokenIndex += 1) {
+    const token = tokens[tokenIndex];
     const parent = stack[stack.length - 1];
     if (token.startsWith("<!--")) {
-      parent.appendChild(new CloskellTestTextNode("", documentRef));
+      if (/^\s*$/.test(tokens[tokenIndex + 1] || "") && (tokens[tokenIndex + 2] || "").startsWith("<!--")) {
+        parent.appendChild(createRuntimeTextNode(documentRef, ""));
+        tokenIndex += 2;
+        continue;
+      }
+      parent.appendChild(createRuntimeTextNode(documentRef, ""));
       continue;
     }
     if (token.startsWith("</")) {
@@ -254,9 +264,13 @@ function parseTestHtmlFragment(value, documentRef) {
       if (!token.endsWith("/>") && !isTestVoidElement(tagName)) stack.push(node);
       continue;
     }
-    parent.appendChild(new CloskellTestTextNode(decodeTestHtml(token), documentRef));
+    parent.appendChild(createRuntimeTextNode(documentRef, decodeTestHtml(token)));
   }
   return fragment;
+}
+
+function createRuntimeTextNode(documentRef, value) {
+  return documentRef?.createTextNode ? documentRef.createTextNode(value) : new CloskellTestTextNode(value, documentRef);
 }
 
 function parseTestHtmlAttrs(value) {
@@ -285,6 +299,7 @@ function ensureRuntimeDocument() {
   if (globalThis.document?.createElement && globalThis.document?.createTextNode) {
     return globalThis.document;
   }
+  const listeners = {};
   const documentRef = {
     createElement(tagName) {
       const element = new CloskellTestElement(tagName, documentRef);
@@ -307,6 +322,19 @@ function ensureRuntimeDocument() {
     },
     querySelectorAll(selector) {
       return documentRef.body.querySelectorAll(selector);
+    },
+    addEventListener(type, listener) {
+      listeners[type] ||= [];
+      listeners[type].push(listener);
+    },
+    removeEventListener(type, listener) {
+      listeners[type] = (listeners[type] || []).filter((entry) => entry !== listener);
+    },
+    dispatchEvent(event) {
+      event.target ||= documentRef;
+      event.currentTarget = documentRef;
+      for (const listener of [...(listeners[event.type] || [])]) listener(event);
+      return !event.defaultPrevented;
     }
   };
   documentRef.body = new CloskellTestElement("body", documentRef);
@@ -587,16 +615,16 @@ export function createCompiledTemplateComponent(definition) {
     return instance;
   };
 
-  const disposeInstance = (current) => {
+  const disposeInstance = (current, detached = false) => {
     if (!current) return;
-    disposeEventSlots(current);
+    disposeEventSlots(current, detached);
     disposeRefs(current);
     for (const slot of current.keyedSlots) {
-      if (slot) for (const entry of slot.byKey.values()) disposeComponent(entry.component);
+      if (slot) for (const entry of slot.byKey.values()) disposeComponent(entry.component, detached);
     }
-    for (const slot of current.conditionalSlots) if (slot) disposeComponent(slot.component);
-    for (const slot of current.componentSlots) if (slot) disposeComponent(slot.component);
-    if (current.root?.parentNode?.removeChild) current.root.parentNode.removeChild(current.root);
+    for (const slot of current.conditionalSlots) if (slot) disposeComponent(slot.component, detached);
+    for (const slot of current.componentSlots) if (slot) disposeComponent(slot.component, detached);
+    if (!detached && current.root?.parentNode?.removeChild) current.root.parentNode.removeChild(current.root);
     current.mounted = false;
   };
 
@@ -617,8 +645,8 @@ export function createCompiledTemplateComponent(definition) {
       definition.update(current, lastDispatch, updateContext);
       return current.root;
     },
-    dispose() {
-      disposeInstance(instance);
+    dispose(detached = false) {
+      disposeInstance(instance, detached);
       instance = null;
     },
     get root() {
@@ -627,8 +655,7 @@ export function createCompiledTemplateComponent(definition) {
   };
 }
 
-export function createCompiledHtmlTemplateComponent(html, paths, update) {
-  const shape = compiledHtmlTemplateShape(html, paths);
+function createCompiledHtmlTemplateComponentFromShape(shape, update) {
   const cloneTemplate = shape.cloneTemplate;
   const nodePaths = shape.nodePaths;
   let instance = null;
@@ -651,16 +678,16 @@ export function createCompiledHtmlTemplateComponent(html, paths, update) {
     return instance;
   };
 
-  const disposeInstance = (current) => {
+  const disposeInstance = (current, detached = false) => {
     if (!current) return;
-    disposeEventSlots(current);
+    disposeEventSlots(current, detached);
     disposeRefs(current);
     for (const slot of current.keyedSlots) {
-      if (slot) for (const entry of slot.byKey.values()) disposeComponent(entry.component);
+      if (slot) for (const entry of slot.byKey.values()) disposeComponent(entry.component, detached);
     }
-    for (const slot of current.conditionalSlots) if (slot) disposeComponent(slot.component);
-    for (const slot of current.componentSlots) if (slot) disposeComponent(slot.component);
-    if (current.root?.parentNode?.removeChild) current.root.parentNode.removeChild(current.root);
+    for (const slot of current.conditionalSlots) if (slot) disposeComponent(slot.component, detached);
+    for (const slot of current.componentSlots) if (slot) disposeComponent(slot.component, detached);
+    if (!detached && current.root?.parentNode?.removeChild) current.root.parentNode.removeChild(current.root);
     current.mounted = false;
   };
 
@@ -681,8 +708,8 @@ export function createCompiledHtmlTemplateComponent(html, paths, update) {
       update(current, lastDispatch);
       return current.root;
     },
-    dispose() {
-      disposeInstance(instance);
+    dispose(detached = false) {
+      disposeInstance(instance, detached);
       instance = null;
     },
     get root() {
@@ -691,23 +718,74 @@ export function createCompiledHtmlTemplateComponent(html, paths, update) {
   };
 }
 
+export function createCompiledHtmlTemplateComponent(html, paths, update) {
+  return createCompiledHtmlTemplateComponentFromShape(compiledHtmlTemplateShape(html, paths), update);
+}
+
+export function createBrowserCompiledHtmlTemplateComponent(html, paths, update) {
+  return createCompiledHtmlTemplateComponentFromShape(browserCompiledHtmlTemplateShape(html, paths), update);
+}
+
 function createCompiledHtmlTemplateFactory(html) {
-  const template = document.createElement("template");
+  const documentRef = ensureRuntimeDocument();
+  const template = documentRef.createElement("template");
   template.innerHTML = html;
-  return () => template.content.firstChild.cloneNode(true);
+  if (template.content?.firstChild) {
+    return () => template.content.firstChild.cloneNode(true);
+  }
+  return () => parseTestHtmlFragment(html, documentRef).firstChild;
 }
 
 const compiledHtmlTemplateShapes = new Map();
+const browserCompiledHtmlTemplateShapes = new Map();
 
 function compiledHtmlTemplateShape(html, paths) {
-  const key = `${paths || ""}\u0000${html}`;
-  let shape = compiledHtmlTemplateShapes.get(key);
+  let byPaths = compiledHtmlTemplateShapes.get(html);
+  if (!byPaths) {
+    byPaths = new Map();
+    compiledHtmlTemplateShapes.set(html, byPaths);
+  }
+  const key = paths || "";
+  let shape = byPaths.get(key);
   if (!shape) {
     shape = {
       cloneTemplate: createCompiledHtmlTemplateFactory(html),
       nodePaths: paths ? paths.split(";").map(compiledHtmlTemplatePath) : []
     };
-    compiledHtmlTemplateShapes.set(key, shape);
+    byPaths.set(key, shape);
+  }
+  return shape;
+}
+
+function createBrowserCompiledHtmlTemplateFactory(html) {
+  const documentRef = browserRuntimeDocument();
+  const template = documentRef.createElement("template");
+  template.innerHTML = html;
+  return () => template.content.firstChild.cloneNode(true);
+}
+
+function browserRuntimeDocument() {
+  const documentRef = globalThis.document;
+  if (!documentRef?.createElement) {
+    throw new Error("Closkell browser app runtime requires a DOM document.");
+  }
+  return documentRef;
+}
+
+function browserCompiledHtmlTemplateShape(html, paths) {
+  let byPaths = browserCompiledHtmlTemplateShapes.get(html);
+  if (!byPaths) {
+    byPaths = new Map();
+    browserCompiledHtmlTemplateShapes.set(html, byPaths);
+  }
+  const key = paths || "";
+  let shape = byPaths.get(key);
+  if (!shape) {
+    shape = {
+      cloneTemplate: createBrowserCompiledHtmlTemplateFactory(html),
+      nodePaths: paths ? paths.split(";").map(compiledHtmlTemplatePath) : []
+    };
+    byPaths.set(key, shape);
   }
   return shape;
 }
@@ -716,7 +794,8 @@ function compiledHtmlTemplateNode(root, path) {
   if (path === null) return root;
   let node = root;
   for (let index = 0; index < path.length; index += 1) {
-    node = node.childNodes[path[index]];
+    const children = node.childNodes || node.children;
+    node = children[path[index]] ?? (children.length === 1 ? children[0] : undefined);
   }
   return node;
 }
@@ -741,8 +820,8 @@ export function bindCompiledComponent(component, arity, bind) {
         if (bind) bind(value, dispatch);
         return component.update(dispatch);
       },
-      dispose() {
-        component.dispose();
+      dispose(detached = false) {
+        component.dispose(detached);
       },
       get root() {
         return component.root;
@@ -759,8 +838,8 @@ export function bindCompiledComponent(component, arity, bind) {
         if (bind) bind(value, index, dispatch);
         return component.update(dispatch);
       },
-      dispose() {
-        component.dispose();
+      dispose(detached = false) {
+        component.dispose(detached);
       },
       get root() {
         return component.root;
@@ -774,10 +853,10 @@ export function bindCompiledComponent(component, arity, bind) {
     },
     update(...args) {
       if (bind) bind(...args);
-      return component.update(args[arity]);
+      return component.update(args[args.length - 1]);
     },
-    dispose() {
-      component.dispose();
+    dispose(detached = false) {
+      component.dispose(detached);
     },
     get root() {
       return component.root;
@@ -1246,9 +1325,15 @@ export function setEvent(instance, slot, node, eventName, messageForEvent, dispa
 export function setCompiledEvent(instance, slot, node, eventName, messageForEvent, dispatch) {
   let current = instance.eventSlots[slot];
   if (current) {
-    current.messageForEvent = messageForEvent;
-    current.dispatch = dispatch;
-    return;
+    if (current.node !== node || current.eventName !== eventName) {
+      if (current.delegated) removeDelegatedCompiledEventSlot(current);
+      else current.node?.removeEventListener?.(current.eventName, current.listener);
+      current = null;
+    } else {
+      current.messageForEvent = messageForEvent;
+      current.dispatch = dispatch;
+      return;
+    }
   }
 
   if (canDelegateCompiledEvent(eventName)) {
@@ -1282,7 +1367,7 @@ const delegatedCompiledEventListeners = new Map();
 const delegatedCompiledEventSlots = new WeakMap();
 
 function canDelegateCompiledEvent(eventName) {
-  return delegatedCompiledEvents.has(eventName) && typeof document !== "undefined";
+  return delegatedCompiledEvents.has(eventName) && typeof document !== "undefined" && typeof document.addEventListener === "function";
 }
 
 function setDelegatedCompiledEventSlot(node, eventName, current) {
@@ -1314,7 +1399,7 @@ function dispatchDelegatedCompiledEvent(eventName, event) {
 
   while (node && node !== document) {
     const current = delegatedCompiledEventSlots.get(node)?.get(eventName);
-    if (current) {
+    if (current && !current.disposed) {
       dispatchTemplateEventResult(current.messageForEvent(delegatedCompiledEvent(event, node)), event, current.dispatch);
       if (event.cancelBubble) return;
     }
@@ -1384,8 +1469,13 @@ export function setKeyedList(instance, slot, marker, items, keyForItem, renderIt
   const parent = marker.parentNode;
   if (!parent) return;
 
-  const current = instance.keyedSlots[slot] || { byKey: new Map(), duplicateKeys: new Map() };
-  if (!current.duplicateKeys) current.duplicateKeys = new Map();
+  const current = instance.keyedSlots[slot] || { byKey: new Map(), duplicateKeys: new Map(), entries: [] };
+  normalizeCompiledKeyedSlot(current);
+  if (items.length === 0) {
+    clearKeyedEntries(parent, marker, current);
+    instance.keyedSlots[slot] = current;
+    return;
+  }
   const slotMetadata = itemName ? null : instance.definition?.slots?.[slot] || {};
   const keyedKind = slotMetadata?.kind || {};
   itemName ||= typeof keyedKind.keyed === "string" ? keyedKind.keyed : null;
@@ -1449,6 +1539,25 @@ export function setCompiledKeyedList(instance, slot, marker, items, keyForItem, 
 
   const current = instance.keyedSlots[slot] || { byKey: new Map(), duplicateKeys: new Map() };
   if (!current.duplicateKeys) current.duplicateKeys = new Map();
+  if (items.length === 0) {
+    clearKeyedEntries(parent, marker, current);
+    instance.keyedSlots[slot] = current;
+    return;
+  }
+  if (
+    current.duplicateKeys.size === 0 &&
+    updateCompiledKeyedListSameOrder(current, items, keyForItem, dispatch, stableItemUpdate)
+  ) {
+    instance.keyedSlots[slot] = current;
+    return;
+  }
+  if (
+    current.duplicateKeys.size === 0 &&
+    updateCompiledKeyedListSameSequence(current, parent, marker, items, keyForItem, renderItem, dispatch, stableItemUpdate)
+  ) {
+    instance.keyedSlots[slot] = current;
+    return;
+  }
   if (
     current.duplicateKeys.size === 0 &&
     setCompiledKeyedListUnique(current, parent, marker, items, keyForItem, renderItem, dispatch, stableItemUpdate)
@@ -1461,11 +1570,125 @@ export function setCompiledKeyedList(instance, slot, marker, items, keyForItem, 
   instance.keyedSlots[slot] = current;
 }
 
+function updateCompiledKeyedListSameOrder(current, items, keyForItem, dispatch, stableItemUpdate) {
+  if (current.byKey.size !== items.length || current.byKey.size === 0) return false;
+
+  let index = 0;
+  for (const entry of current.entries) {
+    if (!sameMapKey(entry.key, keyForItem(items[index], index))) return false;
+    index += 1;
+  }
+
+  index = 0;
+  for (const entry of current.entries) {
+    const item = items[index];
+    if (!canSkipCompiledKeyedEntry(entry, item, index, dispatch, stableItemUpdate)) {
+      updateCompiledKeyedEntry(entry, item, index, dispatch);
+      entry.dispatch = dispatch;
+    }
+    entry.item = item;
+    entry.index = index;
+    index += 1;
+  }
+  return true;
+}
+
+function updateCompiledKeyedListSameSequence(current, parent, marker, items, keyForItem, renderItem, dispatch, stableItemUpdate) {
+  const currentSize = current.byKey.size;
+  if (currentSize === 0 || currentSize === items.length) return false;
+
+  if (items.length > currentSize) {
+    let index = 0;
+    for (const entry of current.entries) {
+      if (!sameMapKey(entry.key, keyForItem(items[index], index))) return false;
+      index += 1;
+    }
+
+    const nextByKey = new Map(current.byKey);
+    const appendedEntries = [];
+    for (; index < items.length; index += 1) {
+      const item = items[index];
+      const key = keyForItem(item, index);
+      if (nextByKey.has(key)) {
+        disposeNewKeyedEntries(appendedEntries);
+        return false;
+      }
+      const component = renderItem(item, index);
+      const entry = { key, component, arity: compiledComponentArity(component), item, index, oldIndex: -1 };
+      appendedEntries.push(entry);
+      nextByKey.set(key, entry);
+    }
+
+    index = 0;
+    for (const entry of current.entries) {
+      const item = items[index];
+      if (!canSkipCompiledKeyedEntry(entry, item, index, dispatch, stableItemUpdate)) {
+        updateCompiledKeyedEntry(entry, item, index, dispatch);
+        entry.dispatch = dispatch;
+      }
+      entry.item = item;
+      entry.index = index;
+      index += 1;
+    }
+    for (const entry of appendedEntries) {
+      updateCompiledKeyedEntry(entry, entry.item, entry.index, dispatch);
+      entry.dispatch = dispatch;
+    }
+    insertKeyedEntries(parent, marker, appendedEntries);
+
+    current.byKey = nextByKey;
+    current.duplicateKeys = new Map();
+    current.entries = current.entries.concat(appendedEntries);
+    return true;
+  }
+
+  let index = 0;
+  const removed = [];
+  const nextByKey = new Map();
+  const nextEntries = [];
+  for (const entry of current.entries) {
+    if (index < items.length && sameMapKey(entry.key, keyForItem(items[index], index))) {
+      nextByKey.set(entry.key, entry);
+      nextEntries.push(entry);
+      index += 1;
+    } else {
+      removed.push(entry);
+    }
+  }
+  if (index !== items.length) return false;
+
+  const removedEntries = removed.length > 0 ? new Set(removed) : null;
+  index = 0;
+  for (const entry of current.entries) {
+    if (removedEntries?.has(entry)) continue;
+    const item = items[index];
+    if (!canSkipCompiledKeyedEntry(entry, item, index, dispatch, stableItemUpdate)) {
+      updateCompiledKeyedEntry(entry, item, index, dispatch);
+      entry.dispatch = dispatch;
+    }
+    entry.item = item;
+    entry.index = index;
+    index += 1;
+  }
+  for (const entry of removed) {
+    if (entry.component.root?.parentNode?.removeChild) {
+      entry.component.root.parentNode.removeChild(entry.component.root);
+    }
+    disposeComponent(entry.component);
+  }
+
+  current.byKey = nextByKey;
+  current.duplicateKeys = new Map();
+  current.entries = nextEntries;
+  return true;
+}
+
 function setCompiledKeyedListUnique(current, parent, marker, items, keyForItem, renderItem, dispatch, stableItemUpdate) {
   const nextByKey = new Map();
   const orderedEntries = [];
   let needsReorder = false;
   let lastOldIndex = -1;
+  let reusedEntries = 0;
 
   let index = 0;
   for (const item of items) {
@@ -1481,6 +1704,7 @@ function setCompiledKeyedListUnique(current, parent, marker, items, keyForItem, 
       needsReorder = true;
     } else {
       entry.oldIndex = entry.index;
+      reusedEntries += 1;
       if (entry.oldIndex < lastOldIndex) needsReorder = true;
       lastOldIndex = entry.oldIndex;
     }
@@ -1495,7 +1719,13 @@ function setCompiledKeyedListUnique(current, parent, marker, items, keyForItem, 
     index += 1;
   }
 
-  if (needsReorder) reorderKeyedEntries(parent, marker, orderedEntries);
+  if (current.byKey.size > 0 && reusedEntries === 0) {
+    clearKeyedEntries(parent, marker, current);
+    needsReorder = true;
+  }
+
+  if (reusedEntries === 0) insertKeyedEntries(parent, marker, orderedEntries);
+  else if (needsReorder) reorderKeyedEntries(parent, marker, orderedEntries);
 
   for (const [key, entry] of current.byKey) {
     if (!nextByKey.has(key)) {
@@ -1508,6 +1738,7 @@ function setCompiledKeyedListUnique(current, parent, marker, items, keyForItem, 
 
   current.byKey = nextByKey;
   current.duplicateKeys = new Map();
+  current.entries = orderedEntries;
   return true;
 }
 
@@ -1518,6 +1749,7 @@ function setCompiledKeyedListWithDuplicates(current, parent, marker, items, keyF
   const orderedEntries = [];
   let needsReorder = false;
   let lastOldIndex = -1;
+  let reusedEntries = 0;
 
   let index = 0;
   for (const item of items) {
@@ -1532,6 +1764,7 @@ function setCompiledKeyedListWithDuplicates(current, parent, marker, items, keyF
       needsReorder = true;
     } else {
       entry.oldIndex = entry.index;
+      reusedEntries += 1;
       if (entry.oldIndex < lastOldIndex) needsReorder = true;
       lastOldIndex = entry.oldIndex;
     }
@@ -1546,7 +1779,13 @@ function setCompiledKeyedListWithDuplicates(current, parent, marker, items, keyF
     index += 1;
   }
 
-  if (needsReorder) reorderKeyedEntries(parent, marker, orderedEntries);
+  if (current.byKey.size > 0 && reusedEntries === 0) {
+    clearKeyedEntries(parent, marker, current);
+    needsReorder = true;
+  }
+
+  if (reusedEntries === 0) insertKeyedEntries(parent, marker, orderedEntries);
+  else if (needsReorder) reorderKeyedEntries(parent, marker, orderedEntries);
 
   for (const [key, entry] of current.byKey) {
     if (!nextByKey.has(key)) {
@@ -1559,6 +1798,46 @@ function setCompiledKeyedListWithDuplicates(current, parent, marker, items, keyF
 
   current.byKey = nextByKey;
   current.duplicateKeys = nextDuplicateKeys;
+  current.entries = orderedEntries;
+}
+
+function clearKeyedEntries(parent, marker, current) {
+  if (current.byKey.size === 0) {
+    current.duplicateKeys = new Map();
+    return;
+  }
+
+  let firstRoot = null;
+  for (const entry of current.entries) {
+    const root = entry.component.root;
+    if (root?.parentNode === parent) {
+      firstRoot = root;
+      break;
+    }
+  }
+
+  let detached = false;
+  const documentRef = parent.ownerDocument || (typeof document !== "undefined" ? document : null);
+  if (firstRoot && documentRef?.createRange) {
+    const range = documentRef.createRange();
+    range.setStartBefore(firstRoot);
+    range.setEndBefore(marker);
+    range.deleteContents();
+    detached = true;
+  }
+
+  for (const entry of current.entries) {
+    if (detached && canDropDetachedComponent(entry.component)) continue;
+    disposeComponent(entry.component, detached);
+  }
+  current.byKey = new Map();
+  current.duplicateKeys = new Map();
+  current.entries = [];
+}
+
+function normalizeCompiledKeyedSlot(current) {
+  if (!current.duplicateKeys) current.duplicateKeys = new Map();
+  if (!Array.isArray(current.entries)) current.entries = Array.from(current.byKey.values());
 }
 
 function disposeNewKeyedEntries(entries) {
@@ -1567,7 +1846,21 @@ function disposeNewKeyedEntries(entries) {
   }
 }
 
+function insertKeyedEntries(parent, marker, entries) {
+  if (entries.length === 0) return;
+  const documentRef = parent.ownerDocument || (typeof document !== "undefined" ? document : null);
+  if (!documentRef?.createDocumentFragment || entries.length === 1) {
+    for (const entry of entries) parent.insertBefore(entry.component.root, marker);
+    return;
+  }
+  const fragment = documentRef.createDocumentFragment();
+  for (const entry of entries) fragment.appendChild(entry.component.root);
+  parent.insertBefore(fragment, marker);
+}
+
 function reorderKeyedEntries(parent, marker, orderedEntries) {
+  if (reorderTwoMovedKeyedEntries(parent, orderedEntries)) return;
+
   const previousIndexes = orderedEntries.map((entry) => entry.oldIndex ?? -1);
   const stableIndexes = longestIncreasingSubsequenceIndexes(previousIndexes);
   let stableCursor = stableIndexes.length - 1;
@@ -1585,6 +1878,34 @@ function reorderKeyedEntries(parent, marker, orderedEntries) {
     }
     cursor = root;
   }
+}
+
+function reorderTwoMovedKeyedEntries(parent, orderedEntries) {
+  let first = -1;
+  let second = -1;
+  for (let index = 0; index < orderedEntries.length; index += 1) {
+    const oldIndex = orderedEntries[index].oldIndex ?? -1;
+    if (oldIndex === index) continue;
+    if (oldIndex < 0) return false;
+    if (first < 0) first = index;
+    else if (second < 0) second = index;
+    else return false;
+  }
+
+  if (first < 0) return true;
+  if (second < 0) return false;
+  const firstEntry = orderedEntries[first];
+  const secondEntry = orderedEntries[second];
+  if (firstEntry.oldIndex !== second || secondEntry.oldIndex !== first) return false;
+
+  const firstRoot = firstEntry.component.root;
+  const secondRoot = secondEntry.component.root;
+  if (firstRoot?.parentNode !== parent || secondRoot?.parentNode !== parent) return false;
+
+  const afterFirstRoot = firstRoot.nextSibling;
+  parent.insertBefore(firstRoot, secondRoot);
+  parent.insertBefore(secondRoot, afterFirstRoot);
+  return true;
 }
 
 function longestIncreasingSubsequenceIndexes(values) {
@@ -1613,6 +1934,10 @@ function longestIncreasingSubsequenceIndexes(values) {
     cursor = predecessors[cursor];
   }
   return result;
+}
+
+function sameMapKey(left, right) {
+  return left === right || (left !== left && right !== right);
 }
 
 function duplicateStorageKey(current, nextDuplicateKeys, rawKey, occurrence) {
@@ -1653,7 +1978,7 @@ function compiledEntryArity(entry) {
 }
 
 function compiledComponentArity(component) {
-  return component?.__closkellArity ?? (component?.update?.length >= 4 ? 2 : 1);
+  return component?.__closkellArity ?? 0;
 }
 
 function keyedItemUpdateContext(updateContext, itemName, indexName, previousItem, nextItem, previousIndex, nextIndex) {
@@ -1795,18 +2120,25 @@ export function setCompiledComponent(instance, slot, marker, render, args, dispa
   if (!parent) return;
 
   const current = instance.componentSlots[slot] || {};
-  if (!current.component || current.renderKey !== expectedKey) {
+  const currentArity = compiledComponentArity(current.component);
+  const shouldRecreate =
+    !current.component ||
+    current.renderKey !== expectedKey ||
+    (args.length > 0 && currentArity === 0 && !sameCompiledComponentArgs(current.args, args));
+  if (shouldRecreate) {
     if (current.component?.root?.parentNode) {
       current.component.root.parentNode.removeChild(current.component.root);
     }
     disposeComponent(current.component);
     current.component = render();
     current.renderKey = expectedKey;
+    current.args = args.slice();
   }
 
   if (current.component) {
-    if (args.length) {
-      current.component.update(...args, dispatch);
+    const arity = compiledComponentArity(current.component);
+    if (arity > 0) {
+      current.component.update(...args.slice(0, arity), dispatch);
     } else {
       current.component.update(dispatch);
     }
@@ -1818,6 +2150,14 @@ export function setCompiledComponent(instance, slot, marker, render, args, dispa
   instance.componentSlots[slot] = current;
 }
 
+function sameCompiledComponentArgs(previous = [], next = []) {
+  if (previous.length !== next.length) return false;
+  for (let index = 0; index < next.length; index += 1) {
+    if (!Object.is(previous[index], next[index])) return false;
+  }
+  return true;
+}
+
 function componentRenderKey(component) {
   return component?.definition?.name || null;
 }
@@ -1827,8 +2167,24 @@ function componentParams(component) {
   return Array.isArray(params) ? params : [];
 }
 
-function disposeComponent(component) {
-  if (component) component.dispose();
+function disposeComponent(component, detached = false) {
+  if (!component) return;
+  component.dispose(detached);
+}
+
+function canDropDetachedComponent(component) {
+  const instance = component?.__closkellInstance;
+  if (!instance) return false;
+  return (
+    slotsEmpty(instance.refSlots) &&
+    slotsEmpty(instance.keyedSlots) &&
+    slotsEmpty(instance.conditionalSlots) &&
+    slotsEmpty(instance.componentSlots)
+  );
+}
+
+function slotsEmpty(slots) {
+  return !Array.isArray(slots) || slots.every((slot) => !slot);
 }
 
 function componentUpdateContext(updateContext, params, previousArgs = [], nextArgs = []) {
@@ -1842,11 +2198,19 @@ function componentUpdateContext(updateContext, params, previousArgs = [], nextAr
   return localUpdateContext(updateContext, localChangedPaths, params);
 }
 
-function disposeEventSlots(instance) {
+function disposeEventSlots(instance, detached = false) {
   for (const current of instance.eventSlots) {
     if (!current) continue;
-    if (current.delegated) removeDelegatedCompiledEventSlot(current);
-    else current.node.removeEventListener(current.eventName, current.listener);
+    if (current.delegated) {
+      if (detached) {
+        current.disposed = true;
+        current.messageForEvent = null;
+        current.dispatch = null;
+      } else {
+        removeDelegatedCompiledEventSlot(current);
+      }
+    }
+    else current.node?.removeEventListener?.(current.eventName, current.listener);
   }
   instance.eventSlots = [];
 }
@@ -4628,10 +4992,11 @@ export function startCompiledApp(options = {}) {
   }
 
   function stopCommand(subscription) {
-    return { kind: subscription.s, id: subscription.id };
+    return compiledStopCommandForSubscription(subscription);
   }
 
-  function runSubscription(command, active) {
+  function runSubscription(subscription, active) {
+    const command = compiledStartCommandForSubscription(subscription);
     const handler = handlers[command.kind];
     settle(command, () => handler(command, dispatch), active);
   }
@@ -4646,7 +5011,7 @@ export function startCompiledApp(options = {}) {
     for (const [key, active] of Array.from(activeSubscriptions.entries())) {
       const next = nextByKey.get(key);
       if (next && next.signature === active.signature) continue;
-      runSubscription(stopCommand(active.subscription), () => false);
+      runCommand(stopCommand(active.subscription), () => false);
       activeSubscriptions.delete(key);
     }
     for (const [key, next] of nextByKey.entries()) {
@@ -4654,6 +5019,12 @@ export function startCompiledApp(options = {}) {
       activeSubscriptions.set(key, next);
       runSubscription(next.subscription, isActive);
     }
+  }
+
+  function runCommand(command, active) {
+    if (!command) return;
+    const handler = handlers[command.kind];
+    settle(command, () => handler(command, dispatch), active);
   }
 
   return {
@@ -4675,7 +5046,7 @@ export function startCompiledApp(options = {}) {
       if (disposed) return;
       disposed = true;
       for (const active of activeSubscriptions.values()) {
-        runSubscription(stopCommand(active.subscription), () => false);
+        runCommand(stopCommand(active.subscription), () => false);
       }
       activeSubscriptions.clear();
       handlers.dispose?.();

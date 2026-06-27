@@ -46,7 +46,6 @@ const entries = [
 
 test.beforeEach(async ({ page }) => {
   await page.addInitScript(({ zonesPayload, entriesPayload }) => {
-    window.__CLOSKELL_ENV__ = { DEV: true };
     localStorage.setItem(
       "heartRateExercise.zones.v1",
       JSON.stringify({ zones: zonesPayload, targetZoneId: 3 })

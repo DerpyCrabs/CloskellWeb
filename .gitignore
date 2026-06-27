@@ -1,6 +1,8 @@
 /target/
 **/*.rs.bk
 runtime-js/node_modules/
+projects/*/.closkell
+projects/*/.closkell/
 hrweb/node_modules/
 hrweb/dist/
 hrweb/.closkell/

@@ -464,6 +464,7 @@ struct BuildArtifact {
     source_map: Option<PathBuf>,
     bytes: u64,
     runtime_effects: BTreeSet<String>,
+    runtime_exports: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -578,25 +579,12 @@ fn parse_app_options(args: &[String]) -> Result<Option<AppOptions>, String> {
 
 fn emit_options_from_env() -> js_backend::EmitOptions {
     js_backend::EmitOptions {
-        env_dev: env::var("CLOSKELL_ENV_DEV")
-            .ok()
-            .and_then(|value| parse_env_bool(&value)),
-        env_mode: env::var("CLOSKELL_ENV_MODE")
-            .ok()
-            .filter(|value| !value.is_empty()),
         reachable_message_kinds: None,
         message_field_reads: BTreeMap::new(),
         static_reads: BTreeMap::new(),
         direct_call_replacements: BTreeMap::new(),
         prelude_code: String::new(),
-    }
-}
-
-fn parse_env_bool(value: &str) -> Option<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
-        _ => None,
+        browser_app_runtime: false,
     }
 }
 
@@ -1007,6 +995,13 @@ function runThrowsAssertion(thunk, expected) {
 }
 
 fn copy_runtime_package(temp_dir: &Path) -> Result<(), String> {
+    copy_runtime_package_with_exports(temp_dir, None)
+}
+
+fn copy_runtime_package_with_exports(
+    temp_dir: &Path,
+    required_exports: Option<&BTreeSet<String>>,
+) -> Result<(), String> {
     let package_dir = temp_dir
         .join("node_modules")
         .join("@closkell")
@@ -1023,10 +1018,18 @@ fn copy_runtime_package(temp_dir: &Path) -> Result<(), String> {
         &source_dir.join("package.json"),
         &package_dir.join("package.json"),
     )?;
-    copy_runtime_file(
-        &source_dir.join("src").join("index.js"),
-        &package_dir.join("src").join("index.js"),
-    )
+    let source_entry = source_dir.join("src").join("index.js");
+    let target_entry = package_dir.join("src").join("index.js");
+    if let Some(required_exports) = required_exports {
+        let source = fs::read_to_string(&source_entry)
+            .map_err(|err| format!("failed to read {}: {}", source_entry.display(), err))?;
+        let tailored = tailored_runtime_source(&source, required_exports)?;
+        fs::write(&target_entry, tailored)
+            .map_err(|err| format!("failed to write {}: {}", target_entry.display(), err))?;
+        Ok(())
+    } else {
+        copy_runtime_file(&source_entry, &target_entry)
+    }
 }
 
 fn copy_runtime_file(source: &Path, target: &Path) -> Result<(), String> {
@@ -1443,6 +1446,1317 @@ fn check_file_inner(
     })
 }
 
+#[derive(Clone, Debug)]
+struct RuntimeChunk {
+    name: String,
+    code: String,
+}
+
+fn collect_runtime_import_exports(code: &str) -> BTreeSet<String> {
+    let mut exports = BTreeSet::new();
+    let runtime_from = "from \"@closkell/runtime\"";
+    let mut search_start = 0;
+    while let Some(relative_from) = code[search_start..].find(runtime_from) {
+        let from_index = search_start + relative_from;
+        let Some(import_index) = code[..from_index].rfind("import") else {
+            search_start = from_index + runtime_from.len();
+            continue;
+        };
+        let import_clause = &code[import_index..from_index];
+        let Some(open_brace) = import_clause.find('{') else {
+            search_start = from_index + runtime_from.len();
+            continue;
+        };
+        let Some(close_brace) = import_clause.rfind('}') else {
+            search_start = from_index + runtime_from.len();
+            continue;
+        };
+        if close_brace <= open_brace {
+            search_start = from_index + runtime_from.len();
+            continue;
+        }
+        for part in import_clause[open_brace + 1..close_brace].split(',') {
+            let name = part.trim().split_whitespace().next().unwrap_or("");
+            if is_js_identifier(name) {
+                exports.insert(name.to_string());
+            }
+        }
+        search_start = from_index + runtime_from.len();
+    }
+    exports
+}
+
+fn tailored_runtime_source(
+    runtime_source: &str,
+    required_exports: &BTreeSet<String>,
+) -> Result<String, String> {
+    if required_exports.is_empty() {
+        return Ok("\n".to_string());
+    }
+    let chunks = runtime_chunks(runtime_source);
+    let chunk_by_name = chunks
+        .iter()
+        .map(|chunk| (chunk.name.clone(), chunk))
+        .collect::<HashMap<_, _>>();
+    let declarations = chunk_by_name.keys().cloned().collect::<BTreeSet<_>>();
+
+    let mut included = BTreeSet::new();
+    let mut pending = required_exports.iter().cloned().collect::<Vec<_>>();
+    while let Some(name) = pending.pop() {
+        if !included.insert(name.clone()) {
+            continue;
+        }
+        let Some(chunk) = chunk_by_name.get(&name) else {
+            return Err(format!(
+                "runtime export `{}` was requested but no declaration was found",
+                name
+            ));
+        };
+        let mut dependencies = runtime_chunk_referenced_dependencies(chunk, &declarations);
+        dependencies.extend(
+            runtime_chunk_declared_dependencies(&chunk.name)
+                .iter()
+                .map(|dependency| (*dependency).to_string()),
+        );
+        for dependency in dependencies {
+            if !declarations.contains(&dependency) {
+                return Err(format!(
+                    "runtime chunk `{}` depends on missing declaration `{}`",
+                    chunk.name, dependency
+                ));
+            }
+            if !included.contains(&dependency) {
+                pending.push(dependency);
+            }
+        }
+    }
+
+    let mut output = String::new();
+    for chunk in chunks {
+        if !included.contains(&chunk.name) {
+            continue;
+        }
+        output.push_str(&chunk.code);
+        if !output.ends_with('\n') {
+            output.push('\n');
+        }
+    }
+    Ok(output)
+}
+
+fn runtime_chunk_referenced_dependencies(
+    chunk: &RuntimeChunk,
+    declarations: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut dependencies = BTreeSet::new();
+    let code = strip_js_strings_and_comments(&chunk.code);
+    let local_bindings = runtime_chunk_local_bindings(&code);
+    let mut chars = code.char_indices().peekable();
+    while let Some((start, ch)) = chars.next() {
+        if !is_js_identifier_start(ch) {
+            continue;
+        }
+
+        let mut end = start + ch.len_utf8();
+        while let Some((next_start, next)) = chars.peek().copied() {
+            if !is_js_identifier_continue(next) {
+                break;
+            }
+            chars.next();
+            end = next_start + next.len_utf8();
+        }
+
+        let name = &code[start..end];
+        if name == chunk.name {
+            continue;
+        }
+        if local_bindings.contains(name) {
+            continue;
+        }
+        if declarations.contains(name)
+            && previous_non_ws(&code, start) != Some('.')
+            && next_non_ws(&code, end) != Some(':')
+        {
+            dependencies.insert(name.to_string());
+        }
+    }
+    dependencies
+}
+
+fn runtime_chunk_local_bindings(code: &str) -> BTreeSet<String> {
+    let mut bindings = BTreeSet::new();
+    let mut cursor = 0;
+    while cursor < code.len() {
+        let Some((start, word, end)) = next_js_identifier(code, cursor) else {
+            break;
+        };
+        match word {
+            "const" | "let" | "var" => collect_js_declaration_bindings(code, end, &mut bindings),
+            "function" => {
+                if let Some((_, name, name_end)) = next_js_identifier(code, end) {
+                    bindings.insert(name.to_string());
+                    collect_js_function_params(code, name_end, &mut bindings);
+                }
+            }
+            "class" => {
+                if let Some((_, name, _)) = next_js_identifier(code, end) {
+                    bindings.insert(name.to_string());
+                }
+            }
+            _ => {}
+        }
+        cursor = start + word.len();
+        if cursor <= start {
+            cursor = end;
+        }
+    }
+    bindings
+}
+
+fn collect_js_declaration_bindings(code: &str, start: usize, bindings: &mut BTreeSet<String>) {
+    let mut index = start;
+    let mut expect_binding = true;
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    while index < code.len() {
+        let Some((offset, ch)) = code[index..].char_indices().next() else {
+            break;
+        };
+        let pos = index + offset;
+        if expect_binding {
+            if ch.is_ascii_whitespace() || ch == ',' {
+                index = pos + ch.len_utf8();
+                continue;
+            }
+            if ch == '{' || ch == '[' {
+                if let Some(end) = matching_js_delimiter(code, pos, ch) {
+                    collect_js_pattern_bindings(&code[pos + 1..end], bindings);
+                    index = end + 1;
+                    expect_binding = false;
+                    continue;
+                }
+            }
+            if is_js_identifier_start(ch) {
+                let (_, name, end) = read_js_identifier(code, pos);
+                bindings.insert(name.to_string());
+                index = end;
+                expect_binding = false;
+                continue;
+            }
+        }
+        match ch {
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '{' => brace_depth += 1,
+            '}' => brace_depth = brace_depth.saturating_sub(1),
+            ',' if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => {
+                expect_binding = true
+            }
+            ';' if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => break,
+            _ => {}
+        }
+        index = pos + ch.len_utf8();
+    }
+}
+
+fn collect_js_function_params(code: &str, after_name: usize, bindings: &mut BTreeSet<String>) {
+    let Some(open) = code[after_name..]
+        .find('(')
+        .map(|offset| after_name + offset)
+    else {
+        return;
+    };
+    let Some(close) = matching_js_delimiter(code, open, '(') else {
+        return;
+    };
+    collect_js_pattern_bindings(&code[open + 1..close], bindings);
+}
+
+fn collect_js_pattern_bindings(pattern: &str, bindings: &mut BTreeSet<String>) {
+    let mut cursor = 0;
+    while let Some((_, name, end)) = next_js_identifier(pattern, cursor) {
+        if !is_js_reserved_word(name) {
+            bindings.insert(name.to_string());
+        }
+        cursor = end;
+    }
+}
+
+fn matching_js_delimiter(code: &str, open: usize, delimiter: char) -> Option<usize> {
+    let close = match delimiter {
+        '(' => ')',
+        '[' => ']',
+        '{' => '}',
+        _ => return None,
+    };
+    let mut depth = 0usize;
+    for (offset, ch) in code[open..].char_indices() {
+        let pos = open + offset;
+        if ch == delimiter {
+            depth += 1;
+        } else if ch == close {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                return Some(pos);
+            }
+        }
+    }
+    None
+}
+
+fn next_js_identifier(source: &str, start: usize) -> Option<(usize, &str, usize)> {
+    let mut cursor = start;
+    while cursor < source.len() {
+        let Some((offset, ch)) = source[cursor..].char_indices().next() else {
+            break;
+        };
+        let pos = cursor + offset;
+        if is_js_identifier_start(ch) {
+            let (start, name, end) = read_js_identifier(source, pos);
+            return Some((start, name, end));
+        }
+        cursor = pos + ch.len_utf8();
+    }
+    None
+}
+
+fn read_js_identifier(source: &str, start: usize) -> (usize, &str, usize) {
+    let mut end = start;
+    for (offset, ch) in source[start..].char_indices() {
+        let pos = start + offset;
+        if offset == 0 {
+            end = pos + ch.len_utf8();
+            continue;
+        }
+        if !is_js_identifier_continue(ch) {
+            return (start, &source[start..pos], pos);
+        }
+        end = pos + ch.len_utf8();
+    }
+    (start, &source[start..end], end)
+}
+
+fn is_js_reserved_word(name: &str) -> bool {
+    matches!(
+        name,
+        "as" | "async"
+            | "await"
+            | "break"
+            | "case"
+            | "catch"
+            | "class"
+            | "const"
+            | "continue"
+            | "default"
+            | "delete"
+            | "do"
+            | "else"
+            | "export"
+            | "extends"
+            | "false"
+            | "finally"
+            | "for"
+            | "from"
+            | "function"
+            | "if"
+            | "import"
+            | "in"
+            | "instanceof"
+            | "let"
+            | "new"
+            | "null"
+            | "return"
+            | "static"
+            | "super"
+            | "switch"
+            | "this"
+            | "throw"
+            | "true"
+            | "try"
+            | "typeof"
+            | "undefined"
+            | "var"
+            | "void"
+            | "while"
+            | "with"
+            | "yield"
+    )
+}
+
+fn strip_js_strings_and_comments(source: &str) -> String {
+    let mut output = String::with_capacity(source.len());
+    let mut chars = source.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' | '\'' | '`' => {
+                let quote = ch;
+                output.push(' ');
+                let mut escaped = false;
+                for next in chars.by_ref() {
+                    output.push(if next == '\n' { '\n' } else { ' ' });
+                    if escaped {
+                        escaped = false;
+                    } else if next == '\\' {
+                        escaped = true;
+                    } else if next == quote {
+                        break;
+                    }
+                }
+            }
+            '/' if chars.peek() == Some(&'/') => {
+                output.push(' ');
+                output.push(' ');
+                chars.next();
+                for next in chars.by_ref() {
+                    if next == '\n' {
+                        output.push('\n');
+                        break;
+                    }
+                    output.push(' ');
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                output.push(' ');
+                output.push(' ');
+                chars.next();
+                let mut previous = '\0';
+                for next in chars.by_ref() {
+                    output.push(if next == '\n' { '\n' } else { ' ' });
+                    if previous == '*' && next == '/' {
+                        break;
+                    }
+                    previous = next;
+                }
+            }
+            _ => output.push(ch),
+        }
+    }
+    output
+}
+
+fn previous_non_ws(source: &str, before: usize) -> Option<char> {
+    source[..before]
+        .chars()
+        .rev()
+        .find(|ch| !ch.is_ascii_whitespace())
+}
+
+fn next_non_ws(source: &str, after: usize) -> Option<char> {
+    source[after..].chars().find(|ch| !ch.is_ascii_whitespace())
+}
+
+fn runtime_chunk_declared_dependencies(name: &str) -> &'static [&'static str] {
+    match name {
+        "CloskellTestTextNode" => &["siblingForNode"],
+        "CloskellTestElement" => &[
+            "CloskellTestStyle",
+            "CloskellTestTextNode",
+            "createTestEvent",
+            "parseTestHtmlFragment",
+            "querySelectorAllFrom",
+            "selectorMatchesNode",
+            "serializeTestNode",
+            "siblingForNode",
+            "style",
+        ],
+        "CloskellTestDocumentFragment" => &["CloskellTestElement"],
+        "parseTestHtmlFragment" => &[
+            "CloskellTestDocumentFragment",
+            "CloskellTestTextNode",
+            "createRuntimeTextNode",
+            "decodeTestHtml",
+            "isTestVoidElement",
+            "parseTestHtmlAttrs",
+        ],
+        "createRuntimeTextNode" => &["CloskellTestTextNode"],
+        "isTestVoidElement" => &[],
+        "ensureRuntimeDocument" => &[
+            "CloskellTestDocumentFragment",
+            "CloskellTestElement",
+            "CloskellTestTextNode",
+        ],
+        "htmlTemplate" => &["ensureRuntimeDocument"],
+        "createDevtoolsOverlay" => &[
+            "createDevtoolsOverlayRoot",
+            "normalizeDevtoolsOverlayOptions",
+            "positiveNumber",
+            "renderDevtoolsOverlay",
+        ],
+        "createDevtoolsOverlayRoot" => &["style"],
+        "renderDevtoolsOverlay" => &[
+            "clearNode",
+            "createDetachedOverlayRow",
+            "devtoolsEventSummary",
+            "style",
+        ],
+        "createDetachedOverlayRow" => &["style"],
+        "createTemplateComponent" => &[
+            "beginTemplateUpdate",
+            "claimHydratedTemplateInstance",
+            "disposeComponent",
+            "disposeEventSlots",
+            "disposeRefs",
+            "emitDispatchDevtools",
+            "endTemplateUpdate",
+            "reportTemplateMount",
+        ],
+        "createCompiledTemplateComponent" => {
+            &["disposeComponent", "disposeEventSlots", "disposeRefs"]
+        }
+        "createCompiledHtmlTemplateComponent" => &[
+            "compiledHtmlTemplateNode",
+            "compiledHtmlTemplateShape",
+            "disposeComponent",
+            "disposeEventSlots",
+            "disposeRefs",
+        ],
+        "createCompiledHtmlTemplateFactory" => &[],
+        "compiledHtmlTemplateShape" => &[
+            "compiledHtmlTemplatePath",
+            "compiledHtmlTemplateShapes",
+            "createCompiledHtmlTemplateFactory",
+        ],
+        "bindCompiledComponent" => &[],
+        "shouldUpdateSlot" => &["recordTemplateSlot", "shouldUpdateSlotForReads"],
+        "shouldUpdateCompiledSlot" => &["shouldUpdateSlotForReads"],
+        "claimHydratedTemplateInstance" => &["claimHydratedTree"],
+        "claimHydratedTree" => &["hydrationNodesCompatible"],
+        "shouldUpdateSlotForReads" => &[
+            "changedPathsForUpdate",
+            "isLocalReadPath",
+            "isStatePath",
+            "pathsOverlap",
+        ],
+        "endTemplateUpdate" => &["emitDevtools"],
+        "reportTemplateMount" => &["emitDispatchDevtools"],
+        "setAttr" => &[
+            "applyClassValue",
+            "applyStyleObject",
+            "clearStyleAttribute",
+            "clearStyleObject",
+            "isStructuredClassValue",
+            "isStyleObject",
+            "setDomProperty",
+            "style",
+        ],
+        "setCompiledAttr" => &["setDomProperty"],
+        "setCompiledClass" => &["applyClassValue", "isStructuredClassValue"],
+        "setCompiledStyle" => &[
+            "applyStyleObject",
+            "clearStyleAttribute",
+            "clearStyleObject",
+            "isStyleObject",
+            "style",
+        ],
+        "setCompiledStyleRecord" => &["removeStyleProperty", "setStyleProperty"],
+        "applyClassValue" => &["classValueToString"],
+        "classValueToString" => &["appendClassTokens"],
+        "appendClassTokens" => &["classTokenName"],
+        "applyStyleObject" => &[
+            "clearStyleAttribute",
+            "hasStyleKey",
+            "isStyleObject",
+            "removeStyleProperty",
+            "setStyleProperty",
+            "style",
+            "styleEntries",
+            "styleKeys",
+        ],
+        "clearStyleObject" => &["removeStyleProperty", "styleKeys"],
+        "clearStyleAttribute" => &["style"],
+        "setStyleProperty" => &["cssStylePropertyName", "jsStylePropertyName"],
+        "removeStyleProperty" => &["cssStylePropertyName", "jsStylePropertyName"],
+        "cssStylePropertyName" => &["stylePropertyName"],
+        "jsStylePropertyName" => &["stylePropertyName"],
+        "setEvent" => &["dispatchTemplateEventResult"],
+        "setCompiledEvent" => &[
+            "canDelegateCompiledEvent",
+            "dispatchTemplateEventResult",
+            "removeDelegatedCompiledEventSlot",
+            "setDelegatedCompiledEventSlot",
+        ],
+        "canDelegateCompiledEvent" => &["delegatedCompiledEvents"],
+        "setDelegatedCompiledEventSlot" => &[
+            "delegatedCompiledEventSlots",
+            "ensureDelegatedCompiledEventListener",
+        ],
+        "removeDelegatedCompiledEventSlot" => &["delegatedCompiledEventSlots"],
+        "ensureDelegatedCompiledEventListener" => &[
+            "delegatedCompiledEventListeners",
+            "dispatchDelegatedCompiledEvent",
+        ],
+        "dispatchDelegatedCompiledEvent" => &[
+            "delegatedCompiledEvent",
+            "delegatedCompiledEventSlots",
+            "dispatchTemplateEventResult",
+        ],
+        "dispatchTemplateEventResult" => &[],
+        "setRef" => &["refName", "registryForDispatch", "unregisterRef"],
+        "setCompiledRef" => &[
+            "compiledRefName",
+            "compiledRegistryForDispatch",
+            "unregisterRef",
+        ],
+        "setKeyedList" => &[
+            "clearKeyedEntries",
+            "disposeComponent",
+            "duplicateStorageKey",
+            "forceUpdateContext",
+            "keyedItemUpdateContext",
+            "reorderKeyedEntries",
+            "updateKeyedComponent",
+        ],
+        "setCompiledKeyedList" => &[
+            "clearKeyedEntries",
+            "setCompiledKeyedListUnique",
+            "setCompiledKeyedListWithDuplicates",
+            "updateCompiledKeyedListSameOrder",
+            "updateCompiledKeyedListSameSequence",
+        ],
+        "updateCompiledKeyedListSameOrder" => &[
+            "canSkipCompiledKeyedEntry",
+            "sameMapKey",
+            "updateCompiledKeyedEntry",
+        ],
+        "updateCompiledKeyedListSameSequence" => &[
+            "canSkipCompiledKeyedEntry",
+            "compiledComponentArity",
+            "disposeComponent",
+            "disposeNewKeyedEntries",
+            "insertKeyedEntries",
+            "sameMapKey",
+            "updateCompiledKeyedEntry",
+        ],
+        "setCompiledKeyedListUnique" => &[
+            "canSkipCompiledKeyedEntry",
+            "clearKeyedEntries",
+            "compiledComponentArity",
+            "disposeComponent",
+            "disposeNewKeyedEntries",
+            "insertKeyedEntries",
+            "reorderKeyedEntries",
+            "updateCompiledKeyedEntry",
+        ],
+        "setCompiledKeyedListWithDuplicates" => &[
+            "canSkipCompiledKeyedEntry",
+            "clearKeyedEntries",
+            "compiledComponentArity",
+            "disposeComponent",
+            "duplicateStorageKey",
+            "insertKeyedEntries",
+            "reorderKeyedEntries",
+            "updateCompiledKeyedEntry",
+        ],
+        "clearKeyedEntries" => &["disposeComponent"],
+        "disposeNewKeyedEntries" => &["disposeComponent"],
+        "insertKeyedEntries" => &[],
+        "reorderKeyedEntries" => &["longestIncreasingSubsequenceIndexes"],
+        "updateKeyedComponent" => &[],
+        "updateCompiledKeyedEntry" => &["compiledEntryArity"],
+        "canSkipCompiledKeyedEntry" => &["compiledEntryArity"],
+        "compiledEntryArity" => &["compiledComponentArity"],
+        "keyedItemUpdateContext" => &["changedStatePaths", "localUpdateContext"],
+        "setConditional" => &["disposeComponent", "forceUpdateContext", "render"],
+        "setCompiledConditional" => &["disposeComponent"],
+        "setComponent" => &[
+            "componentParams",
+            "componentRenderKey",
+            "componentUpdateContext",
+            "disposeComponent",
+            "forceUpdateContext",
+            "render",
+        ],
+        "setCompiledComponent" => &[
+            "compiledComponentArity",
+            "disposeComponent",
+            "sameCompiledComponentArgs",
+        ],
+        "disposeComponent" => &[],
+        "componentUpdateContext" => &["changedStatePaths", "localUpdateContext"],
+        "disposeEventSlots" => &["removeDelegatedCompiledEventSlot"],
+        "disposeRefs" => &["unregisterRef"],
+        "registryForDispatch" => &[],
+        "compiledRegistryForDispatch" => &[],
+        "Cmd" => &["commandOptions", "commands", "plainObject"],
+        "Sub" => &["subscriptions"],
+        "Decoder" => &[
+            "decode",
+            "decoderFieldPath",
+            "decoderSpecEntries",
+            "decoderTypeError",
+            "decoderValueEqual",
+            "hasOwn",
+            "plainObject",
+            "primitiveDecoder",
+            "runDecoder",
+        ],
+        "decode" => &["runDecoder"],
+        "describe" => &["flattenTestEntries"],
+        "test" => &["flattenAssertions"],
+        "collectCloskellTests" => &["flattenModuleTestEntries"],
+        "runCloskellTest" => &[
+            "closkellTestAssertions",
+            "closkellTestName",
+            "runCloskellAssertion",
+        ],
+        "runCloskellAssertion" => &[
+            "assertionKind",
+            "formatTestValue",
+            "runEqualAssertion",
+            "runMatchAssertion",
+            "runThrowsAssertion",
+        ],
+        "registerVitestTests" => &[
+            "describe",
+            "moduleTestEntries",
+            "registerVitestEntry",
+            "test",
+        ],
+        "render" => &[
+            "ensureRuntimeDocument",
+            "messages",
+            "testDispatchForHarness",
+        ],
+        "renderToString" => &[
+            "annotateServerRenderedComponent",
+            "ensureRuntimeDocument",
+            "html",
+            "serializeTestNode",
+            "serverRenderDispatch",
+        ],
+        "render_to_string" => &["renderToString"],
+        "rerender" => &["testDispatchForHarness"],
+        "find" => &["harnessRoot"],
+        "find_all" => &["harnessRoot"],
+        "text" => &["find", "harnessRoot"],
+        "html" => &["find", "harnessRoot"],
+        "attr" => &["find"],
+        "class_" => &["find"],
+        "style" => &["cssStylePropertyName", "find", "jsStylePropertyName"],
+        "subscriptions" => &["testVisibleSubscription"],
+        "testVisibleSubscription" => &["commandValueName", "testVisibleSubscriptionKind"],
+        "mount_app" => &[
+            "commands",
+            "createCommandHandlers",
+            "createSubscriptionHandlers",
+            "ensureRuntimeDocument",
+            "messages",
+            "normalizeTestCommandEnv",
+            "normalizeTestHandlers",
+            "startApp",
+            "subscriptions",
+            "testOption",
+            "testVisibleSubscription",
+        ],
+        "fire" => &[
+            "applyTestInputValue",
+            "dispatchTestEvent",
+            "find",
+            "testEventInit",
+        ],
+        "scopeUpdate" => &["mapScopedCommand", "normalizeUpdateResult", "scopeKey"],
+        "scopeSubscriptions" => &["mapScopedSubscription", "subscriptions"],
+        "scopeView" => &[
+            "forceUpdateContext",
+            "scopedMessageDispatch",
+            "scopedViewUpdateContext",
+        ],
+        "createCommandHandlers" => &[
+            "addMediaQueryListener",
+            "animationFrameMessage",
+            "applyBrowserTheme",
+            "applyCanvasOp",
+            "applyCanvasState",
+            "applyWindowEventControls",
+            "bluetoothRequestOptions",
+            "cancelAnimationFrameEntry",
+            "canvasDrawSizing",
+            "canvasMeasureTexts",
+            "clearFileInput",
+            "commandCancelMessage",
+            "commandErrorMessage",
+            "commandMessage",
+            "commandValueName",
+            "downloadWithBrowser",
+            "eventListenerOptions",
+            "find",
+            "headersToObject",
+            "httpRequestFetchArgs",
+            "httpResponsePayload",
+            "importWithBrowser",
+            "loadAuthStorage",
+            "loadBrowserTheme",
+            "measureNode",
+            "mediaQueryMessage",
+            "namedCommandMessage",
+            "nowMs",
+            "numberOr",
+            "numberOrZero",
+            "parseHeartRateMeasurement",
+            "parseStoredValue",
+            "persistAuthStorage",
+            "proxiedHttpUrl",
+            "queueScrollIntoView",
+            "readImportedFile",
+            "rectFromResizeEntry",
+            "refName",
+            "removeMediaQueryListener",
+            "removeResizeObserver",
+            "removeWindowEventListener",
+            "replaceBrowserSearchParam",
+            "resizeMessage",
+            "resolveRef",
+            "runTask",
+            "serializeStoredValue",
+            "setBrowserCookie",
+            "setCanvasCssSize",
+            "setCanvasTransform",
+            "simulationHeartRateBpm",
+            "taskErrorMessage",
+            "taskSuccessMessage",
+            "text",
+            "windowEventMessage",
+            "writeBrowserRoute",
+        ],
+        "createSelectedCommandHandlers" => &[],
+        "createCompiledCommandHandlers" => &[],
+        "addCommandDisposer" => &[],
+        "registerBluetoothCommandHandlers" => &[
+            "addCommandDisposer",
+            "bluetoothRequestOptions",
+            "commandErrorMessage",
+            "commandMessage",
+            "namedCommandMessage",
+            "parseHeartRateMeasurement",
+        ],
+        "registerCompiledBluetoothHeartRateCommandHandlers" => &[
+            "addCommandDisposer",
+            "compiledBluetoothRequestOptions",
+            "compiledCommandErrorMessage",
+            "compiledCommandMessage",
+            "compiledNamedCommandMessage",
+            "parseHeartRateMeasurement",
+        ],
+        "registerTimerCommandHandlers" => &["addCommandDisposer", "commandMessage"],
+        "registerCompiledTimerCommandHandlers" => &["addCommandDisposer", "compiledCommandMessage"],
+        "registerAnimationCommandHandlers" => &[
+            "addCommandDisposer",
+            "animationFrameMessage",
+            "cancelAnimationFrameEntry",
+            "commandErrorMessage",
+            "commandMessage",
+        ],
+        "registerCompiledAnimationCommandHandlers" => &[
+            "addCommandDisposer",
+            "cancelAnimationFrameEntry",
+            "compiledAnimationFrameMessage",
+            "compiledCommandErrorMessage",
+            "compiledCommandMessage",
+        ],
+        "registerTimeCommandHandlers" => &["commandMessage"],
+        "registerCompiledTimeCommandHandlers" => &["compiledCommandMessage"],
+        "registerStorageCommandHandlers" => &[
+            "commandErrorMessage",
+            "commandMessage",
+            "parseStoredValue",
+            "serializeStoredValue",
+        ],
+        "registerCompiledStorageCommandHandlers" => &[
+            "registerCompiledStorageReadWriteCommandHandlers",
+            "registerCompiledStorageRemoveCommandHandlers",
+        ],
+        "registerCompiledStorageReadWriteCommandHandlers" => &[
+            "compiledCommandErrorMessage",
+            "compiledCommandMessage",
+            "parseCompiledStoredValue",
+            "serializeStoredValue",
+        ],
+        "registerCompiledStorageRemoveCommandHandlers" => {
+            &["compiledCommandErrorMessage", "compiledCommandMessage"]
+        }
+        "registerBrowserCommandHandlers" => &[
+            "applyBrowserTheme",
+            "commandMessage",
+            "loadBrowserTheme",
+            "replaceBrowserSearchParam",
+            "setBrowserCookie",
+            "text",
+            "writeBrowserRoute",
+        ],
+        "registerAuthStorageCommandHandlers" => {
+            &["commandMessage", "loadAuthStorage", "persistAuthStorage"]
+        }
+        "registerRandomCommandHandlers" => &["commandMessage"],
+        "registerCompiledRandomCommandHandlers" => &["compiledCommandMessage"],
+        "registerSimulationCommandHandlers" => &[
+            "addCommandDisposer",
+            "commandMessage",
+            "namedCommandMessage",
+            "numberOr",
+            "simulationHeartRateBpm",
+        ],
+        "registerCompiledSimulationCommandHandlers" => &[
+            "addCommandDisposer",
+            "compiledCommandMessage",
+            "compiledNamedCommandMessage",
+            "numberOr",
+            "simulationHeartRateBpm",
+        ],
+        "registerTaskCommandHandlers" => &["runTask", "taskErrorMessage", "taskSuccessMessage"],
+        "registerHttpCommandHandlers" => &[
+            "commandErrorMessage",
+            "commandMessage",
+            "commandValueName",
+            "headersToObject",
+            "httpRequestFetchArgs",
+            "httpResponsePayload",
+            "nowMs",
+            "proxiedHttpUrl",
+        ],
+        "registerCompiledSimulationStopCommandHandlers" => &["compiledCommandMessage"],
+        "registerFileDownloadCommandHandlers" => &["commandMessage", "downloadWithBrowser"],
+        "registerCompiledFileDownloadCommandHandlers" => &["compiledCommandMessage"],
+        "registerFileImportCommandHandlers" => &[
+            "commandCancelMessage",
+            "commandErrorMessage",
+            "commandMessage",
+            "commandValueName",
+            "importWithBrowser",
+        ],
+        "registerFileReadSelectedCommandHandlers" => &[
+            "clearFileInput",
+            "commandCancelMessage",
+            "commandErrorMessage",
+            "commandMessage",
+            "commandValueName",
+            "readImportedFile",
+            "resolveRef",
+        ],
+        "registerCompiledFileReadSelectedCommandHandlers" => &[
+            "clearFileInput",
+            "compiledCommandCancelMessage",
+            "compiledCommandErrorMessage",
+            "compiledCommandMessage",
+            "readImportedFile",
+            "resolveCompiledRef",
+        ],
+        "registerCanvasDrawCommandHandlers" => &[
+            "applyCanvasOp",
+            "canvasDrawSizing",
+            "commandErrorMessage",
+            "commandMessage",
+            "refName",
+            "resolveRef",
+            "setCanvasCssSize",
+            "setCanvasTransform",
+        ],
+        "registerCompiledCanvasDrawCommandHandlers" => &[
+            "applyCompiledCanvasOp",
+            "compiledCommandErrorMessage",
+            "compiledCommandMessage",
+            "compiledRefName",
+            "numberOrZero",
+            "resolveCompiledRef",
+            "setCanvasTransform",
+        ],
+        "registerCanvasMeasureTextCommandHandlers" => &[
+            "applyCanvasState",
+            "canvasMeasureTexts",
+            "commandErrorMessage",
+            "commandMessage",
+            "numberOrZero",
+            "refName",
+            "resolveRef",
+            "text",
+        ],
+        "registerDomRefCommandHandlers" => &[
+            "commandErrorMessage",
+            "commandMessage",
+            "measureNode",
+            "refName",
+            "resolveRef",
+        ],
+        "registerCompiledDomRefCommandHandlers" => &[
+            "compiledCommandErrorMessage",
+            "compiledCommandMessage",
+            "compiledRefName",
+            "measureNode",
+            "resolveCompiledRef",
+        ],
+        "registerDomScrollCommandHandlers" => &["commandMessage", "queueScrollIntoView"],
+        "registerDomResizeCommandHandlers" => &[
+            "addCommandDisposer",
+            "commandErrorMessage",
+            "commandMessage",
+            "find",
+            "measureNode",
+            "rectFromResizeEntry",
+            "refName",
+            "removeResizeObserver",
+            "resizeMessage",
+            "resolveRef",
+        ],
+        "registerCompiledDomResizeCommandHandlers" => &[
+            "addCommandDisposer",
+            "compiledCommandErrorMessage",
+            "compiledCommandMessage",
+            "compiledResizeMessage",
+            "find",
+            "measureNode",
+            "rectFromResizeEntry",
+            "removeResizeObserver",
+            "resolveCompiledRef",
+        ],
+        "registerCompiledDirectDomResizeCommandHandlers" => &[
+            "addCommandDisposer",
+            "compiledCommandErrorMessage",
+            "removeResizeObserver",
+            "resolveCompiledRef",
+        ],
+        "registerWindowEventCommandHandlers" => &[
+            "addCommandDisposer",
+            "applyWindowEventControls",
+            "commandErrorMessage",
+            "commandMessage",
+            "eventListenerOptions",
+            "removeWindowEventListener",
+            "windowEventMessage",
+        ],
+        "registerCompiledWindowEventCommandHandlers" => &[
+            "addCommandDisposer",
+            "applyCompiledWindowEventControls",
+            "compiledCommandErrorMessage",
+            "compiledCommandMessage",
+            "compiledWindowEventMessage",
+            "removeWindowEventListener",
+        ],
+        "registerCompiledDirectWindowEventCommandHandlers" => {
+            &["addCommandDisposer", "removeWindowEventListener"]
+        }
+        "registerMediaQueryCommandHandlers" => &[
+            "addCommandDisposer",
+            "addMediaQueryListener",
+            "commandErrorMessage",
+            "commandMessage",
+            "mediaQueryMessage",
+            "removeMediaQueryListener",
+        ],
+        "registerCompiledMediaQueryCommandHandlers" => &[
+            "addCommandDisposer",
+            "addMediaQueryListener",
+            "compiledCommandErrorMessage",
+            "compiledCommandMessage",
+            "compiledMediaQueryMessage",
+            "removeMediaQueryListener",
+        ],
+        "registerCompiledDirectMediaQueryCommandHandlers" => &[
+            "addCommandDisposer",
+            "addMediaQueryListener",
+            "removeMediaQueryListener",
+        ],
+        "createSubscriptionHandlersFor" => &[
+            "commandErrorMessage",
+            "commandKind",
+            "startCommandForSubscription",
+            "stopCommandForSubscription",
+        ],
+        "createSubscriptionHandlers" => &["createCommandHandlers", "createSubscriptionHandlersFor"],
+        "startConfiguredApp" => &["createSubscriptionHandlersFor", "startAppCore"],
+        "startApp" => &["createSubscriptionHandlers", "startAppCore"],
+        "startCompiledApp" => &[
+            "compiledCommandErrorMessage",
+            "compiledRefName",
+            "compiledStartCommandForSubscription",
+            "compiledStopCommandForSubscription",
+        ],
+        "startCompiledAppWithoutSubscriptions" => {
+            &["compiledCommandErrorMessage", "compiledRefName"]
+        }
+        "createCompiledSubscriptionHandlersFor" => &[
+            "compiledCommandErrorMessage",
+            "compiledCommandKind",
+            "compiledStartCommandForSubscription",
+            "compiledStopCommandForSubscription",
+        ],
+        "startCompiledAppCore" => &[
+            "flattenSubscriptions",
+            "normalizeUpdateResult",
+            "reconcileCompiledSubscriptions",
+            "refName",
+            "runCompiledCommand",
+            "stopAllCompiledSubscriptions",
+            "subscriptions",
+        ],
+        "startAppCore" => &[
+            "changedStatePaths",
+            "commands",
+            "emitDevtools",
+            "emitDispatchDevtools",
+            "flattenSubscriptions",
+            "mountAppComponent",
+            "normalizeUpdateResult",
+            "reconcileSubscriptions",
+            "refName",
+            "runCommand",
+            "stopAllSubscriptions",
+            "subscriptions",
+        ],
+        "hydrateApp" => &["resolveHydrationRoot", "startApp"],
+        "mountAppComponent" => &["hydrationCandidateForComponent"],
+        "hydrationCandidateForComponent" => &["find"],
+        "flattenSubscriptions" => &["commands", "subscriptionKind", "subscriptions"],
+        "reconcileSubscriptions" => &[
+            "startSubscription",
+            "stopSubscription",
+            "subscriptionKey",
+            "subscriptionSignature",
+        ],
+        "reconcileCompiledSubscriptions" => &[
+            "compiledSubscriptionKey",
+            "compiledSubscriptionSignature",
+            "runCompiledSubscriptionHandler",
+        ],
+        "stopAllSubscriptions" => &["stopSubscription"],
+        "stopAllCompiledSubscriptions" => &["runCompiledSubscriptionHandler"],
+        "startSubscription" => &[
+            "emitDispatchDevtools",
+            "runSubscriptionHandler",
+            "subscriptionKind",
+        ],
+        "stopSubscription" => &[
+            "emitDispatchDevtools",
+            "runSubscriptionHandler",
+            "subscriptionKind",
+        ],
+        "runSubscriptionHandler" => &["callSubscriptionHandler", "handleSubscriptionError"],
+        "runCompiledSubscriptionHandler" => &[
+            "callCompiledSubscriptionHandler",
+            "dispatchCompiledCommandError",
+        ],
+        "callSubscriptionHandler" => &["subscriptionKind"],
+        "callCompiledSubscriptionHandler" => &["compiledCommandKind"],
+        "handleSubscriptionError" => &[
+            "commandErrorMessage",
+            "emitDispatchDevtools",
+            "errorMessage",
+            "subscriptionKind",
+        ],
+        "runCommand" => &[
+            "commands",
+            "compiledCommandKind",
+            "emitDispatchDevtools",
+            "handleCommandError",
+        ],
+        "runCompiledCommand" => &[
+            "commands",
+            "compiledCommandKind",
+            "dispatchCompiledCommandError",
+        ],
+        "dispatchCompiledCommandError" => &["compiledCommandErrorMessage"],
+        "runTask" => &["commandKind", "runHttpTask"],
+        "runHttpTask" => &["errorMessage"],
+        "taskSuccessMessage" => &["commandMessage"],
+        "taskErrorMessage" => &["commandErrorMessage"],
+        "moduleTestEntries" => &["normalizeModuleTestEntries"],
+        "normalizeModuleTestEntries" => &["isLegacyTestRecord", "isTestCase", "isTestGroup"],
+        "flattenModuleTestEntries" => &[
+            "closkellTestName",
+            "fullTestName",
+            "isLegacyTestRecord",
+            "isTestCase",
+            "isTestGroup",
+        ],
+        "registerVitestEntry" => &[
+            "closkellTestName",
+            "formatTestFailure",
+            "isLegacyTestRecord",
+            "isTestCase",
+            "isTestGroup",
+            "normalizeModuleTestEntries",
+            "runCloskellTest",
+        ],
+        "assertionKind" => &["symbolKey"],
+        "closkellTestAssertions" => &["isTestCase"],
+        "runEqualAssertion" => &["deepEqual", "formatTestValue"],
+        "runMatchAssertion" => &["deepMatch", "formatTestValue"],
+        "runThrowsAssertion" => &["errorMessage", "formatTestValue"],
+        "deepEqual" => &["isPlainObject", "symbolKey"],
+        "deepMatch" => &["deepEqual", "isPlainObject", "symbolKey"],
+        "testDispatchForHarness" => &["messages", "testEventSnapshot"],
+        "serverRenderDispatch" => &["dispatch"],
+        "annotateServerRenderedComponent" => &["serverSlotMetadata"],
+        "dispatchTestEvent" => &["createTestEvent", "testEventSnapshot"],
+        "normalizeTestHandlers" => &["handlerKey"],
+        "normalizeTestCommandEnv" => &["normalizeTestHandlers", "testStorageFromMap"],
+        "querySelectorAllFrom" => &["descendantsOf", "selectorMatchesNode"],
+        "selectorMatchesNode" => &["selectorChainMatches"],
+        "selectorChainMatches" => &["simpleSelectorMatches"],
+        "serializeTestNode" => &["escapeHtmlText", "serializableAttributes"],
+        "serializableAttributes" => &["style"],
+        "handleCommandError" => &[
+            "commandErrorMessage",
+            "commandKind",
+            "emitDispatchDevtools",
+            "errorMessage",
+        ],
+        "emitDispatchDevtools" => &["emitDevtools"],
+        "changedStatePaths" => &["isChangeObject", "mapsEqual", "setsEqual"],
+        "scopedMessageDispatch" => &["wrapScopedMessage"],
+        "scopedViewUpdateContext" => &["changedStatePaths"],
+        "mapScopedCommand" => &["commandKind", "commands", "mapScopedContinuations"],
+        "mapScopedSubscription" => &[
+            "commands",
+            "mapScopedContinuations",
+            "subscriptionKind",
+            "subscriptions",
+        ],
+        "mapScopedContinuations" => &[
+            "errorMessage",
+            "mapScopedPayloadContinuation",
+            "wrapScopedMessage",
+        ],
+        "mapScopedPayloadContinuation" => &["namedCommandMessage", "wrapScopedMessage"],
+        "subscriptionKind" => &["commandKind"],
+        "subscriptionKey" => &["subscriptionKind"],
+        "compiledSubscriptionKey" => &["compiledCommandKind"],
+        "startCommandForSubscription" => &["subscriptionKind"],
+        "compiledStartCommandForSubscription" => &["compiledCommandKind"],
+        "stopCommandForSubscription" => &["subscriptionKind"],
+        "compiledStopCommandForSubscription" => &["compiledCommandKind"],
+        "commandErrorMessage" => &["errorMessage"],
+        "compiledCommandErrorMessage" => &["errorMessage"],
+        "simulationHeartRateBpm" => &["clampNumber"],
+        "httpRequestFetchArgs" => &[
+            "HTTP_REQUEST_OPTION_FIELDS",
+            "plainObject",
+            "resolveHttpRequestBody",
+        ],
+        "httpResponsePayload" => &[
+            "baseMime",
+            "blobPreviewUrl",
+            "headerValue",
+            "isLikelyFileResponse",
+            "looksLikeBinary",
+            "looksLikeCsv",
+            "resolveHttpFileName",
+            "textFileResponse",
+            "textMime",
+        ],
+        "httpExtensionFromContentType" => &["baseMime"],
+        "inferHttpFileNameFromUrl" => &["httpExtensionFromContentType"],
+        "resolveHttpFileName" => &["httpFileNameFromDisposition", "inferHttpFileNameFromUrl"],
+        "looksLikeCsv" => &[],
+        "looksLikeBinary" => &[],
+        "isLikelyFileResponse" => &["baseMime"],
+        "blobPreviewUrl" => &["baseMime"],
+        "resolveHttpRequestBody" => &[
+            "commandValueName",
+            "multipartFormBody",
+            "selectedFileByTestId",
+        ],
+        "multipartFormBody" => &["hasOwn", "selectedFileByTestId"],
+        "primitiveDecoder" => &["decode", "decoderTypeError"],
+        "runDecoder" => &["decode"],
+        "decoderSpecEntries" => &["decoderFieldName", "plainObject"],
+        "decoderFieldPath" => &[],
+        "commandOptions" => &["hasOwn", "plainObject"],
+        "resolveRef" => &["refName"],
+        "resolveCompiledRef" => &["compiledRefName"],
+        "measureNode" => &["numberOrZero"],
+        "rectFromResizeEntry" => &["measureNode", "numberOr"],
+        "resizeMessage" => &["namedCommandMessage", "refName"],
+        "compiledResizeMessage" => &["compiledNamedCommandMessage", "compiledRefName"],
+        "windowEventMessage" => &["namedCommandMessage", "windowEventPayload"],
+        "compiledWindowEventMessage" => &["compiledNamedCommandMessage", "windowEventPayload"],
+        "applyWindowEventControls" => &["eventControlMatches"],
+        "applyCompiledWindowEventControls" => &["compiledEventControlMatches"],
+        "queueScrollIntoView" => &["nodeFullyVisible", "scrollTargetNode"],
+        "scrollTargetNode" => &["cssAttr"],
+        "animationFrameMessage" => &["namedCommandMessage", "numberOrZero"],
+        "compiledAnimationFrameMessage" => &["compiledNamedCommandMessage", "numberOrZero"],
+        "canvasDrawSizing" => &["canvasPixelRatio", "numberOrUndefined"],
+        "canvasPixelRatio" => &["commandValueName", "numberOrZero"],
+        "setCanvasCssSize" => &[],
+        "mediaQueryMessage" => &["namedCommandMessage"],
+        "compiledMediaQueryMessage" => &["compiledNamedCommandMessage"],
+        "canvasMeasureTexts" => &[],
+        "applyCanvasOp" => &["applyCanvasState", "commandValueName", "text"],
+        "applyCompiledCanvasOp" => &["applyCompiledCanvasState"],
+        "applyCanvasState" => &["canvasTextStateValue"],
+        "canvasTextStateValue" => &["commandValueName"],
+        "parseStoredValue" => &["commandValueName"],
+        "downloadWithBrowser" => &[],
+        "importWithBrowser" => &["readImportedFile"],
+        "readImportedFile" => &[],
+        _ => &[],
+    }
+}
+
+fn runtime_chunks(source: &str) -> Vec<RuntimeChunk> {
+    let mut starts = Vec::new();
+    let mut offset = 0;
+    for line in source.split_inclusive('\n') {
+        if let Some(name) = runtime_declaration_name(line.trim_end_matches(['\r', '\n'])) {
+            starts.push((offset, name));
+        }
+        offset += line.len();
+    }
+
+    let mut chunks = Vec::new();
+    for index in 0..starts.len() {
+        let (start, name) = &starts[index];
+        let end = starts
+            .get(index + 1)
+            .map(|(next_start, _)| *next_start)
+            .unwrap_or(source.len());
+        chunks.push(RuntimeChunk {
+            name: name.clone(),
+            code: source[*start..end].to_string(),
+        });
+    }
+    chunks
+}
+
+fn runtime_declaration_name(line: &str) -> Option<String> {
+    if line.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let line = line.strip_prefix("export ").unwrap_or(line);
+    let line = line.strip_prefix("async ").unwrap_or(line);
+    for keyword in ["class ", "function ", "const ", "let ", "var "] {
+        let Some(rest) = line.strip_prefix(keyword) else {
+            continue;
+        };
+        let name = rest
+            .chars()
+            .take_while(|ch| is_js_identifier_continue(*ch))
+            .collect::<String>();
+        if is_js_identifier(&name) {
+            return Some(name);
+        }
+    }
+    None
+}
+
+fn is_js_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    is_js_identifier_start(first) && chars.all(is_js_identifier_continue)
+}
+
+fn is_js_identifier_start(ch: char) -> bool {
+    ch.is_ascii_alphabetic() || ch == '_' || ch == '$'
+}
+
+fn is_js_identifier_continue(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_' || ch == '$'
+}
+
 fn build_file(
     path: &Path,
     output: &Path,
@@ -1464,7 +2778,12 @@ fn build_file(
     let input = &module.input;
     let source = &module.source;
 
-    let mut import_emit_options = options.emit_options.clone();
+    let mut module_emit_options = options.emit_options.clone();
+    if options.app.is_some() {
+        module_emit_options.browser_app_runtime = true;
+    }
+
+    let mut import_emit_options = module_emit_options.clone();
     if options.app.is_some() {
         import_emit_options.message_field_reads =
             js_backend::collect_message_field_reads(&module.source);
@@ -1500,7 +2819,7 @@ fn build_file(
         input,
         module,
         modules,
-        &options.emit_options,
+        &module_emit_options,
         options.app.is_some(),
     )?;
     if let Some(app) = &options.app {
@@ -1516,6 +2835,7 @@ fn build_file(
             has_subscriptions,
         );
     }
+    let runtime_exports = collect_runtime_import_exports(&emitted.code);
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)
             .map_err(|err| format!("failed to create {}: {}", parent.display(), err))?;
@@ -1534,7 +2854,14 @@ fn build_file(
     }
     if let Some(app) = &options.app {
         if app.vendor_runtime {
-            copy_runtime_package(&runtime_vendor_root(output))?;
+            let mut required_exports = runtime_exports.clone();
+            for artifact in artifacts.iter() {
+                required_exports.extend(artifact.runtime_exports.iter().cloned());
+            }
+            copy_runtime_package_with_exports(
+                &runtime_vendor_root(output),
+                Some(&required_exports),
+            )?;
         }
     }
     artifacts.push(BuildArtifact {
@@ -1549,6 +2876,7 @@ fn build_file(
             .map(|metadata| metadata.len())
             .unwrap_or(0),
         runtime_effects: emitted.runtime_effects,
+        runtime_exports,
     });
     Ok(())
 }
@@ -1646,10 +2974,7 @@ fn emit_checked_module_from_checked(
         emit_options
             .direct_call_replacements
             .insert(specialization.local_name, specialization.specialized_name);
-        emit_options.prelude_code.push_str(&specialization.code);
-        if !emit_options.prelude_code.ends_with('\n') {
-            emit_options.prelude_code.push('\n');
-        }
+        append_specialization_prelude(&mut emit_options.prelude_code, &specialization.code);
     }
 
     let emitted = js_backend::emit_module_with_types_and_options(
@@ -1686,6 +3011,31 @@ struct ImportedFunctionTarget {
 struct CallSignature {
     arg_types: Option<Vec<String>>,
     conflict: bool,
+}
+
+fn append_specialization_prelude(prelude: &mut String, code: &str) {
+    for line in code.lines() {
+        if specialization_helper_line_already_present(prelude, line) {
+            continue;
+        }
+        prelude.push_str(line);
+        prelude.push('\n');
+    }
+    if !prelude.ends_with('\n') {
+        prelude.push('\n');
+    }
+}
+
+fn specialization_helper_line_already_present(prelude: &str, line: &str) -> bool {
+    [
+        "const __closkellValueEqual",
+        "const __closkellCount",
+        "const __closkellIsObject",
+        "const __closkellObjectEntries",
+        "const __closkellNone",
+    ]
+    .iter()
+    .any(|prefix| line.starts_with(prefix) && prelude.contains(prefix))
 }
 
 fn collect_local_function_specializations(
@@ -5206,8 +6556,6 @@ fn collect_command_shapes_by_binding(
 
 #[derive(Clone, Debug, Default)]
 struct MessageStaticContext {
-    env_dev: Option<bool>,
-    env_mode: Option<String>,
     static_reads: BTreeMap<String, String>,
 }
 
@@ -5260,8 +6608,6 @@ fn collect_reachable_update_message_kinds(
     emit_options: &js_backend::EmitOptions,
 ) -> Option<BTreeSet<String>> {
     let static_context = MessageStaticContext {
-        env_dev: emit_options.env_dev,
-        env_mode: emit_options.env_mode.clone(),
         static_reads: emit_options.static_reads.clone(),
     };
     let summaries = collect_message_kinds_by_binding_with_static(
@@ -5472,7 +6818,7 @@ fn static_state_fields_from_expr(
 
 fn static_js_value(
     expr: &Expr,
-    emit_options: &js_backend::EmitOptions,
+    _emit_options: &js_backend::EmitOptions,
     values: &BTreeMap<String, String>,
 ) -> Option<String> {
     match &expr.kind {
@@ -5481,19 +6827,7 @@ fn static_js_value(
         ExprKind::String(value) | ExprKind::Keyword(value) => Some(json_string(value)),
         ExprKind::Nil => Some("null".to_string()),
         ExprKind::Symbol(name) => values.get(name).cloned(),
-        ExprKind::List(items) => {
-            let (head, args) = items.split_first()?;
-            if args.is_empty() && matches_symbol(head, "env-dev?") {
-                return emit_options.env_dev.map(|value| value.to_string());
-            }
-            if args.is_empty() && matches_symbol(head, "env-mode") {
-                return emit_options
-                    .env_mode
-                    .as_ref()
-                    .map(|value| json_string(value));
-            }
-            None
-        }
+        ExprKind::List(_) => None,
         _ => None,
     }
 }
@@ -5584,6 +6918,18 @@ fn collect_message_kinds_expr_with_static(
                 output.insert(kind);
             }
             for (key, value) in entries {
+                if record_key_name(key)
+                    .as_deref()
+                    .is_some_and(is_message_continuation_field)
+                {
+                    collect_message_value(
+                        Some(value),
+                        imported_message_kinds,
+                        summaries,
+                        output,
+                        static_context,
+                    );
+                }
                 collect_message_kinds_expr_with_static(
                     key,
                     imported_message_kinds,
@@ -6021,6 +7367,21 @@ fn collect_message_value(
     }
 }
 
+fn is_message_continuation_field(field: &str) -> bool {
+    matches!(
+        field,
+        "msg"
+            | "toMessage"
+            | "onError"
+            | "onCancel"
+            | "onSuccess"
+            | "onFrame"
+            | "onReading"
+            | "onDisconnected"
+            | "onChange"
+    )
+}
+
 fn message_static_bool(expr: &Expr, static_context: &MessageStaticContext) -> Option<bool> {
     match &expr.kind {
         ExprKind::Bool(value) => Some(*value),
@@ -6033,7 +7394,6 @@ fn message_static_bool(expr: &Expr, static_context: &MessageStaticContext) -> Op
             let (head, args) = items.split_first()?;
             let head = symbol_name(head)?;
             match head {
-                "env-dev?" if args.is_empty() => static_context.env_dev,
                 "not" if args.len() == 1 => {
                     message_static_bool(&args[0], static_context).map(|value| !value)
                 }
@@ -6082,11 +7442,7 @@ fn message_static_value(expr: &Expr, static_context: &MessageStaticContext) -> O
             Some(value.clone())
         }
         ExprKind::Symbol(name) => static_context.static_reads.get(name).cloned(),
-        ExprKind::List(items) => {
-            let (head, args) = items.split_first()?;
-            if args.is_empty() && matches_symbol(head, "env-mode") {
-                return static_context.env_mode.clone();
-            }
+        ExprKind::List(_) => {
             message_static_bool(expr, static_context).map(|value| value.to_string())
         }
         _ => None,
@@ -6781,20 +8137,16 @@ fn parse_expects_found(message: &str) -> Option<(String, String)> {
     Some((expected.trim().to_string(), actual.trim().to_string()))
 }
 
-const CHECK_CACHE_VERSION: &str = "closkell-check-cache-v1";
-const INSPECT_CACHE_VERSION: &str = "closkell-inspect-cache-v4";
-
 fn check_cache_probe(path: &Path) -> Result<CacheProbe, String> {
-    artifact_cache_probe(path, CHECK_CACHE_VERSION, "check", "cache")
+    artifact_cache_probe(path, "check", "cache")
 }
 
 fn inspect_cache_probe(path: &Path) -> Result<CacheProbe, String> {
-    artifact_cache_probe(path, INSPECT_CACHE_VERSION, "inspect", "json")
+    artifact_cache_probe(path, "inspect", "json")
 }
 
 fn artifact_cache_probe(
     path: &Path,
-    version: &str,
     artifact: &str,
     extension: &str,
 ) -> Result<CacheProbe, String> {
@@ -6805,11 +8157,7 @@ fn artifact_cache_probe(
     collect_module_fingerprints(&canonical, &mut modules, &mut visiting)?;
 
     let mut key_input = String::new();
-    key_input.push_str(version);
-    key_input.push('\n');
-    key_input.push_str("compiler=");
-    key_input.push_str(env!("CARGO_PKG_VERSION"));
-    key_input.push('\n');
+    push_current_compiler_fingerprint(&mut key_input);
     key_input.push_str("entry=");
     key_input.push_str(&cache_path_string(&canonical));
     key_input.push('\n');
@@ -6836,6 +8184,24 @@ fn artifact_cache_probe(
         module_count: modules.len(),
         cache_file,
     })
+}
+
+fn push_current_compiler_fingerprint(output: &mut String) {
+    let Ok(exe) = env::current_exe() else {
+        return;
+    };
+    output.push_str("compiler=");
+    output.push_str(&cache_path_string(&exe));
+    output.push('\n');
+    if let Ok(metadata) = fs::metadata(&exe) {
+        if let Ok(modified) = metadata.modified() {
+            if let Ok(duration) = modified.duration_since(SystemTime::UNIX_EPOCH) {
+                output.push_str("compilerMtime=");
+                output.push_str(&duration.as_nanos().to_string());
+                output.push('\n');
+            }
+        }
+    }
 }
 
 fn collect_module_fingerprints(
@@ -6928,10 +8294,7 @@ fn write_check_cache(probe: &CacheProbe, ok: bool, diagnostics_json: &str) -> Re
         fs::create_dir_all(parent)
             .map_err(|err| format!("failed to create {}: {}", parent.display(), err))?;
     }
-    let text = format!(
-        "{}\nkey={}\nok={}\n\n{}",
-        CHECK_CACHE_VERSION, probe.key, ok, diagnostics_json
-    );
+    let text = format!("key={}\nok={}\n\n{}", probe.key, ok, diagnostics_json);
     fs::write(&probe.cache_file, text)
         .map_err(|err| format!("failed to write {}: {}", probe.cache_file.display(), err))
 }
@@ -6958,19 +8321,30 @@ fn write_inspect_cache(probe: &CacheProbe, report_json: &str) -> Result<(), Stri
         fs::create_dir_all(parent)
             .map_err(|err| format!("failed to create {}: {}", parent.display(), err))?;
     }
-    let text = format!(
-        "{}\nkey={}\n\n{}",
-        INSPECT_CACHE_VERSION, probe.key, report_json
-    );
+    let text = format!("key={}\n\n{}", probe.key, report_json);
     fs::write(&probe.cache_file, text)
         .map_err(|err| format!("failed to write {}: {}", probe.cache_file.display(), err))
 }
 
 fn cache_root_for(path: &Path) -> PathBuf {
-    path.parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(".closkell")
-        .join("cache")
+    project_root_for(path).join(".closkell").join("cache")
+}
+
+fn project_root_for(path: &Path) -> PathBuf {
+    let start = path.parent().unwrap_or_else(|| Path::new("."));
+    for ancestor in start.ancestors() {
+        if ancestor.join("package.json").is_file() || ancestor.join("Cargo.toml").is_file() {
+            return ancestor.to_path_buf();
+        }
+    }
+    for ancestor in start.ancestors() {
+        if ancestor.file_name().is_some_and(|name| name == "src") {
+            if let Some(parent) = ancestor.parent() {
+                return parent.to_path_buf();
+            }
+        }
+    }
+    start.to_path_buf()
 }
 
 fn stable_hash_hex(bytes: &[u8]) -> String {
@@ -7079,6 +8453,146 @@ fn read_stdin() -> Result<String, String> {
         .read_to_string(&mut input)
         .map_err(|err| format!("failed to read stdin: {}", err))?;
     Ok(input)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reachable_update_messages_include_literal_command_errors() {
+        let source = parse_source(
+            r#"
+            (def initialState {:error nil})
+            (defn init [] [initialState {:kind :start}])
+            (defn view [state] #html <button></button>)
+            (defn subscriptions [state] Sub.none)
+            (defn loadCommand []
+              {:kind :http/request
+               :url "/missing.json"
+               :toMessage (fn [response] {:kind :loaded :value response})
+               :onError :failed})
+            (defn update [state msg]
+              (match msg
+                {:kind :start} [state (loadCommand)]
+                {:kind :loaded :value response} [(merge state {:loaded response}) Cmd.none]
+                {:kind :failed :error error} [(merge state {:error error}) Cmd.none]
+                _ [state Cmd.none]))
+            "#,
+        );
+
+        let reachable = collect_reachable_update_message_kinds(
+            &source,
+            &HashMap::new(),
+            &js_backend::EmitOptions::default(),
+        )
+        .expect("update match should be recognized");
+
+        assert!(reachable.contains("start"));
+        assert!(reachable.contains("loaded"));
+        assert!(reachable.contains("failed"));
+    }
+
+    #[test]
+    fn tailored_runtime_discovers_referenced_declarations() {
+        let runtime = r#"
+export function alpha() {
+  return beta() + gamma();
+}
+
+function beta() {
+  return 1;
+}
+
+const gamma = () => 2;
+
+export function unused() {
+  return 0;
+}
+"#;
+        let required = BTreeSet::from(["alpha".to_string()]);
+        let tailored =
+            tailored_runtime_source(runtime, &required).expect("runtime should be tailored");
+
+        assert!(tailored.contains("export function alpha"));
+        assert!(tailored.contains("function beta"));
+        assert!(tailored.contains("const gamma"));
+        assert!(!tailored.contains("export function unused"));
+    }
+
+    #[test]
+    fn tailored_runtime_ignores_local_bindings_that_match_declarations() {
+        let runtime = r#"
+export function alpha(options = {}) {
+  const { subscriptions = () => null, dispatch } = options;
+  function run(command) {
+    const { commands = [] } = command;
+    return commands.length + subscriptions().length + Number(Boolean(dispatch));
+  }
+  return run({ commands: [] });
+}
+
+export function subscriptions() {
+  return ["test helper"];
+}
+
+export function dispatch() {
+  return "test helper";
+}
+
+export function commands() {
+  return ["test helper"];
+}
+"#;
+        let required = BTreeSet::from(["alpha".to_string()]);
+        let tailored =
+            tailored_runtime_source(runtime, &required).expect("runtime should be tailored");
+
+        assert!(tailored.contains("export function alpha"));
+        assert!(!tailored.contains("export function subscriptions"));
+        assert!(!tailored.contains("export function dispatch"));
+        assert!(!tailored.contains("export function commands"));
+    }
+
+    #[test]
+    fn tailored_browser_template_runtime_omits_test_document_fallback() {
+        let runtime_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("runtime-js")
+            .join("src")
+            .join("index.js");
+        let runtime =
+            fs::read_to_string(&runtime_path).expect("workspace runtime source should be readable");
+        let required = BTreeSet::from(["createBrowserCompiledHtmlTemplateComponent".to_string()]);
+        let tailored =
+            tailored_runtime_source(&runtime, &required).expect("runtime should be tailored");
+
+        assert!(tailored.contains("export function createBrowserCompiledHtmlTemplateComponent"));
+        assert!(tailored.contains("function browserRuntimeDocument"));
+        assert!(!tailored.contains("function ensureRuntimeDocument"));
+        assert!(!tailored.contains("class CloskellTestElement"));
+        assert!(!tailored.contains("function parseTestHtmlFragment"));
+    }
+
+    #[test]
+    fn tailored_compiled_app_runtime_keeps_subscription_stop_helpers() {
+        let runtime_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("runtime-js")
+            .join("src")
+            .join("index.js");
+        let runtime =
+            fs::read_to_string(&runtime_path).expect("workspace runtime source should be readable");
+        let required = BTreeSet::from(["startCompiledApp".to_string()]);
+        let tailored =
+            tailored_runtime_source(&runtime, &required).expect("runtime should be tailored");
+
+        assert!(tailored.contains("export function startCompiledApp"));
+        assert!(tailored.contains("function compiledStartCommandForSubscription"));
+        assert!(tailored.contains("function compiledStopCommandForSubscription"));
+    }
 }
 
 fn print_help() {
