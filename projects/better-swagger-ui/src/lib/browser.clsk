@@ -30,7 +30,6 @@
 (defn append-all [items more]
   (reduce more items (fn [result item] (conj result item))))
 
-(ann hasOpenApiShape? (Fn [Js] Bool))
 (defn hasOpenApiShape? [value]
   (and (object? value)
        (or (string? value.openapi) (string? value.swagger))
@@ -60,7 +59,6 @@
         (or (starts-with? trimmed "{")
             (regex-test? trimmed "^(openapi|swagger)\\s*:" "m")))))
 
-(ann parseSpecText (Fn [String] Js))
 (defn parseSpecText [text]
   (let [trimmed (trim text)]
     (if (= trimmed "")
@@ -72,7 +70,6 @@
                   (fail "Invalid JSON spec")))
             (parseYaml trimmed)))))
 
-(ann parseOpenApiText (Fn [String] Js))
 (defn parseOpenApiText [text]
   (let [parsed (parseSpecText text)]
     (if (hasOpenApiShape? parsed)
@@ -328,7 +325,6 @@
 (defn proxyMode? []
   (= (env-mode) "proxy"))
 
-(ann loadThemeCommand (Fn [] (Cmd BrowserCommandMsg)))
 (defn loadThemeCommand []
   {:kind :browser/theme-load
    :key theme-storage-key
@@ -337,19 +333,16 @@
 (defn toggleTheme [current]
   (if (= current "dark") "light" "dark"))
 
-(ann applyThemeCommand (Fn [String] (Cmd msg)))
 (defn applyThemeCommand [theme]
   {:kind :browser/theme-apply
    :theme theme
    :key theme-storage-key})
 
-(ann loadStoredAuthEntries (Fn [String] (Cmd BrowserCommandMsg)))
 (defn loadStoredAuthEntries [sourceUrl]
   {:kind :auth-storage/load
    :sourceUrl sourceUrl
    :toMessage (fn [entries] {:kind :auth-storage-loaded :entries entries})})
 
-(ann persistAuthEntries (Fn [String entries] (Cmd msg)))
 (defn persistAuthEntries [sourceUrl entries]
   {:kind :auth-storage/persist
    :sourceUrl sourceUrl
@@ -358,13 +351,11 @@
 (defn resolveTokenExpiry [response token]
   (resolve-token-expiry (get response :expires_in) token))
 
-(ann setOpQueryParam (Fn [(Option String)] (Cmd msg)))
 (defn setOpQueryParam [value]
   {:kind :browser/history-replace-search-param
    :name "op"
    :value value})
 
-(ann setDefinitionQueryParam (Fn [(Option String)] (Cmd msg)))
 (defn setDefinitionQueryParam [value]
   {:kind :browser/history-replace-search-param
    :name "definition"
@@ -373,7 +364,6 @@
 (defn setUrlQueryParam [url name value]
   (url-set-search-param url name value))
 
-(ann writeRoute (Fn [String (Option String) (Option String)] (Cmd msg)))
 (defn writeRoute [url op definition]
   {:kind :browser/history-write-route
    :url url
@@ -397,12 +387,10 @@
 (defn clipboardText [event]
   (clipboard-text event))
 
-(ann copyText (Fn [String] (Cmd msg)))
 (defn copyText [text]
   {:kind :browser/clipboard-write
    :text text})
 
-(ann setCookie (Fn [String String] (Cmd msg)))
 (defn setCookie [name value]
   {:kind :browser/set-cookie
    :name name

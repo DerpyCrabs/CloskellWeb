@@ -154,22 +154,18 @@
 (ann subscriptions (Fn [AppState] (Sub AppMsg)))
 (ann view (Fn [AppState] Html))
 
-(ann startup-command (Fn [] (Cmd AppMsg)))
 (defn startup-command []
   (Cmd.batch [(Cmd.storage/get zones-storage-key :json (Msg.mapper :zones-loaded :payload) :zones-load-failed)
               (Cmd.storage/get exercise-log-storage-key :json (Msg.mapper :log-loaded :payload) :log-load-failed)]))
 
-(ann active-chart-command (Fn [AppState] (Cmd AppMsg)))
 (defn active-chart-command [state]
   (Cmd.batch [(heart-chart-command state)
               (metric-chart-command state)]))
 
-(ann active-chart-batch (Fn [AppState] (Cmd AppMsg)))
 (defn active-chart-batch [state]
   (Cmd.batch [(heart-chart-batch state)
               (metric-chart-batch state)]))
 
-(ann with-active-chart-command (Fn [AppState (Cmd AppMsg)] (Cmd AppMsg)))
 (defn with-active-chart-command [state command]
   (Cmd.batch [command
               (active-chart-command state)]))
@@ -311,32 +307,25 @@
 (defn target-zone-from-roll [zones roll]
   (nth zones (floor roll)))
 
-(ann log-and-persist-command (Fn [(Vector WorkoutEntry)] (Cmd AppMsg)))
 (defn log-and-persist-command [entries]
   (Cmd.batch [(Cmd.timer/cancel clock-timer-id)
               (Cmd.storage/set exercise-log-storage-key (log-payload entries) (Msg.of :log-saved) :log-save-failed)]))
 
-(ann persist-zone-command (Fn [(Vector HeartZone) Number] (Cmd AppMsg)))
 (defn persist-zone-command [zones target-zone-id]
   (Cmd.storage/set zones-storage-key (zone-state-payload zones target-zone-id) (Msg.of :zones-saved) :zones-save-failed))
 
-(ann persist-zone-silent-command (Fn [(Vector HeartZone) Number] (Cmd AppMsg)))
 (defn persist-zone-silent-command [zones target-zone-id]
   (Cmd.storage/set-silent zones-storage-key (zone-state-payload zones target-zone-id) :zones-save-failed))
 
-(ann persist-log-command (Fn [(Vector WorkoutEntry)] (Cmd AppMsg)))
 (defn persist-log-command [entries]
   (Cmd.storage/set exercise-log-storage-key (log-payload entries) (Msg.of :log-saved) :log-save-failed))
 
-(ann clock-command (Fn [] (Cmd AppMsg)))
 (defn clock-command []
   (Cmd.timer/every clock-timer-id 250 (Msg.of :clock-tick)))
 
-(ann cancel-clock-command (Fn [] (Cmd AppMsg)))
 (defn cancel-clock-command []
   (Cmd.timer/cancel clock-timer-id))
 
-(ann stop-connections-command (Fn [] (Cmd AppMsg)))
 (defn stop-connections-command []
   (Cmd.batch [(Cmd.simulation/stop simulated-monitor-id)
               (cancel-clock-command)
@@ -366,28 +355,23 @@
               :startedAt nil
               :trend "Paused"}))))
 
-(ann disconnect-monitor-command (Fn [AppState] (Cmd AppMsg)))
 (defn disconnect-monitor-command [state]
   (if (= state.exerciseState "running")
       (Cmd.time/now (Msg.mapper :disconnect-paused-at :timestamp))
       (stop-connections-command)))
 
-(ann start-stop-progress-command (Fn [] (Cmd AppMsg)))
 (defn start-stop-progress-command []
   (Cmd.batch [(Cmd.timer/after stop-hold-timer-id stop-hold-ms (Msg.of :stop-hold-complete))
               (Cmd.animation/frame stop-hold-frame-id :stop-hold-frame)]))
 
-(ann cancel-stop-command (Fn [] (Cmd AppMsg)))
 (defn cancel-stop-command []
   (Cmd.batch [(Cmd.timer/cancel stop-hold-timer-id)
               (Cmd.animation/cancel stop-hold-frame-id (Msg.of :stop-hold-cancelled))]))
 
-(ann start-delete-progress-command (Fn [] (Cmd AppMsg)))
 (defn start-delete-progress-command []
   (Cmd.batch [(Cmd.timer/after delete-hold-timer-id delete-hold-ms (Msg.of :delete-hold-complete))
               (Cmd.animation/frame delete-hold-frame-id :delete-hold-frame)]))
 
-(ann cancel-delete-command (Fn [] (Cmd AppMsg)))
 (defn cancel-delete-command []
   (Cmd.batch [(Cmd.timer/cancel delete-hold-timer-id)
               (Cmd.animation/cancel delete-hold-frame-id (Msg.of :delete-hold-cancelled))]))
@@ -408,7 +392,6 @@
           1
           0)))
 
-(ann hold-key? (Fn [String] Bool))
 (defn hold-key? [key]
   (or (= key "Enter")
       (or (= key " ")
@@ -455,7 +438,6 @@
   (let [boundary (nth zones index)]
     (str "Boundary " boundary.max)))
 
-(ann zone-drag-measure-command (Fn [Number Number] (Cmd AppMsg)))
 (defn zone-drag-measure-command [index client-x]
   (Cmd.dom-ref/measure zone-boundary-track-ref
                        (fn [rect]
@@ -502,7 +484,6 @@
 
 (def type-picker-ref "type-picker-input")
 
-(ann focus-type-picker-command (Fn [] (Cmd AppMsg)))
 (defn focus-type-picker-command []
   (Cmd.dom-ref/focus type-picker-ref (Msg.of :type-picker-focused) :type-picker-focus-failed))
 
@@ -1481,7 +1462,6 @@
             {(zones-pane state)}
           </section>))
 
-(ann empty-workout-entry WorkoutEntry)
 (def empty-workout-entry
   {:id ""
    :startedAt 0
@@ -1493,13 +1473,11 @@
    :exerciseType nil
    :hiddenAt nil})
 
-(ann selected-log-present? (Fn [(Option WorkoutEntry)] Bool))
 (defn selected-log-present? [entry]
   (match entry
     (some selected-entry) true
     nil false))
 
-(ann selected-log-value (Fn [(Option WorkoutEntry)] WorkoutEntry))
 (defn selected-log-value [entry]
   (match entry
     (some selected-entry) selected-entry
@@ -1630,7 +1608,9 @@
                           {(for [item entries :key item.id]
                              #html <button type="button"
                                            class={(str "log-row rounded-md border px-3 py-2 text-left "
-                                                       (if (= item.id state.selectedLogId)
+                                                       (if (match state.selectedLogId
+                                                             (some selected-id) (= item.id selected-id)
+                                                             nil false)
                                                            "border-[#d9184b]/35 bg-white text-[#172019]"
                                                            "border-transparent text-[#617066] hover:bg-white"))}
                                            data-testid={(str "log-row-" item.id)}

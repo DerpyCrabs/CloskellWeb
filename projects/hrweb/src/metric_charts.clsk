@@ -396,7 +396,6 @@
                     (trimp-watch-command group)
                     Cmd.none)])))
 
-(ann metric-chart-command (Fn [MetricChartState] (Cmd MetricChartMsg)))
 (defn metric-chart-command [state]
   (if (= state.detailView "metrics")
       (Cmd.batch (map (group-entries-by-type (visible-log state.entries))
@@ -408,7 +407,6 @@
   (Cmd.batch [(metric-group-chart-command state group)
               (metric-group-watch-command group)]))
 
-(ann metric-chart-batch (Fn [MetricChartState] (Cmd MetricChartMsg)))
 (defn metric-chart-batch [state]
   (if (= state.detailView "metrics")
       (Cmd.batch (map (group-entries-by-type (visible-log state.entries))

@@ -351,7 +351,6 @@
         with-readings
         (latest-point-ops with-readings chart state.zones state.readings chart.durationMs))))
 
-(ann selected-log-chart-state (Fn [HeartChartState] HeartChartState))
 (defn selected-log-chart-state [state]
   (match (selected-log state.entries state.selectedLogId)
     (some entry) (merge state
@@ -361,19 +360,16 @@
                          :displayElapsedMs entry.durationMs})
     nil state))
 
-(ann active-heart-chart-state (Fn [HeartChartState] HeartChartState))
 (defn active-heart-chart-state [state]
   (if (= state.detailView "log")
       (selected-log-chart-state state)
       state))
 
-(ann active-heart-chart-ref (Fn [HeartChartState] String))
 (defn active-heart-chart-ref [state]
   (if (= state.detailView "log")
       log-chart-ref
       live-chart-ref))
 
-(ann heart-chart-active? (Fn [HeartChartState] Bool))
 (defn heart-chart-active? [state]
   (if (= state.detailView "live")
       true
@@ -383,11 +379,9 @@
             nil false)
           false)))
 
-(ann watch-heart-chart-command (Fn [String] (Cmd HeartChartMsg)))
 (defn watch-heart-chart-command [ref]
   (Cmd.dom-ref/resize-watch chart-watch-id ref :chart-resized :chart-error))
 
-(ann heart-chart-command (Fn [HeartChartState] (Cmd HeartChartMsg)))
 (defn heart-chart-command [state]
   (if (heart-chart-active? state)
         (let [chart-state (active-heart-chart-state state)
@@ -396,7 +390,6 @@
         (Cmd.canvas/draw ref chart.width chart.height (heart-chart-ops chart-state) :chart-error))
       Cmd.none))
 
-(ann heart-chart-batch (Fn [HeartChartState] (Cmd HeartChartMsg)))
 (defn heart-chart-batch [state]
   (if (heart-chart-active? state)
       (let [ref (active-heart-chart-ref state)]

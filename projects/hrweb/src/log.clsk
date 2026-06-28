@@ -37,21 +37,18 @@
 (defn newest-first [entries]
   (sort-by-desc (visible-log entries) (fn [entry] entry.stoppedAt)))
 
-(ann normalize-exercise-type (Fn [String] (Option String)))
 (defn normalize-exercise-type [value]
   (if (string? value)
       (let [trimmed (trim value)]
         (if (= trimmed "") nil trimmed))
       nil))
 
-(ann first-entry-id (Fn [(Vector WorkoutEntry)] (Option String)))
 (defn first-entry-id [entries]
   (let [entry (nth entries 0)]
     (if (some? entry)
         entry.id
         nil)))
 
-(ann entry-type-label (Fn [WorkoutEntry] String))
 (defn entry-type-label [entry]
   (let [trimmed (if (some? entry.exerciseType)
                     (trim entry.exerciseType)
@@ -60,7 +57,6 @@
         untyped-label
         trimmed)))
 
-(ann upsert-exercise-type (Fn [(Vector String) WorkoutEntry] (Vector String)))
 (defn upsert-exercise-type [types entry]
   (let [label (entry-type-label entry)]
     (if (= label untyped-label)
@@ -69,12 +65,10 @@
             types
             (conj types label)))))
 
-(ann exercise-types (Fn [(Vector WorkoutEntry)] (Vector String)))
 (defn exercise-types [entries]
   (sort-by (reduce (visible-log entries) [] upsert-exercise-type)
            (fn [kind] (lower-case kind))))
 
-(ann filter-matches-entry? (Fn [String WorkoutEntry] Bool))
 (defn filter-matches-entry? [type-filter entry]
   (if (= type-filter all-types-filter)
       true
@@ -82,20 +76,17 @@
           (= (entry-type-label entry) untyped-label)
           (= (entry-type-label entry) type-filter))))
 
-(ann filtered-log (Fn [(Vector WorkoutEntry) String] (Vector WorkoutEntry)))
 (defn filtered-log [entries type-filter]
   (sort-by-desc
     (filter (visible-log entries)
             (fn [entry] (filter-matches-entry? type-filter entry)))
     (fn [entry] entry.stoppedAt)))
 
-(ann selected-id-in-list? (Fn [(Vector WorkoutEntry) (Option String)] Bool))
 (defn selected-id-in-list? [entries selected-id]
   (match selected-id
     (some id) (any? entries (fn [entry] (= entry.id id)))
     nil false))
 
-(ann reconciled-selected-id (Fn [(Vector WorkoutEntry) String (Option String)] (Option String)))
 (defn reconciled-selected-id [entries type-filter selected-id]
   (let [visible (newest-first entries)
         visible-id (if (selected-id-in-list? visible selected-id)
@@ -109,20 +100,17 @@
             visible-id
             (first-entry-id filtered)))))
 
-(ann selected-log (Fn [(Vector WorkoutEntry) (Option String)] (Option WorkoutEntry)))
 (defn selected-log [entries selected-id]
   (match selected-id
     (some id) (find (visible-log entries) (fn [entry] (= entry.id id)))
     nil nil))
 
-(ann first-visible-id (Fn [(Vector WorkoutEntry)] (Option String)))
 (defn first-visible-id [entries]
   (let [entry (nth (newest-first entries) 0)]
     (if (some? entry)
         entry.id
         nil)))
 
-(ann hide-entry (Fn [(Vector WorkoutEntry) (Option String) Number] (Vector WorkoutEntry)))
 (defn hide-entry [entries entry-id hidden-at]
   (match entry-id
     (some id)
@@ -133,7 +121,6 @@
                  entry)))
     nil entries))
 
-(ann update-entry-type (Fn [(Vector WorkoutEntry) (Option String) String] (Vector WorkoutEntry)))
 (defn update-entry-type [entries entry-id value]
   (match entry-id
     (some id)
@@ -244,7 +231,6 @@
 (defn export-log-json [entries]
   (json-stringify (log-payload entries) 2))
 
-(ann export-log-filename (Fn [Number] String))
 (defn export-log-filename [timestamp]
   (str "exercise-log-" (date-format timestamp :iso-date) ".json"))
 
@@ -260,7 +246,6 @@
 (defn date-label [timestamp]
   (date-format timestamp :month-day-time))
 
-(ann log-title (Fn [WorkoutEntry] String))
 (defn log-title [entry]
   (let [label (entry-type-label entry)]
     (if (= label untyped-label)

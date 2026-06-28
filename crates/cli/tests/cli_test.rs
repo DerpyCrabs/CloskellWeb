@@ -2447,8 +2447,9 @@ fn cli_inspect_reports_hrweb_wrapped_panes_and_source_reads() {
         stdout
     );
     assert!(
-        stdout.contains("\"name\":\"startup-command\"") && stdout.contains("(Fn [] (Cmd AppMsg))"),
-        "inspect did not report the HRWeb startup command annotation:\n{}",
+        stdout.contains("\"name\":\"startup-command\",\"schema\":\"(Fn [] (Cmd")
+            && stdout.contains("\"annotated\":false"),
+        "inspect did not report the inferred HRWeb startup command signature:\n{}",
         stdout
     );
     assert!(

@@ -1656,7 +1656,37 @@ impl Inferencer {
         if let Some((_, expected_ret)) = expected_fn {
             body_ty = self.unify(expected_ret, body_ty, span);
         }
+        body_ty = self.infer_command_result_type(body_ty, span);
         Type::Fn(param_types, Box::new(body_ty))
+    }
+
+    fn infer_command_result_type(&mut self, ty: Type, span: Span) -> Type {
+        let resolved = self.resolve(ty);
+        match resolved {
+            Type::Record(fields) if is_command_record_fields(&fields) => {
+                let msg = self.infer_command_record_message_type(fields, span);
+                Type::Cmd(Box::new(self.resolve(msg)))
+            }
+            Type::Union(variants) => {
+                let mut joined = None;
+                for variant in &variants {
+                    let command_ty = self.infer_command_result_type(variant.clone(), span);
+                    let Type::Cmd(msg) = self.resolve(command_ty) else {
+                        return Type::Union(variants);
+                    };
+                    joined = Some(match joined {
+                        Some(existing) => self.join_types(existing, *msg, span),
+                        None => *msg,
+                    });
+                }
+                let msg = match joined {
+                    Some(msg) => msg,
+                    None => self.fresh(),
+                };
+                Type::Cmd(Box::new(self.resolve(msg)))
+            }
+            other => other,
+        }
     }
 
     fn infer_fn_expr_with_expected(
@@ -8657,9 +8687,8 @@ impl Inferencer {
             (Type::Keyword(expected), Type::Keyword(actual)) => {
                 keyword_type_accepts(&expected, &actual)
             }
-            (Type::Js, Type::Js)
-            | (Type::TrustedHtml, Type::TrustedHtml)
-            | (Type::Html, Type::Html) => true,
+            (Type::Js, _) | (_, Type::Js) => true,
+            (Type::TrustedHtml, Type::TrustedHtml) | (Type::Html, Type::Html) => true,
             (Type::Option(expected), Type::Option(actual))
             | (Type::Decoder(expected), Type::Decoder(actual))
             | (Type::List(expected), Type::List(actual))
@@ -11373,6 +11402,46 @@ mod tests {
              (type ChartMsg (Union {:kind :chart-resized :id String :ref String :x Number :y Number :width Number :height Number :top Number :right Number :bottom Number :left Number :value Rect} {:kind :chart-error :error String}))\n\
              (type ChartState {:live Bool})\n\
              (ann chart-command (Fn [ChartState] (Cmd ChartMsg)))\n\
+             (defn chart-command [state]\n  (if state.live\n      {:kind :dom-ref/resize-watch :id \"chart\" :ref \"chart\" :onChange :chart-resized :onError :chart-error}\n      {:kind :none}))",
+        );
+        assert!(helper.diagnostics.is_empty(), "{:?}", helper.diagnostics);
+        let binding = imported_binding(&helper, "chart-command");
+
+        let result = check_with_imports(
+            "(import \"./chart.clsk\" [chart-command])\n\
+             (type Rect {:x Number :y Number :width Number :height Number :top Number :right Number :bottom Number :left Number})\n\
+             (type AppMsg (Union {:kind :start} {:kind :chart-resized :id String :ref String :x Number :y Number :width Number :height Number :top Number :right Number :bottom Number :left Number :value Rect} {:kind :chart-error :error String}))\n\
+             (type UpdateResult [{:live Bool :label String} (Cmd AppMsg)])\n\
+             (ann update (Fn [{:live Bool :label String} AppMsg] UpdateResult))\n\
+             (defn update [state msg]\n  [state {:kind :batch :commands [(chart-command state)]}])",
+            &[binding],
+        );
+
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    }
+
+    #[test]
+    fn unannotated_command_record_helpers_infer_cmd() {
+        let result = check(
+            "(defn apply-theme [theme]\n\
+                {:kind :browser/theme-apply\n\
+                 :theme theme\n\
+                 :key \"theme\"})",
+        );
+
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert!(
+            result.bindings[0].schema().contains("(Cmd"),
+            "{}",
+            result.bindings[0].schema()
+        );
+    }
+
+    #[test]
+    fn unannotated_imported_command_helpers_keep_cmd_message_types() {
+        let helper = check(
+            "(type Rect {:x Number :y Number :width Number :height Number :top Number :right Number :bottom Number :left Number})\n\
+             (type ChartMsg (Union {:kind :chart-resized :id String :ref String :x Number :y Number :width Number :height Number :top Number :right Number :bottom Number :left Number :value Rect} {:kind :chart-error :error String}))\n\
              (defn chart-command [state]\n  (if state.live\n      {:kind :dom-ref/resize-watch :id \"chart\" :ref \"chart\" :onChange :chart-resized :onError :chart-error}\n      {:kind :none}))",
         );
         assert!(helper.diagnostics.is_empty(), "{:?}", helper.diagnostics);
