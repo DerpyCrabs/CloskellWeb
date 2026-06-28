@@ -1,0 +1,14 @@
+[package]
+name = "js_frontend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+effects.workspace = true
+js_emit.workspace = true
+syntax.workspace = true
+typecheck.workspace = true
+
+[lib]
+path = "src/lib.rs"

@@ -1,0 +1,114 @@
+(import "../../log.clsk" [visible-log])
+(import "../../metrics.clsk" [get-metrics-for-type metric-enabled? group-entries-by-type build-zone2-trend build-hrr-trend build-trimp-bars])
+(import "../../metric_charts.clsk" [metric-chart-ref metric-chart-batch])
+(import "../../model.clsk" [HeartReading HeartZone WorkoutEntry MonitorInfo JsonPayload HeartChartRect WindowEventPayload])
+(import "../../messages.clsk" [AppMsg])
+(import "./model.clsk" [MetricsState MetricsUpdateResult])
+(import "../../ui-effects.clsk" [no-cmd])
+(import "../shared/workflow.clsk" [metric-chart-batch-result])
+
+(ann try-metrics-update (Fn [MetricsState AppMsg] (Option MetricsUpdateResult)))
+(defn try-metrics-update [state msg]
+  (match msg
+    {:kind :metrics-grouping :value value}
+      (metric-chart-batch-result (merge state {:metricsGrouping value}))
+    _ nil))
+(defn workout-count-label [count]
+  (str count (if (= count 1) " workout" " workouts")))
+
+(defn metric-card [group-type id title caption points suffix mobile?]
+  #html <article class="metric-summary min-w-0" data-metric={id}>
+          <div class="mb-2">
+            <p class="m-0 text-[0.82rem] font-extrabold uppercase tracking-[0.03em] text-[#617066]">{title}</p>
+            <p class="m-0 mt-0.5 text-[0.78rem] font-semibold text-[#617066]">{caption}</p>
+          </div>
+          <div class={(str "metric-chart-wrap aspect-[16/7] w-full min-w-0 max-w-full "
+                           (if mobile? "" "min-h-[220px]"))}>
+            <canvas ref={(metric-chart-ref group-type id)}
+                    class="metric-chart block h-full w-full min-w-0 max-w-full rounded-lg border border-[#dbe2dc] bg-[#fffdfa]"
+                    data-testid={(metric-chart-ref group-type id)}
+                    width="520"
+                    height="220"
+                    aria-label={(str title " chart")}></canvas>
+          </div>
+        </article>)
+
+(defn metric-group-card [state group]
+  (let [enabled (get-metrics-for-type group.type)
+        zone2-points (build-zone2-trend group.entries state.metricsGrouping)
+        hrr-points (build-hrr-trend group.entries state.metricsGrouping)
+        trimp-points (build-trimp-bars group.entries 20)]
+    #html <section class="metric-group min-w-0 rounded-lg border border-[#dbe2dc] bg-[#fbfcfb] p-4"
+                   data-testid={(str "metric-group-" group.type)}
+                   data-type={group.type}
+                   data-count={(count group.entries)}>
+            <div class="metric-group-head mb-3 flex flex-wrap items-baseline justify-between gap-2">
+              <h3 class="m-0 text-[1.05rem] font-extrabold text-[#172019]">{group.type}</h3>
+              <span class="text-[0.78rem] font-bold text-[#617066]">{(workout-count-label (count group.entries))}</span>
+            </div>
+            <div class="metric-summary-grid grid gap-4">
+              {(if (metric-enabled? enabled "zone2")
+                   #html <div class="metric-slot min-w-0">
+                           {(metric-card group.type
+                                         "zone2"
+                                         "Zone 2 adherence"
+                                         "Share of session time in Zone 2 - aerobic base expansion"
+                                         zone2-points
+                                         "%"
+                                         state.mobile?)}
+                         </div>
+                   #html <div class="metric-slot metric-placeholder hidden"></div>)}
+              {(if (metric-enabled? enabled "hrr")
+                   #html <div class="metric-slot min-w-0">
+                           {(metric-card group.type
+                                         "hrr"
+                                         "HRR 1 min"
+                                         "Peak HR minus HR one minute later - parasympathetic recovery"
+                                         hrr-points
+                                         " bpm"
+                                         state.mobile?)}
+                         </div>
+                   #html <div class="metric-slot metric-placeholder hidden"></div>)}
+              {(if (metric-enabled? enabled "trimp")
+                   #html <div class="metric-slot min-w-0">
+                           {(metric-card group.type
+                                         "trimp"
+                                         "Training load (TRIMP)"
+                                         "Cumulative stress: time in each zone x zone coefficient"
+                                         trimp-points
+                                         ""
+                                         state.mobile?)}
+                         </div>
+                   #html <div class="metric-slot metric-placeholder hidden"></div>)}
+            </div>
+          </section>))
+
+(defn metrics-pane [state]
+  (let [groups (group-entries-by-type (visible-log state.entries))]
+    #html <section class="metrics-pane min-w-0 space-y-4"
+                   data-testid="metrics-pane"
+                   data-grouping={state.metricsGrouping}
+                   data-count={(count groups)}>
+            <div class="section-head flex flex-wrap items-center justify-between gap-3">
+              <p class="m-0 text-[0.95rem] font-extrabold text-[#172019]">Metrics by exercise type</p>
+              <label class="select-field grid gap-1">
+                <span class="text-[0.72rem] font-bold uppercase text-[#617066]">Trend grouping</span>
+                <select data-testid="metrics-grouping"
+                        class="min-h-9 rounded-lg border border-[#dbe2dc] bg-white px-2.5 text-[0.85rem] font-bold text-[#172019]"
+                        value={state.metricsGrouping}
+                        on:change={{:kind :metrics-grouping
+                                    :value event.currentTarget.value}}>
+                  <option value="week">By week</option>
+                  <option value="month">By month</option>
+                </select>
+              </label>
+            </div>
+            {(if (> (count groups) 0)
+                #html <div class="metric-groups space-y-4">
+                        {(for [group groups :key group.type]
+                           #html <div>{(metric-group-card state group)}</div>)}
+                      </div>
+                #html <p class="empty-state m-0 rounded-lg border border-[#dbe2dc] bg-[#fbfcfb] p-4 text-sm font-semibold text-[#617066]">
+                        Complete a workout and assign an exercise type to see metrics.
+                      </p>)}
+          </section>))

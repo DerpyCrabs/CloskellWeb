@@ -5294,7 +5294,7 @@ if (devApp.commands[2].command.id !== "simulated-monitor" || devApp.commands[2].
 if (devApp.commands[2].command.start !== 136 || devApp.commands[2].command.min !== 111 || devApp.commands[2].command.max !== 150 || devApp.commands[2].command.jitter !== 3.5) {{
   throw new Error("simulator command bounds were wrong");
 }}
-if (devApp.commands[2].command.onReading !== "heart-rate") throw new Error("simulator command did not route readings");
+if (devApp.commands[2].command.onReading !== Symbol.for("heart-rate")) throw new Error("simulator command did not route readings");
 if (devApp.state["connected?"] !== true) throw new Error("simulator did not connect");
 if (devApp.state.targetZoneId !== 3) throw new Error("simulator picked the wrong zone");
 if (devApp.state.latestBpm !== 136) throw new Error("simulator rounded the first bpm incorrectly");

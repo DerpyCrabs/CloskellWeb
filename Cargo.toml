@@ -7,7 +7,9 @@ members = [
     "crates/typecheck",
     "crates/effects",
     "crates/template_ir",
-    "crates/js_backend",
+    "crates/js_emit",
+    "crates/js_frontend",
+    "crates/js_server",
     "crates/cli",
 ]
 
@@ -23,4 +25,6 @@ macro_expand = { path = "crates/macro_expand" }
 typecheck = { path = "crates/typecheck" }
 effects = { path = "crates/effects" }
 template_ir = { path = "crates/template_ir" }
-js_backend = { path = "crates/js_backend" }
+js_emit = { path = "crates/js_emit" }
+js_frontend = { path = "crates/js_frontend" }
+js_server = { path = "crates/js_server" }

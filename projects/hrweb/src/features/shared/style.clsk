@@ -1,0 +1,17 @@
+(def card-class
+  "rounded-lg border border-[#dbe2dc]/90 bg-white/95 shadow-[0_18px_45px_rgba(24,31,27,0.11)]")
+
+(def primary-button-class
+  "flex min-h-[46px] cursor-pointer items-center justify-center rounded-lg border border-transparent bg-[#d9184b] px-4 text-center text-[1rem] font-extrabold leading-none text-white hover:bg-[#a80f37] disabled:cursor-not-allowed disabled:opacity-50")
+
+(def secondary-button-class
+  "flex min-h-[46px] cursor-pointer items-center justify-center rounded-lg border border-[#dbe2dc] bg-white px-4 text-center text-[0.95rem] font-bold leading-none text-[#172019] hover:not-disabled:border-[#aebcaf] hover:not-disabled:bg-[#fbfcfb] disabled:cursor-not-allowed disabled:border-[#e5ebe6] disabled:bg-[#fbfcfb] disabled:text-[#9aa39c]")
+
+(def stat-tile-class
+  "min-w-16 rounded-lg border border-[#dbe2dc] bg-[#fbfcfb] px-2.5 py-2 text-right")
+
+(defn mobile-button-class [state base text-size]
+  (str base
+       (if state.mobile?
+           (str " !min-h-10 !px-2.5 " text-size)
+           "")))

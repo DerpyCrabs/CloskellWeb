@@ -1,0 +1,396 @@
+(import "./lib/schema.clsk" [getRequestBodySchema])
+(import "./lib/auth.clsk" [applyAuthHeaders applyAuthUrl authEntriesCount hasAuthSchemes? parseSecuritySchemes])
+(import "./lib/browser.clsk" [initOAuthUrlForSwaggerUiPage loadStoredAuthEntries persistAuthEntries proxyMode? resolveTokenExpiry validHttpUrl? buildUrlEncodedFormBody])
+(import "./lib/param-schema.clsk" [resolveParameterMeta validateAllParams])
+(import "./lib/build-request-url.clsk" [buildRequestHeaders buildUrl])
+(import "./lib/request-body.clsk" [defaultRequestBodyText primaryTryItOutMedia requestBodyMode resolveBodyFormFields])
+(import "marked" [(parse as markedParse)])
+(import "dompurify" [(default domPurify)])
+
+(foreign pure markedParse (Fn [String {:async Bool}] String))
+(foreign pure domPurify {:sanitize (Fn [String] TrustedHtml)})
+
+(defn loadSourceCommand [source definitionName]
+  {:kind :http/request
+   :url source
+   :response :text
+   :proxy (proxyMode?)
+   :toMessage (fn [response] {:kind :source-loaded :source source :value response})
+   :onError :source-load-failed})
+
+(defn loadConfigCommand [configUrl]
+  {:kind :http/request
+   :url configUrl
+   :response :text
+   :proxy (proxyMode?)
+   :toMessage (fn [response] {:kind :config-loaded :url configUrl :value response})
+   :onError :config-failed})
+
+(defn loadSpecDocumentCommand [specUrl]
+  {:kind :http/request
+   :url specUrl
+   :response :text
+   :proxy (proxyMode?)
+   :toMessage (fn [response] {:kind :spec-document-loaded :url specUrl :value response})
+   :onError :spec-failed})
+
+(defn loadDiscoveryCommand [entry]
+  {:kind :http/request
+   :url entry.url
+   :response :text
+   :proxy (proxyMode?)
+   :toMessage (fn [response] {:kind :discovery-response :entry entry :value response})
+   :onError :discovery-failed})
+
+(defn loadOauthInitCommand [currentUrl sourceUrl]
+  (if (validHttpUrl? currentUrl sourceUrl)
+      {:kind :http/request
+       :url (initOAuthUrlForSwaggerUiPage sourceUrl)
+       :response :text
+       :proxy (proxyMode?)
+       :toMessage (fn [response] {:kind :oauth-init-loaded :value response})
+       :onError :oauth-init-failed}
+      Cmd.none))
+
+(defn readSpecFileCommand []
+  {:kind :file/read-selected
+   :ref "spec-file-input"
+   :format :text
+   :toMessage (fn [text] {:kind :pasted-spec :label "uploaded.yaml" :value text})
+   :onError :spec-failed})
+
+(defn openSpecFileCommand []
+  {:kind :dom-ref/click
+   :ref "spec-file-input"})
+
+(defn downloadSpecCommand [spec]
+  {:kind :file/download
+   :name "openapi.json"
+   :content (json-stringify spec 2)
+   :mime "application/json"
+   :msg {:kind :noop}})
+
+(defn validSpec? [spec]
+  (and (some? spec)
+       (object? (get spec :paths))
+       (or (string? (get spec :openapi))
+           (string? (get spec :swagger)))))
+
+(defn specTitle [spec]
+  (let [title (get (get spec :info) :title)]
+    (if (string? title) title "Untitled API")))
+
+(defn specVersion [spec]
+  (let [version (get (get spec :info) :version)]
+    (if (string? version)
+        (str "v" version)
+        "")))
+
+(defn specDescription [spec]
+  (let [description (get (get spec :info) :description)]
+    (if (string? description) description "")))
+
+(defn primaryServerUrl [spec]
+  (let [servers (get spec :servers)
+        firstServer (if (vector? servers) (first servers) nil)
+        url (get firstServer :url)]
+    (if (string? url) url "")))
+
+(defn hasText? [value]
+  (and (string? value) (> (count (trim value)) 0)))
+
+(defn optionalText [value]
+  (if (hasText? value) value nil))
+
+(defn scrollOperationCommand [op]
+  (if (hasText? op)
+      {:kind :dom/scroll-into-view
+       :testId (str "operation-" op)
+       :block "start"
+       :behavior "auto"
+       :msg {:kind :noop}}
+      Cmd.none))
+
+(defn markdownHtml [content]
+  (if (hasText? content)
+      (domPurify.sanitize (markedParse content {:async false}))
+      (unsafe-cast TrustedHtml "")))
+
+(defn authHeaders [state]
+  (applyAuthHeaders {"Accept" "application/json"} state.authEntries))
+
+(defn paramKey [opId name]
+  (str opId "::" name))
+
+(defn bodyKey [opId]
+  (str opId "::body"))
+
+(defn bodyFieldKey [name]
+  (str "body:" name))
+
+(defn paramValueByName [state opId name fallback]
+  (let [stored (object-get state.paramValues (paramKey opId name))]
+    (if (some? stored) stored fallback)))
+
+(defn paramDefaultValue [meta]
+  (if (string? meta.defaultValue) meta.defaultValue ""))
+
+(defn paramValue [state item meta]
+  (paramValueByName state item.id meta.name (paramDefaultValue meta)))
+
+(defn paramValuesForItem [state item defs]
+  (reduce defs
+          {}
+          (fn [values meta]
+            (object-assoc values meta.name (paramValue state item meta)))))
+
+(defn bodyFieldValue [state item name]
+  (paramValueByName state item.id (bodyFieldKey name) ""))
+
+(defn requestBodyInfoFor [state item]
+  (getRequestBodySchema state.spec (get item.operation :requestBody)))
+
+(defn primaryBodyMediaFor [state item]
+  (primaryTryItOutMedia (requestBodyInfoFor state item)))
+
+(defn requestBodyFormFields [state item mode media]
+  (if (= mode "multipart")
+      (resolveBodyFormFields media true)
+      (if (= mode "urlencoded")
+          (resolveBodyFormFields media false)
+          [])))
+
+(defn bodyFieldValuesFor [state item fields]
+  (reduce fields
+          {}
+          (fn [values field]
+            (object-assoc values field.name (bodyFieldValue state item field.name)))))
+
+(defn multipartFileKey [opId name]
+  (str opId "::" name))
+
+(defn requestBodyFileSelected? [state opId]
+  (let [selected (object-get state.requestBodyFiles opId)]
+    (if (bool? selected) selected false)))
+
+(defn multipartFileSelected? [state opId name]
+  (let [selected (object-get state.multipartFiles (multipartFileKey opId name))]
+    (if (bool? selected) selected false)))
+
+(defn selectedFileBody [testId]
+  (unsafe-cast Js {:kind :browser/selected-file
+                   :testId testId}))
+
+(defn multipartFormBody [fields values]
+  (unsafe-cast Js {:kind :browser/multipart-form
+                   :fields fields
+                   :values values}))
+
+(defn operationRequestUrl [state item]
+  (let [defs (resolveParameterMeta state.spec item)
+        values (paramValuesForItem state item defs)
+        url (buildUrl (primaryServerUrl state.spec) state.specUrl item.path defs values)]
+    (applyAuthUrl url state.authEntries)))
+
+(defn executeHeaders [state item]
+  (let [defs (resolveParameterMeta state.spec item)
+        values (paramValuesForItem state item defs)]
+    (buildRequestHeaders defs values (authHeaders state))))
+
+(defn requestBodyDefault [state item]
+  (let [media (primaryBodyMediaFor state item)
+        mode (requestBodyMode media)]
+    (defaultRequestBodyText media mode)))
+
+(defn requestBodyValue [state item]
+  (let [stored (object-get state.bodyValues (bodyKey item.id))]
+    (if (some? stored) stored (requestBodyDefault state item))))
+
+(defn requestContentType [media mode]
+  (if (= mode "json")
+      "application/json"
+      (if (= mode "text")
+          "text/plain"
+          (if (= mode "file")
+              (if (string? media.contentType) media.contentType "application/octet-stream")
+              (if (= mode "urlencoded")
+                  "application/x-www-form-urlencoded"
+                  "")))))
+
+(defn requestBodyPayload [state item mode fields values]
+  (if (= mode "file")
+      (selectedFileBody "request-body-file")
+      (if (= mode "multipart")
+          (multipartFormBody fields values)
+          (if (= mode "urlencoded")
+              (unsafe-cast Js (buildUrlEncodedFormBody fields values))
+              (unsafe-cast Js (requestBodyValue state item))))))
+
+(defn sendsRequestBody? [item mode]
+  (and (some? mode)
+       (not (= item.method "get"))
+       (not (= item.method "head"))))
+
+(defn hasRequestBodyPayload? [state item mode body]
+  (if (= mode "file")
+      (requestBodyFileSelected? state item.id)
+      true))
+
+(defn headersForBody [state item media mode]
+  (let [headers (executeHeaders state item)
+        contentType (requestContentType media mode)]
+    (if (hasText? contentType)
+        (object-assoc headers "content-type" contentType)
+        headers)))
+
+(defn executeRequestRecord [state item]
+  (let [media (primaryBodyMediaFor state item)
+        mode (requestBodyMode media)
+        fields (requestBodyFormFields state item mode media)
+        values (bodyFieldValuesFor state item fields)
+        body (requestBodyPayload state item mode fields values)
+        base {:url (operationRequestUrl state item)
+              :method item.method
+              :headers (executeHeaders state item)}]
+    (if (and (sendsRequestBody? item mode) (hasRequestBodyPayload? state item mode body))
+        (merge base {:headers (headersForBody state item media mode)
+                     :body body})
+        base)))
+
+(defn executeCommand [state item]
+  {:kind :http/request
+   :request (executeRequestRecord state item)
+   :response :auto
+   :proxy (proxyMode?)
+   :toMessage (fn [response] {:kind :request-finished :id item.id :value response})
+   :onError :request-failed})
+
+(defn invalidExecuteMessage [state item]
+  (let [defs (resolveParameterMeta state.spec item)
+        values (paramValuesForItem state item defs)
+        paramErrors (validateAllParams defs values)]
+    (if (> (count (object-keys paramErrors)) 0)
+        "Fix parameter validation errors before executing"
+        (let [info (requestBodyInfoFor state item)
+              media (primaryTryItOutMedia info)
+              mode (requestBodyMode media)
+              fields (requestBodyFormFields state item mode media)
+              values (bodyFieldValuesFor state item fields)
+              missingForm? (any? fields
+                                 (fn [field]
+                                   (and field.required
+                                        (if (= field.kind "file")
+                                            (not (multipartFileSelected? state item.id field.name))
+                                            (not (hasText? (object-get values field.name)))))))]
+          (if (and (sendsRequestBody? item mode)
+                   (or (and (= mode "json") (err? (json-parse-result (requestBodyValue state item))))
+                       (and (= mode "text") info.required (not (hasText? (requestBodyValue state item))))
+                       (and (= mode "file") info.required (not (requestBodyFileSelected? state item.id)))
+                       (and (or (= mode "multipart") (= mode "urlencoded")) missingForm?)))
+              "Fix request body validation errors before executing"
+              nil)))))
+
+(defn authSchemes [state]
+  (parseSecuritySchemes state.spec state.oauthInit))
+
+(defn authFieldKey [scheme field]
+  (str scheme.id "::" field))
+
+(defn authFieldValue [state scheme field fallback]
+  (let [stored (object-get state.authFormValues (authFieldKey scheme field))]
+    (if (some? stored) stored fallback)))
+
+(defn clientCredentialsLocation [state scheme]
+  (authFieldValue state scheme "clientCredentialsLocation" "header"))
+
+(defn authFormId [scheme]
+  (if (= scheme.kind "oauth2-password")
+      (str "oauth-password-" scheme.id)
+      (if (= scheme.kind "oauth2-client-credentials")
+          (str "oauth-client-" scheme.id)
+          (if (= scheme.kind "apiKey")
+              (str "api-key-" scheme.id)
+              (if (= scheme.kind "http-bearer")
+                  (str "bearer-" scheme.id)
+                  (if (= scheme.kind "http-basic")
+                      (str "basic-" scheme.id)
+                      (str "auth-form-" scheme.id)))))))
+
+(defn schemeAuthorized? [state scheme]
+  (some? (object-get state.authEntries scheme.id)))
+
+(defn afterAuthorizedState [state entries]
+  (merge state {:authDialog? false
+                :authorized? (> (authEntriesCount entries) 0)
+                :authEntries entries
+                :expandedOp (if (some? state.pendingAuthOp) state.pendingAuthOp state.expandedOp)
+                :tryActiveOp (if (some? state.pendingAuthOp) state.pendingAuthOp state.tryActiveOp)
+                :pendingAuthOp nil
+                :authLoadingScheme nil
+                :authError nil}))
+
+(defn simpleAuthEntry [state scheme]
+  (if (= scheme.kind "apiKey")
+      {:schemeId scheme.id
+       :type "apiKey"
+       :token (authFieldValue state scheme "value" "")
+       :apiKeyName scheme.name
+       :apiKeyIn scheme.in}
+      (if (= scheme.kind "http-bearer")
+          {:schemeId scheme.id
+           :type "bearer"
+           :token (authFieldValue state scheme "token" "")}
+          {:schemeId scheme.id
+           :type "basic"
+           :token ""
+           :username (authFieldValue state scheme "username" "")
+           :password (authFieldValue state scheme "password" "")})))
+
+(defn oauthClientId [state scheme]
+  (authFieldValue state scheme "clientId" scheme.clientId))
+
+(defn oauthClientSecret [state scheme]
+  (authFieldValue state scheme "clientSecret" scheme.clientSecret))
+
+(defn oauthHeaders [state scheme]
+  (let [base {"content-type" "application/x-www-form-urlencoded" "Accept" "application/json"}]
+    (if (= (clientCredentialsLocation state scheme) "header")
+        (object-assoc base "Authorization" (str "Basic " (base64-encode (str (oauthClientId state scheme) ":" (oauthClientSecret state scheme)))))
+        base)))
+
+(defn oauthPasswordBody [state scheme]
+  (let [base (str "grant_type=password"
+                  "&username=" (encode-uri-component (authFieldValue state scheme "username" ""))
+                  "&password=" (encode-uri-component (authFieldValue state scheme "password" ""))
+                  "&client_id=" (encode-uri-component (oauthClientId state scheme)))]
+    (if (= (clientCredentialsLocation state scheme) "header")
+        base
+        (str base "&client_secret=" (encode-uri-component (oauthClientSecret state scheme))))))
+
+(defn oauthClientCredentialsBody [state scheme]
+  (let [base "grant_type=client_credentials"]
+    (if (= (clientCredentialsLocation state scheme) "header")
+        (str base "&client_id=" (encode-uri-component (oauthClientId state scheme)))
+        (str base
+             "&client_id=" (encode-uri-component (oauthClientId state scheme))
+             "&client_secret=" (encode-uri-component (oauthClientSecret state scheme))))))
+
+(defn oauthTokenCommand [state scheme]
+  {:kind :http/request
+   :url scheme.tokenUrl
+   :method "POST"
+   :headers (oauthHeaders state scheme)
+   :body (if (= scheme.kind "oauth2-password")
+             (oauthPasswordBody state scheme)
+             (oauthClientCredentialsBody state scheme))
+   :response :json
+   :proxy (proxyMode?)
+   :toMessage (fn [response] {:kind :oauth-token-loaded :schemeId scheme.id :value response})
+   :onError :auth-failed})
+
+(defn clearAuthState [state]
+  (merge state {:authorized? false
+                :authEntries {}
+                :authFormValues {}
+                :authLoadingScheme nil
+                :authError nil}))

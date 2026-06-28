@@ -1,0 +1,15 @@
+(import "./model.clsk" [AppState])
+(import "./features/shell/messages.clsk" [ShellMsg])
+(import "./features/session/messages.clsk" [SessionMsg])
+(import "./features/zones/messages.clsk" [ZonesMsg])
+(import "./features/logbook/messages.clsk" [LogbookMsg])
+(import "./features/metrics/messages.clsk" [MetricsMsg])
+
+(type AppMsg
+  (Union ShellMsg SessionMsg ZonesMsg LogbookMsg MetricsMsg))
+
+(type InitResult
+  [AppState (Cmd AppMsg)])
+
+(type UpdateResult
+  [AppState (Cmd AppMsg)])

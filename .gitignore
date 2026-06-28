@@ -1,4 +1,5 @@
 /target/
+.closkell/
 **/*.rs.bk
 runtime-js/node_modules/
 projects/*/.closkell

@@ -1,0 +1,18 @@
+(import "../../model.clsk" [JsonPayload HeartChartRect WindowEventPayload])
+
+(type ZonesMsg
+  (Union
+    {:kind :zones-loaded :payload JsonPayload}
+    {:kind :zones-load-failed :error String}
+    {:kind :target-zone :id Number}
+    {:kind :zone-min-edited :id Number :raw String}
+    {:kind :zone-max-edited :id Number :raw String}
+    {:kind :zone-boundary :index Number :bpm Number}
+    {:kind :zone-boundary-key :index Number :key String}
+    {:kind :zone-boundary-drag-start :index Number :clientX Number}
+    {:kind :zone-boundary-track-measured :index Number :clientX Number :left Number :width Number :value HeartChartRect}
+    {:kind :zone-boundary-track-error :error String}
+    {:kind :zone-boundary-drag-move :id String :value WindowEventPayload}
+    {:kind :zone-boundary-drag-end :id String :value WindowEventPayload}
+    {:kind :zones-saved}
+    {:kind :zones-save-failed :error String}))

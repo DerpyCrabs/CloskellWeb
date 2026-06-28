@@ -1,0 +1,36 @@
+(import "../../model.clsk" [MonitorInfo])
+
+(type SessionMsg
+  (Union
+    {:kind :connect-monitor}
+    {:kind :monitor-connected :info MonitorInfo}
+    {:kind :monitor-error :error String}
+    {:kind :monitor-disconnected}
+    {:kind :disconnect-monitor}
+    {:kind :disconnect-paused-at :timestamp Number}
+    {:kind :connect-simulated}
+    {:kind :sim-zone-picked :roll Number}
+    {:kind :sim-bpm-picked :bpm Number}
+    {:kind :sim-connected :info MonitorInfo}
+    {:kind :start}
+    {:kind :started-at :timestamp Number}
+    {:kind :pause}
+    {:kind :paused-at :timestamp Number}
+    {:kind :resume}
+    {:kind :resumed-at :timestamp Number}
+    {:kind :clock-tick}
+    {:kind :clocked-at :timestamp Number}
+    {:kind :heart-rate :bpm Number}
+    {:kind :heart-rate-at :bpm Number :timestamp Number}
+    {:kind :idle-started-at :timestamp Number}
+    {:kind :stop}
+    {:kind :stop-hold-start}
+    {:kind :stop-hold-key-down :key String}
+    {:kind :stop-hold-key-up :key String}
+    {:kind :stop-hold-started :timestamp Number}
+    {:kind :stop-hold-frame :id String :timestamp Number :value Number}
+    {:kind :stop-hold-cancel}
+    {:kind :stop-hold-cancelled}
+    {:kind :stop-hold-complete}
+    {:kind :stopped-at :timestamp Number}
+    {:kind :id-roll :roll Number}))

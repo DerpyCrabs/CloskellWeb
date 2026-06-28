@@ -32,6 +32,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
     match command {
         "check" => {
             let path = require_check_path(&args)?;
+            let target = parse_framework_target(&args)?;
             let json = has_flag(&args, "--json");
             let cache_debug = has_flag(&args, "--cache-debug");
             let print_forms = !json && (has_flag(&args, "--types") || has_flag(&args, "--verbose"));
@@ -40,7 +41,11 @@ fn run(args: Vec<String>) -> Result<(), String> {
             } else {
                 None
             };
-            let cache_probe = if json && source_override.is_none() && !print_forms {
+            let cache_probe = if target == FrameworkTarget::Browser
+                && json
+                && source_override.is_none()
+                && !print_forms
+            {
                 match check_cache_probe(&path) {
                     Ok(probe) => Some(probe),
                     Err(reason) => {
@@ -84,6 +89,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 &mut checking,
                 print_forms,
                 &mut reporter,
+                target,
                 source_override.as_ref(),
             );
             if json {
@@ -130,6 +136,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
         }
         "build" => {
             let path = require_path(&args)?;
+            let target = parse_framework_target(&args)?;
             let output = output_path(&args);
             let json = has_flag(&args, "--json");
             let source_maps = has_flag(&args, "--sourcemap") || has_flag(&args, "--source-map");
@@ -157,6 +164,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 &mut checking,
                 false,
                 &mut reporter,
+                target,
                 None,
             );
             let module = match checked {
@@ -179,7 +187,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 }
             };
             if app.is_some() {
-                if let Err(error) = require_app_exports(&path, &module.exports) {
+                if let Err(error) = require_app_exports(&path, &module.exports, target) {
                     if json {
                         println!(
                             "{}",
@@ -202,7 +210,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 let options = BuildOptions {
                     source_maps,
                     app,
-                    emit_options: emit_options_from_env(),
+                    target,
+                    emit_options: emit_options_for_target(target),
                 };
                 let mut artifacts = Vec::new();
                 if let Err(error) = build_file(
@@ -243,7 +252,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
                     );
                 }
             } else {
-                let emitted = build_single_module(&path, &modules, &emit_options_from_env())?;
+                let emitted =
+                    build_single_module(&path, &modules, &emit_options_for_target(target))?;
                 print!("{}", emitted);
             }
             Ok(())
@@ -268,15 +278,20 @@ fn run(args: Vec<String>) -> Result<(), String> {
         }
         "inspect" => {
             let path = require_inspect_path(&args)?;
+            let target = parse_framework_target(&args)?;
             let cache_debug = has_flag(&args, "--cache-debug");
-            let cache_probe = match inspect_cache_probe(&path) {
-                Ok(probe) => Some(probe),
-                Err(reason) => {
-                    if cache_debug {
-                        eprintln!("closkell cache disabled: {}", reason);
+            let cache_probe = if target == FrameworkTarget::Browser {
+                match inspect_cache_probe(&path) {
+                    Ok(probe) => Some(probe),
+                    Err(reason) => {
+                        if cache_debug {
+                            eprintln!("closkell cache disabled: {}", reason);
+                        }
+                        None
                     }
-                    None
                 }
+            } else {
+                None
             };
             if let Some(probe) = &cache_probe {
                 if let Some(cached) = read_inspect_cache(probe) {
@@ -298,7 +313,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             }
             let mut modules = HashMap::new();
             let mut checking = HashSet::new();
-            check_file(&path, &mut modules, &mut checking, false)?;
+            check_file_with_target(&path, &mut modules, &mut checking, false, target)?;
             let report = inspect_file(&path, &modules)?;
             if let Some(probe) = &cache_probe {
                 match write_inspect_cache(probe, &report) {
@@ -446,14 +461,16 @@ struct WatchOptions {
     poll_interval: Duration,
     source_maps: bool,
     app: Option<AppOptions>,
-    emit_options: js_backend::EmitOptions,
+    target: FrameworkTarget,
+    emit_options: js_emit::EmitOptions,
 }
 
 #[derive(Clone, Debug)]
 struct BuildOptions {
     source_maps: bool,
     app: Option<AppOptions>,
-    emit_options: js_backend::EmitOptions,
+    target: FrameworkTarget,
+    emit_options: js_emit::EmitOptions,
 }
 
 #[derive(Clone, Debug)]
@@ -472,6 +489,24 @@ struct AppOptions {
     root_id: String,
     css: Option<String>,
     vendor_runtime: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum FrameworkTarget {
+    Core,
+    #[default]
+    Browser,
+    Server,
+}
+
+impl FrameworkTarget {
+    fn as_str(self) -> &'static str {
+        match self {
+            FrameworkTarget::Core => "core",
+            FrameworkTarget::Browser => "browser",
+            FrameworkTarget::Server => "server",
+        }
+    }
 }
 
 impl Default for AppOptions {
@@ -516,9 +551,8 @@ struct ModuleFingerprint {
 }
 
 fn require_path(args: &[String]) -> Result<PathBuf, String> {
-    args.get(1)
-        .map(PathBuf::from)
-        .ok_or_else(|| "expected a source file path".to_string())
+    let command = args.first().map(String::as_str).unwrap_or("command");
+    require_flaggable_path(args, command)
 }
 
 fn require_check_path(args: &[String]) -> Result<PathBuf, String> {
@@ -530,15 +564,55 @@ fn require_inspect_path(args: &[String]) -> Result<PathBuf, String> {
 }
 
 fn require_flaggable_path(args: &[String], command: &str) -> Result<PathBuf, String> {
-    args.iter()
-        .skip(1)
-        .find(|arg| !arg.starts_with('-'))
-        .map(PathBuf::from)
-        .ok_or_else(|| format!("{} expects a source file path", command))
+    let mut index = 1;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--" {
+            return args
+                .get(index + 1)
+                .map(PathBuf::from)
+                .ok_or_else(|| format!("{} expects a source file path", command));
+        }
+        if flag_takes_value(arg) {
+            index += 2;
+            continue;
+        }
+        if arg.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        return Ok(PathBuf::from(arg));
+    }
+    Err(format!("{} expects a source file path", command))
+}
+
+fn flag_takes_value(arg: &str) -> bool {
+    matches!(
+        arg,
+        "--target" | "--out" | "-o" | "--root" | "--css" | "--poll-ms"
+    )
 }
 
 fn has_flag(args: &[String], name: &str) -> bool {
     args.iter().any(|arg| arg == name)
+}
+
+fn parse_framework_target(args: &[String]) -> Result<FrameworkTarget, String> {
+    let Some(index) = args.iter().position(|arg| arg == "--target") else {
+        return Ok(FrameworkTarget::Browser);
+    };
+    let Some(value) = args.get(index + 1) else {
+        return Err("--target expects core, browser, or server".to_string());
+    };
+    match value.as_str() {
+        "core" => Ok(FrameworkTarget::Core),
+        "browser" => Ok(FrameworkTarget::Browser),
+        "server" => Ok(FrameworkTarget::Server),
+        other => Err(format!(
+            "unknown --target `{}`; expected core, browser, or server",
+            other
+        )),
+    }
 }
 
 fn parse_app_options(args: &[String]) -> Result<Option<AppOptions>, String> {
@@ -577,14 +651,72 @@ fn parse_app_options(args: &[String]) -> Result<Option<AppOptions>, String> {
     Ok(app)
 }
 
-fn emit_options_from_env() -> js_backend::EmitOptions {
-    js_backend::EmitOptions {
+fn emit_options_from_env() -> js_emit::EmitOptions {
+    emit_options_for_target(FrameworkTarget::Browser)
+}
+
+fn effect_options_for_target(target: FrameworkTarget) -> effects::EffectOptions {
+    let mut options = effects::EffectOptions::default();
+    if target == FrameworkTarget::Browser {
+        options = js_frontend::add_browser_effect_command_schemas(options);
+    }
+    if target != FrameworkTarget::Browser {
+        options = js_frontend::reject_browser_framework_access(options);
+    }
+    options = js_frontend::reject_browser_direct_access(options);
+    if target != FrameworkTarget::Server {
+        options = js_server::reject_server_framework_access(options);
+    }
+    options
+}
+
+fn typecheck_options_for_target(target: FrameworkTarget) -> typecheck::CheckOptions {
+    let mut options = match target {
+        FrameworkTarget::Browser => js_frontend::browser_typecheck_options(),
+        FrameworkTarget::Server => js_server::server_typecheck_options(),
+        FrameworkTarget::Core => typecheck::CheckOptions::default(),
+    };
+    if target != FrameworkTarget::Browser {
+        options = js_frontend::reject_browser_typecheck_access(options);
+    }
+    if target != FrameworkTarget::Server {
+        options = js_server::reject_server_typecheck_access(options);
+    }
+    options
+}
+
+fn emit_options_for_target(target: FrameworkTarget) -> js_emit::EmitOptions {
+    let mut options = js_emit::EmitOptions {
         reachable_message_kinds: None,
         message_field_reads: BTreeMap::new(),
         static_reads: BTreeMap::new(),
         direct_call_replacements: BTreeMap::new(),
+        symbol_reads: Vec::new(),
+        intrinsic_calls: Vec::new(),
+        custom_calls: Vec::new(),
         prelude_code: String::new(),
-        browser_app_runtime: false,
+        html_templates: html_template_emit_options_for_target(target),
+        omit_replaced_defn_exports: false,
+        export_top_level: true,
+    };
+    match target {
+        FrameworkTarget::Browser => js_frontend::add_browser_emit_intrinsics(&mut options),
+        FrameworkTarget::Server => js_server::add_server_emit_intrinsics(&mut options),
+        FrameworkTarget::Core => {}
+    }
+    options
+}
+
+fn html_template_emit_options_for_target(
+    target: FrameworkTarget,
+) -> js_emit::HtmlTemplateEmitOptions {
+    match target {
+        FrameworkTarget::Browser => js_frontend::browser_html_template_emit_options(),
+        FrameworkTarget::Core | FrameworkTarget::Server => {
+            js_emit::HtmlTemplateEmitOptions::disabled(
+                "#html is a browser framework form; build with --target browser",
+            )
+        }
     }
 }
 
@@ -620,6 +752,7 @@ fn run_module_tests_in_temp(path: &Path, temp_dir: &Path, json: bool) -> Result<
         &BuildOptions {
             source_maps: false,
             app: None,
+            target: FrameworkTarget::Browser,
             emit_options: emit_options_from_env(),
         },
         &modules,
@@ -1098,6 +1231,7 @@ fn parse_watch_options(args: &[String]) -> Result<WatchOptions, String> {
     let mut poll_ms = 250_u64;
     let mut source_maps = false;
     let mut app = None;
+    let target = parse_framework_target(args)?;
     let mut index = 1;
 
     while index < args.len() {
@@ -1152,6 +1286,12 @@ fn parse_watch_options(args: &[String]) -> Result<WatchOptions, String> {
                 options.vendor_runtime = true;
                 index += 1;
             }
+            "--target" => {
+                if args.get(index + 1).is_none() {
+                    return Err("--target expects core, browser, or server".to_string());
+                }
+                index += 2;
+            }
             value if value.starts_with('-') => {
                 return Err(format!("unknown dev --watch option `{}`", value));
             }
@@ -1175,7 +1315,8 @@ fn parse_watch_options(args: &[String]) -> Result<WatchOptions, String> {
         poll_interval: Duration::from_millis(poll_ms.max(1)),
         source_maps,
         app,
-        emit_options: emit_options_from_env(),
+        target,
+        emit_options: emit_options_for_target(target),
     })
 }
 
@@ -1186,15 +1327,17 @@ fn dev_build_once_with_options(
 ) -> Result<(), String> {
     let mut modules = HashMap::new();
     let mut checking = HashSet::new();
-    let module = check_file(source, &mut modules, &mut checking, false)?;
+    let module =
+        check_file_with_target(source, &mut modules, &mut checking, false, options.target)?;
     if options.app.is_some() {
-        require_app_exports(source, &module.exports)?;
+        require_app_exports(source, &module.exports, options.target)?;
     }
 
     let mut visited = HashSet::new();
     let build_options = BuildOptions {
         source_maps: options.source_maps,
         app: options.app.clone(),
+        target: options.target,
         emit_options: options.emit_options.clone(),
     };
     let mut artifacts = Vec::new();
@@ -1267,8 +1410,32 @@ fn check_file(
     checking: &mut HashSet<PathBuf>,
     print_forms: bool,
 ) -> Result<ModuleInfo, String> {
+    check_file_with_target(
+        path,
+        modules,
+        checking,
+        print_forms,
+        FrameworkTarget::Browser,
+    )
+}
+
+fn check_file_with_target(
+    path: &Path,
+    modules: &mut HashMap<PathBuf, ModuleInfo>,
+    checking: &mut HashSet<PathBuf>,
+    print_forms: bool,
+    target: FrameworkTarget,
+) -> Result<ModuleInfo, String> {
     let mut reporter = CheckReporter::new(true);
-    check_file_with_reporter(path, modules, checking, print_forms, &mut reporter, None)
+    check_file_with_reporter(
+        path,
+        modules,
+        checking,
+        print_forms,
+        &mut reporter,
+        target,
+        None,
+    )
 }
 
 fn check_file_with_reporter(
@@ -1277,6 +1444,7 @@ fn check_file_with_reporter(
     checking: &mut HashSet<PathBuf>,
     print_forms: bool,
     reporter: &mut CheckReporter,
+    target: FrameworkTarget,
     source_override: Option<&SourceOverride>,
 ) -> Result<ModuleInfo, String> {
     let canonical = fs::canonicalize(path)
@@ -1294,6 +1462,7 @@ fn check_file_with_reporter(
         checking,
         print_forms,
         reporter,
+        target,
         source_override,
     );
     checking.remove(&canonical);
@@ -1309,6 +1478,7 @@ fn check_file_inner(
     checking: &mut HashSet<PathBuf>,
     print_forms: bool,
     reporter: &mut CheckReporter,
+    target: FrameworkTarget,
     source_override: Option<&SourceOverride>,
 ) -> Result<ModuleInfo, String> {
     let (input, source) = parse_check_file(path, source_override)?;
@@ -1335,6 +1505,7 @@ fn check_file_inner(
             checking,
             false,
             reporter,
+            target,
             source_override,
         )?;
         for name in &import.names {
@@ -1350,7 +1521,7 @@ fn check_file_inner(
             }
             if let Some(binding) = imported.bindings.iter().find(|binding| {
                 binding.name == name.imported
-                    && imported_binding_type_is_importable(&imported, binding)
+                    && imported_binding_type_is_importable(binding, target)
             }) {
                 let binding = binding.import_as(name.name.clone());
                 if binding.returns_cmd() {
@@ -1381,10 +1552,11 @@ fn check_file_inner(
     let expansion = macro_expand::expand_source_with_imported_macros(&source, &imported_macros);
     reporter.report(path, &input, &expansion.diagnostics);
 
-    let type_result = typecheck::check_source_with_module_imports(
+    let type_result = typecheck::check_source_with_module_imports_and_options(
         &expansion.source,
         &import_bindings,
         &import_type_declarations,
+        typecheck_options_for_target(target),
     );
     reporter.report(path, &input, &type_result.diagnostics);
 
@@ -1393,9 +1565,22 @@ fn check_file_inner(
         .filter(|binding| binding.returns_cmd())
         .map(|binding| binding.name.clone())
         .collect::<HashSet<_>>();
-    let effect_report = effects::validate_purity_with_imported_command_helpers(
+    let imported_update_result_helpers = import_bindings
+        .iter()
+        .filter(|binding| binding.returns_update_result())
+        .map(|binding| binding.name.clone())
+        .collect::<HashSet<_>>();
+    let imported_subscription_helpers = import_bindings
+        .iter()
+        .filter(|binding| binding.returns_sub())
+        .map(|binding| binding.name.clone())
+        .collect::<HashSet<_>>();
+    let effect_report = effects::validate_purity_with_effect_helpers(
         &expansion.source,
         &imported_command_helpers,
+        &imported_update_result_helpers,
+        &imported_subscription_helpers,
+        effect_options_for_target(target),
     );
     reporter.report(path, &input, &effect_report.diagnostics);
 
@@ -2337,6 +2522,7 @@ fn runtime_chunk_declared_dependencies(name: &str) -> &'static [&'static str] {
         ],
         "registerCompiledFileReadSelectedCommandHandlers" => &[
             "clearFileInput",
+            "commandValueName",
             "compiledCommandCancelMessage",
             "compiledCommandErrorMessage",
             "compiledCommandMessage",
@@ -2471,10 +2657,32 @@ fn runtime_chunk_declared_dependencies(name: &str) -> &'static [&'static str] {
             "compiledRefName",
             "compiledStartCommandForSubscription",
             "compiledStopCommandForSubscription",
+            "compiledSubscriptionKey",
+            "compiledSubscriptionSignature",
         ],
         "startCompiledAppWithoutSubscriptions" => {
             &["compiledCommandErrorMessage", "compiledRefName"]
         }
+        "startServerService" => &[
+            "commandKind",
+            "errorMessage",
+            "findServerRoute",
+            "handleServerRequest",
+            "normalizeServerError",
+            "normalizeServerInitResult",
+            "readServerResources",
+            "readServerRoutes",
+            "runTask",
+        ],
+        "handleServerRequest" => &["normalizeServerError", "runTask"],
+        "findServerRoute" => &["commandKind", "matchServerPath", "serverRequestPath"],
+        "serverRequestPath" => &[],
+        "matchServerPath" => &["trimServerPath"],
+        "trimServerPath" => &[],
+        "normalizeServerError" => &["errorMessage"],
+        "normalizeServerInitResult" => &[],
+        "readServerRoutes" => &[],
+        "readServerResources" => &[],
         "createCompiledSubscriptionHandlersFor" => &[
             "compiledCommandErrorMessage",
             "compiledCommandKind",
@@ -2620,8 +2828,9 @@ fn runtime_chunk_declared_dependencies(name: &str) -> &'static [&'static str] {
         ],
         "mapScopedPayloadContinuation" => &["namedCommandMessage", "wrapScopedMessage"],
         "subscriptionKind" => &["commandKind"],
-        "subscriptionKey" => &["subscriptionKind"],
-        "compiledSubscriptionKey" => &["compiledCommandKind"],
+        "subscriptionKey" => &["subscriptionKind", "subscriptionIdentityPart"],
+        "compiledSubscriptionKey" => &["compiledCommandKind", "subscriptionIdentityPart"],
+        "compiledSubscriptionSignature" => &["subscriptionSignature"],
         "startCommandForSubscription" => &["subscriptionKind"],
         "compiledStartCommandForSubscription" => &["compiledCommandKind"],
         "stopCommandForSubscription" => &["subscriptionKind"],
@@ -2779,14 +2988,18 @@ fn build_file(
     let source = &module.source;
 
     let mut module_emit_options = options.emit_options.clone();
-    if options.app.is_some() {
-        module_emit_options.browser_app_runtime = true;
+    if options.app.is_some() && options.target == FrameworkTarget::Browser {
+        js_frontend::configure_browser_app_emit_options(&mut module_emit_options);
     }
 
     let mut import_emit_options = module_emit_options.clone();
-    if options.app.is_some() {
+    if options.app.is_some() && options.target == FrameworkTarget::Browser {
         import_emit_options.message_field_reads =
-            js_backend::collect_message_field_reads(&module.source);
+            js_emit::collect_message_field_reads(&module.source);
+        import_emit_options.omit_replaced_defn_exports = false;
+    }
+    if options.app.is_some() {
+        module_emit_options.export_top_level = false;
     }
 
     for import in parse_imports(&input, &source)? {
@@ -2806,6 +3019,7 @@ fn build_file(
             &BuildOptions {
                 source_maps: options.source_maps,
                 app: None,
+                target: options.target,
                 emit_options: import_emit_options.clone(),
             },
             modules,
@@ -2823,17 +3037,33 @@ fn build_file(
         options.app.is_some(),
     )?;
     if let Some(app) = &options.app {
-        let runtime_registrations =
-            collect_app_runtime_registrations(&emitted.runtime_effects, artifacts);
-        let init_takes_boot = emitted_init_takes_boot(&emitted.code);
-        let has_subscriptions = emitted_has_binding(&emitted.code, "subscriptions");
-        wrap_app_module(
-            &mut emitted,
-            app,
-            &runtime_registrations,
-            init_takes_boot,
-            has_subscriptions,
-        );
+        match options.target {
+            FrameworkTarget::Browser => {
+                let artifact_effects = artifacts.iter().map(|artifact| &artifact.runtime_effects);
+                let runtime_registrations = js_frontend::collect_runtime_registrations(
+                    std::iter::once(&emitted.runtime_effects).chain(artifact_effects),
+                );
+                let init_takes_boot = emitted_function_arity(&emitted, "init").unwrap_or(0) > 0;
+                let has_subscriptions = emitted.exports.contains_key("subscriptions");
+                js_frontend::wrap_browser_app_module(
+                    &mut emitted,
+                    &js_frontend::BrowserAppOptions {
+                        root_id: app.root_id.clone(),
+                        css: app.css.clone(),
+                    },
+                    &runtime_registrations,
+                    init_takes_boot,
+                    has_subscriptions,
+                );
+            }
+            FrameworkTarget::Server => {
+                let init_takes_boot = emitted_function_arity(&emitted, "init").unwrap_or(0) > 0;
+                js_server::wrap_server_app_module(&mut emitted, init_takes_boot);
+            }
+            FrameworkTarget::Core => {
+                return Err("build --app is not supported for --target core".to_string());
+            }
+        }
     }
     let runtime_exports = collect_runtime_import_exports(&emitted.code);
     if let Some(parent) = output.parent() {
@@ -2890,14 +3120,14 @@ fn import_has_runtime_names(
         return Ok(import
             .names
             .iter()
-            .any(|name| js_backend::is_runtime_import_name(&name.name)));
+            .any(|name| js_emit::is_runtime_import_name(&name.name)));
     }
     let import_source = resolve_import_source(source_path, &import.path)?;
     let canonical = fs::canonicalize(&import_source)
         .map_err(|err| format!("failed to resolve {}: {}", import_source.display(), err))?;
     let imported = modules.get(&canonical);
     Ok(import.names.iter().any(|name| {
-        js_backend::is_runtime_import_name(&name.name)
+        js_emit::is_runtime_import_name(&name.name)
             && !imported.is_some_and(|module| module.macros.contains_key(&name.imported))
     }))
 }
@@ -2933,7 +3163,7 @@ fn remove_file_if_exists(path: &Path) -> Result<(), String> {
 fn build_single_module(
     path: &Path,
     modules: &HashMap<PathBuf, ModuleInfo>,
-    emit_options: &js_backend::EmitOptions,
+    emit_options: &js_emit::EmitOptions,
 ) -> Result<String, String> {
     let canonical = fs::canonicalize(path)
         .map_err(|err| format!("failed to resolve {}: {}", path.display(), err))?;
@@ -2949,9 +3179,9 @@ fn emit_checked_module_from_checked(
     input: &str,
     module: &ModuleInfo,
     modules: &HashMap<PathBuf, ModuleInfo>,
-    emit_options: &js_backend::EmitOptions,
+    emit_options: &js_emit::EmitOptions,
     prune_update_messages: bool,
-) -> Result<js_backend::EmitResult, String> {
+) -> Result<js_emit::EmitResult, String> {
     let source = &module.source;
     let imports = parse_imports(input, source)?;
     let imported_message_kinds = message_imports_from_imports(path, &imports, modules)?;
@@ -2977,7 +3207,7 @@ fn emit_checked_module_from_checked(
         append_specialization_prelude(&mut emit_options.prelude_code, &specialization.code);
     }
 
-    let emitted = js_backend::emit_module_with_types_and_options(
+    let emitted = js_emit::emit_module_with_types_and_options(
         source,
         module.expr_types.clone(),
         emit_options,
@@ -3038,13 +3268,20 @@ fn specialization_helper_line_already_present(prelude: &str, line: &str) -> bool
     .any(|prefix| line.starts_with(prefix) && prelude.contains(prefix))
 }
 
+fn emitted_specialization_is_prelude_safe(code: &str) -> bool {
+    !code.contains("__closkellValueEqual")
+        && !code.contains("__closkellCreateHtmlTemplate")
+        && !code.contains("__closkellTemplateMetadata")
+        && !code.contains("__closkellDecoder")
+}
+
 fn collect_local_function_specializations(
     path: &Path,
     imports: &[ImportSpec],
     modules: &HashMap<PathBuf, ModuleInfo>,
     source: &SourceFile,
     expr_types: &BTreeMap<usize, String>,
-    emit_options: &js_backend::EmitOptions,
+    emit_options: &js_emit::EmitOptions,
 ) -> Result<Vec<ImportFunctionSpecialization>, String> {
     let local_schemas = local_function_schemas(source, expr_types);
     if local_schemas.is_empty() {
@@ -3124,7 +3361,7 @@ fn emit_recursive_local_specialization(
     local_schemas: &BTreeMap<String, String>,
     imported_targets: &BTreeMap<String, ImportedFunctionTarget>,
     modules: &HashMap<PathBuf, ModuleInfo>,
-    emit_options: &js_backend::EmitOptions,
+    emit_options: &js_emit::EmitOptions,
     interesting_names: &HashSet<String>,
     memo: &mut BTreeMap<String, String>,
     visiting: &mut HashSet<String>,
@@ -3208,18 +3445,14 @@ fn emit_recursive_local_specialization(
     let mut specialization_options = emit_options.clone();
     specialization_options.direct_call_replacements = replacements;
     specialization_options.prelude_code.clear();
-    let emitted = js_backend::emit_function_specialization(
+    let emitted = js_emit::emit_function_specialization(
         source,
         specialized_expr_types,
         name,
         &specialized_name,
         specialization_options,
     );
-    if emitted.diagnostics.is_empty()
-        && !emitted.code.contains("__closkellValueEqual")
-        && !emitted.code.contains("__closkellCreateTemplate")
-        && !emitted.code.contains("__closkellDecoder")
-    {
+    if emitted.diagnostics.is_empty() && emitted_specialization_is_prelude_safe(&emitted.code) {
         memo.insert(key.clone(), specialized_name.clone());
         emitted_code.push(emitted.code);
         visiting.remove(&key);
@@ -3235,7 +3468,7 @@ fn emit_imported_function_specialization(
     arg_types: &[String],
     imported_targets: &BTreeMap<String, ImportedFunctionTarget>,
     modules: &HashMap<PathBuf, ModuleInfo>,
-    emit_options: &js_backend::EmitOptions,
+    emit_options: &js_emit::EmitOptions,
     memo: &mut BTreeMap<String, String>,
     emitted_code: &mut Vec<String>,
 ) -> Option<String> {
@@ -3279,18 +3512,14 @@ fn emit_imported_function_specialization(
     let mut specialization_options = emit_options.clone();
     specialization_options.direct_call_replacements.clear();
     specialization_options.prelude_code.clear();
-    let emitted = js_backend::emit_function_specialization(
+    let emitted = js_emit::emit_function_specialization(
         &module.source,
         specialized_expr_types,
         &target.imported_name,
         &specialized_name,
         specialization_options,
     );
-    if emitted.diagnostics.is_empty()
-        && !emitted.code.contains("__closkellValueEqual")
-        && !emitted.code.contains("__closkellCreateTemplate")
-        && !emitted.code.contains("__closkellDecoder")
-    {
+    if emitted.diagnostics.is_empty() && emitted_specialization_is_prelude_safe(&emitted.code) {
         memo.insert(key, specialized_name.clone());
         emitted_code.push(emitted.code);
         Some(specialized_name)
@@ -3741,71 +3970,16 @@ fn find_defn_form<'a>(source: &'a SourceFile, name: &str) -> Option<&'a Expr> {
 }
 
 fn imported_binding_type_is_importable(
-    module: &ModuleInfo,
     binding: &typecheck::ExportedBinding,
+    target: FrameworkTarget,
 ) -> bool {
     if binding.is_annotated_or_value() {
         return true;
     }
-    find_defn_form(&module.source, &binding.name)
-        .is_some_and(|defn| !defn_contains_dynamic_type_flow(defn))
-}
-
-fn defn_contains_dynamic_type_flow(defn: &Expr) -> bool {
-    let ExprKind::List(items) = &defn.kind else {
-        return false;
-    };
-    items.iter().skip(3).any(expr_contains_dynamic_type_flow)
-}
-
-fn expr_contains_dynamic_type_flow(expr: &Expr) -> bool {
-    match &expr.kind {
-        ExprKind::List(items) => {
-            if items.first().is_some_and(|head| {
-                matches!(
-                    &head.kind,
-                    ExprKind::Symbol(name)
-                        if matches!(
-                            name.as_str(),
-                            "get"
-                                | "object-get"
-                                | "get-in"
-                                | "number?"
-                                | "string?"
-                                | "bool?"
-                                | "keyword?"
-                                | "object?"
-                                | "list?"
-                                | "vector?"
-                                | "set?"
-                                | "map?"
-                                | "json-parse"
-                                | "json-parse-result"
-                        )
-                )
-            }) {
-                return true;
-            }
-            items.iter().any(expr_contains_dynamic_type_flow)
-        }
-        ExprKind::Vector(items) | ExprKind::Set(items) => {
-            items.iter().any(expr_contains_dynamic_type_flow)
-        }
-        ExprKind::Map(entries) => entries.iter().any(|(key, value)| {
-            expr_contains_dynamic_type_flow(key) || expr_contains_dynamic_type_flow(value)
-        }),
-        ExprKind::Quote(inner)
-        | ExprKind::QuasiQuote(inner)
-        | ExprKind::Unquote(inner)
-        | ExprKind::UnquoteSplicing(inner) => expr_contains_dynamic_type_flow(inner),
-        ExprKind::HtmlTemplate(_) => false,
-        ExprKind::Nil
-        | ExprKind::Bool(_)
-        | ExprKind::Number(_)
-        | ExprKind::String(_)
-        | ExprKind::Keyword(_)
-        | ExprKind::Symbol(_) => false,
+    if target == FrameworkTarget::Browser && binding.returns_named("Html") {
+        return true;
     }
+    !binding.uses_dynamic_type_flow()
 }
 
 fn defn_contains_value_equal(defn: &Expr) -> bool {
@@ -4299,319 +4473,8 @@ fn message_imports_from_imports(
     Ok(imported_messages)
 }
 
-struct AppRuntimeRegistration {
-    import_name: &'static str,
-    kinds: &'static [&'static str],
-}
-
-const APP_RUNTIME_REGISTRATIONS: &[AppRuntimeRegistration] = &[
-    AppRuntimeRegistration {
-        import_name: "registerCompiledAnimationCommandHandlers",
-        kinds: &["animation/frame", "animation/cancel"],
-    },
-    AppRuntimeRegistration {
-        import_name: "registerAuthStorageCommandHandlers",
-        kinds: &["auth-storage/persist", "auth-storage/load"],
-    },
-    AppRuntimeRegistration {
-        import_name: "registerBluetoothCommandHandlers",
-        kinds: &["bluetooth/request-device"],
-    },
-    AppRuntimeRegistration {
-        import_name: "registerCompiledBluetoothHeartRateCommandHandlers",
-        kinds: &[
-            "bluetooth/connect-heart-rate",
-            "bluetooth/disconnect",
-            "sub/bluetooth/connect-heart-rate",
-        ],
-    },
-    AppRuntimeRegistration {
-        import_name: "registerBrowserCommandHandlers",
-        kinds: &[
-            "browser/history-replace-search-param",
-            "browser/history-write-route",
-            "browser/theme-load",
-            "browser/theme-apply",
-            "browser/clipboard-write",
-            "browser/set-cookie",
-        ],
-    },
-    AppRuntimeRegistration {
-        import_name: "registerCompiledCanvasDrawCommandHandlers",
-        kinds: &["canvas/draw"],
-    },
-    AppRuntimeRegistration {
-        import_name: "registerCanvasMeasureTextCommandHandlers",
-        kinds: &["canvas/measure-text"],
-    },
-    AppRuntimeRegistration {
-        import_name: "registerCompiledDomRefCommandHandlers",
-        kinds: &["dom-ref/focus", "dom-ref/click", "dom-ref/measure"],
-    },
-    AppRuntimeRegistration {
-        import_name: "registerCompiledDomResizeCommandHandlers",
-        kinds: &[
-            "dom-ref/resize-watch",
-            "dom-ref/resize-unwatch",
-            "sub/dom-ref/resize",
-        ],
-    },
-    AppRuntimeRegistration {
-        import_name: "registerCompiledDirectDomResizeCommandHandlers",
-        kinds: &["dom-ref/resize-watch/direct"],
-    },
-    AppRuntimeRegistration {
-        import_name: "registerDomScrollCommandHandlers",
-        kinds: &["dom/scroll-into-view"],
-    },
-    AppRuntimeRegistration {
-        import_name: "registerCompiledFileDownloadCommandHandlers",
-        kinds: &["file/download"],
-    },
-    AppRuntimeRegistration {
-        import_name: "registerFileImportCommandHandlers",
-        kinds: &["file/import"],
-    },
-    AppRuntimeRegistration {
-        import_name: "registerCompiledFileReadSelectedCommandHandlers",
-        kinds: &["file/read-selected"],
-    },
-    AppRuntimeRegistration {
-        import_name: "registerHttpCommandHandlers",
-        kinds: &["http/request"],
-    },
-    AppRuntimeRegistration {
-        import_name: "registerCompiledMediaQueryCommandHandlers",
-        kinds: &[
-            "media-query/watch",
-            "media-query/unwatch",
-            "sub/media-query",
-        ],
-    },
-    AppRuntimeRegistration {
-        import_name: "registerCompiledDirectMediaQueryCommandHandlers",
-        kinds: &["media-query/watch/direct", "media-query/unwatch/direct"],
-    },
-    AppRuntimeRegistration {
-        import_name: "registerCompiledRandomCommandHandlers",
-        kinds: &["random/number"],
-    },
-    AppRuntimeRegistration {
-        import_name: "registerCompiledSimulationCommandHandlers",
-        kinds: &["simulation/heart-rate", "sub/simulation/heart-rate"],
-    },
-    AppRuntimeRegistration {
-        import_name: "registerCompiledSimulationStopCommandHandlers",
-        kinds: &["simulation/stop"],
-    },
-    AppRuntimeRegistration {
-        import_name: "registerCompiledStorageReadWriteCommandHandlers",
-        kinds: &["storage/get", "storage/set"],
-    },
-    AppRuntimeRegistration {
-        import_name: "registerCompiledStorageRemoveCommandHandlers",
-        kinds: &["storage/remove"],
-    },
-    AppRuntimeRegistration {
-        import_name: "registerTaskCommandHandlers",
-        kinds: &["task/perform"],
-    },
-    AppRuntimeRegistration {
-        import_name: "registerCompiledTimerCommandHandlers",
-        kinds: &[
-            "timer/after",
-            "timer/every",
-            "timer/cancel",
-            "sub/timer/every",
-        ],
-    },
-    AppRuntimeRegistration {
-        import_name: "registerCompiledTimeCommandHandlers",
-        kinds: &["time/now"],
-    },
-    AppRuntimeRegistration {
-        import_name: "registerCompiledWindowEventCommandHandlers",
-        kinds: &[
-            "window/event-watch",
-            "window/event-unwatch",
-            "sub/window/event",
-        ],
-    },
-    AppRuntimeRegistration {
-        import_name: "registerCompiledDirectWindowEventCommandHandlers",
-        kinds: &["window/event-watch/direct", "window/event-unwatch/direct"],
-    },
-];
-
-fn collect_app_runtime_registrations(
-    entry_effects: &BTreeSet<String>,
-    artifacts: &[BuildArtifact],
-) -> BTreeSet<&'static str> {
-    let mut registrations = BTreeSet::new();
-    collect_app_runtime_registrations_from_effects(entry_effects, &mut registrations);
-    for artifact in artifacts {
-        collect_app_runtime_registrations_from_effects(
-            &artifact.runtime_effects,
-            &mut registrations,
-        );
-    }
-    if registrations.contains("registerCompiledSimulationCommandHandlers") {
-        registrations.remove("registerCompiledSimulationStopCommandHandlers");
-    }
-    registrations
-}
-
-fn collect_app_runtime_registrations_from_effects(
-    effects: &BTreeSet<String>,
-    registrations: &mut BTreeSet<&'static str>,
-) {
-    for registration in APP_RUNTIME_REGISTRATIONS {
-        if registration
-            .kinds
-            .iter()
-            .any(|kind| effects.contains(*kind))
-        {
-            registrations.insert(registration.import_name);
-        }
-    }
-}
-
-fn app_runtime_registration_alias(import_name: &str) -> String {
-    let mut chars = import_name.chars();
-    let Some(first) = chars.next() else {
-        return "__closkellRegister".to_string();
-    };
-    format!("__closkell{}{}", first.to_ascii_uppercase(), chars.as_str())
-}
-
-fn wrap_app_module(
-    emitted: &mut js_backend::EmitResult,
-    options: &AppOptions,
-    runtime_registrations: &BTreeSet<&'static str>,
-    init_takes_boot: bool,
-    has_subscriptions: bool,
-) {
-    let prelude = app_bootstrap_prelude(options, runtime_registrations, has_subscriptions);
-    let postlude = app_bootstrap_postlude(
-        options,
-        runtime_registrations,
-        init_takes_boot,
-        has_subscriptions,
-    );
-    let inserted_lines = prelude.lines().count();
-    for mapping in &mut emitted.source_mappings {
-        mapping.generated_line += inserted_lines;
-    }
-    strip_app_entry_exports(&mut emitted.code);
-    if !emitted.code.ends_with('\n') {
-        emitted.code.push('\n');
-    }
-    emitted.code = format!("{}{}{}", prelude, emitted.code, postlude);
-}
-
-fn strip_app_entry_exports(code: &mut String) {
-    *code = code
-        .replace("export function ", "function ")
-        .replace("export const ", "const ");
-}
-
-fn app_bootstrap_prelude(
-    options: &AppOptions,
-    runtime_registrations: &BTreeSet<&'static str>,
-    has_subscriptions: bool,
-) -> String {
-    let mut code = String::new();
-    let app_runner = if has_subscriptions {
-        "startCompiledApp"
-    } else {
-        "startCompiledAppWithoutSubscriptions"
-    };
-    let mut imports = vec![format!("{} as __closkellStartApp", app_runner)];
-    for import_name in runtime_registrations {
-        imports.push(format!(
-            "{} as {}",
-            import_name,
-            app_runtime_registration_alias(import_name)
-        ));
-    }
-    if !imports.is_empty() {
-        code.push_str("import { ");
-        code.push_str(&imports.join(", "));
-        code.push_str(" } from \"@closkell/runtime\";\n");
-    }
-    if let Some(css) = &options.css {
-        code.push_str("import ");
-        code.push_str(&json_string(css));
-        code.push_str(";\n");
-    }
-    code
-}
-
-fn app_bootstrap_postlude(
-    options: &AppOptions,
-    runtime_registrations: &BTreeSet<&'static str>,
-    init_takes_boot: bool,
-    has_subscriptions: bool,
-) -> String {
-    let mut code = String::new();
-    code.push_str("const __closkellRoot = document.getElementById(");
-    code.push_str(&json_string(&options.root_id));
-    code.push_str(");\n");
-    code.push_str("if (!__closkellRoot) {\n");
-    code.push_str("  throw new Error(");
-    code.push_str(&json_string(&format!(
-        "Root element #{} was not found.",
-        options.root_id
-    )));
-    code.push_str(");\n");
-    code.push_str("}\n");
-    code.push_str(
-        "const __closkellHandlerContext = { env: {}, host: globalThis, disposers: [] };\n",
-    );
-    code.push_str("const __closkellHandlers = {};\n");
-    let registrations = runtime_registrations
-        .iter()
-        .map(|import_name| app_runtime_registration_alias(import_name))
-        .collect::<Vec<_>>();
-    for registration in registrations {
-        code.push_str(&registration);
-        code.push_str("(__closkellHandlers, __closkellHandlerContext);\n");
-    }
-    code.push_str("Object.defineProperty(__closkellHandlers, \"dispose\", { value() { for (const dispose of __closkellHandlerContext.disposers.splice(0)) dispose(); } });\n");
-    code.push_str("export const __closkellApp = __closkellStartApp({\n");
-    code.push_str("  root: __closkellRoot,\n");
-    code.push_str("  init,\n");
-    code.push_str("  update,\n");
-    code.push_str("  view,\n");
-    if init_takes_boot {
-        code.push_str("  boot: { currentUrl: globalThis.location?.href ?? \"\" },\n");
-    }
-    if has_subscriptions {
-        code.push_str("  subscriptions,\n");
-    }
-    code.push_str("  handlers: __closkellHandlers\n");
-    code.push_str("});\n\n");
-    code
-}
-
-fn emitted_has_binding(code: &str, name: &str) -> bool {
-    code.contains(&format!("export function {}(", name))
-        || code.contains(&format!("export const {} =", name))
-        || code.contains(&format!("export let {} =", name))
-        || code.contains(&format!("export var {} =", name))
-}
-
-fn emitted_init_takes_boot(code: &str) -> bool {
-    let Some(start) = code.find("export function init(") else {
-        return false;
-    };
-    let params_start = start + "export function init(".len();
-    let Some(params_end) = code[params_start..].find(')') else {
-        return false;
-    };
-    !code[params_start..params_start + params_end]
-        .trim()
-        .is_empty()
+fn emitted_function_arity(emitted: &js_emit::EmitResult, name: &str) -> Option<usize> {
+    emitted.exports.get(name).and_then(|export| export.arity)
 }
 
 fn runtime_vendor_root(output: &Path) -> PathBuf {
@@ -4642,7 +4505,7 @@ fn write_source_map(
     source_path: &Path,
     input: &str,
     output: &Path,
-    mappings: &[js_backend::SourceMapping],
+    mappings: &[js_emit::SourceMapping],
 ) -> Result<(), String> {
     let map_path = source_map_path(output);
     let json = source_map_json(source_path, input, output, mappings);
@@ -4654,7 +4517,7 @@ fn source_map_json(
     source_path: &Path,
     input: &str,
     output: &Path,
-    mappings: &[js_backend::SourceMapping],
+    mappings: &[js_emit::SourceMapping],
 ) -> String {
     format!(
         "{{\n  \"version\": 3,\n  \"file\": {},\n  \"sources\": [{}],\n  \"sourcesContent\": [{}],\n  \"names\": [],\n  \"mappings\": {}\n}}\n",
@@ -4665,7 +4528,7 @@ fn source_map_json(
     )
 }
 
-fn source_map_mappings(input: &str, mappings: &[js_backend::SourceMapping]) -> String {
+fn source_map_mappings(input: &str, mappings: &[js_emit::SourceMapping]) -> String {
     let mut mappings = mappings.to_vec();
     mappings.sort_by_key(|mapping| (mapping.generated_line, mapping.generated_column));
 
@@ -4901,14 +4764,12 @@ fn parse_import_name(expr: &Expr) -> Result<ImportName, Diagnostic> {
 
 fn resolve_import_source(source_path: &Path, import_path: &str) -> Result<PathBuf, String> {
     let relative = Path::new(import_path);
-    if relative.components().any(|component| {
-        matches!(
-            component,
-            Component::ParentDir | Component::RootDir | Component::Prefix(_)
-        )
-    }) {
+    if relative
+        .components()
+        .any(|component| matches!(component, Component::RootDir | Component::Prefix(_)))
+    {
         return Err(format!(
-            "only same-tree relative local imports are supported: {}",
+            "only relative local imports are supported: {}",
             import_path
         ));
     }
@@ -4968,18 +4829,32 @@ fn collect_exports(source: &SourceFile) -> HashSet<String> {
         .collect()
 }
 
-fn require_app_exports(path: &Path, exports: &HashSet<String>) -> Result<(), String> {
-    let missing = ["init", "update", "view"]
-        .into_iter()
+fn require_app_exports(
+    path: &Path,
+    exports: &HashSet<String>,
+    target: FrameworkTarget,
+) -> Result<(), String> {
+    if target == FrameworkTarget::Core {
+        return Err("build --app is not supported for --target core".to_string());
+    }
+    let required: &[&str] = match target {
+        FrameworkTarget::Browser => &["init", "update", "view"],
+        FrameworkTarget::Server => &["init", "update", "routes", "resources"],
+        FrameworkTarget::Core => &[],
+    };
+    let missing = required
+        .iter()
+        .copied()
         .filter(|name| !exports.contains(*name))
         .collect::<Vec<_>>();
     if missing.is_empty() {
         return Ok(());
     }
     Err(format!(
-        "build --app expects {} to export {}; missing {}",
+        "build --app --target {} expects {} to export {}; missing {}",
+        target.as_str(),
         path.display(),
-        "init, update, and view",
+        required.join(", "),
         missing.join(", ")
     ))
 }
@@ -6605,7 +6480,7 @@ fn collect_message_kinds_by_binding_with_static(
 fn collect_reachable_update_message_kinds(
     source: &SourceFile,
     imported_message_kinds: &HashMap<String, BTreeSet<String>>,
-    emit_options: &js_backend::EmitOptions,
+    emit_options: &js_emit::EmitOptions,
 ) -> Option<BTreeSet<String>> {
     let static_context = MessageStaticContext {
         static_reads: emit_options.static_reads.clone(),
@@ -6619,7 +6494,7 @@ fn collect_reachable_update_message_kinds(
     let arms = update_message_arms(update_body)?;
 
     let mut reachable = BTreeSet::new();
-    for entry in ["init", "view", "subscriptions"] {
+    for entry in ["init", "view", "subscriptions", "resources"] {
         if let Some(kinds) = summaries.get(entry) {
             reachable.extend(kinds.iter().cloned());
         }
@@ -6684,7 +6559,7 @@ fn message_kind_pattern(pattern: &Expr) -> Option<String> {
 
 fn collect_app_static_reads(
     source: &SourceFile,
-    emit_options: &js_backend::EmitOptions,
+    emit_options: &js_emit::EmitOptions,
 ) -> BTreeMap<String, String> {
     let Some(fields) = init_static_state_fields(source, emit_options) else {
         return BTreeMap::new();
@@ -6699,7 +6574,7 @@ fn collect_app_static_reads(
 
 fn init_static_state_fields(
     source: &SourceFile,
-    emit_options: &js_backend::EmitOptions,
+    emit_options: &js_emit::EmitOptions,
 ) -> Option<BTreeMap<String, String>> {
     let ExprKind::List(items) = &source
         .forms
@@ -6734,7 +6609,7 @@ fn init_static_state_fields(
 
 fn init_static_state_fields_from_expr(
     expr: &Expr,
-    emit_options: &js_backend::EmitOptions,
+    emit_options: &js_emit::EmitOptions,
     values: &mut BTreeMap<String, String>,
     state_bindings: &mut BTreeMap<String, BTreeMap<String, String>>,
 ) -> Option<BTreeMap<String, String>> {
@@ -6778,7 +6653,7 @@ fn init_static_state_fields_from_expr(
 
 fn static_state_fields_from_expr(
     expr: &Expr,
-    emit_options: &js_backend::EmitOptions,
+    emit_options: &js_emit::EmitOptions,
     values: &BTreeMap<String, String>,
     state_bindings: &BTreeMap<String, BTreeMap<String, String>>,
 ) -> Option<BTreeMap<String, String>> {
@@ -6818,7 +6693,7 @@ fn static_state_fields_from_expr(
 
 fn static_js_value(
     expr: &Expr,
-    _emit_options: &js_backend::EmitOptions,
+    _emit_options: &js_emit::EmitOptions,
     values: &BTreeMap<String, String>,
 ) -> Option<String> {
     match &expr.kind {
@@ -7595,7 +7470,9 @@ fn collect_command_shapes_expr(
     match &expr.kind {
         ExprKind::Map(entries) => {
             if let Some(kind) = kind_literal_from_entries(entries) {
-                if effects::is_known_command_kind(&kind) {
+                if effects::is_known_command_kind(&kind)
+                    || js_frontend::is_browser_command_kind(&kind)
+                {
                     let fields = entries
                         .iter()
                         .filter_map(|(key, _)| record_key_name(key))
@@ -7737,7 +7614,9 @@ fn collect_subscription_shapes_expr(
     match &expr.kind {
         ExprKind::Map(entries) => {
             if let Some(kind) = kind_literal_from_entries(entries) {
-                if effects::is_known_subscription_kind(&kind) {
+                if effects::is_known_subscription_kind(&kind)
+                    || js_frontend::is_browser_subscription_kind(&kind)
+                {
                     let fields = entries
                         .iter()
                         .filter_map(|(key, _)| record_key_name(key))
@@ -8484,13 +8363,83 @@ mod tests {
         let reachable = collect_reachable_update_message_kinds(
             &source,
             &HashMap::new(),
-            &js_backend::EmitOptions::default(),
+            &js_emit::EmitOptions::default(),
         )
         .expect("update match should be recognized");
 
         assert!(reachable.contains("start"));
         assert!(reachable.contains("loaded"));
         assert!(reachable.contains("failed"));
+    }
+
+    #[test]
+    fn local_template_specializations_do_not_duplicate_metadata_consts() {
+        let input = r#"
+            (ann selectedClass (Fn [String String] String))
+            (defn selectedClass [value selected]
+              (if (= value selected) "selected" ""))
+
+            (ann card (Fn [String String] Html))
+            (defn card [value selected]
+              #html <div class={(selectedClass value selected)}>{value}</div>)
+
+            (ann item (Fn [String String] Html))
+            (defn item [value selected]
+              #html <span class={(selectedClass value selected)}>{value}</span>)
+
+            (defn view []
+              #html <main>{(card "a" "a")}{(item "b" "b")}</main>)
+        "#;
+        let source = parse_source(input);
+        let type_result = typecheck::check_source_with_module_imports_and_options(
+            &source,
+            &[],
+            &[],
+            typecheck_options_for_target(FrameworkTarget::Browser),
+        );
+        assert!(
+            type_result.diagnostics.is_empty(),
+            "{:?}",
+            type_result.diagnostics
+        );
+        let module = ModuleInfo {
+            input: input.to_string(),
+            exports: collect_exports(&source),
+            bindings: type_result.bindings,
+            type_declarations: type_result.type_declarations,
+            macros: HashMap::new(),
+            command_shapes_by_binding: HashMap::new(),
+            message_kinds_by_binding: HashMap::new(),
+            source,
+            expr_types: type_result.expr_types,
+        };
+        let emitted = emit_checked_module_from_checked(
+            Path::new("app.clsk"),
+            input,
+            &module,
+            &HashMap::new(),
+            &emit_options_for_target(FrameworkTarget::Browser),
+            false,
+        )
+        .expect("module should emit");
+        let metadata_names = emitted
+            .code
+            .lines()
+            .filter_map(|line| {
+                line.strip_prefix("const ")
+                    .and_then(|rest| rest.split_once(" = "))
+                    .map(|(name, _)| name.to_string())
+                    .filter(|name| name.starts_with("__closkellTemplateMetadata"))
+            })
+            .collect::<Vec<_>>();
+        let unique_metadata_names = metadata_names.iter().collect::<HashSet<_>>();
+
+        assert_eq!(
+            metadata_names.len(),
+            unique_metadata_names.len(),
+            "template metadata declarations must be unique:\n{}",
+            emitted.code
+        );
     }
 
     #[test]
@@ -8592,11 +8541,36 @@ export function commands() {
         assert!(tailored.contains("export function startCompiledApp"));
         assert!(tailored.contains("function compiledStartCommandForSubscription"));
         assert!(tailored.contains("function compiledStopCommandForSubscription"));
+        assert!(tailored.contains("function compiledSubscriptionKey"));
+        assert!(tailored.contains("function compiledSubscriptionSignature"));
+        assert!(tailored.contains("function subscriptionIdentityPart"));
+    }
+
+    #[test]
+    fn tailored_compiled_file_read_runtime_keeps_format_normalizer() {
+        let runtime_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("runtime-js")
+            .join("src")
+            .join("index.js");
+        let runtime =
+            fs::read_to_string(&runtime_path).expect("workspace runtime source should be readable");
+        let required =
+            BTreeSet::from(["registerCompiledFileReadSelectedCommandHandlers".to_string()]);
+        let tailored =
+            tailored_runtime_source(&runtime, &required).expect("runtime should be tailored");
+
+        assert!(
+            tailored.contains("export function registerCompiledFileReadSelectedCommandHandlers")
+        );
+        assert!(tailored.contains("function commandValueName"));
+        assert!(tailored.contains("async function readImportedFile"));
     }
 }
 
 fn print_help() {
     println!(
-        "closkell commands:\n  check <file> [--types] [--json] [--stdin] [--cache-debug]\n  build <file> [-o out.js] [--sourcemap] [--json] [--app] [--root id] [--css path] [--vendor-runtime]\n  expand <file>\n  fmt <file> [--stdin]\n  inspect <file> [--cache-debug]\n  test <file> [--json]\n  dev --watch <file> [--out out.js] [--sourcemap] [--app] [--root id] [--css path] [--vendor-runtime] [--poll-ms ms] [--once]"
+        "closkell commands:\n  check <file> [--target core|browser|server] [--types] [--json] [--stdin] [--cache-debug]\n  build <file> [-o out.js] [--target core|browser|server] [--sourcemap] [--json] [--app] [--root id] [--css path] [--vendor-runtime]\n  expand <file>\n  fmt <file> [--stdin]\n  inspect <file> [--target core|browser|server] [--cache-debug]\n  test <file> [--json]\n  dev --watch <file> [--target core|browser|server] [--out out.js] [--sourcemap] [--app] [--root id] [--css path] [--vendor-runtime] [--poll-ms ms] [--once]"
     );
 }

@@ -19,6 +19,543 @@ pub struct CheckResult {
     pub diagnostics: Vec<Diagnostic>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct CheckOptions {
+    disabled_html_template_message: Option<String>,
+    html_templates: Option<HtmlTemplateCheckOptions>,
+    named_types: Vec<NamedTypeRule>,
+    symbol_types: Vec<SymbolTypeRule>,
+    command_schemas: Vec<CommandSchemaRule>,
+    subscription_schemas: Vec<SubscriptionSchemaRule>,
+    forbidden_types: Vec<ForbiddenTypeRule>,
+    forbidden_symbols: Vec<ForbiddenSymbolRule>,
+    intrinsic_calls: Vec<IntrinsicCallRule>,
+    custom_calls: Vec<CustomCallRule>,
+}
+
+#[derive(Clone, Debug)]
+pub struct HtmlTemplateCheckOptions {
+    html_type: CheckType,
+    trusted_html_type: CheckType,
+    checker: Option<HtmlTemplateChecker>,
+}
+
+pub type HtmlTemplateChecker = for<'a> fn(&mut HtmlTemplateCheckContext<'a>, &HtmlNode);
+
+pub struct HtmlTemplateCheckContext<'a> {
+    inferencer: &'a mut Inferencer,
+    env: &'a mut HashMap<String, Type>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SymbolTypeRule {
+    name: String,
+    ty: CheckType,
+}
+
+#[derive(Clone, Debug)]
+pub struct CustomCallRule {
+    name: String,
+    checker: CustomCallChecker,
+}
+
+pub type CustomCallChecker = for<'a> fn(&mut TypecheckCallContext<'a>, &str, &[Expr]) -> Type;
+
+pub struct TypecheckCallContext<'a> {
+    inferencer: &'a mut Inferencer,
+    env: &'a mut HashMap<String, Type>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NamedTypeRule {
+    name: String,
+    arity: usize,
+    replacement: Option<CheckType>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandSchemaRule {
+    kind: String,
+    required_fields: Vec<String>,
+    one_of_field_groups: Vec<Vec<String>>,
+    field_types: Vec<CommandFieldRule>,
+    continuation_message_fields: Vec<CommandContinuationMessageFieldRule>,
+    success_value: Option<CheckType>,
+    success_value_from_field: Option<String>,
+    success_value_from_payload_format_fields: Vec<String>,
+    require_success: bool,
+    reject_success_continuations: bool,
+    payloadless_success: bool,
+    supported_continuations: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandFieldRule {
+    name: String,
+    ty: CheckType,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubscriptionSchemaRule {
+    kind: String,
+    required_fields: Vec<String>,
+    collection_fields: Vec<String>,
+    field_types: Vec<CommandFieldRule>,
+    command_kind: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandContinuationMessageFieldRule {
+    continuation: String,
+    name: String,
+    ty: CheckType,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForbiddenTypeRule {
+    name: String,
+    message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForbiddenSymbolRule {
+    pattern: CheckSymbolPattern,
+    message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CheckSymbolPattern {
+    Exact(String),
+    Prefix(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IntrinsicCallRule {
+    name: String,
+    overloads: Vec<IntrinsicCallOverload>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IntrinsicCallOverload {
+    params: Vec<IntrinsicParam>,
+    result: CheckType,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IntrinsicParam {
+    Infer,
+    Expect(CheckType),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CheckType {
+    Fresh(String),
+    Argument(usize),
+    Number,
+    String,
+    Bool,
+    Nil,
+    Keyword,
+    Syntax,
+    Js,
+    Named(String, Vec<CheckType>),
+    Option(Box<CheckType>),
+    List(Box<CheckType>),
+    Vector(Box<CheckType>),
+    Tuple(Vec<CheckType>),
+    Set(Box<CheckType>),
+    Map(Box<CheckType>, Box<CheckType>),
+    Result(Box<CheckType>, Box<CheckType>),
+    Cmd(Box<CheckType>),
+    Task(Box<CheckType>, Box<CheckType>),
+    Sub(Box<CheckType>),
+    Event(Box<CheckType>),
+    Record(BTreeMap<String, CheckType>),
+    Union(Vec<CheckType>),
+    Fn(Vec<CheckType>, Box<CheckType>),
+}
+
+impl CheckOptions {
+    pub fn html_templates(mut self, html_type: CheckType, trusted_html_type: CheckType) -> Self {
+        self.html_templates = Some(HtmlTemplateCheckOptions {
+            html_type,
+            trusted_html_type,
+            checker: None,
+        });
+        self
+    }
+
+    pub fn html_templates_with_checker(
+        mut self,
+        html_type: CheckType,
+        trusted_html_type: CheckType,
+        checker: HtmlTemplateChecker,
+    ) -> Self {
+        self.html_templates = Some(HtmlTemplateCheckOptions {
+            html_type,
+            trusted_html_type,
+            checker: Some(checker),
+        });
+        self
+    }
+
+    pub fn named_type(mut self, name: impl Into<String>, arity: usize) -> Self {
+        self.named_types.push(NamedTypeRule {
+            name: name.into(),
+            arity,
+            replacement: None,
+        });
+        self
+    }
+
+    pub fn named_type_alias(mut self, name: impl Into<String>, replacement: CheckType) -> Self {
+        self.named_types.push(NamedTypeRule {
+            name: name.into(),
+            arity: 0,
+            replacement: Some(replacement),
+        });
+        self
+    }
+
+    pub fn symbol_type(mut self, name: impl Into<String>, ty: CheckType) -> Self {
+        self.symbol_types.push(SymbolTypeRule {
+            name: name.into(),
+            ty,
+        });
+        self
+    }
+
+    pub fn command_schema(mut self, rule: CommandSchemaRule) -> Self {
+        self.command_schemas.push(rule);
+        self
+    }
+
+    pub fn subscription_schema(mut self, rule: SubscriptionSchemaRule) -> Self {
+        self.subscription_schemas.push(rule);
+        self
+    }
+
+    pub fn forbid_html_templates(mut self, message: impl Into<String>) -> Self {
+        self.disabled_html_template_message = Some(message.into());
+        self
+    }
+
+    pub fn forbid_type(mut self, name: impl Into<String>, message: impl Into<String>) -> Self {
+        self.forbidden_types.push(ForbiddenTypeRule {
+            name: name.into(),
+            message: message.into(),
+        });
+        self
+    }
+
+    pub fn forbid_symbol(
+        mut self,
+        pattern: CheckSymbolPattern,
+        message: impl Into<String>,
+    ) -> Self {
+        self.forbidden_symbols.push(ForbiddenSymbolRule {
+            pattern,
+            message: message.into(),
+        });
+        self
+    }
+
+    pub fn intrinsic_call(mut self, rule: IntrinsicCallRule) -> Self {
+        self.intrinsic_calls.push(rule);
+        self
+    }
+
+    pub fn custom_call(mut self, rule: CustomCallRule) -> Self {
+        self.custom_calls.push(rule);
+        self
+    }
+
+    fn html_template_message(&self) -> Option<&str> {
+        self.disabled_html_template_message.as_deref()
+    }
+
+    fn html_template_options(&self) -> Option<&HtmlTemplateCheckOptions> {
+        self.html_templates.as_ref()
+    }
+
+    fn named_type_rule(&self, name: &str) -> Option<&NamedTypeRule> {
+        self.named_types.iter().find(|rule| rule.name == name)
+    }
+
+    fn symbol_type_rule(&self, name: &str) -> Option<&SymbolTypeRule> {
+        self.symbol_types.iter().find(|rule| rule.name == name)
+    }
+
+    fn command_schema_rule(&self, kind: &str) -> Option<&CommandSchemaRule> {
+        self.command_schemas.iter().find(|rule| rule.kind == kind)
+    }
+
+    fn subscription_schema_rule(&self, kind: &str) -> Option<&SubscriptionSchemaRule> {
+        self.subscription_schemas
+            .iter()
+            .find(|rule| rule.kind == kind)
+    }
+
+    fn forbidden_type_message(&self, name: &str) -> Option<String> {
+        self.forbidden_types
+            .iter()
+            .find(|rule| rule.name == name)
+            .map(|rule| rule.message.replace("{type}", name))
+    }
+
+    fn forbidden_symbol_message(&self, name: &str) -> Option<String> {
+        self.forbidden_symbols
+            .iter()
+            .find(|rule| rule.pattern.matches(name))
+            .map(|rule| rule.message.replace("{symbol}", name))
+    }
+
+    fn intrinsic_call_rule(&self, name: &str) -> Option<&IntrinsicCallRule> {
+        self.intrinsic_calls.iter().find(|rule| rule.name == name)
+    }
+
+    fn custom_call_rule(&self, name: &str) -> Option<&CustomCallRule> {
+        self.custom_calls.iter().find(|rule| rule.name == name)
+    }
+}
+
+impl CheckSymbolPattern {
+    pub fn exact(name: impl Into<String>) -> Self {
+        Self::Exact(name.into())
+    }
+
+    pub fn prefix(prefix: impl Into<String>) -> Self {
+        Self::Prefix(prefix.into())
+    }
+
+    fn matches(&self, name: &str) -> bool {
+        match self {
+            CheckSymbolPattern::Exact(expected) => name == expected,
+            CheckSymbolPattern::Prefix(prefix) => name.starts_with(prefix),
+        }
+    }
+}
+
+impl IntrinsicCallRule {
+    pub fn new(name: impl Into<String>, overloads: Vec<IntrinsicCallOverload>) -> Self {
+        Self {
+            name: name.into(),
+            overloads,
+        }
+    }
+}
+
+impl CustomCallRule {
+    pub fn new(name: impl Into<String>, checker: CustomCallChecker) -> Self {
+        Self {
+            name: name.into(),
+            checker,
+        }
+    }
+}
+
+impl CommandSchemaRule {
+    pub fn new(kind: impl Into<String>) -> Self {
+        Self {
+            kind: kind.into(),
+            required_fields: Vec::new(),
+            one_of_field_groups: Vec::new(),
+            field_types: Vec::new(),
+            continuation_message_fields: Vec::new(),
+            success_value: None,
+            success_value_from_field: None,
+            success_value_from_payload_format_fields: Vec::new(),
+            require_success: false,
+            reject_success_continuations: false,
+            payloadless_success: false,
+            supported_continuations: Vec::new(),
+        }
+    }
+
+    pub fn required_fields(mut self, fields: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.required_fields = fields.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn one_of_fields(mut self, fields: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.one_of_field_groups
+            .push(fields.into_iter().map(Into::into).collect());
+        self
+    }
+
+    pub fn field(mut self, name: impl Into<String>, ty: CheckType) -> Self {
+        self.field_types.push(CommandFieldRule {
+            name: name.into(),
+            ty,
+        });
+        self
+    }
+
+    pub fn continuation_message_field(
+        mut self,
+        continuation: impl Into<String>,
+        name: impl Into<String>,
+        ty: CheckType,
+    ) -> Self {
+        self.continuation_message_fields
+            .push(CommandContinuationMessageFieldRule {
+                continuation: continuation.into(),
+                name: name.into(),
+                ty,
+            });
+        self
+    }
+
+    pub fn success_value(mut self, ty: CheckType) -> Self {
+        self.success_value = Some(ty);
+        self
+    }
+
+    pub fn success_value_from_field(mut self, field: impl Into<String>) -> Self {
+        self.success_value_from_field = Some(field.into());
+        self
+    }
+
+    pub fn success_value_from_payload_format_fields(
+        mut self,
+        fields: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.success_value_from_payload_format_fields =
+            fields.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn require_success(mut self) -> Self {
+        self.require_success = true;
+        self
+    }
+
+    pub fn reject_success_continuations(mut self) -> Self {
+        self.reject_success_continuations = true;
+        self
+    }
+
+    pub fn payloadless_success(mut self) -> Self {
+        self.payloadless_success = true;
+        self
+    }
+
+    pub fn supported_continuations(
+        mut self,
+        fields: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.supported_continuations = fields.into_iter().map(Into::into).collect();
+        self
+    }
+
+    fn supports_continuation(&self, field: &str) -> bool {
+        self.supported_continuations
+            .iter()
+            .any(|supported| supported == field)
+    }
+}
+
+impl SubscriptionSchemaRule {
+    pub fn new(kind: impl Into<String>) -> Self {
+        Self {
+            kind: kind.into(),
+            required_fields: Vec::new(),
+            collection_fields: Vec::new(),
+            field_types: Vec::new(),
+            command_kind: None,
+        }
+    }
+
+    pub fn required_fields(mut self, fields: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.required_fields = fields.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn collection_fields(
+        mut self,
+        fields: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.collection_fields = fields.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn field(mut self, name: impl Into<String>, ty: CheckType) -> Self {
+        self.field_types.push(CommandFieldRule {
+            name: name.into(),
+            ty,
+        });
+        self
+    }
+
+    pub fn command_kind(mut self, kind: impl Into<String>) -> Self {
+        self.command_kind = Some(kind.into());
+        self
+    }
+}
+
+impl IntrinsicCallOverload {
+    pub fn new(params: Vec<IntrinsicParam>, result: CheckType) -> Self {
+        Self { params, result }
+    }
+}
+
+impl IntrinsicParam {
+    pub fn infer() -> Self {
+        Self::Infer
+    }
+
+    pub fn expect(ty: CheckType) -> Self {
+        Self::Expect(ty)
+    }
+}
+
+impl CheckType {
+    pub fn fresh(name: impl Into<String>) -> Self {
+        Self::Fresh(name.into())
+    }
+
+    pub fn argument(index: usize) -> Self {
+        Self::Argument(index)
+    }
+
+    pub fn named(name: impl Into<String>) -> Self {
+        Self::Named(name.into(), Vec::new())
+    }
+
+    pub fn apply(name: impl Into<String>, args: Vec<CheckType>) -> Self {
+        Self::Named(name.into(), args)
+    }
+
+    pub fn list(inner: CheckType) -> Self {
+        Self::List(Box::new(inner))
+    }
+
+    pub fn vector(inner: CheckType) -> Self {
+        Self::Vector(Box::new(inner))
+    }
+
+    pub fn option(inner: CheckType) -> Self {
+        Self::Option(Box::new(inner))
+    }
+
+    pub fn record(fields: impl IntoIterator<Item = (impl Into<String>, CheckType)>) -> Self {
+        Self::Record(
+            fields
+                .into_iter()
+                .map(|(name, ty)| (name.into(), ty))
+                .collect(),
+        )
+    }
+
+    pub fn task(err: CheckType, ok: CheckType) -> Self {
+        Self::Task(Box::new(err), Box::new(ok))
+    }
+
+    pub fn function(args: Vec<CheckType>, ret: CheckType) -> Self {
+        Self::Fn(args, Box::new(ret))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TypeDeclaration {
     pub name: String,
@@ -75,6 +612,7 @@ pub struct ExportedBinding {
     pub name: String,
     ty: Type,
     annotated: bool,
+    dynamic_type_flow: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -111,6 +649,14 @@ impl ExportedBinding {
         self.annotated || !matches!(self.ty, Type::Fn(_, _))
     }
 
+    pub fn returns_named(&self, name: &str) -> bool {
+        type_returns_named(&self.ty, name)
+    }
+
+    pub fn uses_dynamic_type_flow(&self) -> bool {
+        self.dynamic_type_flow
+    }
+
     pub fn schema(&self) -> String {
         format_type_inner(&self.ty)
     }
@@ -124,10 +670,14 @@ impl ImportedBinding {
     pub fn returns_sub(&self) -> bool {
         type_returns_sub(&self.ty)
     }
+
+    pub fn returns_update_result(&self) -> bool {
+        type_returns_update_result(&self.ty)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum Type {
+pub enum Type {
     Var(u32),
     Number,
     String,
@@ -136,8 +686,7 @@ enum Type {
     Keyword(Option<String>),
     Syntax,
     Js,
-    Html,
-    TrustedHtml,
+    Named(String, Vec<Type>),
     Decoder(Box<Type>),
     Option(Box<Type>),
     List(Box<Type>),
@@ -160,9 +709,186 @@ struct Inferencer {
     next_var: u32,
     subst: HashMap<u32, Type>,
     type_aliases: HashMap<String, TypeAlias>,
+    options: CheckOptions,
     html_event_msg: Option<Type>,
+    dynamic_type_flow: bool,
     expr_types: BTreeMap<usize, Type>,
     diagnostics: Vec<Diagnostic>,
+}
+
+impl HtmlTemplateCheckContext<'_> {
+    pub fn infer_expr(&mut self, expr: &Expr) -> Type {
+        self.inferencer.infer_expr(expr, self.env)
+    }
+
+    pub fn with_locals<R>(
+        &mut self,
+        locals: impl IntoIterator<Item = (impl Into<String>, Type)>,
+        f: impl FnOnce(&mut HtmlTemplateCheckContext<'_>) -> R,
+    ) -> R {
+        let mut scoped_env = self.env.clone();
+        for (name, ty) in locals {
+            scoped_env.insert(name.into(), ty);
+        }
+        let mut scoped = HtmlTemplateCheckContext {
+            inferencer: &mut *self.inferencer,
+            env: &mut scoped_env,
+        };
+        f(&mut scoped)
+    }
+
+    pub fn fresh(&mut self) -> Type {
+        self.inferencer.fresh()
+    }
+
+    pub fn resolve(&mut self, ty: Type) -> Type {
+        self.inferencer.resolve(ty)
+    }
+
+    pub fn shallow_resolve(&mut self, ty: Type) -> Type {
+        self.inferencer.shallow_resolve(ty)
+    }
+
+    pub fn unify(&mut self, left: Type, right: Type, span: Span) -> Type {
+        self.inferencer.unify(left, right, span)
+    }
+
+    pub fn check_type(&mut self, ty: &CheckType) -> Type {
+        self.inferencer
+            .check_type_to_type(ty, &mut HashMap::new(), &[])
+    }
+
+    pub fn html_template_result_type(&mut self) -> Type {
+        self.inferencer.html_template_result_type()
+    }
+
+    pub fn trusted_html_type(&mut self) -> Type {
+        self.inferencer.html_template_trusted_type()
+    }
+
+    pub fn update_message_type(&self) -> Option<Type> {
+        self.inferencer.html_event_msg.clone()
+    }
+
+    pub fn infer_iterable_element(&mut self, collection_ty: Type, span: Span) -> Type {
+        self.inferencer.infer_iterable_element(collection_ty, span)
+    }
+
+    pub fn command_message_matches(&mut self, expected: Type, actual: Type, span: Span) -> bool {
+        self.inferencer
+            .command_message_matches(expected, actual, span)
+    }
+
+    pub fn diagnostic(&mut self, span: Span, message: impl Into<String>) {
+        self.inferencer
+            .diagnostics
+            .push(Diagnostic::error(span, message.into()));
+    }
+
+    pub fn format_type(&mut self, ty: &Type) -> String {
+        self.inferencer.format_type(ty)
+    }
+
+    pub fn format_type_with_literals(&mut self, ty: &Type) -> String {
+        format_type_with_literals(&self.inferencer.resolve(ty.clone()))
+    }
+}
+
+impl TypecheckCallContext<'_> {
+    pub fn infer_expr(&mut self, expr: &Expr) -> Type {
+        self.inferencer.infer_expr(expr, self.env)
+    }
+
+    pub fn fresh(&mut self) -> Type {
+        self.inferencer.fresh()
+    }
+
+    pub fn resolve(&mut self, ty: Type) -> Type {
+        self.inferencer.resolve(ty)
+    }
+
+    pub fn unify(&mut self, left: Type, right: Type, span: Span) -> Type {
+        self.inferencer.unify(left, right, span)
+    }
+
+    pub fn check_type(&mut self, ty: &CheckType) -> Type {
+        self.inferencer
+            .check_type_to_type(ty, &mut HashMap::new(), &[])
+    }
+
+    pub fn arity_error(&mut self, span: Span, name: &str, expected: usize, actual: usize) {
+        self.inferencer.arity_error(span, name, expected, actual);
+    }
+
+    pub fn diagnostic(&mut self, span: Span, message: impl Into<String>) {
+        self.inferencer
+            .diagnostics
+            .push(Diagnostic::error(span, message.into()));
+    }
+
+    pub fn format_type(&mut self, ty: &Type) -> String {
+        self.inferencer.format_type(ty)
+    }
+
+    pub fn format_type_with_literals(&mut self, ty: &Type) -> String {
+        format_type_with_literals(&self.inferencer.resolve(ty.clone()))
+    }
+
+    pub fn update_message_type(&self) -> Option<Type> {
+        self.inferencer.html_event_msg.clone()
+    }
+
+    pub fn command_message_matches(&mut self, expected: Type, actual: Type, span: Span) -> bool {
+        self.inferencer
+            .command_message_matches(expected, actual, span)
+    }
+
+    pub fn command_message_tag_type(
+        &mut self,
+        command_kind: Option<&str>,
+        field: &str,
+        tag: &str,
+        command_fields: &BTreeMap<String, Type>,
+    ) -> Type {
+        self.inferencer
+            .command_message_tag_type(command_kind, field, tag, command_fields)
+    }
+
+    pub fn infer_command_tag_message(
+        &mut self,
+        command_kind: &str,
+        field: &str,
+        arg: &Expr,
+    ) -> Type {
+        self.inferencer
+            .infer_command_tag_message(command_kind, field, arg, self.env)
+    }
+
+    pub fn infer_command_mapper_message(
+        &mut self,
+        command_kind: &str,
+        mapper_ty: Type,
+        payload_ty: Type,
+        span: Span,
+        label: &str,
+    ) -> Type {
+        self.inferencer.infer_command_mapper_message(
+            command_kind,
+            mapper_ty,
+            payload_ty,
+            span,
+            label,
+        )
+    }
+
+    pub fn command_payload_type_from_format_expr(&mut self, expr: &Expr) -> Type {
+        self.inferencer
+            .command_payload_type_from_format_expr(expr, self.env)
+    }
+
+    pub fn join_types(&mut self, left: Type, right: Type, span: Span) -> Type {
+        self.inferencer.join_types(left, right, span)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -184,7 +910,24 @@ pub fn check_source_with_module_imports(
     imports: &[ImportedBinding],
     imported_types: &[ImportedTypeDeclaration],
 ) -> CheckResult {
-    let mut inferencer = Inferencer::default();
+    check_source_with_module_imports_and_options(
+        source,
+        imports,
+        imported_types,
+        CheckOptions::default(),
+    )
+}
+
+pub fn check_source_with_module_imports_and_options(
+    source: &SourceFile,
+    imports: &[ImportedBinding],
+    imported_types: &[ImportedTypeDeclaration],
+    options: CheckOptions,
+) -> CheckResult {
+    let mut inferencer = Inferencer {
+        options,
+        ..Inferencer::default()
+    };
     let mut env = HashMap::new();
     let mut forms = Vec::new();
     let mut bindings = Vec::new();
@@ -288,8 +1031,12 @@ pub fn check_source_with_module_imports(
             continue;
         }
 
-        let form_name = definition_name(form);
-        let ty = if let Some(name) = form_name {
+        let form_name = definition_name(form).map(ToOwned::to_owned);
+        let previous_dynamic_type_flow = inferencer.dynamic_type_flow;
+        if form_name.is_some() {
+            inferencer.dynamic_type_flow = false;
+        }
+        let ty = if let Some(name) = form_name.as_deref() {
             defined_names.insert(name.to_string());
             if let Some(annotation) = annotations_by_name.get(name) {
                 if let Some(expected) = inferencer.type_syntax_to_type(
@@ -307,11 +1054,19 @@ pub fn check_source_with_module_imports(
         } else {
             inferencer.infer_expr(form, &mut env)
         };
-        if let Some(name) = definition_name(form) {
+        let dynamic_type_flow = if form_name.is_some() {
+            let dynamic = inferencer.dynamic_type_flow;
+            inferencer.dynamic_type_flow = previous_dynamic_type_flow;
+            dynamic
+        } else {
+            false
+        };
+        if let Some(name) = form_name.as_deref() {
             bindings.push(ExportedBinding {
                 name: name.to_string(),
                 ty: inferencer.resolve(ty.clone()),
                 annotated: annotations_by_name.contains_key(name),
+                dynamic_type_flow,
             });
         }
         forms.push(TypedForm {
@@ -341,11 +1096,38 @@ pub fn check_source_with_module_imports(
         .iter()
         .map(|(offset, ty)| (*offset, inferencer.format_type(ty)))
         .collect();
+    let type_declarations = type_report
+        .declarations
+        .iter()
+        .map(|declaration| {
+            if declaration.params.is_empty() {
+                let diagnostic_count = inferencer.diagnostics.len();
+                if let Some(ty) = inferencer.type_syntax_to_type(
+                    &declaration.syntax,
+                    &type_aliases,
+                    declaration.span,
+                ) {
+                    let resolved = inferencer.resolve(ty);
+                    if let Some(syntax) = type_to_syntax(&resolved) {
+                        return TypeDeclaration {
+                            name: declaration.name.clone(),
+                            params: declaration.params.clone(),
+                            schema: syntax.render(),
+                            syntax,
+                            span: declaration.span,
+                        };
+                    }
+                }
+                inferencer.diagnostics.truncate(diagnostic_count);
+            }
+            declaration.clone()
+        })
+        .collect();
 
     CheckResult {
         forms,
         expr_types,
-        type_declarations: type_report.declarations,
+        type_declarations,
         type_annotations: annotation_report.annotations,
         foreign_declarations: foreign_report.declarations,
         bindings,
@@ -441,6 +1223,10 @@ pub fn collect_foreign_declarations(source: &SourceFile) -> ForeignDeclarationRe
 }
 
 impl Inferencer {
+    fn mark_dynamic_type_flow(&mut self) {
+        self.dynamic_type_flow = true;
+    }
+
     fn instantiate_imported_type(&mut self, ty: &Type) -> Type {
         let mut vars = HashMap::new();
         self.instantiate_imported_type_inner(ty, &mut vars)
@@ -529,8 +1315,12 @@ impl Inferencer {
             Type::Keyword(name) => Type::Keyword(name.clone()),
             Type::Syntax => Type::Syntax,
             Type::Js => Type::Js,
-            Type::Html => Type::Html,
-            Type::TrustedHtml => Type::TrustedHtml,
+            Type::Named(name, args) => Type::Named(
+                name.clone(),
+                args.iter()
+                    .map(|arg| self.instantiate_imported_type_inner(arg, vars))
+                    .collect(),
+            ),
         }
     }
 
@@ -549,7 +1339,13 @@ impl Inferencer {
             | ExprKind::QuasiQuote(_)
             | ExprKind::Unquote(_)
             | ExprKind::UnquoteSplicing(_) => Type::Syntax,
-            ExprKind::HtmlTemplate(node) => self.infer_html_template(node, env),
+            ExprKind::HtmlTemplate(node) => {
+                if let Some(message) = self.options.html_template_message() {
+                    self.diagnostics
+                        .push(Diagnostic::error(expr.span, message.to_string()));
+                }
+                self.infer_configured_html_template(node, env)
+            }
             ExprKind::List(items) => self.infer_list(expr.span, items, env),
         };
         self.expr_types.insert(expr.span.start, ty.clone());
@@ -562,6 +1358,17 @@ impl Inferencer {
         };
 
         if let ExprKind::Symbol(name) = &head.kind {
+            if let Some(rule) = self.options.custom_call_rule(name).cloned() {
+                self.require_symbol_allowed(name, head.span);
+                let mut context = TypecheckCallContext {
+                    inferencer: self,
+                    env,
+                };
+                return (rule.checker)(&mut context, name, args);
+            }
+            if let Some(rule) = self.options.intrinsic_call_rule(name).cloned() {
+                return self.infer_intrinsic_call(head.span, &rule, args, env);
+            }
             match name.as_str() {
                 "def" => return self.infer_def(span, args, env),
                 "defn" => return self.infer_defn(span, args, env),
@@ -576,15 +1383,8 @@ impl Inferencer {
                 "Msg.with" => return self.infer_msg_with(name, args, env),
                 "Msg.with2" => return self.infer_msg_with2(name, args, env),
                 "Msg.mapper" => return self.infer_msg_mapper(name, args, env),
-                "Event.prevent" | "Event.stop" | "Event.prevent-stop" => {
-                    return self.infer_event_control(name, args, env);
-                }
+                "Cmd.map" => return self.infer_cmd_map(name, args, env),
                 "Cmd.batch" => return self.infer_cmd_batch(name, args, env),
-                "Cmd.storage/get" => return self.infer_cmd_storage_get(name, args, env),
-                "Cmd.storage/set" => return self.infer_cmd_storage_set(name, args, env),
-                "Cmd.storage/set-silent" => {
-                    return self.infer_cmd_storage_set_silent(name, args, env);
-                }
                 "Cmd.time/now" => {
                     return self.infer_cmd_payload_mapper(
                         name,
@@ -600,29 +1400,6 @@ impl Inferencer {
                 "Cmd.timer/cancel" => return self.infer_cmd_timer_cancel(name, args, env),
                 "Cmd.animation/frame" => return self.infer_cmd_animation_frame(name, args, env),
                 "Cmd.animation/cancel" => return self.infer_cmd_animation_cancel(name, args, env),
-                "Cmd.dom-ref/click" => {
-                    return self.infer_cmd_dom_ref_action(name, args, env, "dom-ref/click");
-                }
-                "Cmd.dom-ref/focus" => {
-                    return self.infer_cmd_dom_ref_action(name, args, env, "dom-ref/focus");
-                }
-                "Cmd.file/read-selected" => {
-                    return self.infer_cmd_file_read_selected(name, args, env);
-                }
-                "Cmd.file/download" => return self.infer_cmd_file_download(name, args, env),
-                "Cmd.canvas/draw" => return self.infer_cmd_canvas_draw(name, args, env),
-                "Cmd.dom-ref/measure" => return self.infer_cmd_dom_ref_measure(name, args, env),
-                "Cmd.dom-ref/resize-watch" => return self.infer_cmd_resize_watch(name, args, env),
-                "Cmd.bluetooth/connect-heart-rate" => {
-                    return self.infer_cmd_bluetooth_connect_heart_rate(name, args, env);
-                }
-                "Cmd.bluetooth/disconnect" => {
-                    return self.infer_cmd_bluetooth_disconnect(name, args, env);
-                }
-                "Cmd.simulation/heart-rate" => {
-                    return self.infer_cmd_simulation_heart_rate(name, args, env);
-                }
-                "Cmd.simulation/stop" => return self.infer_cmd_simulation_stop(name, args, env),
                 "Task.succeed" => return self.infer_task_succeed(name, args, env),
                 "Task.fail" => return self.infer_task_fail(name, args, env),
                 "Task.map" => return self.infer_task_map(name, args, env),
@@ -635,19 +1412,6 @@ impl Inferencer {
                 "scope-subscriptions" => {
                     return self.infer_scope_subscriptions(name, args, env);
                 }
-                "scope-view" => return self.infer_scope_view(name, args, env),
-                "Sub.batch" => return self.infer_sub_batch(name, args, env),
-                "Sub.timer/every" => return self.infer_sub_timer_every(name, args, env),
-                "Sub.media-query" => {
-                    return self.infer_sub_change(name, args, env, "sub/media-query");
-                }
-                "Sub.window/event" => return self.infer_sub_window_event(name, args, env),
-                "Sub.window/event-with" => {
-                    return self.infer_sub_window_event_with(name, args, env);
-                }
-                "Sub.dom-ref/resize" => {
-                    return self.infer_sub_change(name, args, env, "sub/dom-ref/resize");
-                }
                 "describe" => return self.infer_test_group(name, args, env),
                 "test" => return self.infer_test_case(name, args, env),
                 "expect=" => return self.infer_expect_equal(name, args, env, false),
@@ -658,7 +1422,6 @@ impl Inferencer {
                 "expect-nil" => return self.infer_expect_nil(name, args, env),
                 "expect-match" => return self.infer_expect_match(name, args, env),
                 "expect-throws" => return self.infer_expect_throws(name, args, env),
-                "render-to-string" => return self.infer_render_to_string(name, args, env),
                 "render" => return self.infer_render_harness(name, args, env),
                 "rerender" => return self.infer_rerender_harness(name, args, env),
                 "dispose" => return self.infer_dispose_harness(name, args, env),
@@ -724,8 +1487,9 @@ impl Inferencer {
                 "count" => return self.infer_count(name, args, env),
                 "empty?" => return self.infer_empty(name, args, env),
                 "some?" => return self.infer_some(name, args, env),
-                "nil?" | "number?" | "string?" | "bool?" | "keyword?" | "list?" | "vector?"
-                | "set?" | "map?" | "object?" => return self.infer_predicate(name, args, env),
+                "nil?" => return self.infer_predicate(name, args, env),
+                "number?" | "string?" | "bool?" | "keyword?" | "list?" | "vector?" | "set?"
+                | "map?" | "object?" => return self.infer_dynamic_predicate(name, args, env),
                 "get" => return self.infer_get(name, args, env),
                 "object-get" => return self.infer_object_get(name, args, env),
                 "first" | "second" => return self.infer_ordered_access(name, args, env),
@@ -793,49 +1557,11 @@ impl Inferencer {
                 "url-without-hash" | "url-origin" | "url-hostname" | "url-pathname" => {
                     return self.infer_url_part(name, args, env);
                 }
-                "browser-current-url" => return self.infer_zero_arg_string(name, args),
                 "url-search-param" => {
                     return self.infer_fixed_string_args(name, args, env, 2, Type::String);
                 }
                 "url-set-search-param" | "url-set-deep-object-param" => {
                     return self.infer_fixed_string_args(name, args, env, 3, Type::String);
-                }
-                "history-replace-search-param" | "browser-set-cookie" => {
-                    return self.infer_fixed_string_args(name, args, env, 2, Type::Nil);
-                }
-                "history-write-route" => {
-                    if args.len() != 3 {
-                        self.diagnostics.push(Diagnostic::error(
-                            args.first().map_or(Span::default(), |arg| arg.span),
-                            format!("{} expects 3 arguments, got {}", name, args.len()),
-                        ));
-                    }
-                    for arg in args {
-                        self.infer_expr(arg, env);
-                    }
-                    return Type::Nil;
-                }
-                "browser-theme-initial" => {
-                    return self.infer_fixed_string_args(name, args, env, 1, Type::String);
-                }
-                "browser-theme-toggle" => {
-                    return self.infer_fixed_string_args(name, args, env, 2, Type::String);
-                }
-                "auth-storage-load" => {
-                    let result = self.fresh();
-                    return self.infer_fixed_string_args(name, args, env, 1, result);
-                }
-                "auth-storage-persist" => {
-                    if args.len() != 2 {
-                        self.diagnostics.push(Diagnostic::error(
-                            args.first().map_or(Span::default(), |arg| arg.span),
-                            format!("{} expects 2 arguments, got {}", name, args.len()),
-                        ));
-                    }
-                    for arg in args {
-                        self.infer_expr(arg, env);
-                    }
-                    return Type::Nil;
                 }
                 "resolve-token-expiry" => {
                     if args.len() != 2 {
@@ -849,54 +1575,14 @@ impl Inferencer {
                     }
                     return Type::Option(Box::new(Type::Number));
                 }
-                "clipboard-text" => return self.infer_clipboard_text(name, args, env),
-                "clipboard-write" => {
-                    return self.infer_fixed_string_args(name, args, env, 1, Type::Nil);
-                }
                 "path-fill-params" => {
                     return self.infer_fixed_string_args(name, args, env, 2, Type::String);
                 }
                 "path-fill-param" => {
                     return self.infer_fixed_string_args(name, args, env, 3, Type::String);
                 }
-                "selected-file-or-blob" => {
-                    let result = self.fresh();
-                    return self.infer_fixed_string_args(name, args, env, 4, result);
-                }
-                "selected-file-by-test-id" => {
-                    let result = self.fresh();
-                    return self.infer_fixed_string_args(name, args, env, 1, result);
-                }
-                "has-selected-file" => {
-                    return self.infer_fixed_string_args(name, args, env, 1, Type::Bool);
-                }
-                "multipart-form-body" => {
-                    if args.len() != 2 {
-                        self.diagnostics.push(Diagnostic::error(
-                            args.first().map_or(Span::default(), |arg| arg.span),
-                            format!("{} expects 2 arguments, got {}", name, args.len()),
-                        ));
-                    }
-                    for arg in args {
-                        self.infer_expr(arg, env);
-                    }
-                    return self.fresh();
-                }
-                "urlencoded-form-body" => {
-                    if args.len() != 2 {
-                        self.diagnostics.push(Diagnostic::error(
-                            args.first().map_or(Span::default(), |arg| arg.span),
-                            format!("{} expects 2 arguments, got {}", name, args.len()),
-                        ));
-                    }
-                    for arg in args {
-                        self.infer_expr(arg, env);
-                    }
-                    return Type::String;
-                }
                 "regex-capture" => return self.infer_regex_capture(name, args, env),
                 "regex-capture-all" => return self.infer_regex_capture_all(name, args, env),
-                "install-virtual-json-viewer" => return self.infer_zero_arg_nil(name, args),
                 "str" => {
                     for arg in args {
                         self.infer_expr(arg, env);
@@ -927,288 +1613,223 @@ impl Inferencer {
         self.resolve(ret)
     }
 
-    fn infer_html_template(&mut self, node: &HtmlNode, env: &mut HashMap<String, Type>) -> Type {
-        self.infer_html_node(node, env);
-        Type::Html
-    }
-
-    fn infer_html_node(&mut self, node: &HtmlNode, env: &mut HashMap<String, Type>) {
-        match node {
-            HtmlNode::Element(element) => {
-                for attr in &element.attrs {
-                    match &attr.value {
-                        HtmlAttrValue::Dynamic { expr, .. } => {
-                            if attr.name.starts_with("on:") {
-                                let mut event_env = env.clone();
-                                event_env.insert("event".to_string(), self.dom_event_type());
-                                let message_ty = self.infer_expr(expr, &mut event_env);
-                                if let Some(expected_msg) = self.html_event_msg.clone() {
-                                    self.require_html_event_message_matches(
-                                        expected_msg,
-                                        message_ty,
-                                        expr.span,
-                                        &attr.name,
-                                    );
-                                }
-                            } else {
-                                let attr_ty = self.infer_expr(expr, env);
-                                if attr.name == "ref" {
-                                    self.require_html_ref_attr(attr_ty, expr.span);
-                                } else if attr.name == "class" {
-                                    self.require_html_class_attr(attr_ty, expr.span);
-                                } else if attr.name == "style" {
-                                    self.require_html_style_attr(attr_ty, expr.span);
-                                } else if attr.name == "innerHTML" {
-                                    self.require_html_inner_html_attr(attr_ty, expr.span);
-                                } else if is_boolean_html_attr(&attr.name) {
-                                    self.unify(attr_ty, Type::Bool, expr.span);
-                                }
-                            }
-                        }
-                        HtmlAttrValue::Bool(_) | HtmlAttrValue::Static(_) => {
-                            self.validate_static_html_attr(&attr.name, &attr.value, attr.span);
-                        }
-                    }
-                }
-                for child in &element.children {
-                    self.infer_html_node(child, env);
-                }
+    fn infer_intrinsic_call(
+        &mut self,
+        span: Span,
+        rule: &IntrinsicCallRule,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        self.require_symbol_allowed(&rule.name, span);
+        let Some(overload) = rule
+            .overloads
+            .iter()
+            .find(|overload| overload.params.len() == args.len())
+        else {
+            self.diagnostics.push(Diagnostic::error(
+                span,
+                format!(
+                    "{} expects {} arguments, found {}",
+                    rule.name,
+                    intrinsic_expected_arities(&rule.overloads),
+                    args.len()
+                ),
+            ));
+            for arg in args {
+                self.infer_expr(arg, env);
             }
-            HtmlNode::Expr { expr, .. } => self.infer_html_expr(expr, env),
-            HtmlNode::Text { .. } => {}
-        }
-    }
+            return self.fresh();
+        };
 
-    fn validate_static_html_attr(&mut self, name: &str, value: &HtmlAttrValue, span: Span) {
-        match value {
-            HtmlAttrValue::Bool(true) => match name {
-                "ref" => self.diagnostics.push(Diagnostic::error(
-                    span,
-                    "ref attribute requires a value; use ref=\"name\" or ref={...}",
-                )),
-                "class" => self.diagnostics.push(Diagnostic::error(
-                    span,
-                    "class attribute requires a value; use class=\"...\" or class={...}",
-                )),
-                "style" => self.diagnostics.push(Diagnostic::error(
-                    span,
-                    "style attribute requires a value; use style=\"...\" or style={...}",
-                )),
-                _ => {}
-            },
-            HtmlAttrValue::Static(static_value) => {
-                if name == "innerHTML" {
-                    self.diagnostics.push(Diagnostic::error(
-                        span,
-                        "innerHTML requires TrustedHtml; use innerHTML={...} with an explicit sanitizer or unsafe-cast boundary",
-                    ));
-                }
+        let actuals = args
+            .iter()
+            .map(|arg| self.infer_expr(arg, env))
+            .collect::<Vec<_>>();
 
-                if name == "ref" && static_value.is_empty() {
-                    self.diagnostics.push(Diagnostic::error(
-                        span,
-                        "ref attribute requires a non-empty ref name",
-                    ));
-                }
-
-                if is_boolean_html_attr(name)
-                    && !static_value.is_empty()
-                    && !static_value.eq_ignore_ascii_case(name)
-                {
-                    self.diagnostics.push(Diagnostic::error(
-                        span,
-                        format!(
-                            "boolean attribute {} ignores string value {:?}; use bare {} or {}={{...}}",
-                            name, static_value, name, name
-                        ),
-                    ));
-                }
+        let mut vars = HashMap::new();
+        for ((arg, param), actual) in args.iter().zip(&overload.params).zip(&actuals) {
+            if let IntrinsicParam::Expect(expected) = param {
+                let expected = self.check_type_to_type(expected, &mut vars, &actuals);
+                self.unify(expected, actual.clone(), arg.span);
             }
-            HtmlAttrValue::Bool(false) | HtmlAttrValue::Dynamic { .. } => {}
         }
+        let result = self.check_type_to_type(&overload.result, &mut vars, &actuals);
+        self.resolve(result)
     }
 
-    fn infer_html_expr(&mut self, expr: &Expr, env: &mut HashMap<String, Type>) {
-        if let Some(spec) = HtmlForSpec::parse(expr) {
-            let collection_ty = self.infer_expr(spec.collection, env);
-            let item_ty = self.infer_iterable_element(collection_ty, spec.collection.span);
-            let mut loop_env = env.clone();
-            loop_env.insert(spec.item.to_string(), item_ty);
-            if let Some(index) = spec.index {
-                loop_env.insert(index.to_string(), Type::Number);
+    fn check_type_to_type(
+        &mut self,
+        ty: &CheckType,
+        vars: &mut HashMap<String, Type>,
+        actuals: &[Type],
+    ) -> Type {
+        match ty {
+            CheckType::Fresh(name) => vars
+                .entry(name.clone())
+                .or_insert_with(|| self.fresh())
+                .clone(),
+            CheckType::Argument(index) => actuals.get(*index).cloned().unwrap_or_else(|| {
+                self.diagnostics.push(Diagnostic::error(
+                    Span::default(),
+                    format!("intrinsic argument reference {} is out of range", index),
+                ));
+                self.fresh()
+            }),
+            CheckType::Number => Type::Number,
+            CheckType::String => Type::String,
+            CheckType::Bool => Type::Bool,
+            CheckType::Nil => Type::Nil,
+            CheckType::Keyword => Type::Keyword(None),
+            CheckType::Syntax => Type::Syntax,
+            CheckType::Js => Type::Js,
+            CheckType::Named(name, args) => {
+                self.named_check_type_to_type(name, args, vars, actuals)
             }
-            self.infer_expr(spec.key, &mut loop_env);
-            self.infer_html_template(spec.template, &mut loop_env);
-            return;
-        }
-
-        if let Some(spec) = HtmlIfSpec::parse(expr) {
-            let condition_ty = self.infer_expr(spec.condition, env);
-            self.unify(condition_ty, Type::Bool, spec.condition.span);
-            self.infer_html_template(spec.then_template, env);
-            self.infer_html_template(spec.else_template, env);
-            return;
-        }
-
-        self.infer_expr(expr, env);
-    }
-
-    fn require_html_ref_attr(&mut self, ty: Type, span: Span) {
-        let resolved = self.resolve(ty);
-        if self.html_ref_attr_type_matches(resolved.clone(), span) {
-            return;
-        }
-
-        let found = self.format_type(&resolved);
-        self.diagnostics.push(Diagnostic::error(
-            span,
-            format!(
-                "ref attribute expects a string, keyword, or nil optional ref name, found {}",
-                found
+            CheckType::Option(inner) => {
+                Type::Option(Box::new(self.check_type_to_type(inner, vars, actuals)))
+            }
+            CheckType::List(inner) => {
+                Type::List(Box::new(self.check_type_to_type(inner, vars, actuals)))
+            }
+            CheckType::Vector(inner) => {
+                Type::Vector(Box::new(self.check_type_to_type(inner, vars, actuals)))
+            }
+            CheckType::Tuple(items) => Type::Tuple(
+                items
+                    .iter()
+                    .map(|item| self.check_type_to_type(item, vars, actuals))
+                    .collect(),
             ),
-        ));
-    }
-
-    fn html_ref_attr_type_matches(&mut self, ty: Type, span: Span) -> bool {
-        match self.resolve(ty) {
-            Type::Var(id) => {
-                self.unify(Type::Var(id), Type::String, span);
-                true
+            CheckType::Set(inner) => {
+                Type::Set(Box::new(self.check_type_to_type(inner, vars, actuals)))
             }
-            Type::String | Type::Keyword(_) | Type::Nil => true,
-            Type::Option(inner) => self.html_ref_attr_type_matches(*inner, span),
-            _ => false,
-        }
-    }
-
-    fn require_html_class_attr(&mut self, ty: Type, span: Span) {
-        let resolved = self.resolve(ty);
-        if self.html_class_attr_type_matches(resolved.clone(), span) {
-            return;
-        }
-
-        let found = self.format_type(&resolved);
-        self.diagnostics.push(Diagnostic::error(
-            span,
-            format!(
-                "class attribute expects a CSS class string, keyword, nil, bool, structured collection, or class flag map, found {}",
-                found
+            CheckType::Map(key, value) => Type::Map(
+                Box::new(self.check_type_to_type(key, vars, actuals)),
+                Box::new(self.check_type_to_type(value, vars, actuals)),
             ),
-        ));
-    }
-
-    fn html_class_attr_type_matches(&mut self, ty: Type, span: Span) -> bool {
-        match self.resolve(ty) {
-            Type::Var(_) | Type::String | Type::Keyword(_) | Type::Bool | Type::Nil => true,
-            Type::Option(inner) => self.html_class_attr_type_matches(*inner, span),
-            Type::List(inner) | Type::Vector(inner) | Type::Set(inner) => {
-                self.html_class_attr_type_matches(*inner, span)
-            }
-            Type::Tuple(items) => items
-                .into_iter()
-                .all(|item| self.html_class_attr_type_matches(item, span)),
-            Type::Record(fields) => fields
-                .into_values()
-                .all(|field_ty| self.html_class_flag_type_matches(field_ty, span)),
-            Type::Map(key, value) => {
-                self.html_class_key_type_matches(*key)
-                    && self.html_class_flag_type_matches(*value, span)
-            }
-            _ => false,
-        }
-    }
-
-    fn html_class_key_type_matches(&mut self, ty: Type) -> bool {
-        match self.resolve(ty) {
-            Type::Var(_) | Type::String | Type::Keyword(_) => true,
-            _ => false,
-        }
-    }
-
-    fn html_class_flag_type_matches(&mut self, ty: Type, span: Span) -> bool {
-        match self.resolve(ty) {
-            Type::Var(id) => {
-                self.unify(Type::Var(id), Type::Bool, span);
-                true
-            }
-            Type::Bool | Type::Nil => true,
-            Type::Option(inner) => self.html_class_flag_type_matches(*inner, span),
-            _ => false,
-        }
-    }
-
-    fn require_html_inner_html_attr(&mut self, ty: Type, span: Span) {
-        let resolved = self.resolve(ty);
-        if self.html_inner_html_attr_type_matches(resolved.clone(), span) {
-            return;
-        }
-
-        let found = self.format_type(&resolved);
-        self.diagnostics.push(Diagnostic::error(
-            span,
-            format!(
-                "innerHTML expects TrustedHtml from an explicit sanitizer or unsafe-cast boundary, found {}",
-                found
+            CheckType::Result(ok, err) => Type::Result(
+                Box::new(self.check_type_to_type(ok, vars, actuals)),
+                Box::new(self.check_type_to_type(err, vars, actuals)),
             ),
-        ));
-    }
-
-    fn html_inner_html_attr_type_matches(&mut self, ty: Type, span: Span) -> bool {
-        match self.resolve(ty) {
-            Type::Var(id) => {
-                self.unify(Type::Var(id), Type::TrustedHtml, span);
-                true
-            }
-            Type::TrustedHtml | Type::Nil => true,
-            Type::Option(inner) => self.html_inner_html_attr_type_matches(*inner, span),
-            _ => false,
-        }
-    }
-
-    fn require_html_style_attr(&mut self, ty: Type, span: Span) {
-        let resolved = self.resolve(ty);
-        if self.html_style_attr_type_matches(resolved.clone()) {
-            return;
-        }
-
-        let found = self.format_type(&resolved);
-        self.diagnostics.push(Diagnostic::error(
-            span,
-            format!(
-                "style attribute expects a CSS string, nil, record, or map with style property values, found {}",
-                found
+            CheckType::Cmd(msg) => Type::Cmd(Box::new(self.check_type_to_type(msg, vars, actuals))),
+            CheckType::Task(err, ok) => Type::Task(
+                Box::new(self.check_type_to_type(err, vars, actuals)),
+                Box::new(self.check_type_to_type(ok, vars, actuals)),
             ),
-        ));
-    }
-
-    fn html_style_attr_type_matches(&mut self, ty: Type) -> bool {
-        match self.resolve(ty) {
-            Type::Var(_) | Type::String | Type::Nil => true,
-            Type::Option(inner) => self.html_style_attr_type_matches(*inner),
-            Type::Record(fields) => fields
-                .into_values()
-                .all(|field_ty| self.html_style_value_type_matches(field_ty)),
-            Type::Map(key, value) => {
-                self.html_style_key_type_matches(*key) && self.html_style_value_type_matches(*value)
+            CheckType::Sub(msg) => Type::Sub(Box::new(self.check_type_to_type(msg, vars, actuals))),
+            CheckType::Event(msg) => {
+                Type::Event(Box::new(self.check_type_to_type(msg, vars, actuals)))
             }
-            _ => false,
+            CheckType::Record(fields) => Type::Record(
+                fields
+                    .iter()
+                    .map(|(name, field)| {
+                        (name.clone(), self.check_type_to_type(field, vars, actuals))
+                    })
+                    .collect(),
+            ),
+            CheckType::Union(variants) => Type::Union(
+                variants
+                    .iter()
+                    .map(|variant| self.check_type_to_type(variant, vars, actuals))
+                    .collect(),
+            ),
+            CheckType::Fn(args, ret) => Type::Fn(
+                args.iter()
+                    .map(|arg| self.check_type_to_type(arg, vars, actuals))
+                    .collect(),
+                Box::new(self.check_type_to_type(ret, vars, actuals)),
+            ),
         }
     }
 
-    fn html_style_key_type_matches(&mut self, ty: Type) -> bool {
-        match self.resolve(ty) {
-            Type::Var(_) | Type::String | Type::Keyword(_) => true,
-            Type::Option(inner) => self.html_style_key_type_matches(*inner),
-            _ => false,
+    fn named_check_type_to_type(
+        &mut self,
+        name: &str,
+        args: &[CheckType],
+        vars: &mut HashMap<String, Type>,
+        actuals: &[Type],
+    ) -> Type {
+        let Some(rule) = self.options.named_type_rule(name).cloned() else {
+            self.diagnostics.push(Diagnostic::error(
+                Span::default(),
+                format!("unknown intrinsic type `{}`", name),
+            ));
+            return self.fresh();
+        };
+        if rule.arity != args.len() {
+            self.diagnostics.push(Diagnostic::error(
+                Span::default(),
+                format!(
+                    "{} expects {} type arguments, found {}",
+                    name,
+                    rule.arity,
+                    args.len()
+                ),
+            ));
+            return self.fresh();
         }
+        if let Some(replacement) = &rule.replacement {
+            return self.check_type_to_type(replacement, vars, actuals);
+        }
+        Type::Named(
+            name.to_string(),
+            args.iter()
+                .map(|arg| self.check_type_to_type(arg, vars, actuals))
+                .collect(),
+        )
     }
 
-    fn html_style_value_type_matches(&mut self, ty: Type) -> bool {
-        match self.resolve(ty) {
-            Type::Var(_) | Type::String | Type::Number | Type::Bool | Type::Nil => true,
-            Type::Option(inner) => self.html_style_value_type_matches(*inner),
-            _ => false,
+    fn infer_configured_html_template(
+        &mut self,
+        node: &HtmlNode,
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        let Some(options) = self.options.html_template_options().cloned() else {
+            self.diagnostics.push(Diagnostic::error(
+                Span::default(),
+                "HTML templates are not enabled for this typecheck profile",
+            ));
+            return self.fresh();
+        };
+        if let Some(checker) = options.checker {
+            let mut context = HtmlTemplateCheckContext {
+                inferencer: self,
+                env,
+            };
+            checker(&mut context, node);
         }
+        self.html_template_result_type()
+    }
+
+    fn html_template_result_type(&mut self) -> Type {
+        let Some(ty) = self
+            .options
+            .html_template_options()
+            .map(|options| options.html_type.clone())
+        else {
+            self.diagnostics.push(Diagnostic::error(
+                Span::default(),
+                "HTML templates are not enabled for this typecheck profile",
+            ));
+            return self.fresh();
+        };
+        self.check_type_to_type(&ty, &mut HashMap::new(), &[])
+    }
+
+    fn html_template_trusted_type(&mut self) -> Type {
+        let Some(ty) = self
+            .options
+            .html_template_options()
+            .map(|options| options.trusted_html_type.clone())
+        else {
+            self.diagnostics.push(Diagnostic::error(
+                Span::default(),
+                "trusted HTML is not enabled for this typecheck profile",
+            ));
+            return self.fresh();
+        };
+        self.check_type_to_type(&ty, &mut HashMap::new(), &[])
     }
 
     fn infer_iterable_element(&mut self, collection_ty: Type, span: Span) -> Type {
@@ -1235,36 +1856,19 @@ impl Inferencer {
         }
     }
 
-    fn dom_event_type(&self) -> Type {
-        let form_target = Type::Record(BTreeMap::from([
-            ("checked".to_string(), Type::Bool),
-            ("value".to_string(), Type::String),
-            ("valueAsNumber".to_string(), Type::Number),
-        ]));
-        Type::Record(BTreeMap::from([
-            ("altKey".to_string(), Type::Bool),
-            ("clientX".to_string(), Type::Number),
-            ("clientY".to_string(), Type::Number),
-            ("ctrlKey".to_string(), Type::Bool),
-            ("currentTarget".to_string(), form_target.clone()),
-            ("key".to_string(), Type::String),
-            ("metaKey".to_string(), Type::Bool),
-            ("shiftKey".to_string(), Type::Bool),
-            ("target".to_string(), form_target),
-        ]))
-    }
-
     fn infer_symbol(&mut self, span: Span, name: &str, env: &mut HashMap<String, Type>) -> Type {
+        self.require_symbol_allowed(name, span);
+
         if let Some(ty) = env.get(name) {
             return ty.clone();
         }
 
-        if name == "Cmd.none" {
-            return Type::Cmd(Box::new(self.fresh()));
+        if let Some(rule) = self.options.symbol_type_rule(name).cloned() {
+            return self.check_type_to_type(&rule.ty, &mut HashMap::new(), &[]);
         }
 
-        if name == "Sub.none" {
-            return Type::Sub(Box::new(self.fresh()));
+        if name == "Cmd.none" {
+            return Type::Cmd(Box::new(self.fresh()));
         }
 
         if let Some(ty) = primitive_decoder_type(name) {
@@ -1663,7 +2267,7 @@ impl Inferencer {
     fn infer_command_result_type(&mut self, ty: Type, span: Span) -> Type {
         let resolved = self.resolve(ty);
         match resolved {
-            Type::Record(fields) if is_command_record_fields(&fields) => {
+            Type::Record(fields) if self.is_command_record_fields(&fields) => {
                 let msg = self.infer_command_record_message_type(fields, span);
                 Type::Cmd(Box::new(self.resolve(msg)))
             }
@@ -2526,41 +3130,9 @@ impl Inferencer {
             return Type::Js;
         }
         let component = self.infer_expr(&args[0], env);
-        self.unify(Type::Html, component, args[0].span);
+        let html = self.html_template_result_type();
+        self.unify(html, component, args[0].span);
         Type::Js
-    }
-
-    fn infer_render_to_string(
-        &mut self,
-        name: &str,
-        args: &[Expr],
-        env: &mut HashMap<String, Type>,
-    ) -> Type {
-        match args.len() {
-            1 => {
-                let component = self.infer_expr(&args[0], env);
-                self.unify(Type::Html, component, args[0].span);
-            }
-            2 => {
-                let view = self.infer_expr(&args[0], env);
-                let state = self.infer_expr(&args[1], env);
-                self.unify(
-                    view,
-                    Type::Fn(vec![state], Box::new(Type::Html)),
-                    args[0].span,
-                );
-            }
-            _ => {
-                self.diagnostics.push(Diagnostic::error(
-                    args.first().map_or(Span::default(), |arg| arg.span),
-                    format!("{} expects a component or view and state", name),
-                ));
-                for arg in args {
-                    self.infer_expr(arg, env);
-                }
-            }
-        }
-        Type::String
     }
 
     fn infer_rerender_harness(
@@ -2583,7 +3155,8 @@ impl Inferencer {
         }
         self.infer_expr(&args[0], env);
         let component = self.infer_expr(&args[1], env);
-        self.unify(Type::Html, component, args[1].span);
+        let html = self.html_template_result_type();
+        self.unify(html, component, args[1].span);
         Type::Js
     }
 
@@ -2824,26 +3397,6 @@ impl Inferencer {
             .unwrap_or_else(|| self.fresh())
     }
 
-    fn infer_event_control(
-        &mut self,
-        name: &str,
-        args: &[Expr],
-        env: &mut HashMap<String, Type>,
-    ) -> Type {
-        if args.len() != 1 {
-            self.arity_error(
-                args.first().map_or(Span::default(), |arg| arg.span),
-                name,
-                1,
-                args.len(),
-            );
-            return Type::Event(Box::new(self.fresh()));
-        }
-
-        let msg = self.infer_expr(&args[0], env);
-        Type::Event(Box::new(msg))
-    }
-
     fn infer_task_succeed(
         &mut self,
         name: &str,
@@ -2882,6 +3435,41 @@ impl Inferencer {
 
         let err = self.infer_expr(&args[0], env);
         Type::Task(Box::new(err), Box::new(self.fresh()))
+    }
+
+    fn infer_cmd_map(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        if args.len() != 2 {
+            self.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                2,
+                args.len(),
+            );
+            return Type::Cmd(Box::new(self.fresh()));
+        }
+
+        let child_msg = self.fresh();
+        let parent_msg = self.fresh();
+        let command = self.infer_expr(&args[0], env);
+        self.unify(
+            command,
+            Type::Cmd(Box::new(child_msg.clone())),
+            args[0].span,
+        );
+
+        let mapper = self.infer_expr(&args[1], env);
+        self.unify(
+            mapper,
+            Type::Fn(vec![child_msg], Box::new(parent_msg.clone())),
+            args[1].span,
+        );
+
+        Type::Cmd(Box::new(self.resolve(parent_msg)))
     }
 
     fn infer_task_map(
@@ -3107,6 +3695,12 @@ impl Inferencer {
         Type::Task(Box::new(Type::String), Box::new(Type::Js))
     }
 
+    fn require_symbol_allowed(&mut self, name: &str, span: Span) {
+        if let Some(message) = self.options.forbidden_symbol_message(name) {
+            self.diagnostics.push(Diagnostic::error(span, message));
+        }
+    }
+
     fn infer_scope_update(
         &mut self,
         name: &str,
@@ -3175,33 +3769,6 @@ impl Inferencer {
         Type::Sub(Box::new(parent_msg))
     }
 
-    fn infer_scope_view(
-        &mut self,
-        name: &str,
-        args: &[Expr],
-        env: &mut HashMap<String, Type>,
-    ) -> Type {
-        if args.len() != 3 {
-            self.arity_error(
-                args.first().map_or(Span::default(), |arg| arg.span),
-                name,
-                3,
-                args.len(),
-            );
-            return Type::Html;
-        }
-
-        self.infer_scope_tag(&args[0], env);
-        let child_state = self.infer_expr(&args[2], env);
-        let view_ty = self.infer_expr(&args[1], env);
-        self.unify(
-            view_ty,
-            Type::Fn(vec![child_state], Box::new(Type::Html)),
-            args[1].span,
-        );
-        Type::Html
-    }
-
     fn infer_scope_parent_child_state(
         &mut self,
         parent_expr: &Expr,
@@ -3239,10 +3806,6 @@ impl Inferencer {
         ]))
     }
 
-    fn infer_scope_tag(&mut self, tag_expr: &Expr, env: &mut HashMap<String, Type>) {
-        let _ = self.scope_keyword_name(tag_expr, env, "scope message tag");
-    }
-
     fn scope_keyword_name(
         &mut self,
         expr: &Expr,
@@ -3255,48 +3818,6 @@ impl Inferencer {
             ExprKind::Keyword(name) => Some(name.clone()),
             _ => None,
         }
-    }
-
-    fn infer_sub_batch(
-        &mut self,
-        name: &str,
-        args: &[Expr],
-        env: &mut HashMap<String, Type>,
-    ) -> Type {
-        if args.len() != 1 {
-            self.arity_error(
-                args.first().map_or(Span::default(), |arg| arg.span),
-                name,
-                1,
-                args.len(),
-            );
-            return Type::Sub(Box::new(self.fresh()));
-        }
-
-        let msg = self.fresh();
-        let batch_ty = self.infer_expr(&args[0], env);
-        match self.resolve(batch_ty) {
-            Type::Vector(item) => {
-                self.unify(Type::Sub(Box::new(msg.clone())), *item, args[0].span);
-            }
-            Type::Tuple(items) => {
-                for item in items {
-                    self.unify(Type::Sub(Box::new(msg.clone())), item, args[0].span);
-                }
-            }
-            Type::Var(_) => {}
-            other => {
-                let found = self.format_type(&other);
-                self.diagnostics.push(Diagnostic::error(
-                    args[0].span,
-                    format!(
-                        "Sub.batch expects a vector of subscriptions, found {}",
-                        found
-                    ),
-                ));
-            }
-        }
-        Type::Sub(Box::new(self.resolve(msg)))
     }
 
     fn infer_cmd_batch(
@@ -3519,83 +4040,6 @@ impl Inferencer {
         Type::Cmd(Box::new(msg))
     }
 
-    fn infer_cmd_storage_get(
-        &mut self,
-        name: &str,
-        args: &[Expr],
-        env: &mut HashMap<String, Type>,
-    ) -> Type {
-        if args.len() != 4 {
-            self.arity_error(
-                args.first().map_or(Span::default(), |arg| arg.span),
-                name,
-                4,
-                args.len(),
-            );
-            return Type::Cmd(Box::new(self.fresh()));
-        }
-        self.require_string_arg(&args[0], env);
-        let payload = self.command_payload_type_from_format_expr(&args[1], env);
-        let ok = self.infer_expr(&args[2], env);
-        let ok_msg = self.infer_command_mapper_message(
-            "storage/get",
-            ok,
-            payload,
-            args[2].span,
-            ":toMessage",
-        );
-        let err_msg = self.infer_command_tag_message("storage/get", "onError", &args[3], env);
-        Type::Cmd(Box::new(self.join_types(ok_msg, err_msg, args[0].span)))
-    }
-
-    fn infer_cmd_storage_set(
-        &mut self,
-        name: &str,
-        args: &[Expr],
-        env: &mut HashMap<String, Type>,
-    ) -> Type {
-        if args.len() != 3 && args.len() != 4 {
-            self.arity_error(
-                args.first().map_or(Span::default(), |arg| arg.span),
-                name,
-                3,
-                args.len(),
-            );
-            return Type::Cmd(Box::new(self.fresh()));
-        }
-        self.require_string_arg(&args[0], env);
-        self.infer_expr(&args[1], env);
-        let msg = self.infer_expr(&args[2], env);
-        let msg = if let Some(error) = args.get(3) {
-            let err_msg = self.infer_command_tag_message("storage/set", "onError", error, env);
-            self.join_types(msg, err_msg, args[0].span)
-        } else {
-            msg
-        };
-        Type::Cmd(Box::new(msg))
-    }
-
-    fn infer_cmd_storage_set_silent(
-        &mut self,
-        name: &str,
-        args: &[Expr],
-        env: &mut HashMap<String, Type>,
-    ) -> Type {
-        if args.len() != 3 {
-            self.arity_error(
-                args.first().map_or(Span::default(), |arg| arg.span),
-                name,
-                3,
-                args.len(),
-            );
-            return Type::Cmd(Box::new(self.fresh()));
-        }
-        self.require_string_arg(&args[0], env);
-        self.infer_expr(&args[1], env);
-        let err_msg = self.infer_command_tag_message("storage/set", "onError", &args[2], env);
-        Type::Cmd(Box::new(err_msg))
-    }
-
     fn infer_cmd_random_number(
         &mut self,
         name: &str,
@@ -3704,307 +4148,6 @@ impl Inferencer {
         Type::Cmd(Box::new(self.infer_expr(&args[1], env)))
     }
 
-    fn infer_cmd_dom_ref_action(
-        &mut self,
-        name: &str,
-        args: &[Expr],
-        env: &mut HashMap<String, Type>,
-        command_kind: &str,
-    ) -> Type {
-        if args.len() != 2 && args.len() != 3 {
-            self.arity_error(
-                args.first().map_or(Span::default(), |arg| arg.span),
-                name,
-                2,
-                args.len(),
-            );
-            return Type::Cmd(Box::new(self.fresh()));
-        }
-        self.require_string_arg(&args[0], env);
-        let msg = self.infer_expr(&args[1], env);
-        let msg = if let Some(error) = args.get(2) {
-            let err_msg = self.infer_command_tag_message(command_kind, "onError", error, env);
-            self.join_types(msg, err_msg, args[0].span)
-        } else {
-            msg
-        };
-        Type::Cmd(Box::new(msg))
-    }
-
-    fn infer_cmd_file_read_selected(
-        &mut self,
-        name: &str,
-        args: &[Expr],
-        env: &mut HashMap<String, Type>,
-    ) -> Type {
-        if args.len() != 5 {
-            self.arity_error(
-                args.first().map_or(Span::default(), |arg| arg.span),
-                name,
-                5,
-                args.len(),
-            );
-            return Type::Cmd(Box::new(self.fresh()));
-        }
-        self.require_string_arg(&args[0], env);
-        let payload = self.command_payload_type_from_format_expr(&args[1], env);
-        let ok = self.infer_expr(&args[2], env);
-        let ok_msg = self.infer_command_mapper_message(
-            "file/read-selected",
-            ok,
-            payload,
-            args[2].span,
-            ":toMessage",
-        );
-        let err_msg =
-            self.infer_command_tag_message("file/read-selected", "onError", &args[3], env);
-        let cancel_msg =
-            self.infer_command_tag_message("file/read-selected", "onCancel", &args[4], env);
-        let msg = self.join_types(ok_msg, err_msg, args[0].span);
-        Type::Cmd(Box::new(self.join_types(msg, cancel_msg, args[0].span)))
-    }
-
-    fn infer_cmd_file_download(
-        &mut self,
-        name: &str,
-        args: &[Expr],
-        env: &mut HashMap<String, Type>,
-    ) -> Type {
-        if args.len() != 5 {
-            self.arity_error(
-                args.first().map_or(Span::default(), |arg| arg.span),
-                name,
-                5,
-                args.len(),
-            );
-            return Type::Cmd(Box::new(self.fresh()));
-        }
-        self.require_string_arg(&args[0], env);
-        self.require_string_arg(&args[1], env);
-        self.require_string_arg(&args[2], env);
-        let msg = self.infer_expr(&args[3], env);
-        let err_msg = self.infer_command_tag_message("file/download", "onError", &args[4], env);
-        Type::Cmd(Box::new(self.join_types(msg, err_msg, args[0].span)))
-    }
-
-    fn infer_cmd_canvas_draw(
-        &mut self,
-        name: &str,
-        args: &[Expr],
-        env: &mut HashMap<String, Type>,
-    ) -> Type {
-        if args.len() != 5 {
-            self.arity_error(
-                args.first().map_or(Span::default(), |arg| arg.span),
-                name,
-                5,
-                args.len(),
-            );
-            return Type::Cmd(Box::new(self.fresh()));
-        }
-        self.require_string_arg(&args[0], env);
-        self.require_number_arg(&args[1], env);
-        self.require_number_arg(&args[2], env);
-        self.infer_expr(&args[3], env);
-        let err_msg = self.infer_command_tag_message("canvas/draw", "onError", &args[4], env);
-        Type::Cmd(Box::new(err_msg))
-    }
-
-    fn infer_cmd_resize_watch(
-        &mut self,
-        name: &str,
-        args: &[Expr],
-        env: &mut HashMap<String, Type>,
-    ) -> Type {
-        if args.len() != 4 {
-            self.arity_error(
-                args.first().map_or(Span::default(), |arg| arg.span),
-                name,
-                4,
-                args.len(),
-            );
-            return Type::Cmd(Box::new(self.fresh()));
-        }
-        self.require_string_arg(&args[0], env);
-        self.require_string_arg(&args[1], env);
-        let change_msg =
-            self.infer_command_tag_message("dom-ref/resize-watch", "onChange", &args[2], env);
-        let err_msg =
-            self.infer_command_tag_message("dom-ref/resize-watch", "onError", &args[3], env);
-        Type::Cmd(Box::new(self.join_types(change_msg, err_msg, args[0].span)))
-    }
-
-    fn infer_cmd_dom_ref_measure(
-        &mut self,
-        name: &str,
-        args: &[Expr],
-        env: &mut HashMap<String, Type>,
-    ) -> Type {
-        if args.len() != 3 {
-            self.arity_error(
-                args.first().map_or(Span::default(), |arg| arg.span),
-                name,
-                3,
-                args.len(),
-            );
-            return Type::Cmd(Box::new(self.fresh()));
-        }
-        self.require_string_arg(&args[0], env);
-        let mapper_ty = self.infer_expr(&args[1], env);
-        let payload_ty = self
-            .command_success_value_type(Some("dom-ref/measure"), &BTreeMap::new())
-            .unwrap_or_else(|| self.fresh());
-        let ok_msg = self.infer_command_mapper_message(
-            "dom-ref/measure",
-            mapper_ty,
-            payload_ty,
-            args[1].span,
-            ":toMessage",
-        );
-        let err_msg = self.infer_command_tag_message("dom-ref/measure", "onError", &args[2], env);
-        Type::Cmd(Box::new(self.join_types(ok_msg, err_msg, args[0].span)))
-    }
-
-    fn infer_cmd_bluetooth_connect_heart_rate(
-        &mut self,
-        name: &str,
-        args: &[Expr],
-        env: &mut HashMap<String, Type>,
-    ) -> Type {
-        if args.len() != 6 {
-            self.arity_error(
-                args.first().map_or(Span::default(), |arg| arg.span),
-                name,
-                6,
-                args.len(),
-            );
-            return Type::Cmd(Box::new(self.fresh()));
-        }
-        self.require_string_arg(&args[0], env);
-        let options_ty = self.infer_expr(&args[1], env);
-        self.unify(Type::Record(BTreeMap::new()), options_ty, args[1].span);
-        let mapper_ty = self.infer_expr(&args[2], env);
-        let payload_ty = self
-            .command_success_value_type(Some("bluetooth/connect-heart-rate"), &BTreeMap::new())
-            .unwrap_or_else(|| self.fresh());
-        let ok_msg = self.infer_command_mapper_message(
-            "bluetooth/connect-heart-rate",
-            mapper_ty,
-            payload_ty,
-            args[2].span,
-            ":toMessage",
-        );
-        let reading_msg = self.infer_command_tag_message(
-            "bluetooth/connect-heart-rate",
-            "onReading",
-            &args[3],
-            env,
-        );
-        let disconnected_msg = self.infer_command_tag_message(
-            "bluetooth/connect-heart-rate",
-            "onDisconnected",
-            &args[4],
-            env,
-        );
-        let err_msg = self.infer_command_tag_message(
-            "bluetooth/connect-heart-rate",
-            "onError",
-            &args[5],
-            env,
-        );
-        let msg = self.join_types(ok_msg, reading_msg, args[0].span);
-        let msg = self.join_types(msg, disconnected_msg, args[0].span);
-        Type::Cmd(Box::new(self.join_types(msg, err_msg, args[0].span)))
-    }
-
-    fn infer_cmd_bluetooth_disconnect(
-        &mut self,
-        name: &str,
-        args: &[Expr],
-        env: &mut HashMap<String, Type>,
-    ) -> Type {
-        if args.len() != 2 {
-            self.arity_error(
-                args.first().map_or(Span::default(), |arg| arg.span),
-                name,
-                2,
-                args.len(),
-            );
-            return Type::Cmd(Box::new(self.fresh()));
-        }
-        self.require_string_arg(&args[0], env);
-        Type::Cmd(Box::new(self.infer_expr(&args[1], env)))
-    }
-
-    fn infer_cmd_simulation_heart_rate(
-        &mut self,
-        name: &str,
-        args: &[Expr],
-        env: &mut HashMap<String, Type>,
-    ) -> Type {
-        if args.len() != 5 && args.len() != 6 {
-            self.diagnostics.push(Diagnostic::error(
-                args.first().map_or(Span::default(), |arg| arg.span),
-                format!("{} expects 5 or 6 arguments, found {}", name, args.len()),
-            ));
-            return Type::Cmd(Box::new(self.fresh()));
-        }
-        self.require_string_arg(&args[0], env);
-        let options_ty = self.infer_expr(&args[1], env);
-        self.unify(Type::Record(BTreeMap::new()), options_ty, args[1].span);
-        let mapper_ty = self.infer_expr(&args[2], env);
-        let payload_ty = self
-            .command_success_value_type(Some("simulation/heart-rate"), &BTreeMap::new())
-            .unwrap_or_else(|| self.fresh());
-        let ok_msg = self.infer_command_mapper_message(
-            "simulation/heart-rate",
-            mapper_ty,
-            payload_ty,
-            args[2].span,
-            ":toMessage",
-        );
-        let reading_msg =
-            self.infer_command_tag_message("simulation/heart-rate", "onReading", &args[3], env);
-        let msg = self.join_types(ok_msg, reading_msg, args[0].span);
-        let (msg, error_index) = if args.len() == 6 {
-            let disconnected_msg = self.infer_command_tag_message(
-                "simulation/heart-rate",
-                "onDisconnected",
-                &args[4],
-                env,
-            );
-            (self.join_types(msg, disconnected_msg, args[0].span), 5)
-        } else {
-            (msg, 4)
-        };
-        let err_msg = self.infer_command_tag_message(
-            "simulation/heart-rate",
-            "onError",
-            &args[error_index],
-            env,
-        );
-        Type::Cmd(Box::new(self.join_types(msg, err_msg, args[0].span)))
-    }
-
-    fn infer_cmd_simulation_stop(
-        &mut self,
-        name: &str,
-        args: &[Expr],
-        env: &mut HashMap<String, Type>,
-    ) -> Type {
-        if args.len() != 1 {
-            self.arity_error(
-                args.first().map_or(Span::default(), |arg| arg.span),
-                name,
-                1,
-                args.len(),
-            );
-            return Type::Cmd(Box::new(self.fresh()));
-        }
-        self.require_string_arg(&args[0], env);
-        Type::Cmd(Box::new(self.fresh()))
-    }
-
     fn infer_command_mapper_message(
         &mut self,
         command_kind: &str,
@@ -4078,126 +4221,6 @@ impl Inferencer {
     fn require_number_arg(&mut self, arg: &Expr, env: &mut HashMap<String, Type>) {
         let ty = self.infer_expr(arg, env);
         self.unify(Type::Number, ty, arg.span);
-    }
-
-    fn infer_sub_timer_every(
-        &mut self,
-        name: &str,
-        args: &[Expr],
-        env: &mut HashMap<String, Type>,
-    ) -> Type {
-        if args.len() != 3 {
-            self.arity_error(
-                args.first().map_or(Span::default(), |arg| arg.span),
-                name,
-                3,
-                args.len(),
-            );
-            return Type::Sub(Box::new(self.fresh()));
-        }
-
-        let id = self.infer_expr(&args[0], env);
-        self.unify(Type::String, id, args[0].span);
-        let ms = self.infer_expr(&args[1], env);
-        self.unify(Type::Number, ms, args[1].span);
-        let msg = self.infer_expr(&args[2], env);
-        Type::Sub(Box::new(msg))
-    }
-
-    fn infer_sub_change(
-        &mut self,
-        name: &str,
-        args: &[Expr],
-        env: &mut HashMap<String, Type>,
-        subscription_kind: &str,
-    ) -> Type {
-        if args.len() != 3 {
-            self.arity_error(
-                args.first().map_or(Span::default(), |arg| arg.span),
-                name,
-                3,
-                args.len(),
-            );
-            return Type::Sub(Box::new(self.fresh()));
-        }
-
-        let id = self.infer_expr(&args[0], env);
-        self.unify(Type::String, id, args[0].span);
-        let target = self.infer_expr(&args[1], env);
-        self.unify(Type::String, target, args[1].span);
-        let tag = self.infer_expr(&args[2], env);
-        let msg = self.subscription_tag_message_type(
-            Some(subscription_kind),
-            "onChange",
-            tag,
-            args[2].span,
-        );
-        Type::Sub(Box::new(msg))
-    }
-
-    fn infer_sub_window_event(
-        &mut self,
-        name: &str,
-        args: &[Expr],
-        env: &mut HashMap<String, Type>,
-    ) -> Type {
-        if args.len() != 3 && args.len() != 4 {
-            self.arity_error(
-                args.first().map_or(Span::default(), |arg| arg.span),
-                name,
-                3,
-                args.len(),
-            );
-            return Type::Sub(Box::new(self.fresh()));
-        }
-
-        let id = self.infer_expr(&args[0], env);
-        self.unify(Type::String, id, args[0].span);
-        let event_type = self.infer_expr(&args[1], env);
-        self.unify(Type::String, event_type, args[1].span);
-        let tag = self.infer_expr(&args[2], env);
-        if let Some(options) = args.get(3) {
-            self.infer_expr(options, env);
-        }
-        let msg = self.subscription_tag_message_type(
-            Some("sub/window/event"),
-            "onEvent",
-            tag,
-            args[2].span,
-        );
-        Type::Sub(Box::new(msg))
-    }
-
-    fn infer_sub_window_event_with(
-        &mut self,
-        name: &str,
-        args: &[Expr],
-        env: &mut HashMap<String, Type>,
-    ) -> Type {
-        if args.len() != 4 {
-            self.arity_error(
-                args.first().map_or(Span::default(), |arg| arg.span),
-                name,
-                4,
-                args.len(),
-            );
-            return Type::Sub(Box::new(self.fresh()));
-        }
-
-        let id = self.infer_expr(&args[0], env);
-        self.unify(Type::String, id, args[0].span);
-        let event_type = self.infer_expr(&args[1], env);
-        self.unify(Type::String, event_type, args[1].span);
-        let tag = self.infer_expr(&args[2], env);
-        let config_ty = self.infer_expr(&args[3], env);
-        self.unify(Type::Record(BTreeMap::new()), config_ty, args[3].span);
-        let msg = self.subscription_tag_message_type(
-            Some("sub/window/event"),
-            "onEvent",
-            tag,
-            args[2].span,
-        );
-        Type::Sub(Box::new(msg))
     }
 
     fn infer_numeric_call(
@@ -4946,6 +4969,7 @@ impl Inferencer {
     }
 
     fn infer_get_in(&mut self, name: &str, args: &[Expr], env: &mut HashMap<String, Type>) -> Type {
+        self.mark_dynamic_type_flow();
         if args.len() != 2 {
             self.arity_error(
                 args.first().map_or(Span::default(), |arg| arg.span),
@@ -5229,13 +5253,6 @@ impl Inferencer {
         Type::String
     }
 
-    fn infer_zero_arg_nil(&mut self, name: &str, args: &[Expr]) -> Type {
-        if !args.is_empty() {
-            self.arity_error(Span::default(), name, 0, args.len());
-        }
-        Type::Nil
-    }
-
     fn infer_fixed_string_args(
         &mut self,
         name: &str,
@@ -5258,25 +5275,6 @@ impl Inferencer {
             self.unify(ty, Type::String, arg.span);
         }
         return_type
-    }
-
-    fn infer_clipboard_text(
-        &mut self,
-        name: &str,
-        args: &[Expr],
-        env: &mut HashMap<String, Type>,
-    ) -> Type {
-        if args.len() != 1 {
-            self.arity_error(
-                args.first().map_or(Span::default(), |arg| arg.span),
-                name,
-                1,
-                args.len(),
-            );
-            return Type::String;
-        }
-        self.infer_expr(&args[0], env);
-        Type::String
     }
 
     fn infer_regex_capture(
@@ -5596,6 +5594,7 @@ impl Inferencer {
         args: &[Expr],
         env: &mut HashMap<String, Type>,
     ) -> Type {
+        self.mark_dynamic_type_flow();
         if args.len() != 1 {
             self.arity_error(
                 args.first().map_or(Span::default(), |arg| arg.span),
@@ -5617,6 +5616,7 @@ impl Inferencer {
         args: &[Expr],
         env: &mut HashMap<String, Type>,
     ) -> Type {
+        self.mark_dynamic_type_flow();
         if args.len() != 1 {
             self.arity_error(
                 args.first().map_or(Span::default(), |arg| arg.span),
@@ -5891,7 +5891,18 @@ impl Inferencer {
         Type::Bool
     }
 
+    fn infer_dynamic_predicate(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        env: &mut HashMap<String, Type>,
+    ) -> Type {
+        self.mark_dynamic_type_flow();
+        self.infer_predicate(name, args, env)
+    }
+
     fn infer_get(&mut self, name: &str, args: &[Expr], env: &mut HashMap<String, Type>) -> Type {
+        self.mark_dynamic_type_flow();
         if args.len() != 2 {
             self.arity_error(
                 args.first().map_or(Span::default(), |arg| arg.span),
@@ -5915,6 +5926,7 @@ impl Inferencer {
         args: &[Expr],
         env: &mut HashMap<String, Type>,
     ) -> Type {
+        self.mark_dynamic_type_flow();
         if args.len() != 2 {
             self.arity_error(
                 args.first().map_or(Span::default(), |arg| arg.span),
@@ -6687,8 +6699,18 @@ impl Inferencer {
             (Type::Syntax, Type::Syntax) => Type::Syntax,
             (Type::Js, Type::Js) => Type::Js,
             (Type::Js, ty) | (ty, Type::Js) => ty,
-            (Type::Html, Type::Html) => Type::Html,
-            (Type::TrustedHtml, Type::TrustedHtml) => Type::TrustedHtml,
+            (Type::Named(left_name, left_args), Type::Named(right_name, right_args))
+                if left_name == right_name && left_args.len() == right_args.len() =>
+            {
+                Type::Named(
+                    left_name,
+                    left_args
+                        .into_iter()
+                        .zip(right_args)
+                        .map(|(left, right)| self.unify(left, right, span))
+                        .collect(),
+                )
+            }
             (Type::Nil, Type::Option(inner)) | (Type::Option(inner), Type::Nil) => {
                 Type::Option(inner)
             }
@@ -6889,7 +6911,7 @@ impl Inferencer {
                 let right_msg = self.infer_command_record_message_type(right, span);
                 Type::Cmd(Box::new(self.join_types(*left, right_msg, span)))
             }
-            (Type::Cmd(left), Type::Record(right)) if is_command_record_fields(&right) => {
+            (Type::Cmd(left), Type::Record(right)) if self.is_command_record_fields(&right) => {
                 let right_msg = self.infer_command_record_message_type(right, span);
                 Type::Cmd(Box::new(self.join_types(*left, right_msg, span)))
             }
@@ -6897,7 +6919,7 @@ impl Inferencer {
                 let left_msg = self.infer_command_record_message_type(left, span);
                 Type::Cmd(Box::new(self.join_types(left_msg, *right, span)))
             }
-            (Type::Record(left), Type::Cmd(right)) if is_command_record_fields(&left) => {
+            (Type::Record(left), Type::Cmd(right)) if self.is_command_record_fields(&left) => {
                 let left_msg = self.infer_command_record_message_type(left, span);
                 Type::Cmd(Box::new(self.join_types(left_msg, *right, span)))
             }
@@ -6927,14 +6949,16 @@ impl Inferencer {
                 Type::Cmd(Box::new(self.join_types(left_msg, right_msg, span)))
             }
             (Type::Record(left), Type::Record(right))
-                if is_batch_command_record_fields(&left) && is_command_record_fields(&right) =>
+                if is_batch_command_record_fields(&left)
+                    && self.is_command_record_fields(&right) =>
             {
                 let left_msg = self.infer_command_record_message_type(left, span);
                 let right_msg = self.infer_command_record_message_type(right, span);
                 Type::Cmd(Box::new(self.join_types(left_msg, right_msg, span)))
             }
             (Type::Record(left), Type::Record(right))
-                if is_command_record_fields(&left) && is_batch_command_record_fields(&right) =>
+                if self.is_command_record_fields(&left)
+                    && is_batch_command_record_fields(&right) =>
             {
                 let left_msg = self.infer_command_record_message_type(left, span);
                 let right_msg = self.infer_command_record_message_type(right, span);
@@ -7041,9 +7065,15 @@ impl Inferencer {
             | (Type::Bool, Type::Bool)
             | (Type::Nil, Type::Nil)
             | (Type::Syntax, Type::Syntax)
-            | (Type::Js, Type::Js)
-            | (Type::Html, Type::Html)
-            | (Type::TrustedHtml, Type::TrustedHtml) => true,
+            | (Type::Js, Type::Js) => true,
+            (Type::Named(left_name, left_args), Type::Named(right_name, right_args)) => {
+                left_name == right_name
+                    && left_args.len() == right_args.len()
+                    && left_args
+                        .into_iter()
+                        .zip(right_args)
+                        .all(|(left, right)| self.union_field_matches(left, right, span))
+            }
             (Type::Keyword(expected), Type::Keyword(actual)) => {
                 keyword_type_accepts(&expected, &actual)
             }
@@ -7119,7 +7149,7 @@ impl Inferencer {
                 self.unify(kind_ty.clone(), Type::Keyword(None), span);
                 command_kind = keyword_literal_name(&kind_ty).map(str::to_string);
                 if let Some(kind) = command_kind.as_deref() {
-                    if !is_known_command_kind(kind) {
+                    if !self.is_known_command_kind(kind) {
                         self.diagnostics.push(Diagnostic::error(
                             span,
                             format!("unknown command kind :{}", kind),
@@ -7182,7 +7212,7 @@ impl Inferencer {
                 self.unify(kind_ty.clone(), Type::Keyword(None), span);
                 subscription_kind = keyword_literal_name(&kind_ty).map(str::to_string);
                 if let Some(kind) = subscription_kind.as_deref() {
-                    if !is_known_subscription_kind(kind) {
+                    if !self.is_known_subscription_kind(kind) {
                         self.diagnostics.push(Diagnostic::error(
                             span,
                             format!("unknown subscription kind :{}", kind),
@@ -7239,6 +7269,7 @@ impl Inferencer {
         fields: &BTreeMap<String, Type>,
         span: Span,
     ) {
+        let registered_schema = self.options.command_schema_rule(command_kind).cloned();
         if command_kind == "task/perform" {
             self.require_command_fields(
                 command_kind,
@@ -7248,13 +7279,21 @@ impl Inferencer {
             );
         } else if matches!(command_kind, "none" | "batch") {
             self.reject_structural_command_continuations(command_kind, fields, span);
-        } else if matches!(command_kind, "dom-ref/resize-watch" | "media-query/watch") {
+        } else if registered_schema
+            .as_ref()
+            .is_some_and(|schema| schema.reject_success_continuations)
+        {
             self.reject_change_command_success_continuations(command_kind, fields, span);
             self.reject_unsupported_continuation_fields(command_kind, fields, span);
         } else {
             self.reject_conflicting_success_command_fields(command_kind, fields, span);
             self.reject_payloadless_success_continuations(command_kind, fields, span);
             self.reject_unsupported_continuation_fields(command_kind, fields, span);
+        }
+
+        if let Some(schema) = registered_schema {
+            self.validate_registered_command_schema(&schema, fields, span);
+            return;
         }
 
         match command_kind {
@@ -7265,100 +7304,6 @@ impl Inferencer {
                         "batch command is missing a :commands vector",
                     ));
                 }
-            }
-            "bluetooth/request-device" => {
-                self.require_success_command_field(command_kind, fields, span);
-                self.require_one_command_field(
-                    command_kind,
-                    fields,
-                    &["options", "filters", "acceptAllDevices"],
-                    span,
-                );
-                self.require_command_field_type(
-                    command_kind,
-                    fields,
-                    "options",
-                    Type::Record(BTreeMap::new()),
-                    span,
-                );
-                self.require_command_field_type(
-                    command_kind,
-                    fields,
-                    "filters",
-                    Type::Vector(Box::new(bluetooth_filter_type())),
-                    span,
-                );
-                self.require_command_field_type(
-                    command_kind,
-                    fields,
-                    "optionalServices",
-                    Type::Vector(Box::new(Type::String)),
-                    span,
-                );
-                self.require_command_field_type(
-                    command_kind,
-                    fields,
-                    "acceptAllDevices",
-                    Type::Bool,
-                    span,
-                );
-            }
-            "bluetooth/connect-heart-rate" => {
-                self.require_command_fields(command_kind, fields, &["id", "onReading"], span);
-                self.require_command_field_type(command_kind, fields, "id", Type::String, span);
-                self.require_success_command_field(command_kind, fields, span);
-                self.require_one_command_field(
-                    command_kind,
-                    fields,
-                    &["options", "filters", "acceptAllDevices"],
-                    span,
-                );
-                self.require_command_field_type(
-                    command_kind,
-                    fields,
-                    "options",
-                    Type::Record(BTreeMap::new()),
-                    span,
-                );
-                self.require_command_field_type(
-                    command_kind,
-                    fields,
-                    "filters",
-                    Type::Vector(Box::new(bluetooth_filter_type())),
-                    span,
-                );
-                self.require_command_field_type(
-                    command_kind,
-                    fields,
-                    "optionalServices",
-                    Type::Vector(Box::new(Type::String)),
-                    span,
-                );
-                self.require_command_field_type(
-                    command_kind,
-                    fields,
-                    "acceptAllDevices",
-                    Type::Bool,
-                    span,
-                );
-                self.require_command_field_type(
-                    command_kind,
-                    fields,
-                    "service",
-                    Type::String,
-                    span,
-                );
-                self.require_command_field_type(
-                    command_kind,
-                    fields,
-                    "characteristic",
-                    Type::String,
-                    span,
-                );
-            }
-            "bluetooth/disconnect" => {
-                self.require_command_fields(command_kind, fields, &["id"], span);
-                self.require_command_field_type(command_kind, fields, "id", Type::String, span);
             }
             "timer/after" => {
                 self.require_command_fields(command_kind, fields, &["ms", "msg"], span);
@@ -7385,256 +7330,10 @@ impl Inferencer {
             "time/now" => {
                 self.require_success_command_field(command_kind, fields, span);
             }
-            "storage/get" => {
-                self.require_command_fields(command_kind, fields, &["key"], span);
-                self.require_command_field_type(command_kind, fields, "key", Type::String, span);
-                self.require_command_field_keyword_or_string(command_kind, fields, "format", span);
-                self.require_command_field_keyword_or_string(command_kind, fields, "parse", span);
-                self.require_success_command_field(command_kind, fields, span);
-            }
-            "storage/set" => {
-                self.require_command_fields(command_kind, fields, &["key", "value"], span);
-                self.require_command_field_type(command_kind, fields, "key", Type::String, span);
-            }
-            "storage/remove" => {
-                self.require_command_fields(command_kind, fields, &["key"], span);
-                self.require_command_field_type(command_kind, fields, "key", Type::String, span);
-            }
-            "browser/history-replace-search-param" => {
-                self.require_command_fields(command_kind, fields, &["name", "value"], span);
-                self.require_command_field_type(command_kind, fields, "name", Type::String, span);
-                self.require_command_field_type(
-                    command_kind,
-                    fields,
-                    "value",
-                    Type::Option(Box::new(Type::String)),
-                    span,
-                );
-            }
-            "browser/history-write-route" => {
-                self.require_command_fields(
-                    command_kind,
-                    fields,
-                    &["url", "op", "definition"],
-                    span,
-                );
-                self.require_command_field_type(command_kind, fields, "url", Type::String, span);
-                self.require_command_field_type(
-                    command_kind,
-                    fields,
-                    "op",
-                    Type::Option(Box::new(Type::String)),
-                    span,
-                );
-                self.require_command_field_type(
-                    command_kind,
-                    fields,
-                    "definition",
-                    Type::Option(Box::new(Type::String)),
-                    span,
-                );
-            }
-            "browser/theme-load" => {
-                self.require_command_fields(command_kind, fields, &["key"], span);
-                self.require_command_field_type(command_kind, fields, "key", Type::String, span);
-                self.require_success_command_field(command_kind, fields, span);
-            }
-            "browser/theme-apply" => {
-                self.require_command_fields(command_kind, fields, &["theme", "key"], span);
-                self.require_command_field_type(command_kind, fields, "theme", Type::String, span);
-                self.require_command_field_type(command_kind, fields, "key", Type::String, span);
-            }
-            "browser/clipboard-write" => {
-                self.require_command_fields(command_kind, fields, &["text"], span);
-                self.require_command_field_type(command_kind, fields, "text", Type::String, span);
-            }
-            "browser/set-cookie" => {
-                self.require_command_fields(command_kind, fields, &["name", "value"], span);
-                self.require_command_field_type(command_kind, fields, "name", Type::String, span);
-                self.require_command_field_type(command_kind, fields, "value", Type::String, span);
-            }
-            "auth-storage/load" => {
-                self.require_command_fields(command_kind, fields, &["sourceUrl"], span);
-                self.require_command_field_type(
-                    command_kind,
-                    fields,
-                    "sourceUrl",
-                    Type::String,
-                    span,
-                );
-                self.require_success_command_field(command_kind, fields, span);
-            }
-            "auth-storage/persist" => {
-                self.require_command_fields(command_kind, fields, &["sourceUrl", "entries"], span);
-                self.require_command_field_type(
-                    command_kind,
-                    fields,
-                    "sourceUrl",
-                    Type::String,
-                    span,
-                );
-            }
             "random/number" => {
                 self.require_success_command_field(command_kind, fields, span);
                 self.require_command_field_type(command_kind, fields, "min", Type::Number, span);
                 self.require_command_field_type(command_kind, fields, "max", Type::Number, span);
-            }
-            "simulation/heart-rate" => {
-                self.require_command_fields(command_kind, fields, &["id", "onReading"], span);
-                self.require_command_field_type(command_kind, fields, "id", Type::String, span);
-                self.require_command_field_type(command_kind, fields, "ms", Type::Number, span);
-                self.require_command_field_type(command_kind, fields, "min", Type::Number, span);
-                self.require_command_field_type(command_kind, fields, "max", Type::Number, span);
-                self.require_command_field_type(command_kind, fields, "jitter", Type::Number, span);
-                self.require_command_field_type(command_kind, fields, "start", Type::Number, span);
-                self.require_command_field_type(
-                    command_kind,
-                    fields,
-                    "deviceName",
-                    Type::String,
-                    span,
-                );
-                self.require_success_command_field(command_kind, fields, span);
-            }
-            "simulation/stop" => {
-                self.require_command_fields(command_kind, fields, &["id"], span);
-                self.require_command_field_type(command_kind, fields, "id", Type::String, span);
-            }
-            "file/download" => {
-                self.require_command_fields(command_kind, fields, &["name", "content"], span);
-                self.require_command_field_type(command_kind, fields, "name", Type::String, span);
-                self.require_command_field_type(command_kind, fields, "mime", Type::String, span);
-            }
-            "file/import" => {
-                self.require_success_command_field(command_kind, fields, span);
-                self.require_command_field_type(command_kind, fields, "accept", Type::String, span);
-                self.require_command_field_keyword_or_string(command_kind, fields, "format", span);
-                self.require_command_field_keyword_or_string(command_kind, fields, "parse", span);
-                self.require_command_field_type(command_kind, fields, "multiple", Type::Bool, span);
-            }
-            "file/read-selected" => {
-                self.require_command_fields(command_kind, fields, &["ref"], span);
-                self.require_command_field_type(command_kind, fields, "ref", Type::String, span);
-                self.require_command_field_keyword_or_string(command_kind, fields, "format", span);
-                self.require_command_field_keyword_or_string(command_kind, fields, "parse", span);
-                self.require_command_field_type(command_kind, fields, "multiple", Type::Bool, span);
-                self.require_command_field_type(command_kind, fields, "clear", Type::Bool, span);
-                self.require_success_command_field(command_kind, fields, span);
-            }
-            "canvas/draw" => {
-                self.require_command_fields(command_kind, fields, &["ref", "ops"], span);
-                self.require_command_field_type(command_kind, fields, "ref", Type::String, span);
-                self.require_command_field_type(command_kind, fields, "width", Type::Number, span);
-                self.require_command_field_type(command_kind, fields, "height", Type::Number, span);
-                self.require_command_field_type(
-                    command_kind,
-                    fields,
-                    "cssWidth",
-                    Type::Number,
-                    span,
-                );
-                self.require_command_field_type(
-                    command_kind,
-                    fields,
-                    "cssHeight",
-                    Type::Number,
-                    span,
-                );
-                self.require_command_field_type(
-                    command_kind,
-                    fields,
-                    "setCssSize",
-                    Type::Bool,
-                    span,
-                );
-            }
-            "canvas/measure-text" => {
-                self.require_command_fields(command_kind, fields, &["ref"], span);
-                self.require_command_field_type(command_kind, fields, "ref", Type::String, span);
-                self.require_success_command_field(command_kind, fields, span);
-                self.require_one_command_field(command_kind, fields, &["text", "texts"], span);
-                self.require_command_field_type(command_kind, fields, "text", Type::String, span);
-                self.require_command_field_type(
-                    command_kind,
-                    fields,
-                    "texts",
-                    Type::Vector(Box::new(Type::String)),
-                    span,
-                );
-                self.require_command_field_type(command_kind, fields, "font", Type::String, span);
-            }
-            "dom-ref/focus" | "dom-ref/click" => {
-                self.require_command_fields(command_kind, fields, &["ref"], span);
-                self.require_command_field_type(command_kind, fields, "ref", Type::String, span);
-            }
-            "dom-ref/measure" => {
-                self.require_command_fields(command_kind, fields, &["ref"], span);
-                self.require_command_field_type(command_kind, fields, "ref", Type::String, span);
-                self.require_success_command_field(command_kind, fields, span);
-            }
-            "dom/scroll-into-view" => {
-                self.require_one_command_field(
-                    command_kind,
-                    fields,
-                    &["selector", "testId", "id"],
-                    span,
-                );
-                self.require_command_field_type(
-                    command_kind,
-                    fields,
-                    "selector",
-                    Type::String,
-                    span,
-                );
-                self.require_command_field_type(command_kind, fields, "testId", Type::String, span);
-                self.require_command_field_type(command_kind, fields, "id", Type::String, span);
-                self.require_command_field_type(
-                    command_kind,
-                    fields,
-                    "behavior",
-                    Type::String,
-                    span,
-                );
-                self.require_command_field_type(command_kind, fields, "block", Type::String, span);
-                self.require_command_field_type(command_kind, fields, "inline", Type::String, span);
-                self.require_command_field_type(
-                    command_kind,
-                    fields,
-                    "skipIfVisible",
-                    Type::Bool,
-                    span,
-                );
-                self.require_command_field_type(command_kind, fields, "smooth", Type::Bool, span);
-            }
-            "dom-ref/resize-watch" => {
-                self.require_command_fields(command_kind, fields, &["ref", "onChange"], span);
-                self.require_command_field_type(command_kind, fields, "id", Type::String, span);
-                self.require_command_field_type(command_kind, fields, "ref", Type::String, span);
-            }
-            "dom-ref/resize-unwatch" => {
-                self.require_one_command_field(command_kind, fields, &["id", "ref"], span);
-                self.require_command_field_type(command_kind, fields, "id", Type::String, span);
-                self.require_command_field_type(command_kind, fields, "ref", Type::String, span);
-            }
-            "window/event-watch" => {
-                self.require_command_fields(command_kind, fields, &["type", "onEvent"], span);
-                self.require_command_field_type(command_kind, fields, "id", Type::String, span);
-                self.require_command_field_type(command_kind, fields, "type", Type::String, span);
-            }
-            "window/event-unwatch" => {
-                self.require_one_command_field(command_kind, fields, &["id", "type"], span);
-                self.require_command_field_type(command_kind, fields, "id", Type::String, span);
-                self.require_command_field_type(command_kind, fields, "type", Type::String, span);
-            }
-            "media-query/watch" => {
-                self.require_command_fields(command_kind, fields, &["query", "onChange"], span);
-                self.require_command_field_type(command_kind, fields, "id", Type::String, span);
-                self.require_command_field_type(command_kind, fields, "query", Type::String, span);
-            }
-            "media-query/unwatch" => {
-                self.require_one_command_field(command_kind, fields, &["id", "query"], span);
-                self.require_command_field_type(command_kind, fields, "id", Type::String, span);
-                self.require_command_field_type(command_kind, fields, "query", Type::String, span);
             }
             "http/request" => {
                 self.require_one_command_field(command_kind, fields, &["request", "url"], span);
@@ -7676,6 +7375,15 @@ impl Inferencer {
         fields: &BTreeMap<String, Type>,
         span: Span,
     ) {
+        if let Some(schema) = self
+            .options
+            .subscription_schema_rule(subscription_kind)
+            .cloned()
+        {
+            self.validate_registered_subscription_schema(&schema, fields, span);
+            return;
+        }
+
         match subscription_kind {
             "none" => {}
             "batch" => {
@@ -7685,175 +7393,6 @@ impl Inferencer {
                         "batch subscription is missing a :subscriptions vector",
                     ));
                 }
-            }
-            "sub/timer/every" => {
-                self.require_command_fields(subscription_kind, fields, &["id", "ms", "msg"], span);
-                self.require_command_field_type(
-                    subscription_kind,
-                    fields,
-                    "id",
-                    Type::String,
-                    span,
-                );
-                self.require_command_field_type(
-                    subscription_kind,
-                    fields,
-                    "ms",
-                    Type::Number,
-                    span,
-                );
-            }
-            "sub/dom-ref/resize" => {
-                self.require_command_fields(subscription_kind, fields, &["ref", "onChange"], span);
-                self.require_command_field_type(
-                    subscription_kind,
-                    fields,
-                    "id",
-                    Type::String,
-                    span,
-                );
-                self.require_command_field_type(
-                    subscription_kind,
-                    fields,
-                    "ref",
-                    Type::String,
-                    span,
-                );
-            }
-            "sub/window/event" => {
-                self.require_command_fields(subscription_kind, fields, &["type", "onEvent"], span);
-                self.require_command_field_type(
-                    subscription_kind,
-                    fields,
-                    "id",
-                    Type::String,
-                    span,
-                );
-                self.require_command_field_type(
-                    subscription_kind,
-                    fields,
-                    "type",
-                    Type::String,
-                    span,
-                );
-            }
-            "sub/media-query" => {
-                self.require_command_fields(
-                    subscription_kind,
-                    fields,
-                    &["query", "onChange"],
-                    span,
-                );
-                self.require_command_field_type(
-                    subscription_kind,
-                    fields,
-                    "id",
-                    Type::String,
-                    span,
-                );
-                self.require_command_field_type(
-                    subscription_kind,
-                    fields,
-                    "query",
-                    Type::String,
-                    span,
-                );
-            }
-            "sub/simulation/heart-rate" => {
-                self.require_command_fields(subscription_kind, fields, &["id", "onReading"], span);
-                self.require_command_field_type(
-                    subscription_kind,
-                    fields,
-                    "id",
-                    Type::String,
-                    span,
-                );
-                self.require_command_field_type(
-                    subscription_kind,
-                    fields,
-                    "ms",
-                    Type::Number,
-                    span,
-                );
-                self.require_command_field_type(
-                    subscription_kind,
-                    fields,
-                    "min",
-                    Type::Number,
-                    span,
-                );
-                self.require_command_field_type(
-                    subscription_kind,
-                    fields,
-                    "max",
-                    Type::Number,
-                    span,
-                );
-                self.require_command_field_type(
-                    subscription_kind,
-                    fields,
-                    "jitter",
-                    Type::Number,
-                    span,
-                );
-                self.require_command_field_type(
-                    subscription_kind,
-                    fields,
-                    "start",
-                    Type::Number,
-                    span,
-                );
-                self.require_command_field_type(
-                    subscription_kind,
-                    fields,
-                    "deviceName",
-                    Type::String,
-                    span,
-                );
-            }
-            "sub/bluetooth/connect-heart-rate" => {
-                self.require_command_fields(subscription_kind, fields, &["id", "onReading"], span);
-                self.require_command_field_type(
-                    subscription_kind,
-                    fields,
-                    "id",
-                    Type::String,
-                    span,
-                );
-                self.require_one_command_field(
-                    subscription_kind,
-                    fields,
-                    &["options", "filters", "acceptAllDevices"],
-                    span,
-                );
-                self.require_command_field_type(
-                    subscription_kind,
-                    fields,
-                    "options",
-                    Type::Record(BTreeMap::new()),
-                    span,
-                );
-                self.require_command_field_type(
-                    subscription_kind,
-                    fields,
-                    "filters",
-                    Type::Vector(Box::new(bluetooth_filter_type())),
-                    span,
-                );
-                self.require_command_field_type(
-                    subscription_kind,
-                    fields,
-                    "optionalServices",
-                    Type::Vector(Box::new(Type::String)),
-                    span,
-                );
-                self.require_command_field_type(
-                    subscription_kind,
-                    fields,
-                    "acceptAllDevices",
-                    Type::Bool,
-                    span,
-                );
             }
             _ => {}
         }
@@ -7953,10 +7492,13 @@ impl Inferencer {
         fields: &BTreeMap<String, Type>,
         span: Span,
     ) {
-        if !matches!(
-            command_kind,
-            "bluetooth/disconnect" | "timer/after" | "timer/every" | "timer/cancel"
-        ) {
+        let registered_payloadless = self
+            .options
+            .command_schema_rule(command_kind)
+            .is_some_and(|schema| schema.payloadless_success);
+        if !registered_payloadless
+            && !matches!(command_kind, "timer/after" | "timer/every" | "timer/cancel")
+        {
             return;
         }
 
@@ -7989,24 +7531,19 @@ impl Inferencer {
         fields: &BTreeMap<String, Type>,
         span: Span,
     ) {
-        for (field, supported) in [
-            ("onCancel", &["file/import", "file/read-selected"][..]),
-            (
-                "onDisconnected",
-                &["bluetooth/connect-heart-rate", "simulation/heart-rate"][..],
-            ),
-            (
-                "onReading",
-                &["bluetooth/connect-heart-rate", "simulation/heart-rate"][..],
-            ),
+        for (field, builtin_supported) in [
+            ("onCancel", &[][..]),
+            ("onDisconnected", &[][..]),
+            ("onReading", &[][..]),
             ("onFrame", &["animation/frame"][..]),
-            (
-                "onChange",
-                &["dom-ref/resize-watch", "media-query/watch"][..],
-            ),
-            ("onEvent", &["window/event-watch"][..]),
+            ("onChange", &[][..]),
+            ("onEvent", &[][..]),
         ] {
-            if fields.contains_key(field) && !supported.contains(&command_kind) {
+            if !fields.contains_key(field) {
+                continue;
+            }
+            let supported = self.command_kinds_supporting_continuation(field, builtin_supported);
+            if !supported.iter().any(|kind| kind == command_kind) {
                 self.diagnostics.push(Diagnostic::error(
                     span,
                     format!(
@@ -8021,6 +7558,104 @@ impl Inferencer {
                     ),
                 ));
             }
+        }
+    }
+
+    fn command_kinds_supporting_continuation(
+        &self,
+        field: &str,
+        builtin_supported: &[&str],
+    ) -> Vec<String> {
+        let mut supported = builtin_supported
+            .iter()
+            .map(|kind| (*kind).to_string())
+            .collect::<Vec<_>>();
+        for schema in &self.options.command_schemas {
+            if schema.supports_continuation(field)
+                && !supported.iter().any(|kind| kind == &schema.kind)
+            {
+                supported.push(schema.kind.clone());
+            }
+        }
+        supported
+    }
+
+    fn is_known_command_kind(&self, kind: &str) -> bool {
+        is_builtin_command_kind(kind) || self.options.command_schema_rule(kind).is_some()
+    }
+
+    fn is_known_subscription_kind(&self, kind: &str) -> bool {
+        is_builtin_subscription_kind(kind) || self.options.subscription_schema_rule(kind).is_some()
+    }
+
+    fn is_command_record_fields(&self, fields: &BTreeMap<String, Type>) -> bool {
+        fields
+            .get("kind")
+            .and_then(keyword_literal_name)
+            .is_some_and(|kind| self.is_known_command_kind(kind))
+    }
+
+    fn validate_registered_command_schema(
+        &mut self,
+        schema: &CommandSchemaRule,
+        fields: &BTreeMap<String, Type>,
+        span: Span,
+    ) {
+        for field in &schema.required_fields {
+            if !fields.contains_key(field) {
+                self.diagnostics.push(Diagnostic::error(
+                    span,
+                    format!("{} command is missing a :{} field", schema.kind, field),
+                ));
+            }
+        }
+        for one_of_fields in &schema.one_of_field_groups {
+            let one_of_fields = one_of_fields.iter().map(String::as_str).collect::<Vec<_>>();
+            self.require_one_command_field(&schema.kind, fields, &one_of_fields, span);
+        }
+        if schema.require_success {
+            self.require_success_command_field(&schema.kind, fields, span);
+        }
+        for field in &schema.field_types {
+            let expected = self.check_type_to_type(&field.ty, &mut HashMap::new(), &[]);
+            self.require_command_field_type(&schema.kind, fields, &field.name, expected, span);
+        }
+    }
+
+    fn validate_registered_subscription_schema(
+        &mut self,
+        schema: &SubscriptionSchemaRule,
+        fields: &BTreeMap<String, Type>,
+        span: Span,
+    ) {
+        for field in &schema.required_fields {
+            if !fields.contains_key(field) {
+                self.diagnostics.push(Diagnostic::error(
+                    span,
+                    format!("{} subscription is missing a :{} field", schema.kind, field),
+                ));
+            }
+        }
+        if !schema.collection_fields.is_empty()
+            && !schema
+                .collection_fields
+                .iter()
+                .any(|field| fields.contains_key(field))
+        {
+            let fields = schema
+                .collection_fields
+                .iter()
+                .map(|field| format!(":{}", field))
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.diagnostics.push(Diagnostic::error(
+                span,
+                format!("{} subscription is missing one of {}", schema.kind, fields),
+            ));
+        }
+        for field in &schema.field_types {
+            let expected = self.check_type_to_type(&field.ty, &mut HashMap::new(), &[]);
+            self.require_command_field_type(&schema.kind, fields, &field.name, expected, span);
         }
     }
 
@@ -8050,7 +7685,23 @@ impl Inferencer {
         span: Span,
     ) {
         if let Some(actual) = fields.get(field).cloned() {
+            if self.command_field_type_accepts(&expected, &actual) {
+                return;
+            }
             self.unify(expected, actual, span);
+        }
+    }
+
+    fn command_field_type_accepts(&mut self, expected: &Type, actual: &Type) -> bool {
+        match (self.resolve(expected.clone()), self.resolve(actual.clone())) {
+            (Type::Keyword(None), Type::Keyword(_)) => true,
+            (Type::Union(variants), actual) => variants
+                .iter()
+                .any(|variant| self.command_field_type_accepts(variant, &actual)),
+            (expected, Type::Union(variants)) => variants
+                .iter()
+                .all(|variant| self.command_field_type_accepts(&expected, variant)),
+            (expected, actual) => expected == actual,
         }
     }
 
@@ -8266,7 +7917,7 @@ impl Inferencer {
     fn infer_command_message_type(&mut self, command_ty: Type, span: Span) -> Type {
         match self.resolve(command_ty) {
             Type::Cmd(msg) => self.resolve(*msg),
-            Type::Record(fields) if is_command_record_fields(&fields) => {
+            Type::Record(fields) if self.is_command_record_fields(&fields) => {
                 self.infer_command_record_message_type(fields, span)
             }
             Type::Union(variants) => {
@@ -8472,8 +8123,23 @@ impl Inferencer {
     ) {
         let label = match self.resolve(tag_ty.clone()) {
             Type::Keyword(Some(tag)) => format!(":{} {}", field, format_keyword_literal(&tag)),
+            Type::Fn(_, _) => format!(":{}", field),
             _ => format!(":{}", field),
         };
+        if let Type::Fn(args, ret) = self.resolve(tag_ty.clone()) {
+            if args.len() != 1 {
+                self.diagnostics.push(Diagnostic::error(
+                    span,
+                    format!(
+                        "subscription :{} mapper must accept exactly one payload argument",
+                        field
+                    ),
+                ));
+                return;
+            }
+            self.require_subscription_message_matches(expected_msg, *ret, span, &label);
+            return;
+        }
         let message_ty = self.subscription_tag_message_type(subscription_kind, field, tag_ty, span);
         if let Type::Var(_) = self.resolve(message_ty.clone()) {
             return;
@@ -8492,7 +8158,7 @@ impl Inferencer {
         match self.resolve(tag_ty) {
             Type::Var(_) | Type::Keyword(None) => self.fresh(),
             Type::Keyword(Some(tag)) => self.command_message_tag_type(
-                subscription_command_kind(subscription_kind),
+                self.subscription_command_kind(subscription_kind).as_deref(),
                 field,
                 &tag,
                 &BTreeMap::new(),
@@ -8508,6 +8174,20 @@ impl Inferencer {
                 ));
                 self.fresh()
             }
+        }
+    }
+
+    fn subscription_command_kind(&self, kind: Option<&str>) -> Option<String> {
+        if let Some(schema) = kind.and_then(|kind| self.options.subscription_schema_rule(kind)) {
+            if let Some(command_kind) = &schema.command_kind {
+                return Some(command_kind.clone());
+            }
+        }
+
+        match kind {
+            Some("none") => Some("none".to_string()),
+            Some("batch") => Some("batch".to_string()),
+            _ => None,
         }
     }
 
@@ -8624,37 +8304,6 @@ impl Inferencer {
         ));
     }
 
-    fn require_html_event_message_matches(
-        &mut self,
-        expected_msg: Type,
-        actual_msg: Type,
-        span: Span,
-        event_name: &str,
-    ) {
-        if self.html_event_message_matches(expected_msg.clone(), actual_msg.clone(), span) {
-            return;
-        }
-
-        let expected = format_type_with_literals(&self.resolve(expected_msg));
-        let actual = format_type_with_literals(&self.resolve(actual_msg));
-        self.diagnostics.push(Diagnostic::error(
-            span,
-            format!(
-                "template event {} message has type {}, which is not part of update message type {}",
-                event_name, actual, expected
-            ),
-        ));
-    }
-
-    fn html_event_message_matches(&mut self, expected: Type, actual: Type, span: Span) -> bool {
-        match self.resolve(actual) {
-            Type::Nil => true,
-            Type::Option(inner) => self.html_event_message_matches(expected, *inner, span),
-            Type::Event(inner) => self.html_event_message_matches(expected, *inner, span),
-            actual => self.command_message_matches(expected, actual, span),
-        }
-    }
-
     fn command_message_matches(&mut self, expected: Type, actual: Type, span: Span) -> bool {
         let expected = self.resolve(expected);
         let actual = self.resolve(actual);
@@ -8688,7 +8337,16 @@ impl Inferencer {
                 keyword_type_accepts(&expected, &actual)
             }
             (Type::Js, _) | (_, Type::Js) => true,
-            (Type::TrustedHtml, Type::TrustedHtml) | (Type::Html, Type::Html) => true,
+            (Type::Named(expected_name, expected_args), Type::Named(actual_name, actual_args)) => {
+                expected_name == actual_name
+                    && expected_args.len() == actual_args.len()
+                    && expected_args
+                        .into_iter()
+                        .zip(actual_args)
+                        .all(|(expected, actual)| {
+                            self.command_message_matches(expected, actual, span)
+                        })
+            }
             (Type::Option(expected), Type::Option(actual))
             | (Type::Decoder(expected), Type::Decoder(actual))
             | (Type::List(expected), Type::List(actual))
@@ -8745,37 +8403,14 @@ impl Inferencer {
             "onError" => {
                 fields.insert("error".to_string(), Type::String);
             }
-            "onReading" => {
-                fields.insert("bpm".to_string(), Type::Number);
-            }
             "onFrame" => {
                 fields.insert("id".to_string(), Type::String);
                 fields.insert("timestamp".to_string(), Type::Number);
                 fields.insert("value".to_string(), Type::Number);
             }
-            "onEvent" => {
-                let event = window_event_payload_type();
-                fields.extend(record_fields(&event));
-                fields.insert("id".to_string(), Type::String);
-                fields.insert("value".to_string(), event);
+            "onChange" => {
+                fields.insert("value".to_string(), self.fresh());
             }
-            "onChange" => match command_kind {
-                Some("dom-ref/resize-watch") => {
-                    let rect = rect_type();
-                    fields.extend(record_fields(&rect));
-                    fields.insert("id".to_string(), Type::String);
-                    fields.insert("ref".to_string(), Type::String);
-                    fields.insert("value".to_string(), rect);
-                }
-                Some("media-query/watch") => {
-                    fields.insert("id".to_string(), Type::String);
-                    fields.insert("media".to_string(), Type::String);
-                    fields.insert("matches".to_string(), Type::Bool);
-                }
-                _ => {
-                    fields.insert("value".to_string(), self.fresh());
-                }
-            },
             "onSuccess" => {
                 if let Some(value_ty) =
                     self.command_success_value_type(command_kind, command_fields)
@@ -8787,6 +8422,19 @@ impl Inferencer {
             _ => {}
         }
 
+        if let Some(schema) =
+            command_kind.and_then(|kind| self.options.command_schema_rule(kind).cloned())
+        {
+            for field_rule in schema
+                .continuation_message_fields
+                .iter()
+                .filter(|field_rule| field_rule.continuation == field)
+            {
+                let field_ty = self.check_type_to_type(&field_rule.ty, &mut HashMap::new(), &[]);
+                fields.insert(field_rule.name.clone(), field_ty);
+            }
+        }
+
         Type::Record(fields)
     }
 
@@ -8795,85 +8443,37 @@ impl Inferencer {
         command_kind: Option<&str>,
         command_fields: &BTreeMap<String, Type>,
     ) -> Option<Type> {
+        if let Some(schema) =
+            command_kind.and_then(|kind| self.options.command_schema_rule(kind).cloned())
+        {
+            if schema.payloadless_success {
+                return None;
+            }
+            if let Some(field) = schema.success_value_from_field {
+                return command_fields
+                    .get(&field)
+                    .cloned()
+                    .or_else(|| Some(self.fresh()));
+            }
+            if !schema.success_value_from_payload_format_fields.is_empty() {
+                return Some(command_payload_type_from_command_fields_by_format_fields(
+                    command_fields,
+                    &schema.success_value_from_payload_format_fields,
+                ));
+            }
+            if let Some(success_value) = schema.success_value.clone() {
+                return Some(self.check_type_to_type(&success_value, &mut HashMap::new(), &[]));
+            }
+        }
         match command_kind {
             Some("time/now") | Some("random/number") => Some(Type::Number),
-            Some("bluetooth/disconnect")
-            | Some("timer/after")
-            | Some("timer/every")
-            | Some("timer/cancel") => None,
-            Some("storage/set") => command_fields
-                .get("value")
-                .cloned()
-                .or_else(|| Some(self.fresh())),
-            Some("storage/get") | Some("file/import") | Some("file/read-selected") => {
-                Some(command_payload_type_from_command_fields(command_fields))
-            }
-            Some("bluetooth/request-device") => Some(self.fresh()),
-            Some("browser/theme-load") | Some("browser/theme-apply") => Some(Type::String),
-            Some("auth-storage/load") => Some(Type::Js),
-            Some("storage/remove") => Some(Type::Record(BTreeMap::from([(
-                "key".to_string(),
-                Type::String,
-            )]))),
+            Some("timer/after") | Some("timer/every") | Some("timer/cancel") => None,
             Some("http/request") => Some(Type::Record(BTreeMap::from([
                 ("status".to_string(), Type::Number),
                 ("ok".to_string(), Type::Bool),
                 ("body".to_string(), self.fresh()),
             ]))),
-            Some("bluetooth/connect-heart-rate") | Some("simulation/heart-rate") => {
-                Some(Type::Record(BTreeMap::from([
-                    ("id".to_string(), Type::String),
-                    ("deviceName".to_string(), Type::String),
-                    ("connected".to_string(), Type::Bool),
-                ])))
-            }
-            Some("simulation/stop") => Some(Type::Record(BTreeMap::from([(
-                "id".to_string(),
-                Type::String,
-            )]))),
-            Some("file/download") => Some(Type::Record(BTreeMap::from([
-                ("name".to_string(), Type::String),
-                ("content".to_string(), Type::String),
-                ("mime".to_string(), Type::String),
-            ]))),
-            Some("canvas/draw") => Some(Type::Record(BTreeMap::from([
-                ("ref".to_string(), Type::String),
-                ("width".to_string(), Type::Number),
-                ("height".to_string(), Type::Number),
-                ("cssWidth".to_string(), Type::Number),
-                ("cssHeight".to_string(), Type::Number),
-                ("pixelRatio".to_string(), Type::Number),
-            ]))),
-            Some("canvas/measure-text") => Some(Type::Record(BTreeMap::from([
-                ("ref".to_string(), Type::String),
-                ("font".to_string(), Type::String),
-                ("texts".to_string(), Type::Vector(Box::new(Type::String))),
-                ("widths".to_string(), Type::Vector(Box::new(Type::Number))),
-                (
-                    "measurements".to_string(),
-                    Type::Vector(Box::new(text_measurement_type())),
-                ),
-            ]))),
-            Some("dom-ref/focus") | Some("dom-ref/click") => {
-                Some(Type::Record(BTreeMap::from([(
-                    "ref".to_string(),
-                    Type::String,
-                )])))
-            }
-            Some("dom-ref/measure") => Some({
-                let mut fields = record_fields(&rect_type());
-                fields.insert("ref".to_string(), Type::String);
-                Type::Record(fields)
-            }),
-            Some("animation/frame")
-            | Some("animation/cancel")
-            | Some("dom-ref/resize-unwatch")
-            | Some("window/event-unwatch")
-            | Some("media-query/unwatch") => Some(id_payload_type()),
-            Some("window/event-watch") => Some(Type::Record(BTreeMap::from([
-                ("id".to_string(), Type::String),
-                ("type".to_string(), Type::String),
-            ]))),
+            Some("animation/frame") | Some("animation/cancel") => Some(id_payload_type()),
             _ => Some(self.fresh()),
         }
     }
@@ -8905,6 +8505,7 @@ impl Inferencer {
             | Type::Cmd(inner)
             | Type::Sub(inner)
             | Type::Event(inner) => self.occurs(id, &inner),
+            Type::Named(_, args) => args.iter().any(|arg| self.occurs(id, arg)),
             Type::Tuple(items) => items.iter().any(|item| self.occurs(id, item)),
             Type::Map(key, value) | Type::Result(key, value) => {
                 self.occurs(id, &key) || self.occurs(id, &value)
@@ -8952,6 +8553,10 @@ impl Inferencer {
             }
             Type::Sub(msg) => Type::Sub(Box::new(self.resolve(*msg))),
             Type::Event(msg) => Type::Event(Box::new(self.resolve(*msg))),
+            Type::Named(name, args) => Type::Named(
+                name,
+                args.into_iter().map(|arg| self.resolve(arg)).collect(),
+            ),
             Type::Union(variants) => Type::Union(
                 variants
                     .into_iter()
@@ -9026,9 +8631,17 @@ impl Inferencer {
                 "Keyword" => Some(Type::Keyword(None)),
                 "Syntax" => Some(Type::Syntax),
                 "Js" => Some(Type::Js),
-                "Html" => Some(Type::Html),
-                "TrustedHtml" => Some(Type::TrustedHtml),
                 _ => {
+                    if let Some(ty) = self.registered_named_type_to_type(
+                        name,
+                        &[],
+                        aliases,
+                        span,
+                        resolving,
+                        type_vars,
+                    ) {
+                        return Some(ty);
+                    }
                     if is_annotation_type_var(name) {
                         return Some(
                             type_vars
@@ -9036,6 +8649,10 @@ impl Inferencer {
                                 .or_insert_with(|| self.fresh())
                                 .clone(),
                         );
+                    }
+                    if let Some(message) = self.options.forbidden_type_message(name) {
+                        self.diagnostics.push(Diagnostic::error(span, message));
+                        return None;
                     }
                     let Some(alias) = aliases.get(name) else {
                         self.diagnostics.push(Diagnostic::error(
@@ -9151,6 +8768,11 @@ impl Inferencer {
                     Some(Type::Task(Box::new(err), Box::new(ok)))
                 }
                 _ => {
+                    if let Some(ty) = self.registered_named_type_to_type(
+                        name, args, aliases, span, resolving, type_vars,
+                    ) {
+                        return Some(ty);
+                    }
                     if let Some(alias) = aliases.get(name) {
                         if alias.params.len() != args.len() {
                             self.diagnostics.push(Diagnostic::error(
@@ -9188,6 +8810,10 @@ impl Inferencer {
                         resolving.remove(name);
                         return ty;
                     }
+                    if let Some(message) = self.options.forbidden_type_message(name) {
+                        self.diagnostics.push(Diagnostic::error(span, message));
+                        return None;
+                    }
                     self.diagnostics.push(Diagnostic::error(
                         span,
                         format!("unknown type constructor `{}` in annotation", name),
@@ -9217,7 +8843,10 @@ impl Inferencer {
                     else {
                         return None;
                     };
-                    checked.push(ty);
+                    match ty {
+                        Type::Union(nested) => checked.extend(nested),
+                        other => checked.push(other),
+                    }
                 }
                 Some(Type::Union(checked))
             }
@@ -9229,6 +8858,46 @@ impl Inferencer {
             span,
             format!("{} expects {} arguments, found {}", form, expected, found),
         ));
+    }
+
+    fn registered_named_type_to_type(
+        &mut self,
+        name: &str,
+        args: &[TypeSyntax],
+        aliases: &HashMap<String, TypeAlias>,
+        span: Span,
+        resolving: &mut BTreeSet<String>,
+        type_vars: &mut HashMap<String, Type>,
+    ) -> Option<Type> {
+        let rule = self.options.named_type_rule(name).cloned()?;
+        self.require_type_allowed(name, span);
+        if rule.arity != args.len() {
+            self.diagnostics.push(Diagnostic::error(
+                span,
+                format!(
+                    "{} expects {} type arguments, found {}",
+                    name,
+                    rule.arity,
+                    args.len()
+                ),
+            ));
+            return None;
+        }
+        if let Some(replacement) = &rule.replacement {
+            return Some(self.check_type_to_type(replacement, &mut HashMap::new(), &[]));
+        }
+        let mut checked_args = Vec::new();
+        for arg in args {
+            let ty = self.type_syntax_to_type_inner(arg, aliases, span, resolving, type_vars)?;
+            checked_args.push(ty);
+        }
+        Some(Type::Named(name.to_string(), checked_args))
+    }
+
+    fn require_type_allowed(&mut self, name: &str, span: Span) {
+        if let Some(message) = self.options.forbidden_type_message(name) {
+            self.diagnostics.push(Diagnostic::error(span, message));
+        }
     }
 }
 
@@ -9246,86 +8915,22 @@ fn ordered_collection_type(kind: CollectionKind, element: Type) -> Type {
     }
 }
 
-struct HtmlForSpec<'a> {
-    item: &'a str,
-    index: Option<&'a str>,
-    collection: &'a Expr,
-    key: &'a Expr,
-    template: &'a HtmlNode,
-}
-
-impl<'a> HtmlForSpec<'a> {
-    fn parse(expr: &'a Expr) -> Option<Self> {
-        let ExprKind::List(items) = &expr.kind else {
-            return None;
-        };
-        if items.len() != 3 || !matches_symbol(&items[0], "for") {
-            return None;
+fn intrinsic_expected_arities(overloads: &[IntrinsicCallOverload]) -> String {
+    let mut arities = overloads
+        .iter()
+        .map(|overload| overload.params.len())
+        .collect::<Vec<_>>();
+    arities.sort_unstable();
+    arities.dedup();
+    match arities.as_slice() {
+        [] => "0".to_string(),
+        [one] => one.to_string(),
+        [first, second] => format!("{} or {}", first, second),
+        many => {
+            let mut parts = many.iter().map(usize::to_string).collect::<Vec<_>>();
+            let last = parts.pop().unwrap_or_default();
+            format!("{}, or {}", parts.join(", "), last)
         }
-
-        let ExprKind::Vector(bindings) = &items[1].kind else {
-            return None;
-        };
-        if bindings.len() != 4 && bindings.len() != 5 {
-            return None;
-        }
-
-        let ExprKind::Symbol(item) = &bindings[0].kind else {
-            return None;
-        };
-        let (index, key_marker, key) = if bindings.len() == 5 {
-            let ExprKind::Symbol(index) = &bindings[2].kind else {
-                return None;
-            };
-            (Some(index.as_str()), &bindings[3], &bindings[4])
-        } else {
-            (None, &bindings[2], &bindings[3])
-        };
-        if !matches!(&key_marker.kind, ExprKind::Keyword(name) if name == "key") {
-            return None;
-        }
-
-        let ExprKind::HtmlTemplate(template) = &items[2].kind else {
-            return None;
-        };
-
-        Some(Self {
-            item,
-            index,
-            collection: &bindings[1],
-            key,
-            template,
-        })
-    }
-}
-
-struct HtmlIfSpec<'a> {
-    condition: &'a Expr,
-    then_template: &'a HtmlNode,
-    else_template: &'a HtmlNode,
-}
-
-impl<'a> HtmlIfSpec<'a> {
-    fn parse(expr: &'a Expr) -> Option<Self> {
-        let ExprKind::List(items) = &expr.kind else {
-            return None;
-        };
-        if items.len() != 4 || !matches_symbol(&items[0], "if") {
-            return None;
-        }
-
-        let ExprKind::HtmlTemplate(then_template) = &items[2].kind else {
-            return None;
-        };
-        let ExprKind::HtmlTemplate(else_template) = &items[3].kind else {
-            return None;
-        };
-
-        Some(Self {
-            condition: &items[1],
-            then_template,
-            else_template,
-        })
     }
 }
 
@@ -9584,6 +9189,79 @@ impl TypeSyntax {
             }
         }
     }
+}
+
+fn type_to_syntax(ty: &Type) -> Option<TypeSyntax> {
+    match ty {
+        Type::Var(_) => None,
+        Type::Number => Some(TypeSyntax::Named("Number".to_string())),
+        Type::String => Some(TypeSyntax::Named("String".to_string())),
+        Type::Bool => Some(TypeSyntax::Named("Bool".to_string())),
+        Type::Nil => Some(TypeSyntax::Named("Nil".to_string())),
+        Type::Keyword(Some(name)) => Some(TypeSyntax::Keyword(name.clone())),
+        Type::Keyword(None) => Some(TypeSyntax::Named("Keyword".to_string())),
+        Type::Syntax => Some(TypeSyntax::Named("Syntax".to_string())),
+        Type::Js => Some(TypeSyntax::Named("Js".to_string())),
+        Type::Named(name, args) if args.is_empty() => Some(TypeSyntax::Named(name.clone())),
+        Type::Named(name, args) => args
+            .iter()
+            .map(type_to_syntax)
+            .collect::<Option<Vec<_>>>()
+            .map(|args| TypeSyntax::Apply {
+                name: name.clone(),
+                args,
+            }),
+        Type::Decoder(inner) => type_apply_syntax("Decoder", [inner.as_ref()]),
+        Type::Option(inner) => type_apply_syntax("Option", [inner.as_ref()]),
+        Type::List(inner) => type_apply_syntax("List", [inner.as_ref()]),
+        Type::Vector(inner) => type_apply_syntax("Vector", [inner.as_ref()]),
+        Type::Tuple(items) => items
+            .iter()
+            .map(type_to_syntax)
+            .collect::<Option<Vec<_>>>()
+            .map(TypeSyntax::Tuple),
+        Type::Set(inner) => type_apply_syntax("Set", [inner.as_ref()]),
+        Type::Map(key, value) => type_apply_syntax("Map", [key.as_ref(), value.as_ref()]),
+        Type::Result(ok, err) => type_apply_syntax("Result", [ok.as_ref(), err.as_ref()]),
+        Type::Cmd(msg) => type_apply_syntax("Cmd", [msg.as_ref()]),
+        Type::Task(err, ok) => type_apply_syntax("Task", [err.as_ref(), ok.as_ref()]),
+        Type::Sub(msg) => type_apply_syntax("Sub", [msg.as_ref()]),
+        Type::Event(msg) => type_apply_syntax("Event", [msg.as_ref()]),
+        Type::Union(variants) => variants
+            .iter()
+            .map(type_to_syntax)
+            .collect::<Option<Vec<_>>>()
+            .map(TypeSyntax::Union),
+        Type::Record(fields) => fields
+            .iter()
+            .map(|(name, field)| type_to_syntax(field).map(|syntax| (name.clone(), syntax)))
+            .collect::<Option<BTreeMap<_, _>>>()
+            .map(TypeSyntax::Record),
+        Type::Fn(args, ret) => {
+            let args = args
+                .iter()
+                .map(type_to_syntax)
+                .collect::<Option<Vec<_>>>()?;
+            let ret = type_to_syntax(ret)?;
+            Some(TypeSyntax::Fn {
+                args,
+                ret: Box::new(ret),
+            })
+        }
+    }
+}
+
+fn type_apply_syntax<'a>(
+    name: &str,
+    args: impl IntoIterator<Item = &'a Type>,
+) -> Option<TypeSyntax> {
+    args.into_iter()
+        .map(type_to_syntax)
+        .collect::<Option<Vec<_>>>()
+        .map(|args| TypeSyntax::Apply {
+            name: name.to_string(),
+            args,
+        })
 }
 
 fn substitute_type_syntax(
@@ -9884,34 +9562,34 @@ fn type_returns_sub(ty: &Type) -> bool {
     }
 }
 
-fn is_known_subscription_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "none"
-            | "batch"
-            | "sub/timer/every"
-            | "sub/dom-ref/resize"
-            | "sub/window/event"
-            | "sub/media-query"
-            | "sub/simulation/heart-rate"
-            | "sub/bluetooth/connect-heart-rate"
-    )
+fn type_returns_update_result(ty: &Type) -> bool {
+    match ty {
+        Type::Fn(_, ret) => type_returns_update_result(ret),
+        Type::Option(inner) => type_is_update_result(inner),
+        other => type_is_update_result(other),
+    }
 }
 
-fn subscription_command_kind(kind: Option<&str>) -> Option<&'static str> {
-    match kind {
-        Some("sub/timer/every") => Some("timer/every"),
-        Some("sub/dom-ref/resize") => Some("dom-ref/resize-watch"),
-        Some("sub/window/event") => Some("window/event-watch"),
-        Some("sub/media-query") => Some("media-query/watch"),
-        Some("sub/simulation/heart-rate") => Some("simulation/heart-rate"),
-        Some("sub/bluetooth/connect-heart-rate") => Some("bluetooth/connect-heart-rate"),
-        _ => kind.and_then(|kind| match kind {
-            "none" => Some("none"),
-            "batch" => Some("batch"),
-            _ => None,
-        }),
+fn type_returns_named(ty: &Type, name: &str) -> bool {
+    match ty {
+        Type::Fn(_, ret) => type_returns_named(ret, name),
+        other => type_is_named(other, name),
     }
+}
+
+fn type_is_named(ty: &Type, name: &str) -> bool {
+    matches!(ty, Type::Named(actual, args) if actual == name && args.is_empty())
+}
+
+fn type_is_update_result(ty: &Type) -> bool {
+    match ty {
+        Type::Tuple(items) if items.len() == 2 => type_returns_cmd(&items[1]),
+        _ => false,
+    }
+}
+
+fn is_builtin_subscription_kind(kind: &str) -> bool {
+    matches!(kind, "none" | "batch")
 }
 
 fn format_type_inner_with_keywords(ty: &Type, show_keyword_literals: bool) -> String {
@@ -9925,8 +9603,14 @@ fn format_type_inner_with_keywords(ty: &Type, show_keyword_literals: bool) -> St
         Type::Keyword(_) => "Keyword".to_string(),
         Type::Syntax => "Syntax".to_string(),
         Type::Js => "Js".to_string(),
-        Type::Html => "Html".to_string(),
-        Type::TrustedHtml => "TrustedHtml".to_string(),
+        Type::Named(name, args) if args.is_empty() => name.clone(),
+        Type::Named(name, args) => {
+            let args = args
+                .iter()
+                .map(|arg| format_type_inner_with_keywords(arg, show_keyword_literals))
+                .collect::<Vec<_>>();
+            format!("({} {})", name, args.join(" "))
+        }
         Type::Decoder(inner) => {
             format!(
                 "(Decoder {})",
@@ -10111,36 +9795,6 @@ fn could_be_homogeneous(left: &Type, right: &Type) -> bool {
     }
 }
 
-fn is_boolean_html_attr(name: &str) -> bool {
-    matches!(
-        name,
-        "allowfullscreen"
-            | "async"
-            | "autofocus"
-            | "autoplay"
-            | "checked"
-            | "controls"
-            | "default"
-            | "defer"
-            | "disabled"
-            | "formnovalidate"
-            | "hidden"
-            | "inert"
-            | "ismap"
-            | "loop"
-            | "multiple"
-            | "muted"
-            | "nomodule"
-            | "novalidate"
-            | "open"
-            | "playsinline"
-            | "readonly"
-            | "required"
-            | "reversed"
-            | "selected"
-    )
-}
-
 pub fn free_symbols(expr: &Expr) -> Vec<String> {
     let mut symbols = BTreeSet::new();
     collect_symbols(expr, &mut symbols);
@@ -10230,50 +9884,19 @@ const COMMAND_CONTINUATION_FIELDS: &[&str] = &[
     "onEvent",
 ];
 
-fn is_known_command_kind(kind: &str) -> bool {
+fn is_builtin_command_kind(kind: &str) -> bool {
     matches!(
         kind,
         "none"
             | "batch"
-            | "bluetooth/request-device"
-            | "bluetooth/connect-heart-rate"
-            | "bluetooth/disconnect"
             | "timer/after"
             | "timer/every"
             | "timer/cancel"
             | "animation/frame"
             | "animation/cancel"
             | "time/now"
-            | "storage/get"
-            | "storage/set"
-            | "storage/remove"
-            | "browser/history-replace-search-param"
-            | "browser/history-write-route"
-            | "browser/theme-load"
-            | "browser/theme-apply"
-            | "browser/clipboard-write"
-            | "browser/set-cookie"
-            | "auth-storage/load"
-            | "auth-storage/persist"
             | "random/number"
-            | "simulation/heart-rate"
-            | "simulation/stop"
             | "task/perform"
-            | "file/download"
-            | "file/import"
-            | "file/read-selected"
-            | "canvas/draw"
-            | "canvas/measure-text"
-            | "dom-ref/focus"
-            | "dom-ref/click"
-            | "dom-ref/measure"
-            | "dom/scroll-into-view"
-            | "dom-ref/resize-watch"
-            | "dom-ref/resize-unwatch"
-            | "window/event-watch"
-            | "window/event-unwatch"
-            | "media-query/watch"
-            | "media-query/unwatch"
             | "http/request"
     )
 }
@@ -10293,10 +9916,18 @@ fn command_payload_type_from_format_name(name: Option<&str>) -> Type {
     }
 }
 
-fn command_payload_type_from_command_fields(fields: &BTreeMap<String, Type>) -> Type {
+fn command_payload_type_from_command_fields_by_format_fields(
+    fields: &BTreeMap<String, Type>,
+    format_fields: &[impl AsRef<str>],
+) -> Type {
     let format = fields
-        .get("format")
-        .or_else(|| fields.get("parse"))
+        .iter()
+        .find_map(|(name, value)| {
+            format_fields
+                .iter()
+                .any(|field| field.as_ref() == name)
+                .then_some(value)
+        })
         .and_then(keyword_literal_name);
     command_payload_type_from_format_name(format)
 }
@@ -10360,13 +9991,6 @@ fn records_have_distinct_tags(
     }
 }
 
-fn is_command_record_fields(fields: &BTreeMap<String, Type>) -> bool {
-    fields
-        .get("kind")
-        .and_then(keyword_literal_name)
-        .is_some_and(is_known_command_kind)
-}
-
 fn is_batch_command_record_fields(fields: &BTreeMap<String, Type>) -> bool {
     fields
         .get("kind")
@@ -10378,87 +10002,1667 @@ fn format_keyword_literal(name: &str) -> String {
     format!(":{}", name)
 }
 
-fn rect_type() -> Type {
-    Type::Record(BTreeMap::from([
-        ("x".to_string(), Type::Number),
-        ("y".to_string(), Type::Number),
-        ("width".to_string(), Type::Number),
-        ("height".to_string(), Type::Number),
-        ("top".to_string(), Type::Number),
-        ("right".to_string(), Type::Number),
-        ("bottom".to_string(), Type::Number),
-        ("left".to_string(), Type::Number),
-    ]))
-}
-
-fn window_event_payload_type() -> Type {
-    Type::Record(BTreeMap::from([
-        ("type".to_string(), Type::String),
-        ("clientX".to_string(), Type::Number),
-        ("clientY".to_string(), Type::Number),
-        ("pageX".to_string(), Type::Number),
-        ("pageY".to_string(), Type::Number),
-        ("screenX".to_string(), Type::Number),
-        ("screenY".to_string(), Type::Number),
-        ("movementX".to_string(), Type::Number),
-        ("movementY".to_string(), Type::Number),
-        ("button".to_string(), Type::Number),
-        ("buttons".to_string(), Type::Number),
-        ("pointerId".to_string(), Type::Number),
-        ("pointerType".to_string(), Type::String),
-        ("isPrimary".to_string(), Type::Bool),
-        ("key".to_string(), Type::String),
-        ("code".to_string(), Type::String),
-        ("altKey".to_string(), Type::Bool),
-        ("ctrlKey".to_string(), Type::Bool),
-        ("metaKey".to_string(), Type::Bool),
-        ("shiftKey".to_string(), Type::Bool),
-    ]))
-}
-
-fn text_measurement_type() -> Type {
-    Type::Record(BTreeMap::from([
-        ("text".to_string(), Type::String),
-        ("width".to_string(), Type::Number),
-        ("actualBoundingBoxLeft".to_string(), Type::Number),
-        ("actualBoundingBoxRight".to_string(), Type::Number),
-        ("actualBoundingBoxAscent".to_string(), Type::Number),
-        ("actualBoundingBoxDescent".to_string(), Type::Number),
-    ]))
-}
-
 fn id_payload_type() -> Type {
     Type::Record(BTreeMap::from([("id".to_string(), Type::String)]))
-}
-
-fn bluetooth_filter_type() -> Type {
-    Type::Record(BTreeMap::from([(
-        "services".to_string(),
-        Type::Vector(Box::new(Type::String)),
-    )]))
-}
-
-fn record_fields(ty: &Type) -> BTreeMap<String, Type> {
-    match ty {
-        Type::Record(fields) => fields.clone(),
-        _ => BTreeMap::new(),
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn test_check_options() -> CheckOptions {
+        let html = CheckType::named("Html");
+        let trusted_html = CheckType::named("TrustedHtml");
+        let child_state = CheckType::fresh("child_state");
+        let render_state = CheckType::fresh("render_state");
+        CheckOptions::default()
+            .named_type("Html", 0)
+            .named_type("TrustedHtml", 0)
+            .html_templates_with_checker(html.clone(), trusted_html, test_html_template_checker)
+            .symbol_type(
+                "Sub.none",
+                CheckType::Sub(Box::new(CheckType::fresh("msg"))),
+            )
+            .command_schema(
+                CommandSchemaRule::new("browser/history-replace-search-param")
+                    .required_fields(["name", "value"])
+                    .field("name", CheckType::String)
+                    .field("value", CheckType::option(CheckType::String)),
+            )
+            .command_schema(
+                CommandSchemaRule::new("browser/history-write-route")
+                    .required_fields(["url", "op", "definition"])
+                    .field("url", CheckType::String)
+                    .field("op", CheckType::option(CheckType::String))
+                    .field("definition", CheckType::option(CheckType::String)),
+            )
+            .command_schema(
+                CommandSchemaRule::new("browser/theme-load")
+                    .required_fields(["key"])
+                    .field("key", CheckType::String)
+                    .success_value(CheckType::String)
+                    .require_success(),
+            )
+            .command_schema(
+                CommandSchemaRule::new("browser/theme-apply")
+                    .required_fields(["theme", "key"])
+                    .field("theme", CheckType::String)
+                    .field("key", CheckType::String)
+                    .success_value(CheckType::String),
+            )
+            .command_schema(
+                CommandSchemaRule::new("browser/clipboard-write")
+                    .required_fields(["text"])
+                    .field("text", CheckType::String),
+            )
+            .command_schema(
+                CommandSchemaRule::new("browser/set-cookie")
+                    .required_fields(["name", "value"])
+                    .field("name", CheckType::String)
+                    .field("value", CheckType::String),
+            )
+            .command_schema(test_storage_get_command_schema())
+            .command_schema(test_storage_set_command_schema())
+            .command_schema(test_storage_remove_command_schema())
+            .command_schema(test_auth_storage_load_command_schema())
+            .command_schema(test_auth_storage_persist_command_schema())
+            .command_schema(test_file_download_command_schema())
+            .command_schema(test_file_import_command_schema())
+            .command_schema(test_file_read_selected_command_schema())
+            .command_schema(test_bluetooth_request_device_command_schema())
+            .command_schema(test_bluetooth_connect_heart_rate_command_schema())
+            .command_schema(test_bluetooth_disconnect_command_schema())
+            .command_schema(test_simulation_heart_rate_command_schema())
+            .command_schema(test_simulation_stop_command_schema())
+            .command_schema(test_canvas_draw_command_schema())
+            .command_schema(test_canvas_measure_text_command_schema())
+            .command_schema(test_dom_ref_focus_command_schema())
+            .command_schema(test_dom_ref_click_command_schema())
+            .command_schema(test_dom_ref_measure_command_schema())
+            .command_schema(test_dom_scroll_into_view_command_schema())
+            .command_schema(
+                CommandSchemaRule::new("dom-ref/resize-watch")
+                    .required_fields(["ref", "onChange"])
+                    .field("id", CheckType::String)
+                    .field("ref", CheckType::String)
+                    .reject_success_continuations()
+                    .supported_continuations(["onChange"])
+                    .continuation_message_field("onChange", "id", CheckType::String)
+                    .continuation_message_field("onChange", "ref", CheckType::String)
+                    .continuation_message_field("onChange", "x", CheckType::Number)
+                    .continuation_message_field("onChange", "y", CheckType::Number)
+                    .continuation_message_field("onChange", "width", CheckType::Number)
+                    .continuation_message_field("onChange", "height", CheckType::Number)
+                    .continuation_message_field("onChange", "top", CheckType::Number)
+                    .continuation_message_field("onChange", "right", CheckType::Number)
+                    .continuation_message_field("onChange", "bottom", CheckType::Number)
+                    .continuation_message_field("onChange", "left", CheckType::Number)
+                    .continuation_message_field("onChange", "value", test_rect_check_type()),
+            )
+            .command_schema(
+                CommandSchemaRule::new("dom-ref/resize-unwatch")
+                    .one_of_fields(["id", "ref"])
+                    .field("id", CheckType::String)
+                    .field("ref", CheckType::String)
+                    .success_value(test_id_payload_check_type()),
+            )
+            .command_schema(
+                CommandSchemaRule::new("window/event-watch")
+                    .required_fields(["type", "onEvent"])
+                    .field("id", CheckType::String)
+                    .field("type", CheckType::String)
+                    .success_value(CheckType::record([
+                        ("id", CheckType::String),
+                        ("type", CheckType::String),
+                    ]))
+                    .supported_continuations(["onEvent"])
+                    .continuation_message_field("onEvent", "type", CheckType::String)
+                    .continuation_message_field("onEvent", "clientX", CheckType::Number)
+                    .continuation_message_field("onEvent", "clientY", CheckType::Number)
+                    .continuation_message_field("onEvent", "pageX", CheckType::Number)
+                    .continuation_message_field("onEvent", "pageY", CheckType::Number)
+                    .continuation_message_field("onEvent", "screenX", CheckType::Number)
+                    .continuation_message_field("onEvent", "screenY", CheckType::Number)
+                    .continuation_message_field("onEvent", "movementX", CheckType::Number)
+                    .continuation_message_field("onEvent", "movementY", CheckType::Number)
+                    .continuation_message_field("onEvent", "button", CheckType::Number)
+                    .continuation_message_field("onEvent", "buttons", CheckType::Number)
+                    .continuation_message_field("onEvent", "pointerId", CheckType::Number)
+                    .continuation_message_field("onEvent", "pointerType", CheckType::String)
+                    .continuation_message_field("onEvent", "isPrimary", CheckType::Bool)
+                    .continuation_message_field("onEvent", "key", CheckType::String)
+                    .continuation_message_field("onEvent", "code", CheckType::String)
+                    .continuation_message_field("onEvent", "altKey", CheckType::Bool)
+                    .continuation_message_field("onEvent", "ctrlKey", CheckType::Bool)
+                    .continuation_message_field("onEvent", "metaKey", CheckType::Bool)
+                    .continuation_message_field("onEvent", "shiftKey", CheckType::Bool)
+                    .continuation_message_field("onEvent", "id", CheckType::String)
+                    .continuation_message_field("onEvent", "value", test_window_event_check_type()),
+            )
+            .command_schema(
+                CommandSchemaRule::new("window/event-unwatch")
+                    .one_of_fields(["id", "type"])
+                    .field("id", CheckType::String)
+                    .field("type", CheckType::String)
+                    .success_value(test_id_payload_check_type()),
+            )
+            .command_schema(
+                CommandSchemaRule::new("media-query/watch")
+                    .required_fields(["query", "onChange"])
+                    .field("id", CheckType::String)
+                    .field("query", CheckType::String)
+                    .reject_success_continuations()
+                    .supported_continuations(["onChange"])
+                    .continuation_message_field("onChange", "id", CheckType::String)
+                    .continuation_message_field("onChange", "media", CheckType::String)
+                    .continuation_message_field("onChange", "matches", CheckType::Bool),
+            )
+            .command_schema(
+                CommandSchemaRule::new("media-query/unwatch")
+                    .one_of_fields(["id", "query"])
+                    .field("id", CheckType::String)
+                    .field("query", CheckType::String)
+                    .success_value(test_id_payload_check_type()),
+            )
+            .subscription_schema(
+                SubscriptionSchemaRule::new("sub/timer/every")
+                    .required_fields(["id", "ms", "msg"])
+                    .field("id", CheckType::String)
+                    .field("ms", CheckType::Number)
+                    .command_kind("timer/every"),
+            )
+            .subscription_schema(
+                SubscriptionSchemaRule::new("sub/simulation/heart-rate")
+                    .required_fields(["id", "onReading"])
+                    .field("id", CheckType::String)
+                    .field("ms", CheckType::Number)
+                    .field("min", CheckType::Number)
+                    .field("max", CheckType::Number)
+                    .field("jitter", CheckType::Number)
+                    .field("start", CheckType::Number)
+                    .field("deviceName", CheckType::String)
+                    .command_kind("simulation/heart-rate"),
+            )
+            .subscription_schema(
+                SubscriptionSchemaRule::new("sub/bluetooth/connect-heart-rate")
+                    .required_fields(["id", "onReading"])
+                    .field("id", CheckType::String)
+                    .field(
+                        "options",
+                        CheckType::record(std::iter::empty::<(&str, CheckType)>()),
+                    )
+                    .field(
+                        "filters",
+                        CheckType::vector(test_bluetooth_filter_check_type()),
+                    )
+                    .field("optionalServices", CheckType::vector(CheckType::String))
+                    .field("acceptAllDevices", CheckType::Bool)
+                    .command_kind("bluetooth/connect-heart-rate"),
+            )
+            .subscription_schema(
+                SubscriptionSchemaRule::new("sub/dom-ref/resize")
+                    .required_fields(["ref", "onChange"])
+                    .field("id", CheckType::String)
+                    .field("ref", CheckType::String)
+                    .command_kind("dom-ref/resize-watch"),
+            )
+            .subscription_schema(
+                SubscriptionSchemaRule::new("sub/window/event")
+                    .required_fields(["type", "onEvent"])
+                    .field("id", CheckType::String)
+                    .field("type", CheckType::String)
+                    .command_kind("window/event-watch"),
+            )
+            .subscription_schema(
+                SubscriptionSchemaRule::new("sub/media-query")
+                    .required_fields(["query", "onChange"])
+                    .field("id", CheckType::String)
+                    .field("query", CheckType::String)
+                    .command_kind("media-query/watch"),
+            )
+            .intrinsic_call(IntrinsicCallRule::new(
+                "Event.prevent",
+                vec![IntrinsicCallOverload::new(
+                    vec![IntrinsicParam::infer()],
+                    CheckType::Event(Box::new(CheckType::argument(0))),
+                )],
+            ))
+            .intrinsic_call(IntrinsicCallRule::new(
+                "Event.stop",
+                vec![IntrinsicCallOverload::new(
+                    vec![IntrinsicParam::infer()],
+                    CheckType::Event(Box::new(CheckType::argument(0))),
+                )],
+            ))
+            .intrinsic_call(IntrinsicCallRule::new(
+                "Event.prevent-stop",
+                vec![IntrinsicCallOverload::new(
+                    vec![IntrinsicParam::infer()],
+                    CheckType::Event(Box::new(CheckType::argument(0))),
+                )],
+            ))
+            .intrinsic_call(IntrinsicCallRule::new(
+                "scope-view",
+                vec![IntrinsicCallOverload::new(
+                    vec![
+                        IntrinsicParam::expect(CheckType::Keyword),
+                        IntrinsicParam::expect(CheckType::function(
+                            vec![child_state.clone()],
+                            html.clone(),
+                        )),
+                        IntrinsicParam::expect(child_state),
+                    ],
+                    html.clone(),
+                )],
+            ))
+            .intrinsic_call(IntrinsicCallRule::new(
+                "render-to-string",
+                vec![
+                    IntrinsicCallOverload::new(
+                        vec![IntrinsicParam::expect(html.clone())],
+                        CheckType::String,
+                    ),
+                    IntrinsicCallOverload::new(
+                        vec![
+                            IntrinsicParam::expect(CheckType::function(
+                                vec![render_state.clone()],
+                                html,
+                            )),
+                            IntrinsicParam::expect(render_state),
+                        ],
+                        CheckType::String,
+                    ),
+                ],
+            ))
+            .intrinsic_call(IntrinsicCallRule::new(
+                "auth-storage-load",
+                vec![IntrinsicCallOverload::new(
+                    vec![IntrinsicParam::expect(CheckType::String)],
+                    CheckType::fresh("auth_storage"),
+                )],
+            ))
+            .intrinsic_call(IntrinsicCallRule::new(
+                "auth-storage-persist",
+                vec![IntrinsicCallOverload::new(
+                    vec![IntrinsicParam::infer(), IntrinsicParam::infer()],
+                    CheckType::Nil,
+                )],
+            ))
+            .custom_call(CustomCallRule::new(
+                "Cmd.storage/get",
+                test_cmd_storage_get_call,
+            ))
+            .custom_call(CustomCallRule::new(
+                "Cmd.storage/set",
+                test_cmd_storage_set_call,
+            ))
+            .custom_call(CustomCallRule::new(
+                "Cmd.storage/set-silent",
+                test_cmd_storage_set_silent_call,
+            ))
+            .custom_call(CustomCallRule::new(
+                "Cmd.dom-ref/click",
+                test_cmd_dom_ref_click_call,
+            ))
+            .custom_call(CustomCallRule::new(
+                "Cmd.dom-ref/focus",
+                test_cmd_dom_ref_focus_call,
+            ))
+            .custom_call(CustomCallRule::new(
+                "Cmd.file/read-selected",
+                test_cmd_file_read_selected_call,
+            ))
+            .custom_call(CustomCallRule::new(
+                "Cmd.file/download",
+                test_cmd_file_download_call,
+            ))
+            .custom_call(CustomCallRule::new(
+                "Cmd.canvas/draw",
+                test_cmd_canvas_draw_call,
+            ))
+            .custom_call(CustomCallRule::new(
+                "Cmd.dom-ref/measure",
+                test_cmd_dom_ref_measure_call,
+            ))
+            .custom_call(CustomCallRule::new(
+                "Cmd.bluetooth/connect-heart-rate",
+                test_cmd_bluetooth_connect_heart_rate_call,
+            ))
+            .custom_call(CustomCallRule::new(
+                "Cmd.bluetooth/disconnect",
+                test_cmd_bluetooth_disconnect_call,
+            ))
+            .custom_call(CustomCallRule::new(
+                "Cmd.simulation/heart-rate",
+                test_cmd_simulation_heart_rate_call,
+            ))
+            .custom_call(CustomCallRule::new(
+                "Cmd.simulation/stop",
+                test_cmd_simulation_stop_call,
+            ))
+            .custom_call(CustomCallRule::new(
+                "Cmd.dom-ref/resize-watch",
+                test_cmd_dom_ref_resize_watch_call,
+            ))
+            .custom_call(CustomCallRule::new("Sub.batch", test_sub_batch_call))
+            .custom_call(CustomCallRule::new(
+                "Sub.timer/every",
+                test_sub_timer_every_call,
+            ))
+            .custom_call(CustomCallRule::new(
+                "Sub.media-query",
+                test_sub_media_query_call,
+            ))
+            .custom_call(CustomCallRule::new(
+                "Sub.dom-ref/resize",
+                test_sub_dom_ref_resize_call,
+            ))
+    }
+
+    fn test_html_template_checker(context: &mut HtmlTemplateCheckContext<'_>, node: &HtmlNode) {
+        match node {
+            HtmlNode::Element(element) => {
+                for attr in &element.attrs {
+                    match &attr.value {
+                        HtmlAttrValue::Dynamic { expr, .. } => {
+                            if attr.name.starts_with("on:") {
+                                let message_ty = context.with_locals(
+                                    [("event".to_string(), test_dom_event_type())],
+                                    |context| context.infer_expr(expr),
+                                );
+                                if let Some(expected_msg) = context.update_message_type() {
+                                    test_require_event_message_matches(
+                                        context,
+                                        expected_msg,
+                                        message_ty,
+                                        expr.span,
+                                        &attr.name,
+                                    );
+                                }
+                            } else {
+                                let attr_ty = context.infer_expr(expr);
+                                if attr.name == "ref" {
+                                    test_require_ref_attr(context, attr_ty, expr.span);
+                                } else if attr.name == "class" {
+                                    test_require_class_attr(context, attr_ty, expr.span);
+                                } else if attr.name == "style" {
+                                    test_require_style_attr(context, attr_ty, expr.span);
+                                } else if attr.name == "innerHTML" {
+                                    test_require_inner_html_attr(context, attr_ty, expr.span);
+                                } else if test_is_boolean_html_attr(&attr.name) {
+                                    context.unify(attr_ty, Type::Bool, expr.span);
+                                }
+                            }
+                        }
+                        HtmlAttrValue::Bool(_) | HtmlAttrValue::Static(_) => {
+                            test_validate_static_attr(context, &attr.name, &attr.value, attr.span);
+                        }
+                    }
+                }
+                for child in &element.children {
+                    test_html_template_checker(context, child);
+                }
+            }
+            HtmlNode::Expr { expr, .. } => test_html_expr(context, expr),
+            HtmlNode::Text { .. } => {}
+        }
+    }
+
+    fn test_validate_static_attr(
+        context: &mut HtmlTemplateCheckContext<'_>,
+        name: &str,
+        value: &HtmlAttrValue,
+        span: Span,
+    ) {
+        match value {
+            HtmlAttrValue::Bool(true) => match name {
+                "ref" => context.diagnostic(
+                    span,
+                    "ref attribute requires a value; use ref=\"name\" or ref={...}",
+                ),
+                "class" => context.diagnostic(
+                    span,
+                    "class attribute requires a value; use class=\"...\" or class={...}",
+                ),
+                "style" => context.diagnostic(
+                    span,
+                    "style attribute requires a value; use style=\"...\" or style={...}",
+                ),
+                _ => {}
+            },
+            HtmlAttrValue::Static(static_value) => {
+                if name == "innerHTML" {
+                    context.diagnostic(
+                        span,
+                        "innerHTML requires TrustedHtml; use innerHTML={...} with an explicit sanitizer or unsafe-cast boundary",
+                    );
+                }
+                if name == "ref" && static_value.is_empty() {
+                    context.diagnostic(span, "ref attribute requires a non-empty ref name");
+                }
+                if test_is_boolean_html_attr(name)
+                    && !static_value.is_empty()
+                    && !static_value.eq_ignore_ascii_case(name)
+                {
+                    context.diagnostic(
+                        span,
+                        format!(
+                            "boolean attribute {} ignores string value {:?}; use bare {} or {}={{...}}",
+                            name, static_value, name, name
+                        ),
+                    );
+                }
+            }
+            HtmlAttrValue::Bool(false) | HtmlAttrValue::Dynamic { .. } => {}
+        }
+    }
+
+    fn test_html_expr(context: &mut HtmlTemplateCheckContext<'_>, expr: &Expr) {
+        if let Some(spec) = TestHtmlForSpec::parse(expr) {
+            let collection_ty = context.infer_expr(spec.collection);
+            let item_ty = context.infer_iterable_element(collection_ty, spec.collection.span);
+            let mut locals = vec![(spec.item.to_string(), item_ty)];
+            if let Some(index) = spec.index {
+                locals.push((index.to_string(), Type::Number));
+            }
+            context.with_locals(locals, |context| {
+                context.infer_expr(spec.key);
+                test_html_template_checker(context, spec.template);
+            });
+            return;
+        }
+
+        if let Some(spec) = TestHtmlIfSpec::parse(expr) {
+            let condition_ty = context.infer_expr(spec.condition);
+            context.unify(condition_ty, Type::Bool, spec.condition.span);
+            test_html_template_checker(context, spec.then_template);
+            test_html_template_checker(context, spec.else_template);
+            return;
+        }
+
+        context.infer_expr(expr);
+    }
+
+    fn test_require_ref_attr(context: &mut HtmlTemplateCheckContext<'_>, ty: Type, span: Span) {
+        let resolved = context.resolve(ty);
+        if test_ref_attr_type_matches(context, resolved.clone(), span) {
+            return;
+        }
+        let found = context.format_type(&resolved);
+        context.diagnostic(
+            span,
+            format!(
+                "ref attribute expects a string, keyword, or nil optional ref name, found {}",
+                found
+            ),
+        );
+    }
+
+    fn test_ref_attr_type_matches(
+        context: &mut HtmlTemplateCheckContext<'_>,
+        ty: Type,
+        span: Span,
+    ) -> bool {
+        match context.resolve(ty) {
+            Type::Var(id) => {
+                context.unify(Type::Var(id), Type::String, span);
+                true
+            }
+            Type::String | Type::Keyword(_) | Type::Nil => true,
+            Type::Option(inner) => test_ref_attr_type_matches(context, *inner, span),
+            _ => false,
+        }
+    }
+
+    fn test_require_class_attr(context: &mut HtmlTemplateCheckContext<'_>, ty: Type, span: Span) {
+        let resolved = context.resolve(ty);
+        if test_class_attr_type_matches(context, resolved.clone(), span) {
+            return;
+        }
+        let found = context.format_type(&resolved);
+        context.diagnostic(
+            span,
+            format!(
+                "class attribute expects a CSS class string, keyword, nil, bool, structured collection, or class flag map, found {}",
+                found
+            ),
+        );
+    }
+
+    fn test_class_attr_type_matches(
+        context: &mut HtmlTemplateCheckContext<'_>,
+        ty: Type,
+        span: Span,
+    ) -> bool {
+        match context.resolve(ty) {
+            Type::Var(_) | Type::String | Type::Keyword(_) | Type::Bool | Type::Nil => true,
+            Type::Option(inner) => test_class_attr_type_matches(context, *inner, span),
+            Type::List(inner) | Type::Vector(inner) | Type::Set(inner) => {
+                test_class_attr_type_matches(context, *inner, span)
+            }
+            Type::Tuple(items) => items
+                .into_iter()
+                .all(|item| test_class_attr_type_matches(context, item, span)),
+            Type::Record(fields) => fields
+                .into_values()
+                .all(|field_ty| test_class_flag_type_matches(context, field_ty, span)),
+            Type::Map(key, value) => {
+                test_class_key_type_matches(context, *key)
+                    && test_class_flag_type_matches(context, *value, span)
+            }
+            _ => false,
+        }
+    }
+
+    fn test_class_key_type_matches(context: &mut HtmlTemplateCheckContext<'_>, ty: Type) -> bool {
+        matches!(
+            context.resolve(ty),
+            Type::Var(_) | Type::String | Type::Keyword(_)
+        )
+    }
+
+    fn test_class_flag_type_matches(
+        context: &mut HtmlTemplateCheckContext<'_>,
+        ty: Type,
+        span: Span,
+    ) -> bool {
+        match context.resolve(ty) {
+            Type::Var(id) => {
+                context.unify(Type::Var(id), Type::Bool, span);
+                true
+            }
+            Type::Bool | Type::Nil => true,
+            Type::Option(inner) => test_class_flag_type_matches(context, *inner, span),
+            _ => false,
+        }
+    }
+
+    fn test_require_inner_html_attr(
+        context: &mut HtmlTemplateCheckContext<'_>,
+        ty: Type,
+        span: Span,
+    ) {
+        let resolved = context.resolve(ty);
+        if test_inner_html_attr_type_matches(context, resolved.clone(), span) {
+            return;
+        }
+        let found = context.format_type(&resolved);
+        context.diagnostic(
+            span,
+            format!(
+                "innerHTML expects TrustedHtml from an explicit sanitizer or unsafe-cast boundary, found {}",
+                found
+            ),
+        );
+    }
+
+    fn test_inner_html_attr_type_matches(
+        context: &mut HtmlTemplateCheckContext<'_>,
+        ty: Type,
+        span: Span,
+    ) -> bool {
+        match context.resolve(ty) {
+            Type::Var(id) => {
+                let trusted = context.trusted_html_type();
+                context.unify(Type::Var(id), trusted, span);
+                true
+            }
+            Type::Nil => true,
+            Type::Option(inner) => test_inner_html_attr_type_matches(context, *inner, span),
+            resolved => resolved == context.trusted_html_type(),
+        }
+    }
+
+    fn test_require_style_attr(context: &mut HtmlTemplateCheckContext<'_>, ty: Type, span: Span) {
+        let resolved = context.resolve(ty);
+        if test_style_attr_type_matches(context, resolved.clone()) {
+            return;
+        }
+        let found = context.format_type(&resolved);
+        context.diagnostic(
+            span,
+            format!(
+                "style attribute expects a CSS string, nil, record, or map with style property values, found {}",
+                found
+            ),
+        );
+    }
+
+    fn test_style_attr_type_matches(context: &mut HtmlTemplateCheckContext<'_>, ty: Type) -> bool {
+        match context.resolve(ty) {
+            Type::Var(_) | Type::String | Type::Nil => true,
+            Type::Option(inner) => test_style_attr_type_matches(context, *inner),
+            Type::Record(fields) => fields
+                .into_values()
+                .all(|field_ty| test_style_value_type_matches(context, field_ty)),
+            Type::Map(key, value) => {
+                test_style_key_type_matches(context, *key)
+                    && test_style_value_type_matches(context, *value)
+            }
+            _ => false,
+        }
+    }
+
+    fn test_style_key_type_matches(context: &mut HtmlTemplateCheckContext<'_>, ty: Type) -> bool {
+        match context.resolve(ty) {
+            Type::Var(_) | Type::String | Type::Keyword(_) => true,
+            Type::Option(inner) => test_style_key_type_matches(context, *inner),
+            _ => false,
+        }
+    }
+
+    fn test_style_value_type_matches(context: &mut HtmlTemplateCheckContext<'_>, ty: Type) -> bool {
+        match context.resolve(ty) {
+            Type::Var(_) | Type::String | Type::Number | Type::Bool | Type::Nil => true,
+            Type::Option(inner) => test_style_value_type_matches(context, *inner),
+            _ => false,
+        }
+    }
+
+    fn test_require_event_message_matches(
+        context: &mut HtmlTemplateCheckContext<'_>,
+        expected_msg: Type,
+        actual_msg: Type,
+        span: Span,
+        event_name: &str,
+    ) {
+        if test_event_message_matches(context, expected_msg.clone(), actual_msg.clone(), span) {
+            return;
+        }
+        let expected = context.format_type_with_literals(&expected_msg);
+        let actual = context.format_type_with_literals(&actual_msg);
+        context.diagnostic(
+            span,
+            format!(
+                "template event {} message has type {}, which is not part of update message type {}",
+                event_name, actual, expected
+            ),
+        );
+    }
+
+    fn test_event_message_matches(
+        context: &mut HtmlTemplateCheckContext<'_>,
+        expected: Type,
+        actual: Type,
+        span: Span,
+    ) -> bool {
+        match context.resolve(actual) {
+            Type::Nil => true,
+            Type::Option(inner) => test_event_message_matches(context, expected, *inner, span),
+            Type::Event(inner) => test_event_message_matches(context, expected, *inner, span),
+            actual => context.command_message_matches(expected, actual, span),
+        }
+    }
+
+    fn test_dom_event_type() -> Type {
+        let form_target = Type::Record(BTreeMap::from([
+            ("checked".to_string(), Type::Bool),
+            ("value".to_string(), Type::String),
+            ("valueAsNumber".to_string(), Type::Number),
+        ]));
+        Type::Record(BTreeMap::from([
+            ("altKey".to_string(), Type::Bool),
+            ("clientX".to_string(), Type::Number),
+            ("clientY".to_string(), Type::Number),
+            ("ctrlKey".to_string(), Type::Bool),
+            ("currentTarget".to_string(), form_target.clone()),
+            ("key".to_string(), Type::String),
+            ("metaKey".to_string(), Type::Bool),
+            ("shiftKey".to_string(), Type::Bool),
+            ("target".to_string(), form_target),
+        ]))
+    }
+
+    fn test_storage_get_command_schema() -> CommandSchemaRule {
+        CommandSchemaRule::new("storage/get")
+            .required_fields(["key"])
+            .field("key", CheckType::String)
+            .field("format", test_keyword_or_string_check_type())
+            .field("parse", test_keyword_or_string_check_type())
+            .require_success()
+            .success_value_from_payload_format_fields(["format", "parse"])
+    }
+
+    fn test_storage_set_command_schema() -> CommandSchemaRule {
+        CommandSchemaRule::new("storage/set")
+            .required_fields(["key", "value"])
+            .field("key", CheckType::String)
+            .success_value_from_field("value")
+    }
+
+    fn test_storage_remove_command_schema() -> CommandSchemaRule {
+        CommandSchemaRule::new("storage/remove")
+            .required_fields(["key"])
+            .field("key", CheckType::String)
+            .success_value(CheckType::record([("key", CheckType::String)]))
+    }
+
+    fn test_auth_storage_load_command_schema() -> CommandSchemaRule {
+        CommandSchemaRule::new("auth-storage/load")
+            .required_fields(["sourceUrl"])
+            .field("sourceUrl", CheckType::String)
+            .require_success()
+            .success_value(CheckType::Js)
+    }
+
+    fn test_auth_storage_persist_command_schema() -> CommandSchemaRule {
+        CommandSchemaRule::new("auth-storage/persist")
+            .required_fields(["sourceUrl", "entries"])
+            .field("sourceUrl", CheckType::String)
+    }
+
+    fn test_file_download_command_schema() -> CommandSchemaRule {
+        CommandSchemaRule::new("file/download")
+            .required_fields(["name", "content"])
+            .field("name", CheckType::String)
+            .field("content", CheckType::String)
+            .field("mime", CheckType::String)
+            .success_value(CheckType::record([
+                ("name", CheckType::String),
+                ("content", CheckType::String),
+                ("mime", CheckType::String),
+            ]))
+    }
+
+    fn test_file_import_command_schema() -> CommandSchemaRule {
+        CommandSchemaRule::new("file/import")
+            .field("accept", CheckType::String)
+            .field("multiple", CheckType::Bool)
+            .field("format", test_keyword_or_string_check_type())
+            .field("parse", test_keyword_or_string_check_type())
+            .require_success()
+            .success_value_from_payload_format_fields(["format", "parse"])
+            .supported_continuations(["onCancel"])
+    }
+
+    fn test_file_read_selected_command_schema() -> CommandSchemaRule {
+        CommandSchemaRule::new("file/read-selected")
+            .required_fields(["ref"])
+            .field("ref", CheckType::String)
+            .field("multiple", CheckType::Bool)
+            .field("clear", CheckType::Bool)
+            .field("format", test_keyword_or_string_check_type())
+            .field("parse", test_keyword_or_string_check_type())
+            .require_success()
+            .success_value_from_payload_format_fields(["format", "parse"])
+            .supported_continuations(["onCancel"])
+    }
+
+    fn test_bluetooth_request_device_command_schema() -> CommandSchemaRule {
+        CommandSchemaRule::new("bluetooth/request-device")
+            .one_of_fields(["options", "filters", "acceptAllDevices"])
+            .field(
+                "options",
+                CheckType::record(std::iter::empty::<(&str, CheckType)>()),
+            )
+            .field(
+                "filters",
+                CheckType::vector(test_bluetooth_filter_check_type()),
+            )
+            .field("optionalServices", CheckType::vector(CheckType::String))
+            .field("acceptAllDevices", CheckType::Bool)
+            .require_success()
+            .success_value(CheckType::fresh("device"))
+    }
+
+    fn test_bluetooth_connect_heart_rate_command_schema() -> CommandSchemaRule {
+        CommandSchemaRule::new("bluetooth/connect-heart-rate")
+            .required_fields(["id", "onReading"])
+            .one_of_fields(["options", "filters", "acceptAllDevices"])
+            .field("id", CheckType::String)
+            .field(
+                "options",
+                CheckType::record(std::iter::empty::<(&str, CheckType)>()),
+            )
+            .field(
+                "filters",
+                CheckType::vector(test_bluetooth_filter_check_type()),
+            )
+            .field("optionalServices", CheckType::vector(CheckType::String))
+            .field("acceptAllDevices", CheckType::Bool)
+            .field("service", CheckType::String)
+            .field("characteristic", CheckType::String)
+            .require_success()
+            .success_value(test_connected_payload_check_type())
+            .supported_continuations(["onReading", "onDisconnected"])
+            .continuation_message_field("onReading", "bpm", CheckType::Number)
+    }
+
+    fn test_bluetooth_disconnect_command_schema() -> CommandSchemaRule {
+        CommandSchemaRule::new("bluetooth/disconnect")
+            .required_fields(["id"])
+            .field("id", CheckType::String)
+            .payloadless_success()
+    }
+
+    fn test_simulation_heart_rate_command_schema() -> CommandSchemaRule {
+        CommandSchemaRule::new("simulation/heart-rate")
+            .required_fields(["id", "onReading"])
+            .field("id", CheckType::String)
+            .field("ms", CheckType::Number)
+            .field("min", CheckType::Number)
+            .field("max", CheckType::Number)
+            .field("jitter", CheckType::Number)
+            .field("start", CheckType::Number)
+            .field("deviceName", CheckType::String)
+            .require_success()
+            .success_value(test_connected_payload_check_type())
+            .supported_continuations(["onReading", "onDisconnected"])
+            .continuation_message_field("onReading", "bpm", CheckType::Number)
+    }
+
+    fn test_simulation_stop_command_schema() -> CommandSchemaRule {
+        CommandSchemaRule::new("simulation/stop")
+            .required_fields(["id"])
+            .field("id", CheckType::String)
+            .success_value(test_id_payload_check_type())
+    }
+
+    fn test_canvas_draw_command_schema() -> CommandSchemaRule {
+        CommandSchemaRule::new("canvas/draw")
+            .required_fields(["ref", "ops"])
+            .field("ref", CheckType::String)
+            .field("width", CheckType::Number)
+            .field("height", CheckType::Number)
+            .field("cssWidth", CheckType::Number)
+            .field("cssHeight", CheckType::Number)
+            .field("setCssSize", CheckType::Bool)
+            .success_value(test_canvas_draw_payload_check_type())
+    }
+
+    fn test_canvas_measure_text_command_schema() -> CommandSchemaRule {
+        CommandSchemaRule::new("canvas/measure-text")
+            .required_fields(["ref"])
+            .one_of_fields(["text", "texts"])
+            .field("ref", CheckType::String)
+            .field("text", CheckType::String)
+            .field("texts", CheckType::vector(CheckType::String))
+            .field("font", CheckType::String)
+            .require_success()
+            .success_value(test_text_measure_payload_check_type())
+    }
+
+    fn test_dom_ref_focus_command_schema() -> CommandSchemaRule {
+        CommandSchemaRule::new("dom-ref/focus")
+            .required_fields(["ref"])
+            .field("ref", CheckType::String)
+            .success_value(CheckType::record([("ref", CheckType::String)]))
+    }
+
+    fn test_dom_ref_click_command_schema() -> CommandSchemaRule {
+        CommandSchemaRule::new("dom-ref/click")
+            .required_fields(["ref"])
+            .field("ref", CheckType::String)
+            .success_value(CheckType::record([("ref", CheckType::String)]))
+    }
+
+    fn test_dom_ref_measure_command_schema() -> CommandSchemaRule {
+        CommandSchemaRule::new("dom-ref/measure")
+            .required_fields(["ref"])
+            .field("ref", CheckType::String)
+            .require_success()
+            .success_value(test_dom_ref_measure_payload_check_type())
+    }
+
+    fn test_dom_scroll_into_view_command_schema() -> CommandSchemaRule {
+        CommandSchemaRule::new("dom/scroll-into-view")
+            .one_of_fields(["selector", "testId", "id"])
+            .field("selector", CheckType::String)
+            .field("testId", CheckType::String)
+            .field("id", CheckType::String)
+            .field("behavior", CheckType::String)
+            .field("block", CheckType::String)
+            .field("inline", CheckType::String)
+            .field("skipIfVisible", CheckType::Bool)
+            .field("smooth", CheckType::Bool)
+    }
+
+    fn test_rect_check_type() -> CheckType {
+        CheckType::Record(test_rect_check_fields())
+    }
+
+    fn test_rect_check_fields() -> BTreeMap<String, CheckType> {
+        [
+            ("x", CheckType::Number),
+            ("y", CheckType::Number),
+            ("width", CheckType::Number),
+            ("height", CheckType::Number),
+            ("top", CheckType::Number),
+            ("right", CheckType::Number),
+            ("bottom", CheckType::Number),
+            ("left", CheckType::Number),
+        ]
+        .into_iter()
+        .map(|(name, ty)| (name.to_string(), ty))
+        .collect()
+    }
+
+    fn test_dom_ref_measure_payload_check_type() -> CheckType {
+        let mut fields = test_rect_check_fields();
+        fields.insert("ref".to_string(), CheckType::String);
+        CheckType::Record(fields)
+    }
+
+    fn test_connected_payload_check_type() -> CheckType {
+        CheckType::record([
+            ("id", CheckType::String),
+            ("deviceName", CheckType::String),
+            ("connected", CheckType::Bool),
+        ])
+    }
+
+    fn test_canvas_draw_payload_check_type() -> CheckType {
+        CheckType::record([
+            ("ref", CheckType::String),
+            ("width", CheckType::Number),
+            ("height", CheckType::Number),
+            ("cssWidth", CheckType::Number),
+            ("cssHeight", CheckType::Number),
+            ("pixelRatio", CheckType::Number),
+        ])
+    }
+
+    fn test_text_measure_payload_check_type() -> CheckType {
+        CheckType::record([
+            ("ref", CheckType::String),
+            ("font", CheckType::String),
+            ("texts", CheckType::vector(CheckType::String)),
+            ("widths", CheckType::vector(CheckType::Number)),
+            (
+                "measurements",
+                CheckType::vector(test_text_measurement_check_type()),
+            ),
+        ])
+    }
+
+    fn test_text_measurement_check_type() -> CheckType {
+        CheckType::record([
+            ("text", CheckType::String),
+            ("width", CheckType::Number),
+            ("actualBoundingBoxLeft", CheckType::Number),
+            ("actualBoundingBoxRight", CheckType::Number),
+            ("actualBoundingBoxAscent", CheckType::Number),
+            ("actualBoundingBoxDescent", CheckType::Number),
+        ])
+    }
+
+    fn test_bluetooth_filter_check_type() -> CheckType {
+        CheckType::record([
+            ("services", CheckType::vector(CheckType::String)),
+            ("name", CheckType::String),
+            ("namePrefix", CheckType::String),
+        ])
+    }
+
+    fn test_window_event_check_type() -> CheckType {
+        CheckType::record([
+            ("type", CheckType::String),
+            ("clientX", CheckType::Number),
+            ("clientY", CheckType::Number),
+            ("pageX", CheckType::Number),
+            ("pageY", CheckType::Number),
+            ("screenX", CheckType::Number),
+            ("screenY", CheckType::Number),
+            ("movementX", CheckType::Number),
+            ("movementY", CheckType::Number),
+            ("button", CheckType::Number),
+            ("buttons", CheckType::Number),
+            ("pointerId", CheckType::Number),
+            ("pointerType", CheckType::String),
+            ("isPrimary", CheckType::Bool),
+            ("key", CheckType::String),
+            ("code", CheckType::String),
+            ("altKey", CheckType::Bool),
+            ("ctrlKey", CheckType::Bool),
+            ("metaKey", CheckType::Bool),
+            ("shiftKey", CheckType::Bool),
+        ])
+    }
+
+    fn test_id_payload_check_type() -> CheckType {
+        CheckType::record([("id", CheckType::String)])
+    }
+
+    fn test_keyword_or_string_check_type() -> CheckType {
+        CheckType::Union(vec![CheckType::Keyword, CheckType::String])
+    }
+
+    struct TestHtmlForSpec<'a> {
+        item: &'a str,
+        index: Option<&'a str>,
+        collection: &'a Expr,
+        key: &'a Expr,
+        template: &'a HtmlNode,
+    }
+
+    impl<'a> TestHtmlForSpec<'a> {
+        fn parse(expr: &'a Expr) -> Option<Self> {
+            let ExprKind::List(items) = &expr.kind else {
+                return None;
+            };
+            if items.len() != 3 || !matches_symbol(&items[0], "for") {
+                return None;
+            }
+            let ExprKind::Vector(bindings) = &items[1].kind else {
+                return None;
+            };
+            if bindings.len() != 4 && bindings.len() != 5 {
+                return None;
+            }
+            let ExprKind::Symbol(item) = &bindings[0].kind else {
+                return None;
+            };
+            let (index, key_marker, key) = if bindings.len() == 5 {
+                let ExprKind::Symbol(index) = &bindings[2].kind else {
+                    return None;
+                };
+                (Some(index.as_str()), &bindings[3], &bindings[4])
+            } else {
+                (None, &bindings[2], &bindings[3])
+            };
+            if !matches!(&key_marker.kind, ExprKind::Keyword(name) if name == "key") {
+                return None;
+            }
+            let ExprKind::HtmlTemplate(template) = &items[2].kind else {
+                return None;
+            };
+            Some(Self {
+                item,
+                index,
+                collection: &bindings[1],
+                key,
+                template,
+            })
+        }
+    }
+
+    struct TestHtmlIfSpec<'a> {
+        condition: &'a Expr,
+        then_template: &'a HtmlNode,
+        else_template: &'a HtmlNode,
+    }
+
+    impl<'a> TestHtmlIfSpec<'a> {
+        fn parse(expr: &'a Expr) -> Option<Self> {
+            let ExprKind::List(items) = &expr.kind else {
+                return None;
+            };
+            if items.len() != 4 || !matches_symbol(&items[0], "if") {
+                return None;
+            }
+            let ExprKind::HtmlTemplate(then_template) = &items[2].kind else {
+                return None;
+            };
+            let ExprKind::HtmlTemplate(else_template) = &items[3].kind else {
+                return None;
+            };
+            Some(Self {
+                condition: &items[1],
+                then_template,
+                else_template,
+            })
+        }
+    }
+
+    fn test_is_boolean_html_attr(name: &str) -> bool {
+        matches!(
+            name,
+            "allowfullscreen"
+                | "async"
+                | "autofocus"
+                | "autoplay"
+                | "checked"
+                | "controls"
+                | "default"
+                | "defer"
+                | "disabled"
+                | "formnovalidate"
+                | "hidden"
+                | "inert"
+                | "ismap"
+                | "itemscope"
+                | "loop"
+                | "multiple"
+                | "muted"
+                | "nomodule"
+                | "novalidate"
+                | "open"
+                | "playsinline"
+                | "readonly"
+                | "required"
+                | "reversed"
+                | "selected"
+        )
+    }
+
+    fn test_cmd_storage_get_call(
+        context: &mut TypecheckCallContext<'_>,
+        name: &str,
+        args: &[Expr],
+    ) -> Type {
+        if args.len() != 4 {
+            context.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                4,
+                args.len(),
+            );
+            return Type::Cmd(Box::new(context.fresh()));
+        }
+        test_require_arg(context, &args[0], Type::String);
+        let payload = context.command_payload_type_from_format_expr(&args[1]);
+        let ok = context.infer_expr(&args[2]);
+        let ok_msg = context.infer_command_mapper_message(
+            "storage/get",
+            ok,
+            payload,
+            args[2].span,
+            ":toMessage",
+        );
+        let err_msg = context.infer_command_tag_message("storage/get", "onError", &args[3]);
+        Type::Cmd(Box::new(context.join_types(ok_msg, err_msg, args[0].span)))
+    }
+
+    fn test_cmd_storage_set_call(
+        context: &mut TypecheckCallContext<'_>,
+        name: &str,
+        args: &[Expr],
+    ) -> Type {
+        if args.len() != 3 && args.len() != 4 {
+            context.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                3,
+                args.len(),
+            );
+            return Type::Cmd(Box::new(context.fresh()));
+        }
+        test_require_arg(context, &args[0], Type::String);
+        context.infer_expr(&args[1]);
+        let msg = context.infer_expr(&args[2]);
+        let msg = if let Some(error) = args.get(3) {
+            let err_msg = context.infer_command_tag_message("storage/set", "onError", error);
+            context.join_types(msg, err_msg, args[0].span)
+        } else {
+            msg
+        };
+        Type::Cmd(Box::new(msg))
+    }
+
+    fn test_cmd_storage_set_silent_call(
+        context: &mut TypecheckCallContext<'_>,
+        name: &str,
+        args: &[Expr],
+    ) -> Type {
+        if args.len() != 3 {
+            context.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                3,
+                args.len(),
+            );
+            return Type::Cmd(Box::new(context.fresh()));
+        }
+        test_require_arg(context, &args[0], Type::String);
+        context.infer_expr(&args[1]);
+        let err_msg = context.infer_command_tag_message("storage/set", "onError", &args[2]);
+        Type::Cmd(Box::new(err_msg))
+    }
+
+    fn test_cmd_dom_ref_click_call(
+        context: &mut TypecheckCallContext<'_>,
+        name: &str,
+        args: &[Expr],
+    ) -> Type {
+        test_cmd_dom_ref_action_call(context, name, args, "dom-ref/click")
+    }
+
+    fn test_cmd_dom_ref_focus_call(
+        context: &mut TypecheckCallContext<'_>,
+        name: &str,
+        args: &[Expr],
+    ) -> Type {
+        test_cmd_dom_ref_action_call(context, name, args, "dom-ref/focus")
+    }
+
+    fn test_cmd_dom_ref_action_call(
+        context: &mut TypecheckCallContext<'_>,
+        name: &str,
+        args: &[Expr],
+        command_kind: &str,
+    ) -> Type {
+        if args.len() != 2 && args.len() != 3 {
+            context.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                2,
+                args.len(),
+            );
+            return Type::Cmd(Box::new(context.fresh()));
+        }
+        test_require_arg(context, &args[0], Type::String);
+        let msg = context.infer_expr(&args[1]);
+        let msg = if let Some(error) = args.get(2) {
+            let err_msg = context.infer_command_tag_message(command_kind, "onError", error);
+            context.join_types(msg, err_msg, args[0].span)
+        } else {
+            msg
+        };
+        Type::Cmd(Box::new(msg))
+    }
+
+    fn test_cmd_file_read_selected_call(
+        context: &mut TypecheckCallContext<'_>,
+        name: &str,
+        args: &[Expr],
+    ) -> Type {
+        if args.len() != 5 {
+            context.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                5,
+                args.len(),
+            );
+            return Type::Cmd(Box::new(context.fresh()));
+        }
+        test_require_arg(context, &args[0], Type::String);
+        let payload = context.command_payload_type_from_format_expr(&args[1]);
+        let ok = context.infer_expr(&args[2]);
+        let ok_msg = context.infer_command_mapper_message(
+            "file/read-selected",
+            ok,
+            payload,
+            args[2].span,
+            ":toMessage",
+        );
+        let err_msg = context.infer_command_tag_message("file/read-selected", "onError", &args[3]);
+        let cancel_msg =
+            context.infer_command_tag_message("file/read-selected", "onCancel", &args[4]);
+        let msg = context.join_types(ok_msg, err_msg, args[0].span);
+        Type::Cmd(Box::new(context.join_types(msg, cancel_msg, args[0].span)))
+    }
+
+    fn test_cmd_file_download_call(
+        context: &mut TypecheckCallContext<'_>,
+        name: &str,
+        args: &[Expr],
+    ) -> Type {
+        if args.len() != 5 {
+            context.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                5,
+                args.len(),
+            );
+            return Type::Cmd(Box::new(context.fresh()));
+        }
+        test_require_arg(context, &args[0], Type::String);
+        test_require_arg(context, &args[1], Type::String);
+        test_require_arg(context, &args[2], Type::String);
+        let msg = context.infer_expr(&args[3]);
+        let err_msg = context.infer_command_tag_message("file/download", "onError", &args[4]);
+        Type::Cmd(Box::new(context.join_types(msg, err_msg, args[0].span)))
+    }
+
+    fn test_cmd_canvas_draw_call(
+        context: &mut TypecheckCallContext<'_>,
+        name: &str,
+        args: &[Expr],
+    ) -> Type {
+        if args.len() != 5 {
+            context.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                5,
+                args.len(),
+            );
+            return Type::Cmd(Box::new(context.fresh()));
+        }
+        test_require_arg(context, &args[0], Type::String);
+        test_require_arg(context, &args[1], Type::Number);
+        test_require_arg(context, &args[2], Type::Number);
+        context.infer_expr(&args[3]);
+        let err_msg = context.infer_command_tag_message("canvas/draw", "onError", &args[4]);
+        Type::Cmd(Box::new(err_msg))
+    }
+
+    fn test_cmd_dom_ref_measure_call(
+        context: &mut TypecheckCallContext<'_>,
+        name: &str,
+        args: &[Expr],
+    ) -> Type {
+        if args.len() != 3 {
+            context.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                3,
+                args.len(),
+            );
+            return Type::Cmd(Box::new(context.fresh()));
+        }
+        test_require_arg(context, &args[0], Type::String);
+        let mapper_ty = context.infer_expr(&args[1]);
+        let payload_ty = context.check_type(&test_dom_ref_measure_payload_check_type());
+        let ok_msg = context.infer_command_mapper_message(
+            "dom-ref/measure",
+            mapper_ty,
+            payload_ty,
+            args[1].span,
+            ":toMessage",
+        );
+        let err_msg = context.infer_command_tag_message("dom-ref/measure", "onError", &args[2]);
+        Type::Cmd(Box::new(context.join_types(ok_msg, err_msg, args[0].span)))
+    }
+
+    fn test_cmd_bluetooth_connect_heart_rate_call(
+        context: &mut TypecheckCallContext<'_>,
+        name: &str,
+        args: &[Expr],
+    ) -> Type {
+        if args.len() != 6 {
+            context.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                6,
+                args.len(),
+            );
+            return Type::Cmd(Box::new(context.fresh()));
+        }
+        test_require_arg(context, &args[0], Type::String);
+        test_require_arg(context, &args[1], Type::Record(BTreeMap::new()));
+        let mapper_ty = context.infer_expr(&args[2]);
+        let payload_ty = context.check_type(&test_connected_payload_check_type());
+        let ok_msg = context.infer_command_mapper_message(
+            "bluetooth/connect-heart-rate",
+            mapper_ty,
+            payload_ty,
+            args[2].span,
+            ":toMessage",
+        );
+        let reading_msg = context.infer_command_tag_message(
+            "bluetooth/connect-heart-rate",
+            "onReading",
+            &args[3],
+        );
+        let disconnected_msg = context.infer_command_tag_message(
+            "bluetooth/connect-heart-rate",
+            "onDisconnected",
+            &args[4],
+        );
+        let err_msg =
+            context.infer_command_tag_message("bluetooth/connect-heart-rate", "onError", &args[5]);
+        let msg = context.join_types(ok_msg, reading_msg, args[0].span);
+        let msg = context.join_types(msg, disconnected_msg, args[0].span);
+        Type::Cmd(Box::new(context.join_types(msg, err_msg, args[0].span)))
+    }
+
+    fn test_cmd_bluetooth_disconnect_call(
+        context: &mut TypecheckCallContext<'_>,
+        name: &str,
+        args: &[Expr],
+    ) -> Type {
+        if args.len() != 2 {
+            context.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                2,
+                args.len(),
+            );
+            return Type::Cmd(Box::new(context.fresh()));
+        }
+        test_require_arg(context, &args[0], Type::String);
+        Type::Cmd(Box::new(context.infer_expr(&args[1])))
+    }
+
+    fn test_cmd_simulation_heart_rate_call(
+        context: &mut TypecheckCallContext<'_>,
+        name: &str,
+        args: &[Expr],
+    ) -> Type {
+        if args.len() != 5 && args.len() != 6 {
+            context.diagnostic(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                format!("{} expects 5 or 6 arguments, found {}", name, args.len()),
+            );
+            return Type::Cmd(Box::new(context.fresh()));
+        }
+        test_require_arg(context, &args[0], Type::String);
+        test_require_arg(context, &args[1], Type::Record(BTreeMap::new()));
+        let mapper_ty = context.infer_expr(&args[2]);
+        let payload_ty = context.check_type(&test_connected_payload_check_type());
+        let ok_msg = context.infer_command_mapper_message(
+            "simulation/heart-rate",
+            mapper_ty,
+            payload_ty,
+            args[2].span,
+            ":toMessage",
+        );
+        let reading_msg =
+            context.infer_command_tag_message("simulation/heart-rate", "onReading", &args[3]);
+        let msg = context.join_types(ok_msg, reading_msg, args[0].span);
+        let (msg, error_index) = if args.len() == 6 {
+            let disconnected_msg = context.infer_command_tag_message(
+                "simulation/heart-rate",
+                "onDisconnected",
+                &args[4],
+            );
+            (context.join_types(msg, disconnected_msg, args[0].span), 5)
+        } else {
+            (msg, 4)
+        };
+        let err_msg = context.infer_command_tag_message(
+            "simulation/heart-rate",
+            "onError",
+            &args[error_index],
+        );
+        Type::Cmd(Box::new(context.join_types(msg, err_msg, args[0].span)))
+    }
+
+    fn test_cmd_simulation_stop_call(
+        context: &mut TypecheckCallContext<'_>,
+        name: &str,
+        args: &[Expr],
+    ) -> Type {
+        if args.len() != 1 {
+            context.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                1,
+                args.len(),
+            );
+            return Type::Cmd(Box::new(context.fresh()));
+        }
+        test_require_arg(context, &args[0], Type::String);
+        Type::Cmd(Box::new(context.fresh()))
+    }
+
+    fn test_cmd_dom_ref_resize_watch_call(
+        context: &mut TypecheckCallContext<'_>,
+        name: &str,
+        args: &[Expr],
+    ) -> Type {
+        if args.len() != 4 {
+            context.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                4,
+                args.len(),
+            );
+            return Type::Cmd(Box::new(context.fresh()));
+        }
+        test_require_arg(context, &args[0], Type::String);
+        test_require_arg(context, &args[1], Type::String);
+        let change_msg =
+            context.infer_command_tag_message("dom-ref/resize-watch", "onChange", &args[2]);
+        let err_msg =
+            context.infer_command_tag_message("dom-ref/resize-watch", "onError", &args[3]);
+        Type::Cmd(Box::new(context.join_types(
+            change_msg,
+            err_msg,
+            args[0].span,
+        )))
+    }
+
+    fn test_sub_batch_call(
+        context: &mut TypecheckCallContext<'_>,
+        name: &str,
+        args: &[Expr],
+    ) -> Type {
+        if args.len() != 1 {
+            context.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                1,
+                args.len(),
+            );
+            return Type::Sub(Box::new(context.fresh()));
+        }
+        let msg = context.fresh();
+        let batch_ty = context.infer_expr(&args[0]);
+        match context.resolve(batch_ty) {
+            Type::Vector(item) => {
+                context.unify(Type::Sub(Box::new(msg.clone())), *item, args[0].span);
+            }
+            Type::Tuple(items) => {
+                for item in items {
+                    context.unify(Type::Sub(Box::new(msg.clone())), item, args[0].span);
+                }
+            }
+            Type::Var(_) => {}
+            other => {
+                let found = context.format_type(&other);
+                context.diagnostic(
+                    args[0].span,
+                    format!(
+                        "Sub.batch expects a vector of subscriptions, found {}",
+                        found
+                    ),
+                );
+            }
+        }
+        Type::Sub(Box::new(context.resolve(msg)))
+    }
+
+    fn test_sub_timer_every_call(
+        context: &mut TypecheckCallContext<'_>,
+        name: &str,
+        args: &[Expr],
+    ) -> Type {
+        if args.len() != 3 {
+            context.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                3,
+                args.len(),
+            );
+            return Type::Sub(Box::new(context.fresh()));
+        }
+        test_require_arg(context, &args[0], Type::String);
+        test_require_arg(context, &args[1], Type::Number);
+        let msg = context.infer_expr(&args[2]);
+        Type::Sub(Box::new(msg))
+    }
+
+    fn test_sub_media_query_call(
+        context: &mut TypecheckCallContext<'_>,
+        name: &str,
+        args: &[Expr],
+    ) -> Type {
+        test_sub_change_call(context, name, args, "sub/media-query")
+    }
+
+    fn test_sub_dom_ref_resize_call(
+        context: &mut TypecheckCallContext<'_>,
+        name: &str,
+        args: &[Expr],
+    ) -> Type {
+        test_sub_change_call(context, name, args, "sub/dom-ref/resize")
+    }
+
+    fn test_sub_change_call(
+        context: &mut TypecheckCallContext<'_>,
+        name: &str,
+        args: &[Expr],
+        subscription_kind: &str,
+    ) -> Type {
+        if args.len() != 3 {
+            context.arity_error(
+                args.first().map_or(Span::default(), |arg| arg.span),
+                name,
+                3,
+                args.len(),
+            );
+            return Type::Sub(Box::new(context.fresh()));
+        }
+        test_require_arg(context, &args[0], Type::String);
+        test_require_arg(context, &args[1], Type::String);
+        let tag = context.infer_expr(&args[2]);
+        let msg = test_subscription_tag_message_type(
+            context,
+            Some(subscription_kind),
+            "onChange",
+            tag,
+            args[2].span,
+        );
+        Type::Sub(Box::new(msg))
+    }
+
+    fn test_require_arg(context: &mut TypecheckCallContext<'_>, arg: &Expr, expected: Type) {
+        let actual = context.infer_expr(arg);
+        context.unify(expected, actual, arg.span);
+    }
+
+    fn test_subscription_tag_message_type(
+        context: &mut TypecheckCallContext<'_>,
+        subscription_kind: Option<&str>,
+        field: &str,
+        tag_ty: Type,
+        span: Span,
+    ) -> Type {
+        match context.resolve(tag_ty) {
+            Type::Var(_) | Type::Keyword(None) => context.fresh(),
+            Type::Keyword(Some(tag)) => context.command_message_tag_type(
+                test_subscription_command_kind(subscription_kind),
+                field,
+                &tag,
+                &BTreeMap::new(),
+            ),
+            other => {
+                let found = context.format_type(&other);
+                context.diagnostic(
+                    span,
+                    format!(
+                        "subscription continuation :{} must be a keyword tag, found {}",
+                        field, found
+                    ),
+                );
+                context.fresh()
+            }
+        }
+    }
+
+    fn test_subscription_command_kind(kind: Option<&str>) -> Option<&'static str> {
+        match kind {
+            Some("sub/dom-ref/resize") => Some("dom-ref/resize-watch"),
+            Some("sub/media-query") => Some("media-query/watch"),
+            _ => kind.and_then(|kind| match kind {
+                "none" => Some("none"),
+                "batch" => Some("batch"),
+                _ => None,
+            }),
+        }
+    }
+
     fn check(input: &str) -> CheckResult {
         let source = syntax::parse_source(input);
         assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
-        check_source(&source)
+        check_source_with_module_imports_and_options(&source, &[], &[], test_check_options())
     }
 
     fn check_with_imports(input: &str, imports: &[ImportedBinding]) -> CheckResult {
         let source = syntax::parse_source(input);
         assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
-        check_source_with_imports(&source, imports)
+        check_source_with_module_imports_and_options(&source, imports, &[], test_check_options())
     }
 
     fn check_with_module_imports(
@@ -10468,7 +11672,12 @@ mod tests {
     ) -> CheckResult {
         let source = syntax::parse_source(input);
         assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
-        check_source_with_module_imports(&source, imports, imported_types)
+        check_source_with_module_imports_and_options(
+            &source,
+            imports,
+            imported_types,
+            test_check_options(),
+        )
     }
 
     fn imported_binding(result: &CheckResult, name: &str) -> ImportedBinding {
@@ -10552,6 +11761,29 @@ mod tests {
             result.forms[0].ty,
             "(Fn [{:durationMs Number :id String}] String)"
         );
+    }
+
+    #[test]
+    fn imported_union_alias_members_are_flattened() {
+        let api = check(
+            "(type SourceMsg (Union {:kind :load} {:kind :loaded :value String}))\n\
+             (type UiMsg (Union {:kind :select :id String}))\n\
+             (type AppMsg (Union SourceMsg UiMsg))",
+        );
+        assert!(api.diagnostics.is_empty(), "{:?}", api.diagnostics);
+        let app_msg = imported_type(&api, "AppMsg");
+
+        let result = check_with_module_imports(
+            "(import \"./messages.clsk\" [AppMsg])\n\
+             (type State {:value String})\n\
+             (type UpdateResult [State (Cmd AppMsg)])\n\
+             (ann update (Fn [State AppMsg] UpdateResult))\n\
+             (defn update [state msg]\n  (match msg\n    {:kind :load} [state Cmd.none]\n    {:kind :loaded :value value} [(merge state {:value value}) Cmd.none]\n    {:kind :select :id id} [state Cmd.none]))",
+            &[],
+            &[app_msg],
+        );
+
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
     }
 
     #[test]
@@ -10646,7 +11878,7 @@ mod tests {
         );
         assert_eq!(
             result.type_declarations[1].schema,
-            "(Union {:kind :start} {:kind :heart-rate :reading HeartReading})"
+            "(Union {:kind :start} {:kind :heart-rate :reading {:bpm Number :time Number}})"
         );
         assert_eq!(
             result.type_declarations[2].schema,
@@ -11393,6 +12625,24 @@ mod tests {
             "{:?}",
             result.diagnostics
         );
+    }
+
+    #[test]
+    fn cmd_map_lifts_child_command_messages() {
+        let result = check(
+            "(type ChildMsg (Union {:kind :loaded :value String} {:kind :failed :error String}))\n\
+             (type AppMsg (Union {:kind :child :msg ChildMsg} {:kind :route-changed :href String}))\n\
+             (type State {})\n\
+             (type UpdateResult [State (Cmd AppMsg)])\n\
+             (ann child-command (Fn [] (Cmd ChildMsg)))\n\
+             (defn child-command [] {:kind :storage/get :key \"child\" :format :text :onSuccess :loaded :onError :failed})\n\
+             (ann update (Fn [State AppMsg] UpdateResult))\n\
+             (defn update [state msg]\n  [state (Cmd.map (child-command) (fn [child-msg] {:kind :child :msg child-msg}))])",
+        );
+
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert!(result.forms[1].ty.contains("(Cmd (Union"));
+        assert!(result.forms[1].ty.contains(":msg (Union"));
     }
 
     #[test]

@@ -1,0 +1,38 @@
+(import "../../model.clsk" [JsonPayload])
+
+(type LogbookMsg
+  (Union
+    {:kind :log-loaded :payload JsonPayload}
+    {:kind :log-load-failed :error String}
+    {:kind :filter-log-type :value String}
+    {:kind :select-log :id String}
+    {:kind :edit-type-draft :text String}
+    {:kind :type-draft-key :key String}
+    {:kind :type-picker-draft :text String}
+    {:kind :type-picker-key :key String}
+    {:kind :confirm-type-picker}
+    {:kind :skip-type-picker}
+    {:kind :type-picker-focused}
+    {:kind :type-picker-focus-failed :error String}
+    {:kind :save-type}
+    {:kind :delete-hold-start}
+    {:kind :delete-hold-key-down :key String}
+    {:kind :delete-hold-key-up :key String}
+    {:kind :delete-hold-started :timestamp Number}
+    {:kind :delete-hold-frame :id String :timestamp Number :value Number}
+    {:kind :delete-hold-cancel}
+    {:kind :delete-hold-cancelled}
+    {:kind :delete-hold-complete}
+    {:kind :delete-selected-at :timestamp Number}
+    {:kind :log-saved}
+    {:kind :log-save-failed :error String}
+    {:kind :open-import}
+    {:kind :import-opened}
+    {:kind :read-import}
+    {:kind :log-imported :payload JsonPayload}
+    {:kind :import-cancelled}
+    {:kind :import-failed :error String}
+    {:kind :export-log}
+    {:kind :export-log-at :timestamp Number}
+    {:kind :export-failed :error String}
+    {:kind :exported}))

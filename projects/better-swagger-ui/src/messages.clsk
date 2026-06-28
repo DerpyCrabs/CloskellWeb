@@ -1,0 +1,11 @@
+(import "./model.clsk" [AppState])
+(import "./features/source/messages.clsk" [SourceMsg])
+(import "./features/document/messages.clsk" [DocumentMsg])
+(import "./features/auth/messages.clsk" [AuthMsg])
+(import "./features/try-it/messages.clsk" [TryItMsg])
+
+(type AppMsg
+  (Union SourceMsg DocumentMsg AuthMsg TryItMsg))
+
+(type UpdateResult
+  [AppState (Cmd AppMsg)])

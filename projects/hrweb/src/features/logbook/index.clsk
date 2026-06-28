@@ -1,0 +1,429 @@
+(import "../../domain.clsk" [delete-hold-frame-id])
+(import "../../log.clsk" [all-types-filter untyped-filter visible-log selected-log first-visible-id hide-entry update-entry-type load-log-entries import-log-error import-success-message log-payload export-log-json export-log-filename reconciled-selected-id filtered-log newest-first duration-label date-label entry-type-label exercise-types])
+(import "../../metrics.clsk" [zone-display-stats])
+(import "../../model.clsk" [HeartReading HeartZone WorkoutEntry MonitorInfo JsonPayload HeartChartRect WindowEventPayload])
+(import "../../messages.clsk" [AppMsg])
+(import "./model.clsk" [LogbookState LogbookUpdateResult])
+(import "../../ui-effects.clsk" [no-cmd])
+(import "../shared/interactions.clsk" [hold-key? progress-width type-picker-ref])
+(import "../shared/workflow.clsk" [active-chart-command with-active-chart-command active-chart-result with-active-chart-result set-status reconcile-log-state selected-type-draft persist-log-command log-and-persist-command start-delete-hold-state cancel-delete-hold-state delete-hold-allowed? start-delete-progress-command cancel-delete-command progress-for focus-type-picker-command save-entry-type-result])
+(import "../shared/style.clsk" [primary-button-class secondary-button-class])
+(import "../zones/summary.clsk" [zone-time-stats])
+(defn selected-type-picker? [state entry]
+  (match state.typePickerEntryId
+    (some id) (= id entry.id)
+    nil false))
+
+(defn quiet-import-status? [status]
+  (or (= status "Ready")
+      (= status "Log reset")
+      (= status "Opening import")
+      (= status "Choose a JSON file")
+      (= status "Reading import")
+      (= status "Import cancelled")
+      (= status "Exporting log")
+      (= status "Exported log")))
+
+(defn import-status-class [status]
+  (if (quiet-import-status? status)
+      "hidden"
+      "m-0 text-sm font-semibold text-[#617066]"))
+
+
+(ann try-logbook-update (Fn [LogbookState AppMsg] (Option LogbookUpdateResult)))
+(defn try-logbook-update [state msg]
+  (match msg
+    {:kind :log-loaded :payload payload}
+      (let [entries (load-log-entries payload)
+            selected-id (first-visible-id entries)]
+        (active-chart-result
+          (reconcile-log-state
+            (set-status
+              (merge state
+                     {:entries entries
+                      :selectedLogId selected-id
+                      :typePickerEntryId nil
+                      :typePickerDraft ""
+                      :importStatus "Ready"})
+              "Ready"
+              (str "Loaded " (count (visible-log entries)) " workouts")
+              "muted"))))
+    {:kind :log-load-failed :error error}
+      (active-chart-result
+        (set-status
+          (merge state
+                 {:entries []
+                  :selectedLogId nil
+                  :logTypeFilter all-types-filter
+                  :importStatus "Log reset"})
+          "Ready"
+          error
+          "warn"))
+    {:kind :filter-log-type :value value}
+      (active-chart-result
+        (reconcile-log-state
+          (merge state
+                 {:logTypeFilter value
+                  :typePickerEntryId nil
+                  :typePickerDraft ""
+                  :message (if (= value all-types-filter)
+                               "Showing all workout types"
+                               (if (= value untyped-filter)
+                                   "Showing untyped workouts"
+                                   (str "Showing " value)))})))
+    {:kind :select-log :id id}
+      (active-chart-result
+        (reconcile-log-state
+          (merge state
+                 {:selectedLogId id
+                  :typePickerEntryId nil
+                  :typePickerDraft ""
+                  :detailView "log"})))
+    {:kind :edit-type-draft :text text}
+      (no-cmd (merge state {:typeDraft text}))
+    {:kind :type-draft-key :key key}
+      (if (= key "Enter")
+          (save-entry-type-result state state.selectedLogId state.typeDraft)
+          (no-cmd state))
+    {:kind :type-picker-draft :text text}
+      (no-cmd (merge state {:typePickerDraft text}))
+    {:kind :type-picker-key :key key}
+      (if (= key "Enter")
+          (save-entry-type-result state state.typePickerEntryId state.typePickerDraft)
+          (no-cmd state))
+    {:kind :confirm-type-picker}
+      (save-entry-type-result state state.typePickerEntryId state.typePickerDraft)
+    {:kind :skip-type-picker}
+      [(reconcile-log-state
+         (merge state
+                {:typePickerEntryId nil
+                 :typePickerDraft ""
+                 :message "Workout type skipped"}))
+       Cmd.none]
+    {:kind :type-picker-focused}
+      (no-cmd state)
+    {:kind :type-picker-focus-failed :error error}
+      (no-cmd (merge state {:message error}))
+    {:kind :save-type}
+      (save-entry-type-result state state.selectedLogId state.typeDraft)
+    {:kind :delete-hold-start}
+      (if (delete-hold-allowed? state)
+          [(start-delete-hold-state state)
+           (Cmd.time/now (Msg.mapper :delete-hold-started :timestamp))]
+          (no-cmd state))
+    {:kind :delete-hold-key-down :key key}
+      (if (and (hold-key? key)
+               (delete-hold-allowed? state))
+          [(start-delete-hold-state state)
+           (Cmd.time/now (Msg.mapper :delete-hold-started :timestamp))]
+          (no-cmd state))
+    {:kind :delete-hold-started :timestamp timestamp}
+      (if state.deleteHold?
+          [(merge state {:deleteHoldStartedAt timestamp})
+           (start-delete-progress-command)]
+          (no-cmd state))
+    {:kind :delete-hold-frame :timestamp timestamp}
+      (if state.deleteHold?
+          (let [progress (progress-for state.deleteHoldStartedAt timestamp)]
+            [(merge state
+                    {:deleteHoldProgress progress
+                     :message (str "Deleting " (progress-width progress))})
+             (if (< progress 1)
+                 (Cmd.animation/frame delete-hold-frame-id :delete-hold-frame)
+                 Cmd.none)])
+          (no-cmd state))
+    {:kind :delete-hold-cancel}
+      (if state.deleteHold?
+          [(cancel-delete-hold-state state)
+           (cancel-delete-command)]
+          (no-cmd state))
+    {:kind :delete-hold-key-up :key key}
+      (if (and (hold-key? key)
+               state.deleteHold?)
+          [(cancel-delete-hold-state state)
+           (cancel-delete-command)]
+          (no-cmd state))
+    {:kind :delete-hold-cancelled}
+      (no-cmd state)
+    {:kind :delete-hold-complete}
+      (if state.deleteHold?
+          [(merge state
+                  {:deleteHoldProgress 1
+                   :message "Deleting workout"})
+           (Cmd.time/now (Msg.mapper :delete-selected-at :timestamp))]
+          (no-cmd state))
+    {:kind :delete-selected-at :timestamp timestamp}
+      (let [entries (hide-entry state.entries state.selectedLogId timestamp)
+            selected-id (first-visible-id entries)]
+        (with-active-chart-result
+          (reconcile-log-state
+            (merge state
+                   {:entries entries
+                    :selectedLogId selected-id
+                    :deleteHold? false
+                    :deleteHoldStartedAt 0
+                    :deleteHoldProgress 0
+                    :typePickerEntryId nil
+                    :typePickerDraft ""
+                    :message "Workout deleted"}))
+          (persist-log-command entries)))
+    {:kind :log-saved}
+      (no-cmd state)
+    {:kind :log-save-failed :error error}
+      [(set-status
+         (merge state {:importStatus error})
+         "Save failed"
+         error
+         "warn")
+       Cmd.none]
+    {:kind :open-import}
+      [(merge state {:importStatus "Opening import"})
+       (Cmd.dom-ref/click "import-file" (Msg.of :import-opened) :import-failed)]
+    {:kind :import-opened}
+      (no-cmd (merge state {:importStatus "Choose a JSON file"}))
+    {:kind :read-import}
+      [(merge state {:importStatus "Reading import"})
+       (Cmd.file/read-selected "import-file" :json (Msg.mapper :log-imported :payload) :import-failed :import-cancelled)]
+    {:kind :log-imported :payload payload}
+      (let [entries (load-log-entries payload)
+            error (import-log-error payload entries)]
+        (if (some? error)
+            (no-cmd (merge state {:importStatus error}))
+            (let [selected-id (first-visible-id entries)]
+              (with-active-chart-result
+                (reconcile-log-state
+                  (merge state
+                         {:entries entries
+                          :selectedLogId selected-id
+                          :logTypeFilter all-types-filter
+                          :typePickerEntryId nil
+                          :typePickerDraft ""
+                          :importStatus (import-success-message (count entries))
+                          :detailView "log"}))
+                (persist-log-command entries)))))
+    {:kind :import-cancelled}
+      (no-cmd (merge state {:importStatus "Import cancelled"}))
+    {:kind :import-failed :error error}
+      (no-cmd (merge state {:importStatus error}))
+    {:kind :export-log}
+      [(merge state {:importStatus "Exporting log"})
+       (Cmd.time/now (Msg.mapper :export-log-at :timestamp))]
+    {:kind :export-log-at :timestamp timestamp}
+      [(merge state {:importStatus "Exporting log"})
+       (Cmd.file/download (export-log-filename timestamp)
+                          (export-log-json (visible-log state.entries))
+                          "application/json"
+                          (Msg.of :exported)
+                          :export-failed)]
+    {:kind :export-failed :error error}
+      [(set-status
+         (merge state {:importStatus error})
+         "Export failed"
+         error
+         "warn")
+       Cmd.none]
+    {:kind :exported}
+      (no-cmd (merge state {:importStatus "Exported log"}))
+    _ nil))
+
+
+(def empty-workout-entry
+  {:id ""
+   :startedAt 0
+   :stoppedAt 0
+   :durationMs 0
+   :readings []
+   :targetZoneId 0
+   :zones []
+   :exerciseType nil
+   :hiddenAt nil})
+
+(defn selected-log-present? [entry]
+  (match entry
+    (some selected-entry) true
+    nil false))
+
+(defn selected-log-value [entry]
+  (match entry
+    (some selected-entry) selected-entry
+    nil empty-workout-entry))
+
+(defn exercise-type-options [list-id types]
+  #html <datalist id={list-id}>
+          {(for [kind types :key kind]
+             #html <option value={kind}></option>)}
+        </datalist>)
+
+(defn type-editor-form [state types]
+  #html <div class="type-form grid gap-2" data-testid="type-editor">
+          <label class="text-[0.78rem] font-bold text-[#617066]" for="exercise-type-options">Exercise type</label>
+          <div class="flex items-center gap-2">
+            <input id="exercise-type-options"
+                  data-testid="type-draft"
+                  class="min-h-9 min-w-0 flex-1 rounded-lg border border-[#dbe2dc] bg-[#fbfcfb] px-3 text-[0.9rem] font-semibold text-[#172019] outline-none focus:border-[#d9184b]/45"
+                  list="exercise-type-options-list"
+                  type="text"
+                  value={state.typeDraft}
+                  placeholder="Select or enter type"
+                  on:input={{:kind :edit-type-draft
+                             :text event.currentTarget.value}}
+                  on:keydown={(if (= event.key "Enter")
+                                  (Event.prevent {:kind :type-draft-key
+                                                  :key event.key})
+                                  {:kind :type-draft-key
+                                   :key event.key})}></input>
+            <button type="button"
+                    class={(str primary-button-class " type-save !min-h-9 !shrink-0 !px-3 !text-[0.82rem]")}
+                    on:click={{:kind :save-type}}>Save</button>
+          </div>
+          {(exercise-type-options "exercise-type-options-list" types)}
+        </div>)
+
+(defn type-picker-form [state types]
+  #html <div class="type-form type-picker grid gap-2 rounded-lg border border-[#dbe2dc] bg-white p-3" data-testid="type-picker">
+          <label class="text-[0.78rem] font-bold text-[#617066]" for="exercise-type-picker-options">Exercise type</label>
+          <div class="flex items-center gap-2">
+            <input ref={type-picker-ref}
+                   id="exercise-type-picker-options"
+                   data-testid="type-picker-input"
+                   class="min-h-9 min-w-0 flex-1 rounded-lg border border-[#dbe2dc] bg-[#fbfcfb] px-3 text-[0.9rem] font-semibold text-[#172019] outline-none focus:border-[#d9184b]/45"
+                   list="exercise-type-picker-options-list"
+                   type="text"
+                   value={state.typePickerDraft}
+                   placeholder="Select or enter type"
+                   on:input={{:kind :type-picker-draft
+                              :text event.currentTarget.value}}
+                   on:keydown={(if (= event.key "Enter")
+                                   (Event.prevent {:kind :type-picker-key
+                                                   :key event.key})
+                                   {:kind :type-picker-key
+                                    :key event.key})}></input>
+            <button type="button"
+                    class={(str primary-button-class " type-save !min-h-9 !shrink-0 !px-3 !text-[0.82rem]")}
+                    data-testid="type-picker-save"
+                    on:click={{:kind :confirm-type-picker}}>Save</button>
+            <button type="button"
+                    class={(str secondary-button-class " type-skip !min-h-9 !shrink-0 !px-3 !text-[0.82rem]")}
+                    data-testid="type-picker-skip"
+                    on:click={{:kind :skip-type-picker}}>Skip</button>
+          </div>
+          {(exercise-type-options "exercise-type-picker-options-list" types)}
+        </div>)
+
+(defn log-pane [state]
+  (let [entries (filtered-log state.entries state.logTypeFilter)
+        visible-count (count (newest-first state.entries))
+        types (exercise-types state.entries)
+        entry (selected-log state.entries state.selectedLogId)
+        selected-entry (selected-log-value entry)
+        selected-zone-stats (zone-display-stats selected-entry)
+        has-selected-entry? (selected-log-present? entry)]
+    #html <section class="log-pane grid grid-cols-[minmax(180px,260px)_1fr] gap-3 max-[940px]:grid-cols-1 max-[820px]:gap-2"
+                   data-testid="log-pane"
+                   data-count={count entries}
+                   data-filter={state.logTypeFilter}>
+            <input ref="import-file"
+                   class="file-input absolute h-px w-px opacity-0 pointer-events-none"
+                   type="file"
+                   accept="application/json,.json"
+                   on:change={{:kind :read-import}}></input>
+            <div class="flex min-h-[220px] flex-col rounded-lg border border-[#dbe2dc] bg-[#fbfcfb] p-2">
+              <label class="mb-2 grid gap-1">
+                <span class="text-[0.72rem] font-bold uppercase tracking-[0.04em] text-[#617066]">Filter by type</span>
+                <select data-testid="log-type-filter"
+                        class="min-h-9 rounded-lg border border-[#dbe2dc] bg-white px-2.5 text-[0.85rem] font-bold text-[#172019]"
+                        value={state.logTypeFilter}
+                        on:change={{:kind :filter-log-type
+                                    :value event.currentTarget.value}}>
+                  <option value={all-types-filter}>All types</option>
+                  <option value={untyped-filter}>Untyped</option>
+                  {(for [kind types :key kind]
+                     #html <option value={kind}>{kind}</option>)}
+                </select>
+              </label>
+              {(if (> (count entries) 0)
+                  #html <div class="log-list grid gap-1.5" data-testid="log-list">
+                          {(for [item entries :key item.id]
+                             #html <button type="button"
+                                           class={(str "log-row rounded-md border px-3 py-2 text-left "
+                                                       (if (match state.selectedLogId
+                                                             (some selected-id) (= item.id selected-id)
+                                                             nil false)
+                                                           "border-[#d9184b]/35 bg-white text-[#172019]"
+                                                           "border-transparent text-[#617066] hover:bg-white"))}
+                                           data-testid={(str "log-row-" item.id)}
+                                           data-type={(entry-type-label item)}
+                                           data-selected={(= item.id state.selectedLogId)}
+                                           on:click={{:kind :select-log
+                                                      :id item.id}}>
+                                     <span class="block text-[0.9rem] font-extrabold">{(date-label item.startedAt)}</span>
+                                     <span class="block text-[0.78rem] font-bold">{(str (duration-label item.durationMs)
+                                                                                         " - "
+                                                                                         (count item.readings)
+                                                                                         " readings"
+                                                                                         (if (some? item.exerciseType)
+                                                                                             (str " - " item.exerciseType)
+                                                                                             ""))}</span>
+                                   </button>)}
+                        </div>
+                  #html <article class="empty-state compact rounded-lg border border-[#dbe2dc] bg-white p-3.5" data-testid="empty-filtered-log">
+                          <h3 class="m-0 text-[1.05rem] font-extrabold">{(if (> visible-count 0) "No matching workouts" "No workouts yet")}</h3>
+                          <p class="m-0 mt-2 text-sm font-semibold text-[#596a60]">{(if (> visible-count 0)
+                                                                                        "No exercises match this type filter."
+                                                                                        "Start a session or import an HRWeb log.")}</p>
+                        </article>)}
+              <div class="mt-auto grid grid-cols-3 gap-2 border-t border-[#dbe2dc] pt-2">
+                <button type="button"
+                        class={(str secondary-button-class " !min-h-9 !px-2 !text-[0.82rem]")}
+                        disabled={(= (count (visible-log state.entries)) 0)}
+                        on:click={{:kind :export-log}}>Export</button>
+                <button type="button"
+                        class={(str secondary-button-class " !min-h-9 !px-2 !text-[0.82rem]")}
+                        on:click={{:kind :open-import}}>Import</button>
+                <button type="button"
+                        class={(str secondary-button-class " relative !min-h-9 overflow-hidden !px-2 !text-[0.82rem] "
+                                    (if (> state.deleteHoldProgress 0)
+                                        "border-[#d9184b]/45 text-[#d9184b]"
+                                        ""))}
+                        data-testid="delete-log"
+                        data-holding={state.deleteHold?}
+                        disabled={not has-selected-entry?}
+                        on:pointerdown={(Event.prevent {:kind :delete-hold-start})}
+                        on:pointerup={{:kind :delete-hold-cancel}}
+                        on:pointerleave={{:kind :delete-hold-cancel}}
+                        on:pointercancel={{:kind :delete-hold-cancel}}
+                        on:keydown={(if (hold-key? event.key)
+                                      (Event.prevent {:kind :delete-hold-key-down
+                                                      :key event.key})
+                                      {:kind :delete-hold-key-down
+                                       :key event.key})}
+                        on:keyup={{:kind :delete-hold-key-up
+                                    :key event.key}}>
+                  <span class="absolute inset-y-0 left-0 bg-[#d9184b]/12"
+                        style={{:width (progress-width state.deleteHoldProgress)}}></span>
+                  <span class="relative">{(if state.deleteHold? "Hold" "Delete")}</span>
+                </button>
+              </div>
+            </div>
+            <div class="min-w-0">
+              {(if has-selected-entry?
+                  #html <article class="log-detail min-w-0" data-testid="log-detail">
+                          {(if (selected-type-picker? state selected-entry)
+                               #html <div>{(type-picker-form state types)}</div>
+                               #html <div>{(type-editor-form state types)}</div>)}
+                          <div class={(str "heart-chart-wrap log-heart-chart-wrap mt-5 w-full aspect-[16/9] min-h-[360px] "
+                                           (if state.mobile? "!mt-2" ""))}>
+                            <canvas ref="log-heart-chart"
+                                    class="heart-chart block h-full w-full rounded-lg border border-[#dbe2dc] bg-[#fffdfa]"
+                                    data-testid="log-heart-chart"
+                                    aria-label="Heart rate line chart"></canvas>
+                          </div>
+                          {(zone-time-stats selected-zone-stats state.mobile?)}
+                        </article>
+                  #html <article class="empty-state rounded-lg border border-[#dbe2dc] bg-white p-3.5" data-testid="empty-log">
+                          <h3 class="m-0 text-[1.05rem] font-extrabold">No workouts yet</h3>
+                          <p class="m-0 mt-2 text-sm font-semibold text-[#596a60]">Start a session or import an HRWeb log.</p>
+                        </article>)}
+            </div>
+            <p class={(import-status-class state.importStatus)} data-testid="import-status">{state.importStatus}</p>
+          </section>))

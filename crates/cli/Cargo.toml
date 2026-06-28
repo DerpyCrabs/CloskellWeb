@@ -10,7 +10,9 @@ path = "src/main.rs"
 
 [dependencies]
 effects.workspace = true
-js_backend.workspace = true
+js_emit.workspace = true
+js_frontend.workspace = true
+js_server.workspace = true
 macro_expand.workspace = true
 syntax.workspace = true
 template_ir.workspace = true

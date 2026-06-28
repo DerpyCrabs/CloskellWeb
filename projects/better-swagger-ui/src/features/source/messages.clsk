@@ -1,0 +1,25 @@
+(type SourceMsg
+  (Union
+    {:kind :url-input :value String}
+    {:kind :url-paste :value String}
+    {:kind :load}
+    {:kind :source-loaded :source String :value Js}
+    {:kind :source-load-failed :error String}
+    {:kind :config-loaded :url String :value Js}
+    {:kind :config-failed :error String}
+    {:kind :discovery-response :entry Js :value Js}
+    {:kind :discovery-failed :error String}
+    {:kind :spec-document-loaded :url String :value Js}
+    {:kind :pasted-spec :label String :value String}
+    {:kind :spec-file-selected}
+    {:kind :open-spec-file}
+    {:kind :download-schema}
+    {:kind :definition-change :name String}
+    {:kind :route-changed :href String}
+    {:kind :toggle-theme}
+    {:kind :theme-loaded :theme String}
+    {:kind :auth-storage-loaded :entries Js}
+    {:kind :spec-loaded :value Js}
+    {:kind :spec-failed :error String}
+    {:kind :oauth-init-loaded :value Js}
+    {:kind :oauth-init-failed :error String}))

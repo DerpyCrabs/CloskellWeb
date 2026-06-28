@@ -8,7 +8,16 @@ fn typecheck_golden_files() {
     let source = syntax::parse_source(&input);
     assert!(source.diagnostics.is_empty(), "{:?}", source.diagnostics);
 
-    let result = typecheck::check_source(&source);
+    let html = typecheck::CheckType::named("Html");
+    let result = typecheck::check_source_with_module_imports_and_options(
+        &source,
+        &[],
+        &[],
+        typecheck::CheckOptions::default()
+            .named_type("Html", 0)
+            .named_type("TrustedHtml", 0)
+            .html_templates(html, typecheck::CheckType::named("TrustedHtml")),
+    );
     assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
 
     let actual = result

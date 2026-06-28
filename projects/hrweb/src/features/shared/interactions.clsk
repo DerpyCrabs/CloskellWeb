@@ -1,0 +1,11 @@
+(def zone-boundary-track-ref "zone-boundary-track")
+
+(def type-picker-ref "type-picker-input")
+
+(defn hold-key? [key]
+  (or (= key "Enter")
+      (or (= key " ")
+          (= key "Space"))))
+
+(defn progress-width [progress]
+  (str (round (* progress 100)) "%"))

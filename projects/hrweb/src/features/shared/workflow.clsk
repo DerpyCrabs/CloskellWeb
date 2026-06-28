@@ -1,0 +1,319 @@
+(import "../../domain.clsk" [zones-storage-key exercise-log-storage-key clock-timer-id simulated-monitor-id stop-hold-timer-id stop-hold-frame-id stop-hold-ms delete-hold-timer-id delete-hold-frame-id delete-hold-ms])
+(import "../../zones.clsk" [zone-state-payload zone-label-for-bpm set-zone-boundary])
+(import "../../log.clsk" [current-elapsed selected-log update-entry-type reconciled-selected-id log-payload])
+(import "../../chart.clsk" [heart-chart-command heart-chart-batch])
+(import "../../metric_charts.clsk" [metric-chart-command metric-chart-batch])
+(import "../../model.clsk" [HeartReading HeartZone WorkoutEntry MonitorInfo JsonPayload HeartChartRect WindowEventPayload])
+(import "../../messages.clsk" [AppMsg])
+(import "../../ui-effects.clsk" [no-cmd])
+(import "./interactions.clsk" [zone-boundary-track-ref type-picker-ref progress-width])
+(import "./model.clsk" [WorkflowState])
+
+(ann startup-command (Fn [] (Cmd AppMsg)))
+(defn startup-command []
+  (Cmd.batch [(Cmd.storage/get zones-storage-key :json (Msg.mapper :zones-loaded :payload) :zones-load-failed)
+              (Cmd.storage/get exercise-log-storage-key :json (Msg.mapper :log-loaded :payload) :log-load-failed)]))
+
+(ann active-chart-command (Fn [WorkflowState] (Cmd AppMsg)))
+(defn active-chart-command [state]
+  (Cmd.batch [(heart-chart-command state)
+              (metric-chart-command state)]))
+
+(ann active-chart-batch (Fn [WorkflowState] (Cmd AppMsg)))
+(defn active-chart-batch [state]
+  (Cmd.batch [(heart-chart-batch state)
+              (metric-chart-batch state)]))
+
+(ann with-active-chart-command (Fn [WorkflowState (Cmd AppMsg)] (Cmd AppMsg)))
+(defn with-active-chart-command [state command]
+  (Cmd.batch [command
+              (active-chart-command state)]))
+
+(defmacro active-chart-result [state-expr] `(let [next-state# ~state-expr] [next-state# (active-chart-command next-state#)]))
+(defmacro active-chart-batch-result [state-expr] `(let [next-state# ~state-expr] [next-state# (active-chart-batch next-state#)]))
+(defmacro metric-chart-batch-result [state-expr] `(let [next-state# ~state-expr] [next-state# (metric-chart-batch next-state#)]))
+(defmacro with-active-chart-result [state-expr command-expr] `(let [next-state# ~state-expr] [next-state# (with-active-chart-command next-state# ~command-expr)]))
+
+(defn set-status [state status message mode]
+  (merge state
+         {:appStatus status
+          :message message
+          :statusMode mode}))
+
+(defn reading [bpm elapsed-ms]
+  {:bpm (round bpm)
+   :time (max 0 (round elapsed-ms))})
+
+(defn trend-label [last-rate bpm]
+  (if (some? last-rate)
+      (let [delta (- bpm last-rate)]
+        (if (= delta 0)
+            "Recording"
+            (if (> delta 0)
+                (str (abs delta) " bpm up")
+                (str (abs delta) " bpm down"))))
+      "Recording"))
+
+(defn idle-elapsed [state timestamp]
+  (match state.idleStartedAt
+    (some started-at) (max 0 (- timestamp started-at))
+    nil state.elapsedMs))
+
+(defn live-elapsed [state timestamp]
+  (if (= state.exerciseState "running")
+      (current-elapsed state timestamp)
+      (if (= state.exerciseState "idle")
+          (idle-elapsed state timestamp)
+          state.elapsedMs)))
+
+(defn heart-rate-trend [state bpm]
+  (if (= state.exerciseState "running")
+      (trend-label state.lastRate bpm)
+      (if (= state.exerciseState "paused")
+          "Paused"
+          (if (= state.exerciseState "stopped")
+              "Stopped"
+              "Idle"))))
+
+(defn append-live-reading? [state]
+  (or (= state.exerciseState "running")
+      (= state.exerciseState "idle")))
+
+(defn ensure-idle-start [state timestamp]
+  (if (and (= state.exerciseState "idle")
+           (not (some? state.idleStartedAt)))
+      (merge state {:idleStartedAt timestamp})
+      state))
+
+(defn add-heart-rate-at [state bpm timestamp]
+  (let [rounded (round bpm)
+        timed-state (ensure-idle-start state timestamp)
+        elapsed (live-elapsed timed-state timestamp)
+        next-readings (if (append-live-reading? timed-state)
+                          (conj timed-state.readings (reading rounded elapsed))
+                          timed-state.readings)]
+    (merge timed-state
+           {:latestBpm rounded
+            :lastRate (if (append-live-reading? timed-state)
+                          rounded
+                          timed-state.lastRate)
+            :trend (heart-rate-trend timed-state rounded)
+            :readings next-readings
+            :displayElapsedMs elapsed
+            :message (zone-label-for-bpm timed-state.zones rounded)})))
+
+(defn clear-idle-live-state [state]
+  (if (= state.exerciseState "idle")
+      (merge state
+             {:idleStartedAt nil
+              :displayElapsedMs 0
+              :readings []})
+      state))
+
+(defn low-zone-bpm [zones]
+  (let [zone (nth zones 0)]
+    zone.min))
+
+(defn high-zone-bpm [zones]
+  (let [zone (last zones)]
+    zone.max))
+
+(defn target-zone-from-roll [zones roll]
+  (nth zones (floor roll)))
+
+(ann log-and-persist-command (Fn [(Vector WorkoutEntry)] (Cmd AppMsg)))
+(defn log-and-persist-command [entries]
+  (Cmd.batch [(Cmd.timer/cancel clock-timer-id)
+              (Cmd.storage/set exercise-log-storage-key (log-payload entries) (Msg.of :log-saved) :log-save-failed)]))
+
+(ann persist-zone-command (Fn [(Vector HeartZone) Number] (Cmd AppMsg)))
+(defn persist-zone-command [zones target-zone-id]
+  (Cmd.storage/set zones-storage-key (zone-state-payload zones target-zone-id) (Msg.of :zones-saved) :zones-save-failed))
+
+(ann persist-zone-silent-command (Fn [(Vector HeartZone) Number] (Cmd AppMsg)))
+(defn persist-zone-silent-command [zones target-zone-id]
+  (Cmd.storage/set-silent zones-storage-key (zone-state-payload zones target-zone-id) :zones-save-failed))
+
+(ann persist-log-command (Fn [(Vector WorkoutEntry)] (Cmd AppMsg)))
+(defn persist-log-command [entries]
+  (Cmd.storage/set exercise-log-storage-key (log-payload entries) (Msg.of :log-saved) :log-save-failed))
+
+(ann clock-command (Fn [] (Cmd AppMsg)))
+(defn clock-command []
+  (Cmd.timer/every clock-timer-id 250 (Msg.of :clock-tick)))
+
+(ann cancel-clock-command (Fn [] (Cmd AppMsg)))
+(defn cancel-clock-command []
+  (Cmd.timer/cancel clock-timer-id))
+
+(ann stop-connections-command (Fn [] (Cmd AppMsg)))
+(defn stop-connections-command []
+  (Cmd.batch [(Cmd.simulation/stop simulated-monitor-id)
+              (cancel-clock-command)
+              (Cmd.bluetooth/disconnect "hrm" (Msg.of :monitor-disconnected))]))
+
+(defn connected-off-state [state]
+  (clear-idle-live-state
+    (merge state
+           {:connected? false
+            :simulated? false
+            :deviceName ""})))
+
+(defn disconnected-status-state [state]
+  (set-status
+    (connected-off-state state)
+    "Disconnected"
+    "Monitor disconnected"
+    "warn"))
+
+(defn pause-for-disconnect-state [state timestamp]
+  (let [elapsed (current-elapsed state timestamp)]
+    (disconnected-status-state
+      (merge state
+             {:exerciseState "paused"
+              :elapsedMs elapsed
+              :displayElapsedMs elapsed
+              :startedAt nil
+              :trend "Paused"}))))
+
+(ann disconnect-monitor-command (Fn [WorkflowState] (Cmd AppMsg)))
+(defn disconnect-monitor-command [state]
+  (if (= state.exerciseState "running")
+      (Cmd.time/now (Msg.mapper :disconnect-paused-at :timestamp))
+      (stop-connections-command)))
+
+(ann start-stop-progress-command (Fn [] (Cmd AppMsg)))
+(defn start-stop-progress-command []
+  (Cmd.batch [(Cmd.timer/after stop-hold-timer-id stop-hold-ms (Msg.of :stop-hold-complete))
+              (Cmd.animation/frame stop-hold-frame-id :stop-hold-frame)]))
+
+(ann cancel-stop-command (Fn [] (Cmd AppMsg)))
+(defn cancel-stop-command []
+  (Cmd.batch [(Cmd.timer/cancel stop-hold-timer-id)
+              (Cmd.animation/cancel stop-hold-frame-id (Msg.of :stop-hold-cancelled))]))
+
+(ann start-delete-progress-command (Fn [] (Cmd AppMsg)))
+(defn start-delete-progress-command []
+  (Cmd.batch [(Cmd.timer/after delete-hold-timer-id delete-hold-ms (Msg.of :delete-hold-complete))
+              (Cmd.animation/frame delete-hold-frame-id :delete-hold-frame)]))
+
+(ann cancel-delete-command (Fn [] (Cmd AppMsg)))
+(defn cancel-delete-command []
+  (Cmd.batch [(Cmd.timer/cancel delete-hold-timer-id)
+              (Cmd.animation/cancel delete-hold-frame-id (Msg.of :delete-hold-cancelled))]))
+
+(defn zone-boundary-bpm-from-client-x [state client-x]
+  (let [first-zone (nth state.zones 0)
+        last-zone (last state.zones)
+        width (max 1 state.zoneTrackWidth)
+        ratio (max 0 (min 1 (/ (- client-x state.zoneTrackLeft) width)))]
+    (+ first-zone.min (* ratio (- last-zone.max first-zone.min)))))
+
+(defn zone-boundary-key-delta [key]
+  (if (or (= key "ArrowLeft") (= key "ArrowDown"))
+      -1
+      (if (or (= key "ArrowRight") (= key "ArrowUp"))
+          1
+          0)))
+
+(defn stop-hold-allowed? [state]
+  (and (or (= state.exerciseState "running")
+           (= state.exerciseState "paused"))
+       (not state.stopHold?)))
+
+(defn start-stop-hold-state [state]
+  (merge state
+         {:stopHold? true
+          :stopHoldStartedAt 0
+          :stopHoldProgress 0
+          :message "Hold to stop"}))
+
+(defn cancel-stop-hold-state [state]
+  (merge state
+         {:stopHold? false
+          :stopHoldStartedAt 0
+          :stopHoldProgress 0
+          :message "Stop cancelled"}))
+
+(defn delete-hold-allowed? [state]
+  (and (some? (selected-log state.entries state.selectedLogId))
+       (not state.deleteHold?)))
+
+(defn start-delete-hold-state [state]
+  (merge state
+         {:deleteHold? true
+          :deleteHoldStartedAt 0
+          :deleteHoldProgress 0
+          :message "Hold to delete"}))
+
+(defn cancel-delete-hold-state [state]
+  (merge state
+         {:deleteHold? false
+          :deleteHoldStartedAt 0
+          :deleteHoldProgress 0
+          :message "Delete cancelled"}))
+
+(defn zone-boundary-status [zones index]
+  (let [boundary (nth zones index)]
+    (str "Boundary " boundary.max)))
+
+(ann zone-drag-measure-command (Fn [Number Number] (Cmd AppMsg)))
+(defn zone-drag-measure-command [index client-x]
+  (Cmd.dom-ref/measure zone-boundary-track-ref
+                       (fn [rect]
+                         {:kind :zone-boundary-track-measured
+                          :index index
+                          :clientX client-x
+                          :left rect.left
+                          :width rect.width
+                          :value {:x rect.x
+                                  :y rect.y
+                                  :width rect.width
+                                  :height rect.height
+                                  :top rect.top
+                                  :right rect.right
+                                  :bottom rect.bottom
+                                  :left rect.left}})
+                       :zone-boundary-track-error))
+
+(defn hold-progress-for [duration-ms started-at timestamp]
+  (max 0 (min 1 (/ (- timestamp started-at) duration-ms))))
+
+(defn stop-progress-for [started-at timestamp]
+  (hold-progress-for stop-hold-ms started-at timestamp))
+
+(defn progress-for [started-at timestamp]
+  (hold-progress-for delete-hold-ms started-at timestamp))
+
+(defn selected-type-draft [entries selected-id]
+  (match (selected-log entries selected-id)
+    (some entry)
+      (if (some? entry.exerciseType)
+          entry.exerciseType
+          "")
+    nil ""))
+
+(defn reconcile-log-state [state]
+  (let [selected-id (reconciled-selected-id state.entries state.logTypeFilter state.selectedLogId)]
+    (merge state
+           {:selectedLogId selected-id
+            :typeDraft (selected-type-draft state.entries selected-id)})))
+
+(ann focus-type-picker-command (Fn [] (Cmd AppMsg)))
+(defn focus-type-picker-command []
+  (Cmd.dom-ref/focus type-picker-ref (Msg.of :type-picker-focused) :type-picker-focus-failed))
+
+(defmacro save-entry-type-result [state selected-id draft]
+  `(let [selected-id# ~selected-id
+         draft# ~draft]
+     (if (some? (selected-log (get ~state :entries) selected-id#))
+      (let [entries (update-entry-type (get ~state :entries) selected-id# draft#)]
+        (let [next-state (reconcile-log-state
+                           (merge ~state
+                                  {:entries entries
+                                   :typePickerEntryId nil
+                                   :typePickerDraft ""
+                                   :message "Workout type saved"}))]
+          [next-state
+           (with-active-chart-command next-state (persist-log-command entries))]))
+      (no-cmd ~state))))

@@ -876,6 +876,11 @@ fn cli_check_json_invalidates_cache_when_import_changes() {
     let temp_dir = temp_dir("closkell-cli-check-cache-invalidation");
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+    fs::write(
+        temp_dir.join("package.json"),
+        "{\"name\":\"cache-invalidation\"}\n",
+    )
+    .expect("package marker should be written");
     let api = temp_dir.join("api.clsk");
     let app = temp_dir.join("app.clsk");
     fs::write(&api, "(ann answer Number)\n(def answer 1)\n").expect("api module should be written");
@@ -1344,7 +1349,7 @@ const mod = await import(fileUrl({module_path}));
 if (mod.reading_summary.bpm !== 142) throw new Error("imported gensym macro did not expand reading bpm");
 if (mod.reading_summary.label !== "HR 142") throw new Error("imported gensym macro did not reuse the fresh binding");
 const [, command] = mod.update({{}}, Symbol.for("noop"));
-if (command.kind !== "none") throw new Error("imported cmd-none macro did not expand");
+if (command.kind !== Symbol.for("none")) throw new Error("imported cmd-none macro did not expand");
 
 function fileUrl(path) {{
   return "file:///" + path.replace(/\\/g, "/").replace(/^([A-Za-z]):/, "$1:");
@@ -1517,7 +1522,10 @@ fn cli_build_app_writes_vite_entry_bootstrap() {
     assert!(app_js.contains("import \"./styles.css\";"));
     assert!(app_js.contains("from \"@closkell/runtime\";"));
     assert!(app_js.contains("startCompiledAppWithoutSubscriptions as __closkellStartApp"));
-    assert!(app_js.contains("createCompiledHtmlTemplateComponent as __closkellCreateHtmlTemplate"));
+    assert!(
+        app_js
+            .contains("createBrowserCompiledHtmlTemplateComponent as __closkellCreateHtmlTemplate")
+    );
     assert!(!app_js.contains("function startCompiledAppWithoutSubscriptions(options = {})"));
     assert!(!app_js.contains("__closkellRuntime_"));
     assert!(app_js.contains("document.getElementById(\"app\")"));
@@ -1565,6 +1573,295 @@ fn cli_build_app_writes_vite_entry_bootstrap() {
 }
 
 #[test]
+fn cli_build_app_keeps_specialized_import_module_exports() {
+    let temp_dir = temp_dir("closkell-cli-app-import-specialization-exports");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+
+    let app = temp_dir.join("app.clsk");
+    let helper = temp_dir.join("helper.clsk");
+    let output = temp_dir.join("dist").join("app.mjs");
+    let helper_output = temp_dir.join("dist").join("helper.mjs");
+
+    fs::write(
+        &helper,
+        "(ann selected-label (Fn [String String] String))\n\
+         (defn selected-label [value selected]\n\
+           (if (= value selected) \"selected\" \"\"))\n\
+         \n\
+         (ann local-label (Fn [String] String))\n\
+         (defn local-label [value]\n\
+           (selected-label value \"a\"))\n",
+    )
+    .expect("helper module should be written");
+    fs::write(
+        &app,
+        "(import \"./helper.clsk\" [selected-label])\n\
+         \n\
+         (def init {:value \"a\"})\n\
+         (defn update [state msg] [state Cmd.none])\n\
+         (defn view [state]\n\
+           #html <main class={(selected-label state.value \"a\")}>{state.value}</main>)\n",
+    )
+    .expect("app module should be written");
+
+    let run = Command::new(env!("CARGO_BIN_EXE_closkell"))
+        .arg("build")
+        .arg(&app)
+        .arg("--out")
+        .arg(&output)
+        .arg("--app")
+        .output()
+        .expect("closkell build --app should run");
+
+    assert!(
+        run.status.success(),
+        "closkell build --app failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let helper_js = fs::read_to_string(&helper_output).expect("helper JS should be readable");
+    assert!(
+        helper_js.contains("export function selected_label"),
+        "imported helper module dropped a public specialized export:\n{}",
+        helper_js
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn cli_build_imported_unannotated_html_component_in_keyed_list_as_component_slot() {
+    let temp_dir = temp_dir("closkell-cli-imported-html-component-keyed-list");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+
+    let component = temp_dir.join("component.clsk");
+    let app = temp_dir.join("app.clsk");
+    let output = temp_dir.join("app.mjs");
+
+    fs::write(
+        &component,
+        "(defn operationPanel [state item]\n\
+           (let [summary (get item.operation :summary)]\n\
+             #html <article data-testid={(str \"operation-\" item.id)}>{(if (string? summary) summary item.method)}</article>))\n",
+    )
+    .expect("component module should be written");
+    fs::write(
+        &app,
+        "(import \"./component.clsk\" [operationPanel])\n\
+         (defn view [state entry]\n\
+           #html <section>{(for [item entry.value :key item.id] #html <div>{(operationPanel state item)}</div>)}</section>)\n",
+    )
+    .expect("app module should be written");
+
+    let run = Command::new(env!("CARGO_BIN_EXE_closkell"))
+        .arg("build")
+        .arg(&app)
+        .arg("-o")
+        .arg(&output)
+        .output()
+        .expect("closkell build should run");
+
+    assert!(
+        run.status.success(),
+        "closkell build failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let app_js = fs::read_to_string(&output).expect("app JS should be readable");
+    let _ = fs::remove_dir_all(&temp_dir);
+
+    assert!(
+        app_js.contains("__closkellSetKeyedList") && app_js.contains("__closkellSetComponent"),
+        "imported Html component inside keyed list should emit a component slot:\n{}",
+        app_js
+    );
+    assert!(
+        !app_js.contains("__closkellSetText(i, 0, i.nodes[0], operationPanel(state, item)"),
+        "imported Html component inside keyed list must not emit as text:\n{}",
+        app_js
+    );
+}
+
+#[test]
+fn cli_check_server_target_rejects_browser_templates() {
+    let temp_dir = temp_dir("closkell-cli-server-rejects-browser");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+    let source = temp_dir.join("server.clsk");
+    fs::write(
+        &source,
+        "(ann init (Fn [ServerBoot] [{:ok Bool} (Cmd {:kind :noop})]))\n\
+         (defn init [boot] [{:ok true} Cmd.none])\n\
+         (ann routes (Fn [{:ok Bool}] (Vector (Route Request (Task HttpError Response)))))\n\
+         (defn routes [state] [])\n\
+         (ann resources (Fn [{:ok Bool}] (ServerResources {:kind :noop})))\n\
+         (defn resources [state] (Server.resources []))\n\
+         (defn view [state] #html <main>server</main>)\n",
+    )
+    .expect("server source should be written");
+
+    let run = Command::new(env!("CARGO_BIN_EXE_closkell"))
+        .arg("check")
+        .arg(&source)
+        .arg("--target")
+        .arg("server")
+        .output()
+        .expect("closkell check should run");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+
+    assert!(
+        !run.status.success(),
+        "server target unexpectedly accepted browser template\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let output = combined_output(&run.stdout, &run.stderr);
+    assert!(
+        output.contains("#html is a browser framework form"),
+        "server target did not report the browser framework boundary:\n{}",
+        output
+    );
+}
+
+#[test]
+fn cli_target_flag_can_precede_source_path() {
+    let source = workspace_root()
+        .join("fixtures")
+        .join("server")
+        .join("media_service.clsk");
+
+    let check = Command::new(env!("CARGO_BIN_EXE_closkell"))
+        .arg("check")
+        .arg("--target")
+        .arg("server")
+        .arg(&source)
+        .output()
+        .expect("closkell check should run");
+
+    assert!(
+        check.status.success(),
+        "closkell check --target server <file> failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr)
+    );
+
+    let temp_dir = temp_dir("closkell-cli-target-before-path");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+    let output = temp_dir.join("server.mjs");
+
+    let build = Command::new(env!("CARGO_BIN_EXE_closkell"))
+        .arg("build")
+        .arg("--target")
+        .arg("server")
+        .arg(&source)
+        .arg("--app")
+        .arg("--out")
+        .arg(&output)
+        .output()
+        .expect("closkell build should run");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+
+    assert!(
+        build.status.success(),
+        "closkell build --target server <file> --app failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+}
+
+#[test]
+fn cli_build_server_app_writes_service_bootstrap() {
+    if !node_available() {
+        eprintln!("skipping server app build smoke test because node is unavailable");
+        return;
+    }
+
+    let temp_dir = temp_dir("closkell-cli-build-server-app");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+    let output = temp_dir.join("server.mjs");
+    let source = workspace_root()
+        .join("fixtures")
+        .join("server")
+        .join("media_service.clsk");
+
+    let run = Command::new(env!("CARGO_BIN_EXE_closkell"))
+        .arg("build")
+        .arg(&source)
+        .arg("--target")
+        .arg("server")
+        .arg("--app")
+        .arg("--vendor-runtime")
+        .arg("--out")
+        .arg(&output)
+        .output()
+        .expect("closkell build --target server --app should run");
+
+    assert!(
+        run.status.success(),
+        "closkell server build failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let app_js = fs::read_to_string(&output).expect("server JS should be readable");
+    assert!(app_js.contains("startServerService as __closkellStartServerService"));
+    assert!(app_js.contains("export const __closkellService"));
+    assert!(!app_js.contains("document.getElementById"));
+    assert!(app_js.contains("kind: Symbol.for(\"server/route\")"));
+    assert!(app_js.contains("kind: Symbol.for(\"response/file\")"));
+
+    let script = format!(
+        r#"
+const mod = await import(fileUrl({module_path}));
+const service = mod.__closkellService;
+if (!service) throw new Error("server service was not exported");
+if (globalThis.document !== undefined) throw new Error("server runtime import should not create a document");
+if (service.routes.length !== 3) throw new Error(`expected three routes, found ${{service.routes.length}}`);
+if (service.resources.resources.length !== 1) throw new Error("server resource was not registered");
+const health = await service.handle({{ method: "GET", path: "/health" }});
+if (health.kind !== Symbol.for("response/json") || health.body.ok !== true) throw new Error("health response was wrong");
+const status = await service.handle({{ method: "GET", path: "/status" }});
+if (status.status !== 201) throw new Error(`response status override was wrong: ${{JSON.stringify(status)}}`);
+const media = await service.handle({{ method: "GET", path: "/media/movie.mp4" }});
+if (media.kind !== Symbol.for("response/file") || media.path !== "movie.mp4") throw new Error(`media response was wrong: ${{JSON.stringify(media)}}`);
+service.dispatch({{ kind: Symbol.for("files-changed"), path: "updated-root" }});
+if (service.state.root !== "updated-root") throw new Error("server update dispatch did not update state");
+if (service.resources.resources[0].config.root !== "updated-root") throw new Error("server resources did not refresh after update");
+const missing = await service.handle({{ method: "GET", path: "/missing" }});
+if (missing.status !== 404) throw new Error("missing route should return 404");
+
+function fileUrl(path) {{
+  return "file:///" + path.replace(/\\/g, "/").replace(/^([A-Za-z]):/, "$1:");
+}}
+"#,
+        module_path = json_string_for_test(&output.display().to_string())
+    );
+
+    let node = Command::new("node")
+        .arg("--input-type=module")
+        .arg("--eval")
+        .arg(script)
+        .output()
+        .expect("node should run");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+
+    assert!(
+        node.status.success(),
+        "generated server app failed under Node\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&node.stdout),
+        String::from_utf8_lossy(&node.stderr)
+    );
+}
+
+#[test]
 fn cli_build_app_requires_app_exports() {
     let temp_dir = temp_dir("closkell-cli-build-app-missing-exports");
     let _ = fs::remove_dir_all(&temp_dir);
@@ -1593,7 +1890,8 @@ fn cli_build_app_requires_app_exports() {
     );
     let output = combined_output(&run.stdout, &run.stderr);
     assert!(
-        output.contains("build --app expects") && output.contains("missing update, view"),
+        output.contains("build --app --target browser expects")
+            && output.contains("missing update, view"),
         "missing app exports were not reported clearly:\n{}",
         output
     );
@@ -1959,10 +2257,71 @@ fn cli_inspect_uses_persistent_cache_for_unchanged_module_graph() {
 }
 
 #[test]
+fn cli_cache_uses_cargo_workspace_root_without_package_root() {
+    let temp_dir = temp_dir("closkell-cli-cache-root-cargo-workspace");
+    let _ = fs::remove_dir_all(&temp_dir);
+    let fixture_dir = temp_dir.join("fixtures").join("hrweb");
+    fs::create_dir_all(&fixture_dir).expect("fixture dir should be created");
+    fs::write(temp_dir.join("Cargo.toml"), "[workspace]\n")
+        .expect("workspace marker should be written");
+    let source = fixture_dir.join("app.clsk");
+    fs::write(&source, "(def answer 42)\n").expect("source module should be written");
+
+    let check = Command::new(env!("CARGO_BIN_EXE_closkell"))
+        .arg("check")
+        .arg("--json")
+        .arg("--cache-debug")
+        .arg(&source)
+        .output()
+        .expect("closkell check --json should run");
+    assert!(
+        check.status.success(),
+        "check failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr)
+    );
+
+    let inspect = Command::new(env!("CARGO_BIN_EXE_closkell"))
+        .arg("inspect")
+        .arg("--cache-debug")
+        .arg(&source)
+        .output()
+        .expect("closkell inspect should run");
+    assert!(
+        inspect.status.success(),
+        "inspect failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&inspect.stdout),
+        String::from_utf8_lossy(&inspect.stderr)
+    );
+
+    let check_cache = temp_dir.join(".closkell").join("cache").join("check");
+    let inspect_cache = temp_dir.join(".closkell").join("cache").join("inspect");
+    assert!(
+        check_cache.is_dir(),
+        "check cache should use the Cargo workspace root"
+    );
+    assert!(
+        inspect_cache.is_dir(),
+        "inspect cache should use the Cargo workspace root"
+    );
+    assert!(
+        !fixture_dir.join(".closkell").exists(),
+        "cache should not be scattered under fixture folders"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
 fn cli_inspect_invalidates_cache_when_import_changes() {
     let temp_dir = temp_dir("closkell-cli-inspect-cache-invalidation");
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+    fs::write(
+        temp_dir.join("package.json"),
+        "{\"name\":\"inspect-cache-invalidation\"}\n",
+    )
+    .expect("package marker should be written");
     let api = temp_dir.join("api.clsk");
     let app = temp_dir.join("app.clsk");
     fs::write(&api, "(def answer 1)\n").expect("api module should be written");
@@ -2358,62 +2717,79 @@ fn cli_inspect_includes_imported_match_command_helper_schema() {
 
 #[test]
 fn cli_inspect_reports_hrweb_wrapped_panes_and_source_reads() {
-    let inspect = Command::new(env!("CARGO_BIN_EXE_closkell"))
-        .arg("inspect")
-        .arg(
-            workspace_root()
-                .join("projects")
-                .join("hrweb")
-                .join("src")
-                .join("app.clsk"),
-        )
-        .output()
-        .expect("closkell inspect should run");
+    let inspect_module = |module_name: &str| {
+        let inspect = Command::new(env!("CARGO_BIN_EXE_closkell"))
+            .arg("inspect")
+            .arg(
+                workspace_root()
+                    .join("projects")
+                    .join("hrweb")
+                    .join("src")
+                    .join(module_name),
+            )
+            .output()
+            .expect("closkell inspect should run");
 
-    assert!(
-        inspect.status.success(),
-        "closkell inspect failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&inspect.stdout),
-        String::from_utf8_lossy(&inspect.stderr)
-    );
+        assert!(
+            inspect.status.success(),
+            "closkell inspect failed for {}\nstdout:\n{}\nstderr:\n{}",
+            module_name,
+            String::from_utf8_lossy(&inspect.stdout),
+            String::from_utf8_lossy(&inspect.stderr)
+        );
 
-    let stdout = String::from_utf8_lossy(&inspect.stdout);
+        String::from_utf8(inspect.stdout).expect("inspect stdout should be valid utf-8")
+    };
+
+    let view_stdout = inspect_module("features/shell/index.clsk");
+    let stdout = view_stdout.as_str();
     for component in ["live-pane", "log-pane", "metrics-pane"] {
         assert!(
-            stdout.contains(&format!("\"name\":{}", json_string_for_test(component))),
-            "inspect did not include wrapped HRWeb pane `{}`:\n{}",
+            stdout.contains(&format!("\"imported\":{}", json_string_for_test(component)))
+                && stdout.contains(&format!("({} state)", component)),
+            "inspect did not report shell feature delegation to HRWeb pane `{}`:\n{}",
             component,
             stdout
         );
     }
-    assert!(
-        stdout.contains(
-            "\"component\":\"detail-pane\",\"uses\":[\"live-pane\",\"log-pane\",\"metrics-pane\"]"
-        ),
-        "inspect did not report detail-pane branch component dependencies:\n{}",
-        stdout
-    );
+    for (module_name, component) in [
+        ("features/session/index.clsk", "live-pane"),
+        ("features/logbook/index.clsk", "log-pane"),
+        ("features/metrics/index.clsk", "metrics-pane"),
+    ] {
+        let feature_stdout = inspect_module(module_name);
+        assert!(
+            feature_stdout.contains(&format!("\"name\":{}", json_string_for_test(component))),
+            "inspect did not report HRWeb pane `{}` in feature module {}:\n{}",
+            component,
+            module_name,
+            feature_stdout
+        );
+    }
     assert!(
         stdout.contains("\"path\":\"state.readings\"")
             && stdout.contains("\"template\":\"summary-stat-grid\""),
         "inspect did not map summary stat derived reads back to state.readings:\n{}",
         stdout
     );
+    let logbook_stdout = inspect_module("features/logbook/index.clsk");
     assert!(
-        stdout.contains("\"path\":\"state.entries\"")
-            && stdout.contains("\"template\":\"log-pane\""),
+        logbook_stdout.contains("\"path\":\"state.entries\"")
+            && logbook_stdout.contains("\"template\":\"log-pane\""),
         "inspect did not map log-pane derived reads back to state.entries:\n{}",
-        stdout
+        logbook_stdout
     );
+    let session_stdout = inspect_module("features/session/index.clsk");
     assert!(
-        stdout.contains("\"expr\":\"(latest-bpm-label state)\",\"reads\":[\"state.latestBpm\"]"),
+        session_stdout
+            .contains("\"expr\":\"(latest-bpm-label state)\",\"reads\":[\"state.latestBpm\"]"),
         "inspect did not project the live-pane helper read to state.latestBpm:\n{}",
-        stdout
+        session_stdout
     );
     assert!(
-        stdout.contains("\"expr\":\"(monitor-status-label state)\",\"reads\":[\"state.appStatus\",\"state.connected?\",\"state.simulated?\",\"state.statusMode\"]"),
+        session_stdout.contains("\"expr\":\"(monitor-status-label state)\",\"reads\":[\"state.appStatus\",\"state.connected?\",\"state.simulated?\",\"state.statusMode\"]"),
         "inspect did not project the connection helper reads to precise state paths:\n{}",
-        stdout
+        session_stdout
     );
     assert!(
         stdout.contains(
@@ -2430,27 +2806,44 @@ fn cli_inspect_reports_hrweb_wrapped_panes_and_source_reads() {
         "inspect leaked local summary bindings into HRWeb state reads:\n{}",
         stdout
     );
+
+    let messages_stdout = inspect_module("messages.clsk");
     assert!(
-        stdout.contains("\"name\":\"AppMsg\"") && stdout.contains(":monitor-connected"),
-        "inspect did not report the HRWeb message union:\n{}",
-        stdout
+        messages_stdout.contains("\"name\":\"AppMsg\"")
+            && messages_stdout
+                .contains("(Union ShellMsg SessionMsg ZonesMsg LogbookMsg MetricsMsg)"),
+        "inspect did not report the HRWeb composed message union:\n{}",
+        messages_stdout
     );
     assert!(
-        stdout.contains("\"name\":\"UpdateResult\"") && stdout.contains("[AppState (Cmd AppMsg)]"),
+        messages_stdout.contains("\"name\":\"UpdateResult\"")
+            && messages_stdout.contains("[AppState (Cmd AppMsg)]"),
         "inspect did not report the HRWeb update result type:\n{}",
-        stdout
+        messages_stdout
     );
+    let session_messages_stdout = inspect_module("features/session/messages.clsk");
+    assert!(
+        session_messages_stdout.contains("\"name\":\"SessionMsg\"")
+            && session_messages_stdout.contains(":monitor-connected"),
+        "inspect did not report HRWeb session-owned messages:\n{}",
+        session_messages_stdout
+    );
+
+    let app_stdout = inspect_module("app.clsk");
+    let stdout = app_stdout.as_str();
     assert!(
         stdout.contains("\"name\":\"update\"")
             && stdout.contains("(Fn [AppState AppMsg] UpdateResult)"),
         "inspect did not report the HRWeb update annotation:\n{}",
         stdout
     );
+
+    let shared_stdout = inspect_module("features/shared/workflow.clsk");
     assert!(
-        stdout.contains("\"name\":\"startup-command\",\"schema\":\"(Fn [] (Cmd")
-            && stdout.contains("\"annotated\":false"),
+        shared_stdout.contains("\"name\":\"startup-command\",\"schema\":\"(Fn [] (Cmd")
+            && shared_stdout.contains("\"annotated\":true"),
         "inspect did not report the inferred HRWeb startup command signature:\n{}",
-        stdout
+        shared_stdout
     );
     assert!(
         stdout.contains("\"kind\":\"storage/get\",\"fields\":[\"format\",\"key\",\"kind\",\"onError\",\"toMessage\"],\"sources\":[\"startup-command\"]"),
@@ -2458,18 +2851,18 @@ fn cli_inspect_reports_hrweb_wrapped_panes_and_source_reads() {
         stdout
     );
     assert!(
-        stdout.contains("\"kind\":\"canvas/draw\"")
-            && stdout.contains(
+        shared_stdout.contains("\"kind\":\"canvas/draw\"")
+            && shared_stdout.contains(
                 "\"sources\":[\"heart-chart-batch\",\"heart-chart-command\",\"metric-chart-batch\",\"metric-chart-command\"]"
             ),
         "inspect did not preserve imported chart command sources:\n{}",
-        stdout
+        shared_stdout
     );
     assert!(
-        stdout.contains("\"kind\":\"dom-ref/resize-watch\"")
-            && stdout.contains("\"sources\":[\"heart-chart-batch\",\"metric-chart-batch\"]"),
+        shared_stdout.contains("\"kind\":\"dom-ref/resize-watch\"")
+            && shared_stdout.contains("\"sources\":[\"heart-chart-batch\",\"metric-chart-batch\"]"),
         "inspect did not preserve imported chart resize sources:\n{}",
-        stdout
+        shared_stdout
     );
 }
 

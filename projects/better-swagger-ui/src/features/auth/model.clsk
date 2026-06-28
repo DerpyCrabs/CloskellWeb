@@ -1,0 +1,14 @@
+(import "../../messages.clsk" [AppMsg])
+
+(type AuthState
+  {:authDialog? Bool
+   :authorized? Bool
+   :pendingAuthOp (Option String)
+   :sourceUrl String
+   :authEntries Js
+   :authFormValues Js
+   :authLoadingScheme (Option String)
+   :authError (Option String)})
+
+(type AuthUpdateResult
+  [AuthState (Cmd AppMsg)])

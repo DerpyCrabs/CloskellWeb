@@ -1,0 +1,166 @@
+(import "../../log.clsk" [selected-log duration-label])
+(import "../../metrics.clsk" [stat-value average-bpm min-bpm max-bpm])
+(import "../../model.clsk" [HeartReading HeartZone WorkoutEntry MonitorInfo JsonPayload HeartChartRect WindowEventPayload])
+(import "../../messages.clsk" [AppMsg])
+(import "./model.clsk" [ShellState ShellUpdateResult])
+(import "../../ui-effects.clsk" [no-cmd])
+(import "../shared/workflow.clsk" [active-chart-command active-chart-batch active-chart-batch-result active-chart-result set-status])
+(import "../shared/style.clsk" [card-class stat-tile-class])
+(import "../session/index.clsk" [monitor-card live-pane])
+(import "../logbook/index.clsk" [log-pane selected-log-value])
+(import "../metrics/index.clsk" [metrics-pane])
+(import "../zones/summary.clsk" [live-stats-entry-from])
+
+(ann try-shell-update (Fn [ShellState AppMsg] (Option ShellUpdateResult)))
+(defn try-shell-update [state msg]
+  (match msg
+    {:kind :media-changed :matches matches}
+      (active-chart-batch-result (merge state {:mobile? matches}))
+    {:kind :chart-resized :width width :height height}
+      (active-chart-result (merge state {:chartWidth width :chartHeight height}))
+    {:kind :chart-error :error error}
+      (no-cmd (merge state {:message error}))
+    {:kind :select-tab :view view}
+      (active-chart-batch-result (merge state {:detailView view}))
+    _ nil))
+
+(ann shell-subscriptions (Fn [ShellState] (Sub AppMsg)))
+(defn shell-subscriptions [state]
+  (Sub.batch
+    [(Sub.media-query "mobile" "(max-width: 700px)" :media-changed)
+     (if state.dev?
+         (Sub.window/event-with "dev-hotkey"
+                                "keydown"
+                                :dev-key
+                                {:preventDefault {:key "h"
+                                                  :ctrlKey true
+                                                  :shiftKey true
+                                                  :altKey false
+                                                  :metaKey false}})
+         Sub.none)]))
+
+(defn tab-class [state view]
+  (str "tab min-h-9 rounded-md px-3 text-[0.9rem] font-extrabold "
+       (if (= state.detailView view)
+           "bg-white text-[#172019] shadow-sm"
+           "text-[#617066]")))
+
+(defn tab-button [state view label]
+  #html <button type="button"
+                class={(tab-class state view)}
+                data-active={(= state.detailView view)}
+                on:click={{:kind :select-tab
+                           :view view}}>{label}</button>)
+
+(defn desktop-tab-strip [state]
+  #html <div id="chart-title"
+              class="tabs grid grid-cols-3 rounded-lg border border-[#dbe2dc] bg-[#fbfcfb] p-1"
+              data-testid="exercise-tabs-desktop"
+              aria-label="Exercise view">
+          {(tab-button state "live" "Live")}
+          {(tab-button state "log" "Log")}
+          {(tab-button state "metrics" "Metrics")}
+        </div>)
+
+(defn mobile-tab-strip [state]
+  #html <div class="tabs mt-2 grid grid-cols-3 rounded-lg border border-[#dbe2dc] bg-[#fbfcfb] p-1"
+              data-testid="exercise-tabs-mobile"
+              aria-label="Exercise view">
+          {(tab-button state "live" "Live")}
+          {(tab-button state "log" "Log")}
+          {(tab-button state "metrics" "Metrics")}
+        </div>)
+
+(defn summary-stat-tile-class [state]
+  (str stat-tile-class
+       " summary-stat-tile "
+       (if state.mobile?
+           "!min-w-0 !p-[5px_6px] text-left [&_span]:text-[1.05rem] [&_span]:font-extrabold [&_span]:tabular-nums [&_small]:text-[0.68rem] [&_small]:whitespace-nowrap"
+           "w-20 [&_span]:text-[1.1rem] [&_span]:font-extrabold [&_span]:tabular-nums [&_span]:whitespace-nowrap")))
+
+(defn summary-stat-tile [state label value]
+  #html <div class={(summary-stat-tile-class state)}>
+          <span class="block">{value}</span>
+          <small class="block font-bold text-[#617066]">{label}</small>
+        </div>)
+
+
+(defn display-stats-entry [detail-view entries selected-log-id display-elapsed-ms readings target-zone-id zones active-exercise-type]
+  (if (= detail-view "log")
+      (selected-log-value (selected-log entries selected-log-id))
+      (live-stats-entry-from display-elapsed-ms
+                             readings
+                             target-zone-id
+                             zones
+                             active-exercise-type)))
+
+(defn summary-stat-grid [state]
+  (let [entry (display-stats-entry state.detailView
+                                   state.entries
+                                   state.selectedLogId
+                                   state.displayElapsedMs
+                                   state.readings
+                                   state.targetZoneId
+                                   state.zones
+                                   state.activeExerciseType)]
+    #html <div class={(str "grid grid-cols-4 gap-2 "
+                           (if state.mobile? "!w-full !grid-cols-4 !gap-1" ""))}
+               data-testid="summary-stats">
+            {(summary-stat-tile state "Time" (duration-label entry.durationMs))}
+            {(summary-stat-tile state "Min HR" (stat-value (min-bpm entry.readings)))}
+            {(summary-stat-tile state "Avg HR" (stat-value (average-bpm entry.readings)))}
+            {(summary-stat-tile state "Max HR" (stat-value (max-bpm entry.readings)))}
+          </div>))
+
+(defn detail-content-class [state]
+  (str "workspace-content mt-5 min-h-[617px] min-w-0 "
+       (if state.mobile? "!mt-2 !min-h-[520px]" "")))
+
+(defn metrics-content-class [state]
+  (str (detail-content-class state)
+       (if state.mobile?
+           " overflow-x-hidden"
+           " max-h-[617px] overflow-y-auto")))
+
+(defn detail-pane [state]
+  #html <div class={(if (= state.detailView "metrics")
+                        (metrics-content-class state)
+                        (detail-content-class state))}
+              data-testid={(if (= state.detailView "metrics")
+                              "metrics-content"
+                              "detail-content")}>
+          {(if (= state.detailView "live")
+              (live-pane state)
+              (if (= state.detailView "metrics")
+                  (metrics-pane state)
+                  (log-pane state)))}
+        </div>)
+
+(ann view (Fn [ShellState] Html))
+(defn view [state]
+  #html <div class="min-h-screen bg-[radial-gradient(circle_at_top_left,rgba(217,24,75,0.13),transparent_30rem),linear-gradient(145deg,#f6f7f4_0%,#eef4f2_45%,#faf7f2_100%)] text-[#172019]"
+             data-testid="hrweb-app"
+             data-state={state.exerciseState}
+             data-status={state.statusMode}
+             data-message={state.message}
+             data-mobile={state.mobile?}>
+          <main class={(str "dashboard mx-auto grid w-[min(1180px,calc(100vw-32px))] grid-cols-[minmax(300px,390px)_1fr] gap-[18px] py-8 max-[820px]:grid-cols-1 max-[820px]:py-[18px] "
+                            (if state.mobile? "!w-[calc(100vw-14px)] !gap-2 !py-2" ""))}>
+            {(monitor-card state)}
+            <section class={(str card-class " workspace min-w-0 p-[22px] "
+                                 (if state.mobile? "!p-[8px_8px_10px]" ""))} aria-labelledby="chart-title">
+              <div class={(str "topbar flex items-start justify-between gap-4 "
+                               (if state.mobile? "!block" ""))}
+                   data-testid="workspace-topbar">
+                {(if state.mobile?
+                     #html <div class="hidden"></div>
+                     #html <div>{(desktop-tab-strip state)}</div>)}
+                {(summary-stat-grid state)}
+              </div>
+              {(if state.mobile?
+                   #html <div>{(mobile-tab-strip state)}</div>
+                   #html <div class="hidden"></div>)}
+              {(detail-pane state)}
+            </section>
+          </main>
+        </div>)

@@ -1,0 +1,25 @@
+(import "../../model.clsk" [WorkoutEntry])
+(import "../../messages.clsk" [AppMsg])
+
+(type LogbookState
+  {:appStatus String
+   :message String
+   :statusMode String
+   :mobile? Bool
+   :exerciseState String
+   :elapsedMs Number
+   :idleStartedAt (Option Number)
+   :readings (Vector {:bpm Number :time Number})
+   :entries (Vector WorkoutEntry)
+   :selectedLogId (Option String)
+   :logTypeFilter String
+   :typeDraft String
+   :typePickerEntryId (Option String)
+   :typePickerDraft String
+   :deleteHold? Bool
+   :deleteHoldStartedAt Number
+   :deleteHoldProgress Number
+   :importStatus String})
+
+(type LogbookUpdateResult
+  [LogbookState (Cmd AppMsg)])

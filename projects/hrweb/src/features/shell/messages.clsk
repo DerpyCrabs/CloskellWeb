@@ -1,0 +1,10 @@
+(import "../../model.clsk" [HeartChartRect WindowEventPayload])
+
+(type ShellMsg
+  (Union
+    {:kind :media-changed :id String :media String :matches Bool}
+    {:kind :chart-resized :id String :ref String :x Number :y Number :width Number :height Number :top Number :right Number :bottom Number :left Number :value HeartChartRect}
+    {:kind :chart-error :error String}
+    {:kind :dev-key :id String :value WindowEventPayload}
+    {:kind :dev-opened}
+    {:kind :select-tab :view String}))

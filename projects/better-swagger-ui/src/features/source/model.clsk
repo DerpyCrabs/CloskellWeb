@@ -1,0 +1,44 @@
+(import "../../messages.clsk" [AppMsg])
+
+(type Definition
+  {:name String
+   :url String})
+
+(type SourceState
+  {:input String
+   :loading? Bool
+   :error (Option String)
+   :spec Js
+   :expandedOp (Option String)
+   :expandedTags (Set String)
+   :tryActiveOp (Option String)
+   :executingOp (Option String)
+   :definitions (Vector Definition)
+   :selectedDefinition String
+   :currentUrl String
+   :sourceUrl String
+   :specUrl String
+   :pendingDefinition String
+   :pendingDefinitions (Vector Definition)
+   :pendingSelectedDefinition String
+   :pendingSourceUrl String
+   :pendingSpecUrl String
+   :discoveryQueue (Vector Js)
+   :discoveryActiveEntry Js
+   :oauthInit Js
+   :routeOp (Option String)
+   :theme String
+   :responses Js
+   :paramValues Js
+   :bodyValues Js
+   :requestBodyFiles Js
+   :multipartFiles Js
+   :formError (Option String)
+   :authEntries Js
+   :authFormValues Js
+   :authLoadingScheme (Option String)
+   :authError (Option String)
+   :authorized? Bool})
+
+(type SourceUpdateResult
+  [SourceState (Cmd AppMsg)])

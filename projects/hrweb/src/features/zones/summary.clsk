@@ -1,0 +1,58 @@
+(import "../../metrics.clsk" [zone-display-stats])
+(defn format-zone-duration [duration-ms]
+  (if (<= duration-ms 0)
+      "0:00"
+      (let [total-seconds (floor (/ duration-ms 1000))
+            hours (floor (/ total-seconds 3600))
+            minutes (floor (/ (mod total-seconds 3600) 60))
+            seconds (mod total-seconds 60)]
+        (if (> hours 0)
+            (str hours
+                 ":"
+                 (pad-start (str minutes) 2 "0")
+                 ":"
+                 (pad-start (str seconds) 2 "0"))
+            (str minutes ":" (pad-start (str seconds) 2 "0"))))))
+
+(defn live-stats-entry-from [display-elapsed-ms readings target-zone-id zones active-exercise-type]
+  {:id "live"
+   :startedAt 0
+   :stoppedAt 0
+   :durationMs display-elapsed-ms
+   :readings readings
+   :targetZoneId target-zone-id
+   :zones zones
+   :exerciseType active-exercise-type
+   :hiddenAt nil})
+
+(defn live-stats-entry [state]
+  (live-stats-entry-from state.displayElapsedMs
+                         state.readings
+                         state.targetZoneId
+                         state.zones
+                         state.activeExerciseType))
+
+(defn zone-time-card [item mobile?]
+  #html <div class={(str "zone-time-card min-w-0 rounded-lg border border-[#dbe2dc] bg-[#fbfcfb] p-2 "
+                         (if mobile? "!p-[5px_6px]" ""))}
+              data-testid={(str "zone-time-" item.id)}
+              data-percent={item.percent}>
+          <div class="zone-time-meter mb-1 h-1.5 overflow-hidden rounded-full bg-[#e5ebe6]">
+            <span class="block h-full rounded-full"
+                  style={{:width (str item.percent "%")
+                          :background item.color}}></span>
+          </div>
+          <strong class={(str "block truncate font-extrabold tabular-nums "
+                              (if mobile? "text-[0.82rem]" "text-[0.95rem]"))}>{(format-zone-duration item.durationMs)}</strong>
+          <small class={(str "block truncate font-bold text-[#617066] "
+                             (if mobile? "text-[0.62rem]" "text-[0.72rem]"))}>{item.name}</small>
+        </div>)
+
+(defn zone-time-stats [stats mobile?]
+  #html <div class={(str "zone-time-stats mt-3 grid grid-cols-5 gap-2 "
+                         (if mobile? "!mt-2 !gap-1" ""))}
+              data-testid="zone-time-stats"
+              aria-label="Time in heart rate zones">
+          {(for [item stats :key item.id]
+             #html <div>{(zone-time-card item mobile?)}</div>)}
+        </div>)

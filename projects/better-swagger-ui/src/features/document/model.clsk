@@ -1,0 +1,24 @@
+(import "../../messages.clsk" [AppMsg])
+(import "../source/model.clsk" [Definition])
+
+(type DocumentState
+  {:currentUrl String
+   :spec Js
+   :specUrl String
+   :expandedOp (Option String)
+   :expandedTags (Set String)
+   :tryActiveOp (Option String)
+   :definitions (Vector Definition)
+   :selectedDefinition String
+   :oauthInit Js
+   :authEntries Js
+   :responses Js
+   :paramValues Js
+   :bodyValues Js
+   :requestBodyFiles Js
+   :multipartFiles Js
+   :formError (Option String)
+   :executingOp (Option String)})
+
+(type DocumentUpdateResult
+  [DocumentState (Cmd AppMsg)])

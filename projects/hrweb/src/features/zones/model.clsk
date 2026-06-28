@@ -1,0 +1,19 @@
+(import "../../model.clsk" [HeartZone])
+(import "../../messages.clsk" [AppMsg])
+
+(type ZonesState
+  {:appStatus String
+   :message String
+   :statusMode String
+   :mobile? Bool
+   :targetZoneId Number
+   :zones (Vector HeartZone)
+   :zoneTrackLeft Number
+   :zoneTrackWidth Number
+   :zoneDragIndex (Option Number)
+   :zoneStatus String
+   :chartWidth Number
+   :chartHeight Number})
+
+(type ZonesUpdateResult
+  [ZonesState (Cmd AppMsg)])

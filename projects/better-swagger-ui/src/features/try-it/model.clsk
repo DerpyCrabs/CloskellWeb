@@ -1,0 +1,20 @@
+(import "../../messages.clsk" [AppMsg])
+
+(type TryItState
+  {:currentUrl String
+   :sourceUrl String
+   :spec Js
+   :oauthInit Js
+   :expandedOp (Option String)
+   :tryActiveOp (Option String)
+   :executingOp (Option String)
+   :responses Js
+   :paramValues Js
+   :bodyValues Js
+   :requestBodyFiles Js
+   :multipartFiles Js
+   :formError (Option String)
+   :authEntries Js})
+
+(type TryItUpdateResult
+  [TryItState (Cmd AppMsg)])

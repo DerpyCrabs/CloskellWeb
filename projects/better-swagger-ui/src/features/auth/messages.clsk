@@ -1,0 +1,10 @@
+(type AuthMsg
+  (Union
+    {:kind :open-auth :id String}
+    {:kind :close-auth}
+    {:kind :auth-input :scheme Js :field String :value String}
+    {:kind :authorize-scheme :scheme Js}
+    {:kind :oauth-token-loaded :schemeId String :value Js}
+    {:kind :auth-failed :error String}
+    {:kind :logout-scheme :scheme Js}
+    {:kind :logout}))

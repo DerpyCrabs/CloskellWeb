@@ -239,11 +239,6 @@ function parseTestHtmlFragment(value, documentRef) {
     const token = tokens[tokenIndex];
     const parent = stack[stack.length - 1];
     if (token.startsWith("<!--")) {
-      if (/^\s*$/.test(tokens[tokenIndex + 1] || "") && (tokens[tokenIndex + 2] || "").startsWith("<!--")) {
-        parent.appendChild(createRuntimeTextNode(documentRef, ""));
-        tokenIndex += 2;
-        continue;
-      }
       parent.appendChild(createRuntimeTextNode(documentRef, ""));
       continue;
     }
@@ -301,6 +296,7 @@ function ensureRuntimeDocument() {
   }
   const listeners = {};
   const documentRef = {
+    __closkellTestDocument: true,
     createElement(tagName) {
       const element = new CloskellTestElement(tagName, documentRef);
       if (String(tagName).toLowerCase() === "template") {
@@ -541,12 +537,7 @@ export function createTemplateComponent(definition) {
 
   const disposeInstance = (current) => {
     if (!current) return;
-    if (current.__closkellTemplateReported) {
-      emitDispatchDevtools(lastDispatch, {
-        type: "template/dispose",
-        name: definition.name
-      });
-    }
+    reportTemplateDispose(current, lastDispatch, definition);
     disposeEventSlots(current);
     disposeRefs(current);
     for (const slot of current.keyedSlots) {
@@ -578,6 +569,10 @@ export function createTemplateComponent(definition) {
     update(dispatch = lastDispatch, updateContext = null) {
       lastDispatch = dispatch || lastDispatch;
       const current = ensureInstance();
+      if (!updateContext) {
+        definition.update(current, lastDispatch, null);
+        return current.root;
+      }
       reportTemplateMount(current, lastDispatch, definition);
       const frame = beginTemplateUpdate(updateContext, definition);
       definition.update(current, lastDispatch, updateContext);
@@ -617,6 +612,7 @@ export function createCompiledTemplateComponent(definition) {
 
   const disposeInstance = (current, detached = false) => {
     if (!current) return;
+    reportTemplateDispose(current, lastDispatch, definition);
     disposeEventSlots(current, detached);
     disposeRefs(current);
     for (const slot of current.keyedSlots) {
@@ -629,20 +625,32 @@ export function createCompiledTemplateComponent(definition) {
   };
 
   return {
-    mount(parent, dispatch = lastDispatch) {
+    mount(parent, dispatch = lastDispatch, hydrateNode = null) {
       lastDispatch = dispatch || lastDispatch;
       const current = ensureInstance();
       if (!current.mounted) {
-        parent.appendChild(current.root);
+        if (hydrateNode && claimHydratedTemplateInstance(current, definition, hydrateNode)) {
+          if (current.root.parentNode !== parent) parent.appendChild(current.root);
+        } else {
+          parent.appendChild(current.root);
+        }
         current.mounted = true;
       }
+      reportTemplateMount(current, lastDispatch, definition);
       definition.update(current, lastDispatch, null);
       return current.root;
     },
     update(dispatch = lastDispatch, updateContext = null) {
       lastDispatch = dispatch || lastDispatch;
       const current = ensureInstance();
+      if (!updateContext) {
+        definition.update(current, lastDispatch, null);
+        return current.root;
+      }
+      reportTemplateMount(current, lastDispatch, definition);
+      const frame = beginTemplateUpdate(updateContext, definition);
       definition.update(current, lastDispatch, updateContext);
+      endTemplateUpdate(updateContext, frame);
       return current.root;
     },
     dispose(detached = false) {
@@ -651,13 +659,21 @@ export function createCompiledTemplateComponent(definition) {
     },
     get root() {
       return ensureInstance().root;
+    },
+    get definition() {
+      return definition;
     }
   };
 }
 
-function createCompiledHtmlTemplateComponentFromShape(shape, update) {
+function createCompiledHtmlTemplateComponentFromShape(shape, update, metadata = {}) {
   const cloneTemplate = shape.cloneTemplate;
   const nodePaths = shape.nodePaths;
+  const definition = {
+    name: metadata.name || "template",
+    slots: Array.isArray(metadata.slots) ? metadata.slots : [],
+    params: Array.isArray(metadata.params) ? metadata.params : []
+  };
   let instance = null;
   let lastDispatch = () => {};
 
@@ -672,7 +688,8 @@ function createCompiledHtmlTemplateComponentFromShape(shape, update) {
         keyedSlots: [],
         conditionalSlots: [],
         componentSlots: [],
-        refSlots: []
+        refSlots: [],
+        definition
       };
     }
     return instance;
@@ -680,6 +697,7 @@ function createCompiledHtmlTemplateComponentFromShape(shape, update) {
 
   const disposeInstance = (current, detached = false) => {
     if (!current) return;
+    reportTemplateDispose(current, lastDispatch, definition);
     disposeEventSlots(current, detached);
     disposeRefs(current);
     for (const slot of current.keyedSlots) {
@@ -692,20 +710,32 @@ function createCompiledHtmlTemplateComponentFromShape(shape, update) {
   };
 
   return {
-    mount(parent, dispatch = lastDispatch) {
+    mount(parent, dispatch = lastDispatch, hydrateNode = null) {
       lastDispatch = dispatch || lastDispatch;
       const current = ensureInstance();
-      update(current, lastDispatch);
       if (!current.mounted) {
-        parent.appendChild(current.root);
+        if (hydrateNode && claimHydratedTemplateInstance(current, definition, hydrateNode)) {
+          if (current.root.parentNode !== parent) parent.appendChild(current.root);
+        } else {
+          parent.appendChild(current.root);
+        }
         current.mounted = true;
       }
+      reportTemplateMount(current, lastDispatch, definition);
+      update(current, lastDispatch, null);
       return current.root;
     },
-    update(dispatch = lastDispatch) {
+    update(dispatch = lastDispatch, updateContext = null) {
       lastDispatch = dispatch || lastDispatch;
       const current = ensureInstance();
-      update(current, lastDispatch);
+      if (!updateContext) {
+        update(current, lastDispatch, null);
+        return current.root;
+      }
+      reportTemplateMount(current, lastDispatch, definition);
+      const frame = beginTemplateUpdate(updateContext, definition);
+      update(current, lastDispatch, updateContext);
+      endTemplateUpdate(updateContext, frame);
       return current.root;
     },
     dispose(detached = false) {
@@ -714,16 +744,19 @@ function createCompiledHtmlTemplateComponentFromShape(shape, update) {
     },
     get root() {
       return ensureInstance().root;
+    },
+    get definition() {
+      return definition;
     }
   };
 }
 
-export function createCompiledHtmlTemplateComponent(html, paths, update) {
-  return createCompiledHtmlTemplateComponentFromShape(compiledHtmlTemplateShape(html, paths), update);
+export function createCompiledHtmlTemplateComponent(html, paths, update, metadata = {}) {
+  return createCompiledHtmlTemplateComponentFromShape(compiledHtmlTemplateShape(html, paths), update, metadata);
 }
 
-export function createBrowserCompiledHtmlTemplateComponent(html, paths, update) {
-  return createCompiledHtmlTemplateComponentFromShape(browserCompiledHtmlTemplateShape(html, paths), update);
+export function createBrowserCompiledHtmlTemplateComponent(html, paths, update, metadata = {}) {
+  return createCompiledHtmlTemplateComponentFromShape(browserCompiledHtmlTemplateShape(html, paths), update, metadata);
 }
 
 function createCompiledHtmlTemplateFactory(html) {
@@ -795,7 +828,9 @@ function compiledHtmlTemplateNode(root, path) {
   let node = root;
   for (let index = 0; index < path.length; index += 1) {
     const children = node.childNodes || node.children;
-    node = children[path[index]] ?? (children.length === 1 ? children[0] : undefined);
+    node = children[path[index]]
+      ?? (children.length === 1 ? children[0] : undefined)
+      ?? (children.length === path[index] ? children[children.length - 1] : undefined);
   }
   return node;
 }
@@ -813,53 +848,65 @@ export function bindCompiledComponent(component, arity, bind) {
   if (arity === 1) {
     return {
       __closkellArity: arity,
-      mount(parent, dispatch) {
-        return component.mount(parent, dispatch);
+      mount(parent, dispatch, hydrateNode = null) {
+        return component.mount(parent, dispatch, hydrateNode);
       },
-      update(value, dispatch) {
+      update(value, dispatch, updateContext = null) {
         if (bind) bind(value, dispatch);
-        return component.update(dispatch);
+        return component.update(dispatch, updateContext);
       },
       dispose(detached = false) {
         component.dispose(detached);
       },
       get root() {
         return component.root;
+      },
+      get definition() {
+        return component.definition;
       }
     };
   }
   if (arity === 2) {
     return {
       __closkellArity: arity,
-      mount(parent, dispatch) {
-        return component.mount(parent, dispatch);
+      mount(parent, dispatch, hydrateNode = null) {
+        return component.mount(parent, dispatch, hydrateNode);
       },
-      update(value, index, dispatch) {
+      update(value, index, dispatch, updateContext = null) {
         if (bind) bind(value, index, dispatch);
-        return component.update(dispatch);
+        return component.update(dispatch, updateContext);
       },
       dispose(detached = false) {
         component.dispose(detached);
       },
       get root() {
         return component.root;
+      },
+      get definition() {
+        return component.definition;
       }
     };
   }
   return {
     __closkellArity: arity,
-    mount(parent, dispatch) {
-      return component.mount(parent, dispatch);
+    mount(parent, dispatch, hydrateNode = null) {
+      return component.mount(parent, dispatch, hydrateNode);
     },
     update(...args) {
-      if (bind) bind(...args);
-      return component.update(args[args.length - 1]);
+      const values = args.slice(0, arity);
+      const dispatch = args[arity] ?? args.at(-1);
+      const updateContext = args.length > arity + 1 ? args[arity + 1] : null;
+      if (bind) bind(...values, dispatch);
+      return component.update(dispatch, updateContext);
     },
     dispose(detached = false) {
       component.dispose(detached);
     },
     get root() {
       return component.root;
+    },
+    get definition() {
+      return component.definition;
     }
   };
 }
@@ -869,6 +916,10 @@ export function shouldUpdateSlot(instance, slot, updateContext) {
   const shouldUpdate = shouldUpdateSlotForReads(slotMetadata.reads || [], updateContext);
   recordTemplateSlot(updateContext, slotMetadata, shouldUpdate);
   return shouldUpdate;
+}
+
+function shouldApplyCompiledSlot(instance, slot, updateContext) {
+  return !updateContext || shouldUpdateSlot(instance, slot, updateContext);
 }
 
 export function shouldUpdateCompiledSlot(reads, updateContext) {
@@ -881,7 +932,8 @@ function claimHydratedTemplateInstance(instance, definition, hydrateNode) {
   if (!templateName || templateName !== definition.name) return false;
 
   const nodeMap = new Map();
-  if (!claimHydratedTree(instance.root, hydrateNode, nodeMap)) return false;
+  const usedNodes = new Set((instance.nodes || []).filter(Boolean));
+  if (!claimHydratedTree(instance.root, hydrateNode, nodeMap, usedNodes)) return false;
 
   instance.root = hydrateNode;
   instance.nodes = (instance.nodes || []).map((node) => nodeMap.get(node) || node);
@@ -889,26 +941,40 @@ function claimHydratedTemplateInstance(instance, definition, hydrateNode) {
   return true;
 }
 
-function claimHydratedTree(blueprint, existing, nodeMap) {
+function claimHydratedTree(blueprint, existing, nodeMap, usedNodes) {
   if (!hydrationNodesCompatible(blueprint, existing)) return false;
   nodeMap.set(blueprint, existing);
 
   const blueprintChildren = Array.from(blueprint?.childNodes || blueprint?.children || []);
   const existingChildren = Array.from(existing?.childNodes || existing?.children || []);
-  if (blueprintChildren.length !== existingChildren.length) return false;
 
-  for (let index = 0; index < blueprintChildren.length; index += 1) {
-    if (!claimHydratedTree(blueprintChildren[index], existingChildren[index], nodeMap)) {
+  let existingIndex = 0;
+  for (const blueprintChild of blueprintChildren) {
+    if (canSkipHydrationBlueprintNode(blueprintChild, usedNodes)) continue;
+    const existingChild = existingChildren[existingIndex];
+    if (!claimHydratedTree(blueprintChild, existingChild, nodeMap, usedNodes)) {
       return false;
     }
+    existingIndex += 1;
   }
-  return true;
+  while (existingIndex < existingChildren.length && isIgnorableHydrationNode(existingChildren[existingIndex])) {
+    existingIndex += 1;
+  }
+  return existingIndex === existingChildren.length;
 }
 
 function hydrationNodesCompatible(blueprint, existing) {
   if (!blueprint || !existing || blueprint.nodeType !== existing.nodeType) return false;
   if (blueprint.nodeType !== 1) return true;
   return String(blueprint.tagName || "").toLowerCase() === String(existing.tagName || "").toLowerCase();
+}
+
+function canSkipHydrationBlueprintNode(node, usedNodes) {
+  return isIgnorableHydrationNode(node) && !usedNodes.has(node);
+}
+
+function isIgnorableHydrationNode(node) {
+  return node?.nodeType === 3 && String(node.nodeValue ?? "") === "";
 }
 
 function shouldUpdateSlotForReads(reads, updateContext) {
@@ -956,6 +1022,7 @@ function recordTemplateSlot(updateContext, slot, updated) {
 }
 
 function reportTemplateMount(instance, dispatch, definition) {
+  if (!dispatch?.__closkellDevtools) return;
   if (instance.__closkellTemplateReported) return;
   instance.__closkellTemplateReported = true;
   emitDispatchDevtools(dispatch, {
@@ -965,7 +1032,18 @@ function reportTemplateMount(instance, dispatch, definition) {
   });
 }
 
-export function setText(instance, slot, node, value) {
+function reportTemplateDispose(instance, dispatch, definition) {
+  if (!dispatch?.__closkellDevtools) return;
+  if (!instance.__closkellTemplateReported || instance.__closkellTemplateDisposed) return;
+  instance.__closkellTemplateDisposed = true;
+  emitDispatchDevtools(dispatch, {
+    type: "template/dispose",
+    name: definition.name
+  });
+}
+
+export function setText(instance, slot, node, value, updateContext = null) {
+  if (!shouldApplyCompiledSlot(instance, slot, updateContext)) return;
   const next = value == null ? "" : String(value);
   if (instance.values[slot] === next) return;
   instance.values[slot] = next;
@@ -1016,7 +1094,8 @@ export function setAttr(instance, slot, node, name, value) {
   if (!isSvg && name in node) setDomProperty(node, name, value);
 }
 
-export function setCompiledAttr(instance, slot, node, name, value) {
+export function setCompiledAttr(instance, slot, node, name, value, updateContext = null) {
+  if (!shouldApplyCompiledSlot(instance, slot, updateContext)) return;
   const previous = instance.values[slot];
   if (previous === value) return;
   instance.values[slot] = value;
@@ -1038,14 +1117,16 @@ export function setCompiledAttr(instance, slot, node, name, value) {
   if (!isSvg && name in node) setDomProperty(node, name, value);
 }
 
-export function setCompiledTextAttr(instance, slot, node, name, value) {
+export function setCompiledTextAttr(instance, slot, node, name, value, updateContext = null) {
+  if (!shouldApplyCompiledSlot(instance, slot, updateContext)) return;
   const next = String(value);
   if (instance.values[slot] === next) return;
   instance.values[slot] = next;
   node.setAttribute(name, next);
 }
 
-export function setCompiledNullableTextAttr(instance, slot, node, name, value) {
+export function setCompiledNullableTextAttr(instance, slot, node, name, value, updateContext = null) {
+  if (!shouldApplyCompiledSlot(instance, slot, updateContext)) return;
   const next = value == null ? null : String(value);
   if (instance.values[slot] === next) return;
   instance.values[slot] = next;
@@ -1053,7 +1134,8 @@ export function setCompiledNullableTextAttr(instance, slot, node, name, value) {
   else node.setAttribute(name, next);
 }
 
-export function setCompiledTextProperty(instance, slot, node, name, value) {
+export function setCompiledTextProperty(instance, slot, node, name, value, updateContext = null) {
+  if (!shouldApplyCompiledSlot(instance, slot, updateContext)) return;
   const next = String(value);
   if (instance.values[slot] === next) return;
   instance.values[slot] = next;
@@ -1061,7 +1143,8 @@ export function setCompiledTextProperty(instance, slot, node, name, value) {
   node[name] = next;
 }
 
-export function setCompiledNullableTextProperty(instance, slot, node, name, value) {
+export function setCompiledNullableTextProperty(instance, slot, node, name, value, updateContext = null) {
+  if (!shouldApplyCompiledSlot(instance, slot, updateContext)) return;
   const next = value == null ? null : String(value);
   if (instance.values[slot] === next) return;
   instance.values[slot] = next;
@@ -1074,7 +1157,8 @@ export function setCompiledNullableTextProperty(instance, slot, node, name, valu
   }
 }
 
-export function setCompiledPresenceAttr(instance, slot, node, name, value) {
+export function setCompiledPresenceAttr(instance, slot, node, name, value, updateContext = null) {
+  if (!shouldApplyCompiledSlot(instance, slot, updateContext)) return;
   const next = Boolean(value);
   if (instance.values[slot] === next) return;
   instance.values[slot] = next;
@@ -1082,7 +1166,8 @@ export function setCompiledPresenceAttr(instance, slot, node, name, value) {
   else node.removeAttribute(name);
 }
 
-export function setCompiledBooleanProperty(instance, slot, node, name, value) {
+export function setCompiledBooleanProperty(instance, slot, node, name, value, updateContext = null) {
+  if (!shouldApplyCompiledSlot(instance, slot, updateContext)) return;
   const next = Boolean(value);
   if (instance.values[slot] === next) return;
   instance.values[slot] = next;
@@ -1091,7 +1176,8 @@ export function setCompiledBooleanProperty(instance, slot, node, name, value) {
   node[name] = next;
 }
 
-export function setCompiledClassName(instance, slot, node, value) {
+export function setCompiledClassName(instance, slot, node, value, updateContext = null) {
+  if (!shouldApplyCompiledSlot(instance, slot, updateContext)) return;
   const next = String(value);
   if (instance.values[slot] === next) return;
   instance.values[slot] = next;
@@ -1100,7 +1186,8 @@ export function setCompiledClassName(instance, slot, node, value) {
   node.className = next;
 }
 
-export function setCompiledClass(instance, slot, node, value) {
+export function setCompiledClass(instance, slot, node, value, updateContext = null) {
+  if (!shouldApplyCompiledSlot(instance, slot, updateContext)) return;
   const previous = instance.values[slot];
   if (previous === value) return;
   instance.values[slot] = value;
@@ -1118,7 +1205,8 @@ export function setCompiledClass(instance, slot, node, value) {
   if ("className" in node) node.className = className;
 }
 
-export function setCompiledStyle(instance, slot, node, value) {
+export function setCompiledStyle(instance, slot, node, value, updateContext = null) {
+  if (!shouldApplyCompiledSlot(instance, slot, updateContext)) return;
   const previous = instance.values[slot];
   if (previous === value) return;
   instance.values[slot] = value;
@@ -1135,7 +1223,8 @@ export function setCompiledStyle(instance, slot, node, value) {
   if (node.style) node.style.cssText = String(value);
 }
 
-export function setCompiledStyleRecord(instance, slot, node, value) {
+export function setCompiledStyleRecord(instance, slot, node, value, updateContext = null) {
+  if (!shouldApplyCompiledSlot(instance, slot, updateContext)) return;
   const previous = instance.values[slot];
   if (previous === value) return;
   instance.values[slot] = value;
@@ -1216,6 +1305,7 @@ function appendClassTokens(value, tokens) {
 }
 
 function classTokenName(value) {
+  if (typeof value === "symbol") return Symbol.keyFor(value) || value.description || "";
   return String(value);
 }
 
@@ -1297,6 +1387,7 @@ function jsStylePropertyName(name) {
 }
 
 function stylePropertyName(name) {
+  if (typeof name === "symbol") return Symbol.keyFor(name) || name.description || String(name);
   return String(name);
 }
 
@@ -1322,7 +1413,8 @@ export function setEvent(instance, slot, node, eventName, messageForEvent, dispa
   instance.eventSlots[slot] = current;
 }
 
-export function setCompiledEvent(instance, slot, node, eventName, messageForEvent, dispatch) {
+export function setCompiledEvent(instance, slot, node, eventName, messageForEvent, dispatch, updateContext = null) {
+  if (!shouldApplyCompiledSlot(instance, slot, updateContext)) return;
   let current = instance.eventSlots[slot];
   if (current) {
     if (current.node !== node || current.eventName !== eventName) {
@@ -1367,7 +1459,10 @@ const delegatedCompiledEventListeners = new Map();
 const delegatedCompiledEventSlots = new WeakMap();
 
 function canDelegateCompiledEvent(eventName) {
-  return delegatedCompiledEvents.has(eventName) && typeof document !== "undefined" && typeof document.addEventListener === "function";
+  return delegatedCompiledEvents.has(eventName)
+    && typeof document !== "undefined"
+    && !document.__closkellTestDocument
+    && typeof document.addEventListener === "function";
 }
 
 function setDelegatedCompiledEventSlot(node, eventName, current) {
@@ -1447,7 +1542,8 @@ export function setRef(instance, slot, node, value, dispatch) {
   instance.refSlots[slot] = { registry, name, node };
 }
 
-export function setCompiledRef(instance, slot, node, value, dispatch) {
+export function setCompiledRef(instance, slot, node, value, dispatch, updateContext = null) {
+  if (!shouldApplyCompiledSlot(instance, slot, updateContext)) return;
   const registry = compiledRegistryForDispatch(dispatch);
   const name = compiledRefName(value);
   const current = instance.refSlots[slot];
@@ -1533,10 +1629,16 @@ export function setKeyedList(instance, slot, marker, items, keyForItem, renderIt
   instance.keyedSlots[slot] = current;
 }
 
-export function setCompiledKeyedList(instance, slot, marker, items, keyForItem, renderItem, dispatch, stableItemUpdate = false) {
+export function setCompiledKeyedList(instance, slot, marker, items, keyForItem, renderItem, dispatch, updateContext = null, stableItemUpdate = false) {
+  if (updateContext && !shouldUpdateSlot(instance, slot, updateContext)) return;
   const parent = marker.parentNode;
   if (!parent) return;
 
+  const slotMetadata = instance.definition?.slots?.[slot] || {};
+  const keyedKind = slotMetadata?.kind || {};
+  const itemName = typeof keyedKind.keyed === "string" ? keyedKind.keyed : null;
+  const indexName = typeof keyedKind.index === "string" ? keyedKind.index : null;
+  if (updateContext) stableItemUpdate = false;
   const current = instance.keyedSlots[slot] || { byKey: new Map(), duplicateKeys: new Map() };
   if (!current.duplicateKeys) current.duplicateKeys = new Map();
   if (items.length === 0) {
@@ -1546,31 +1648,31 @@ export function setCompiledKeyedList(instance, slot, marker, items, keyForItem, 
   }
   if (
     current.duplicateKeys.size === 0 &&
-    updateCompiledKeyedListSameOrder(current, items, keyForItem, dispatch, stableItemUpdate)
+    updateCompiledKeyedListSameOrder(current, items, keyForItem, dispatch, stableItemUpdate, updateContext, itemName, indexName)
   ) {
     instance.keyedSlots[slot] = current;
     return;
   }
   if (
     current.duplicateKeys.size === 0 &&
-    updateCompiledKeyedListSameSequence(current, parent, marker, items, keyForItem, renderItem, dispatch, stableItemUpdate)
+    updateCompiledKeyedListSameSequence(current, parent, marker, items, keyForItem, renderItem, dispatch, stableItemUpdate, updateContext, itemName, indexName)
   ) {
     instance.keyedSlots[slot] = current;
     return;
   }
   if (
     current.duplicateKeys.size === 0 &&
-    setCompiledKeyedListUnique(current, parent, marker, items, keyForItem, renderItem, dispatch, stableItemUpdate)
+    setCompiledKeyedListUnique(current, parent, marker, items, keyForItem, renderItem, dispatch, stableItemUpdate, updateContext, itemName, indexName)
   ) {
     instance.keyedSlots[slot] = current;
     return;
   }
 
-  setCompiledKeyedListWithDuplicates(current, parent, marker, items, keyForItem, renderItem, dispatch, stableItemUpdate);
+  setCompiledKeyedListWithDuplicates(current, parent, marker, items, keyForItem, renderItem, dispatch, stableItemUpdate, updateContext, itemName, indexName);
   instance.keyedSlots[slot] = current;
 }
 
-function updateCompiledKeyedListSameOrder(current, items, keyForItem, dispatch, stableItemUpdate) {
+function updateCompiledKeyedListSameOrder(current, items, keyForItem, dispatch, stableItemUpdate, updateContext, itemName, indexName) {
   if (current.byKey.size !== items.length || current.byKey.size === 0) return false;
 
   let index = 0;
@@ -1583,7 +1685,15 @@ function updateCompiledKeyedListSameOrder(current, items, keyForItem, dispatch, 
   for (const entry of current.entries) {
     const item = items[index];
     if (!canSkipCompiledKeyedEntry(entry, item, index, dispatch, stableItemUpdate)) {
-      updateCompiledKeyedEntry(entry, item, index, dispatch);
+      updateCompiledKeyedEntry(
+        entry,
+        item,
+        index,
+        dispatch,
+        updateContext
+          ? keyedItemUpdateContext(updateContext, itemName, indexName, entry.item, item, entry.index, index)
+          : null
+      );
       entry.dispatch = dispatch;
     }
     entry.item = item;
@@ -1593,7 +1703,7 @@ function updateCompiledKeyedListSameOrder(current, items, keyForItem, dispatch, 
   return true;
 }
 
-function updateCompiledKeyedListSameSequence(current, parent, marker, items, keyForItem, renderItem, dispatch, stableItemUpdate) {
+function updateCompiledKeyedListSameSequence(current, parent, marker, items, keyForItem, renderItem, dispatch, stableItemUpdate, updateContext, itemName, indexName) {
   const currentSize = current.byKey.size;
   if (currentSize === 0 || currentSize === items.length) return false;
 
@@ -1623,7 +1733,15 @@ function updateCompiledKeyedListSameSequence(current, parent, marker, items, key
     for (const entry of current.entries) {
       const item = items[index];
       if (!canSkipCompiledKeyedEntry(entry, item, index, dispatch, stableItemUpdate)) {
-        updateCompiledKeyedEntry(entry, item, index, dispatch);
+        updateCompiledKeyedEntry(
+          entry,
+          item,
+          index,
+          dispatch,
+          updateContext
+            ? keyedItemUpdateContext(updateContext, itemName, indexName, entry.item, item, entry.index, index)
+            : null
+        );
         entry.dispatch = dispatch;
       }
       entry.item = item;
@@ -1631,7 +1749,7 @@ function updateCompiledKeyedListSameSequence(current, parent, marker, items, key
       index += 1;
     }
     for (const entry of appendedEntries) {
-      updateCompiledKeyedEntry(entry, entry.item, entry.index, dispatch);
+      updateCompiledKeyedEntry(entry, entry.item, entry.index, dispatch, updateContext ? forceUpdateContext(updateContext) : null);
       entry.dispatch = dispatch;
     }
     insertKeyedEntries(parent, marker, appendedEntries);
@@ -1663,7 +1781,15 @@ function updateCompiledKeyedListSameSequence(current, parent, marker, items, key
     if (removedEntries?.has(entry)) continue;
     const item = items[index];
     if (!canSkipCompiledKeyedEntry(entry, item, index, dispatch, stableItemUpdate)) {
-      updateCompiledKeyedEntry(entry, item, index, dispatch);
+      updateCompiledKeyedEntry(
+        entry,
+        item,
+        index,
+        dispatch,
+        updateContext
+          ? keyedItemUpdateContext(updateContext, itemName, indexName, entry.item, item, entry.index, index)
+          : null
+      );
       entry.dispatch = dispatch;
     }
     entry.item = item;
@@ -1683,7 +1809,7 @@ function updateCompiledKeyedListSameSequence(current, parent, marker, items, key
   return true;
 }
 
-function setCompiledKeyedListUnique(current, parent, marker, items, keyForItem, renderItem, dispatch, stableItemUpdate) {
+function setCompiledKeyedListUnique(current, parent, marker, items, keyForItem, renderItem, dispatch, stableItemUpdate, updateContext, itemName, indexName) {
   const nextByKey = new Map();
   const orderedEntries = [];
   let needsReorder = false;
@@ -1709,7 +1835,17 @@ function setCompiledKeyedListUnique(current, parent, marker, items, keyForItem, 
       lastOldIndex = entry.oldIndex;
     }
     if (!canSkipCompiledKeyedEntry(entry, item, index, dispatch, stableItemUpdate)) {
-      updateCompiledKeyedEntry(entry, item, index, dispatch);
+      updateCompiledKeyedEntry(
+        entry,
+        item,
+        index,
+        dispatch,
+        updateContext
+          ? (entry.oldIndex < 0
+            ? forceUpdateContext(updateContext)
+            : keyedItemUpdateContext(updateContext, itemName, indexName, entry.item, item, entry.index, index))
+          : null
+      );
       entry.dispatch = dispatch;
     }
     entry.item = item;
@@ -1742,7 +1878,7 @@ function setCompiledKeyedListUnique(current, parent, marker, items, keyForItem, 
   return true;
 }
 
-function setCompiledKeyedListWithDuplicates(current, parent, marker, items, keyForItem, renderItem, dispatch, stableItemUpdate) {
+function setCompiledKeyedListWithDuplicates(current, parent, marker, items, keyForItem, renderItem, dispatch, stableItemUpdate, updateContext, itemName, indexName) {
   const nextByKey = new Map();
   const nextDuplicateKeys = new Map();
   const seenKeys = new Map();
@@ -1769,7 +1905,17 @@ function setCompiledKeyedListWithDuplicates(current, parent, marker, items, keyF
       lastOldIndex = entry.oldIndex;
     }
     if (!canSkipCompiledKeyedEntry(entry, item, index, dispatch, stableItemUpdate)) {
-      updateCompiledKeyedEntry(entry, item, index, dispatch);
+      updateCompiledKeyedEntry(
+        entry,
+        item,
+        index,
+        dispatch,
+        updateContext
+          ? (entry.oldIndex < 0
+            ? forceUpdateContext(updateContext)
+            : keyedItemUpdateContext(updateContext, itemName, indexName, entry.item, item, entry.index, index))
+          : null
+      );
       entry.dispatch = dispatch;
     }
     entry.item = item;
@@ -1961,11 +2107,17 @@ function updateKeyedComponent(component, item, index, dispatch, updateContext) {
   return component.update(item, dispatch, updateContext);
 }
 
-function updateCompiledKeyedEntry(entry, item, index, dispatch) {
-  if (compiledEntryArity(entry) >= 2) {
-    return entry.component.update(item, index, dispatch);
+function updateCompiledKeyedEntry(entry, item, index, dispatch, updateContext = null) {
+  if (!updateContext) {
+    if (compiledEntryArity(entry) >= 2) {
+      return entry.component.update(item, index, dispatch);
+    }
+    return entry.component.update(item, dispatch);
   }
-  return entry.component.update(item, dispatch);
+  if (compiledEntryArity(entry) >= 2) {
+    return entry.component.update(item, index, dispatch, updateContext);
+  }
+  return entry.component.update(item, dispatch, updateContext);
 }
 
 function canSkipCompiledKeyedEntry(entry, item, index, dispatch, stableItemUpdate) {
@@ -2033,7 +2185,8 @@ export function setConditional(instance, slot, marker, condition, renderThen, re
   instance.conditionalSlots[slot] = current;
 }
 
-export function setCompiledConditional(instance, slot, marker, condition, renderThen, renderElse, dispatch) {
+export function setCompiledConditional(instance, slot, marker, condition, renderThen, renderElse, dispatch, updateContext = null) {
+  if (updateContext && !shouldUpdateSlot(instance, slot, updateContext)) return;
   const parent = marker.parentNode;
   if (!parent) return;
 
@@ -2048,12 +2201,14 @@ export function setCompiledConditional(instance, slot, marker, condition, render
     disposeComponent(current.component);
     current = {
       branch: nextBranch,
-      component: render()
+      component: render(),
+      fresh: true
     };
   }
 
   if (current.component) {
-    current.component.update(dispatch);
+    current.component.update(dispatch, current.fresh ? forceUpdateContext(updateContext) : updateContext);
+    current.fresh = false;
     if (current.component.root.parentNode !== parent) {
       parent.insertBefore(current.component.root, marker);
     }
@@ -2115,7 +2270,8 @@ export function setComponent(instance, slot, marker, render, args, dispatch, upd
   instance.componentSlots[slot] = current;
 }
 
-export function setCompiledComponent(instance, slot, marker, render, args, dispatch, expectedKey) {
+export function setCompiledComponent(instance, slot, marker, render, args, dispatch, updateContext = null, expectedKey) {
+  if (updateContext && !shouldUpdateSlot(instance, slot, updateContext)) return;
   const parent = marker.parentNode;
   if (!parent) return;
 
@@ -2137,11 +2293,17 @@ export function setCompiledComponent(instance, slot, marker, render, args, dispa
 
   if (current.component) {
     const arity = compiledComponentArity(current.component);
+    const nextArgs = Array.isArray(args) ? args : [];
+    const params = componentParams(current.component);
+    const componentContext = shouldRecreate
+      ? forceUpdateContext(updateContext)
+      : componentUpdateContext(updateContext, params, current.args, nextArgs);
     if (arity > 0) {
-      current.component.update(...args.slice(0, arity), dispatch);
+      current.component.update(...nextArgs.slice(0, arity), dispatch, componentContext);
     } else {
-      current.component.update(dispatch);
+      current.component.update(dispatch, componentContext);
     }
+    current.args = nextArgs.slice();
     if (current.component.root.parentNode !== parent) {
       parent.insertBefore(current.component.root, marker);
     }
@@ -2247,6 +2409,9 @@ export const Cmd = {
   },
   batch(commands) {
     return { kind: Symbol.for("batch"), commands };
+  },
+  map(command, mapper) {
+    return mapCommand(command, mapper);
   },
   bluetoothRequestDevice(options, onSuccess, onError) {
     return { kind: Symbol.for("bluetooth/request-device"), options, onSuccess, onError };
@@ -2734,20 +2899,20 @@ function testVisibleSubscription(subscription) {
 function testVisibleSubscriptionKind(kind) {
   switch (kind) {
     case "timer/every":
-      return "sub/timer/every";
+      return Symbol.for("sub/timer/every");
     case "dom-ref/resize-watch":
     case "dom-ref/resize-watch/direct":
-      return "sub/dom-ref/resize";
+      return Symbol.for("sub/dom-ref/resize");
     case "window/event-watch":
     case "window/event-watch/direct":
-      return "sub/window/event";
+      return Symbol.for("sub/window/event");
     case "media-query/watch":
     case "media-query/watch/direct":
-      return "sub/media-query";
+      return Symbol.for("sub/media-query");
     case "simulation/heart-rate":
-      return "sub/simulation/heart-rate";
+      return Symbol.for("sub/simulation/heart-rate");
     case "bluetooth/connect-heart-rate":
-      return "sub/bluetooth/connect-heart-rate";
+      return Symbol.for("sub/bluetooth/connect-heart-rate");
     default:
       return null;
   }
@@ -2870,6 +3035,22 @@ export function scopeUpdate(parentState, field, childMessage, update, tag) {
 export function scopeSubscriptions(childState, subscriptions, tag) {
   if (typeof subscriptions !== "function") return { kind: "none" };
   return mapScopedSubscription(subscriptions(childState), tag);
+}
+
+export function mapCommand(command, mapper) {
+  if (!command) return command;
+  if (Array.isArray(command)) return command.map((item) => mapCommand(item, mapper));
+
+  const kind = commandKind(command);
+  if (kind === "none") return command;
+  if (kind === "batch") {
+    return {
+      ...command,
+      commands: (command.commands || []).map((item) => mapCommand(item, mapper))
+    };
+  }
+
+  return mapMessageContinuations(command, mapper);
 }
 
 export function scopeView(tag, view, childState) {
@@ -4334,7 +4515,7 @@ export function registerCompiledFileReadSelectedCommandHandlers(handlers) {
     const input = resolveCompiledRef(command.ref, dispatch);
     if (!input) return compiledCommandErrorMessage(command, new Error(`Missing file ref ${String(command.ref)}`));
 
-    const format = command.format;
+    const format = commandValueName(command.format || command.parse || "text");
     const shouldClear = command.clear !== false;
     try {
       const files = Array.from(input.files || []);
@@ -4940,13 +5121,14 @@ export function startCompiledApp(options = {}) {
 
   function run(command) {
     if (disposed) return;
-    const commandKind = command.kind;
-    if (commandKind === "none") return;
-    if (commandKind === "batch") {
+    const kind = commandKind(command);
+    if (kind === "none") return;
+    if (kind === "batch") {
       for (const item of command.commands) run(item);
       return;
     }
-    const handler = handlers[commandKind];
+    const handler = handlers[kind];
+    if (typeof handler !== "function") return;
     settle(command, () => handler(command, dispatch), isActive);
   }
 
@@ -4974,11 +5156,15 @@ export function startCompiledApp(options = {}) {
   }
 
   function flatten(subscription, output) {
-    if (!subscription) return output;
-    const subscriptionKind = subscription.kind;
+    if (subscription == null || subscription === false) return output;
+    if (Array.isArray(subscription)) {
+      for (const item of subscription) flatten(item, output);
+      return output;
+    }
+    const subscriptionKind = compiledCommandKind(subscription);
     if (subscriptionKind === "none") return output;
     if (subscriptionKind === "batch") {
-      for (const item of subscription.subscriptions) {
+      for (const item of subscription.subscriptions ?? subscription.subs ?? subscription.commands ?? []) {
         flatten(item, output);
       }
     } else {
@@ -4988,7 +5174,7 @@ export function startCompiledApp(options = {}) {
   }
 
   function subscriptionKey(subscription) {
-    return `${subscription.kind}:${subscription.id}`;
+    return compiledSubscriptionKey(subscription);
   }
 
   function stopCommand(subscription) {
@@ -4997,7 +5183,8 @@ export function startCompiledApp(options = {}) {
 
   function runSubscription(subscription, active) {
     const command = compiledStartCommandForSubscription(subscription);
-    const handler = handlers[command.kind];
+    const handler = handlers[compiledCommandKind(command)];
+    if (typeof handler !== "function") return;
     settle(command, () => handler(command, dispatch), active);
   }
 
@@ -5006,7 +5193,8 @@ export function startCompiledApp(options = {}) {
     const nextByKey = new Map();
     for (const subscription of flatten(subscriptions(state), [])) {
       const key = subscriptionKey(subscription);
-      nextByKey.set(key, { subscription, signature: JSON.stringify(subscription) });
+      if (!key) continue;
+      nextByKey.set(key, { subscription, signature: compiledSubscriptionSignature(subscription) });
     }
     for (const [key, active] of Array.from(activeSubscriptions.entries())) {
       const next = nextByKey.get(key);
@@ -5023,7 +5211,8 @@ export function startCompiledApp(options = {}) {
 
   function runCommand(command, active) {
     if (!command) return;
-    const handler = handlers[command.kind];
+    const handler = handlers[compiledCommandKind(command)];
+    if (typeof handler !== "function") return;
     settle(command, () => handler(command, dispatch), active);
   }
 
@@ -5086,13 +5275,14 @@ export function startCompiledAppWithoutSubscriptions(options = {}) {
 
   function run(command) {
     if (disposed) return;
-    const commandKind = command.kind;
-    if (commandKind === "none") return;
-    if (commandKind === "batch") {
+    const kind = commandKind(command);
+    if (kind === "none") return;
+    if (kind === "batch") {
       for (const item of command.commands) run(item);
       return;
     }
-    const handler = handlers[commandKind];
+    const handler = handlers[kind];
+    if (typeof handler !== "function") return;
     settle(command, () => handler(command, dispatch), isActive);
   }
 
@@ -5140,6 +5330,145 @@ export function startCompiledAppWithoutSubscriptions(options = {}) {
       handlers.dispose?.();
       component?.dispose?.();
     }
+  };
+}
+
+export function startServerService(options = {}) {
+  const boot = options.boot;
+  const initResult = typeof options.init === "function"
+    ? (boot === undefined ? options.init() : options.init(boot))
+    : [{}, { kind: "none" }];
+  const [initialState, initialCommand] = normalizeServerInitResult(initResult);
+  const service = {
+    boot,
+    state: initialState,
+    commands: initialCommand && commandKind(initialCommand) !== "none" ? [initialCommand] : [],
+    routes: [],
+    resources: { kind: "server/resources", resources: [] },
+    dispatch(message) {
+      if (typeof options.update !== "function") return service.state;
+      const [nextState, command] = normalizeServerInitResult(options.update(service.state, message));
+      service.state = nextState;
+      if (command && commandKind(command) !== "none") service.commands.push(command);
+      service.routes = readServerRoutes(options.routes, service.state);
+      service.resources = readServerResources(options.resources, service.state);
+      return service.state;
+    },
+    async handle(request, context = {}) {
+      return handleServerRequest(service, request, context);
+    }
+  };
+  service.routes = readServerRoutes(options.routes, service.state);
+  service.resources = readServerResources(options.resources, service.state);
+  return service;
+}
+
+function normalizeServerInitResult(result) {
+  if (Array.isArray(result)) return [result[0], result[1] ?? { kind: "none" }];
+  return [result ?? {}, { kind: "none" }];
+}
+
+function readServerRoutes(routes, state) {
+  if (typeof routes !== "function") return [];
+  const value = routes(state);
+  return Array.isArray(value) ? value.flat().filter(Boolean) : [];
+}
+
+function readServerResources(resources, state) {
+  if (typeof resources !== "function") return { kind: "server/resources", resources: [] };
+  const value = resources(state);
+  if (!value) return { kind: "server/resources", resources: [] };
+  if (Array.isArray(value)) return { kind: "server/resources", resources: value };
+  return value;
+}
+
+async function handleServerRequest(service, request = {}, context = {}) {
+  const match = findServerRoute(service.routes, request);
+  if (!match) {
+    return { kind: "response/json", status: 404, headers: {}, body: { error: "Not found" } };
+  }
+  const routeRequest = normalizeServerRequest(request, match.params);
+  try {
+    return await runTask(match.route.handler(routeRequest), context);
+  } catch (error) {
+    return normalizeServerError(error);
+  }
+}
+
+function normalizeServerRequest(request = {}, params = {}) {
+  const path = serverRequestPath(request);
+  return {
+    ...request,
+    method: request.method || "GET",
+    url: request.url ?? request.path ?? path,
+    path,
+    headers: request.headers || {},
+    query: request.query || {},
+    params: { ...(request.params || {}), ...params },
+  };
+}
+
+function findServerRoute(routes, request) {
+  const requestMethod = String(request.method || "GET").toUpperCase();
+  const requestPath = serverRequestPath(request);
+  for (const route of routes) {
+    if (!route || commandKind(route) !== "server/route") continue;
+    if (String(route.method || "GET").toUpperCase() !== requestMethod) continue;
+    const params = matchServerPath(String(route.path || ""), requestPath);
+    if (params) return { route, params };
+  }
+  return null;
+}
+
+function serverRequestPath(request) {
+  const raw = request.path ?? request.url ?? "/";
+  try {
+    return new URL(String(raw), "http://closkell.local").pathname;
+  } catch {
+    return String(raw).split("?")[0] || "/";
+  }
+}
+
+function matchServerPath(pattern, path) {
+  if (pattern === path) return {};
+  const patternParts = trimServerPath(pattern).split("/");
+  const pathParts = trimServerPath(path).split("/");
+  const params = {};
+  for (let index = 0; index < patternParts.length; index += 1) {
+    const patternPart = patternParts[index];
+    const pathPart = pathParts[index];
+    if (patternPart === "*") {
+      params.path = pathParts.slice(index).join("/");
+      return params;
+    }
+    if (pathPart == null) return null;
+    if (patternPart.startsWith(":")) {
+      params[patternPart.slice(1)] = decodeURIComponent(pathPart);
+      continue;
+    }
+    if (patternPart !== pathPart) return null;
+  }
+  return patternParts.length === pathParts.length ? params : null;
+}
+
+function trimServerPath(value) {
+  return String(value || "/").replace(/^\/+|\/+$/g, "");
+}
+
+function normalizeServerError(error) {
+  if (error && typeof error === "object" && "status" in error) {
+    return {
+      kind: "response/json",
+      status: error.status || 500,
+      headers: error.headers || {},
+      body: error.body ?? { error: error.message || "Server error" },
+    };
+  }
+  return {
+    kind: "response/json",
+    status: 500,
+    headers: {},
+    body: { error: errorMessage(error) },
   };
 }
 
@@ -6365,7 +6694,7 @@ function commandKind(command) {
 }
 
 function compiledCommandKind(command) {
-  return command?.kind || "";
+  return commandKind(command);
 }
 
 function scopeKey(value) {
@@ -6432,26 +6761,36 @@ function mapScopedSubscription(subscription, tag) {
 }
 
 function mapScopedContinuations(effect, tag) {
+  return mapMessageContinuations(effect, (message) => wrapScopedMessage(message, tag));
+}
+
+function mapMessageContinuations(effect, mapper) {
   const mapped = { ...effect };
-  if (effect.msg !== undefined) mapped.msg = wrapScopedMessage(effect.msg, tag);
+  if (effect.msg !== undefined) mapped.msg = mapper(effect.msg);
   if (effect.toMessage !== undefined) {
-    mapped.toMessage = (value) => wrapScopedMessage(effect.toMessage(value), tag);
+    mapped.toMessage = (value) => mapper(effect.toMessage(value));
   }
-  mapScopedPayloadContinuation(mapped, effect, "onSuccess", tag, (value) => ({ value }));
-  mapScopedPayloadContinuation(mapped, effect, "onError", tag, (error) => ({ error: errorMessage(error) }));
-  mapScopedPayloadContinuation(mapped, effect, "onFrame", tag, (value) => value);
-  mapScopedPayloadContinuation(mapped, effect, "onChange", tag, (value) => value);
-  mapScopedPayloadContinuation(mapped, effect, "onReading", tag, (value) => value);
-  mapScopedPayloadContinuation(mapped, effect, "onEvent", tag, (value) => value);
-  mapScopedPayloadContinuation(mapped, effect, "onCancel", tag, () => ({}));
-  mapScopedPayloadContinuation(mapped, effect, "onDisconnected", tag, () => ({}));
+  mapPayloadContinuation(mapped, effect, "onSuccess", mapper, (value) => ({ value }));
+  mapPayloadContinuation(mapped, effect, "onError", mapper, (error) => ({ error: errorMessage(error) }));
+  mapPayloadContinuation(mapped, effect, "onFrame", mapper, (value) => value);
+  mapPayloadContinuation(mapped, effect, "onChange", mapper, (value) => value);
+  mapPayloadContinuation(mapped, effect, "onReading", mapper, (value) => value);
+  mapPayloadContinuation(mapped, effect, "onEvent", mapper, (value) => value);
+  mapPayloadContinuation(mapped, effect, "onCancel", mapper, () => ({}));
+  mapPayloadContinuation(mapped, effect, "onDisconnected", mapper, () => ({}));
   return mapped;
 }
 
-function mapScopedPayloadContinuation(target, source, field, tag, payloadForValue) {
+function mapPayloadContinuation(target, source, field, mapper, payloadForValue) {
   if (source[field] === undefined) return;
   const continuation = source[field];
-  target[field] = (value) => wrapScopedMessage(namedCommandMessage(continuation, payloadForValue(value)), tag);
+  target[field] = (value) => {
+    const message =
+      typeof continuation === "function"
+        ? continuation(value)
+        : namedCommandMessage(continuation, payloadForValue(value));
+    return mapper(message);
+  };
 }
 
 function subscriptionKind(subscription) {
@@ -6507,11 +6846,11 @@ function compiledSubscriptionKey(subscription) {
     subscription.type ??
     subscription.event ??
     kind;
-  return `${kind}:${id == null ? "" : String(id)}`;
+  return `${kind}:${subscriptionIdentityPart(id)}`;
 }
 
 function compiledSubscriptionSignature(subscription) {
-  return JSON.stringify(subscription);
+  return subscriptionSignature(subscription);
 }
 
 function startCommandForSubscription(subscription) {
@@ -6588,6 +6927,12 @@ function compiledStopCommandForSubscription(subscription) {
     case "sub/bluetooth/connect-heart-rate":
       return { kind: "bluetooth/disconnect", id: subscription.id };
     default:
+      if (subscription.s !== undefined) {
+        return { ...subscription, kind: subscription.s };
+      }
+      if (subscription.stop !== undefined) {
+        return { ...subscription, kind: subscription.stop };
+      }
       return undefined;
   }
 }
@@ -7501,7 +7846,8 @@ function applyCanvasOp(ctx, canvas, op) {
 }
 
 function applyCompiledCanvasOp(ctx, canvas, op) {
-  switch (op.op || op.kind) {
+  const name = commandValueName(op.op || op.kind);
+  switch (name) {
     case "clear":
       ctx.clearRect(op.x ?? 0, op.y ?? 0, op.width ?? canvas.width ?? 0, op.height ?? canvas.height ?? 0);
       break;
@@ -7538,10 +7884,10 @@ function applyCompiledCanvasOp(ctx, canvas, op) {
       ctx.fillText(String(op.text ?? ""), op.x ?? 0, op.y ?? 0);
       break;
     case "set":
-      if (op.name) ctx[op.name] = op.value;
+      if (op.name) ctx[commandValueName(op.name)] = op.value;
       break;
     default:
-      throw new Error(`Bad canvas op ${op.op || op.kind}`);
+      throw new Error(`Bad canvas op ${name}`);
   }
 }
 
@@ -7575,8 +7921,10 @@ function applyCompiledCanvasState(ctx, op, paintMode) {
   if (op.lineJoin !== undefined) ctx.lineJoin = op.lineJoin;
   if (op.globalAlpha !== undefined) ctx.globalAlpha = op.globalAlpha;
   if (op.font !== undefined) ctx.font = op.font;
-  if (op.textAlign !== undefined) ctx.textAlign = String(op.textAlign || "");
-  if (op.textBaseline !== undefined) ctx.textBaseline = String(op.textBaseline || "");
+  const textAlign = canvasTextStateValue(op.textAlign);
+  const textBaseline = canvasTextStateValue(op.textBaseline);
+  if (textAlign !== undefined) ctx.textAlign = textAlign;
+  if (textBaseline !== undefined) ctx.textBaseline = textBaseline;
 }
 
 function canvasTextStateValue(value) {

@@ -1,0 +1,36 @@
+(import "../../model.clsk" [HeartReading HeartZone WorkoutEntry MonitorInfo WindowEventPayload])
+(import "../../messages.clsk" [AppMsg])
+
+(type SessionState
+  {:appStatus String
+   :message String
+   :statusMode String
+   :dev? Bool
+   :mobile? Bool
+   :detailView String
+   :exerciseState String
+   :connected? Bool
+   :simulated? Bool
+   :deviceName String
+   :elapsedMs Number
+   :displayElapsedMs Number
+   :startedAt (Option Number)
+   :sessionStartedAt (Option Number)
+   :idleStartedAt (Option Number)
+   :pendingStoppedAt (Option Number)
+   :latestBpm Number
+   :lastRate (Option Number)
+   :trend String
+   :readings (Vector HeartReading)
+   :entries (Vector WorkoutEntry)
+   :selectedLogId (Option String)
+   :logTypeFilter String
+   :targetZoneId Number
+   :zones (Vector HeartZone)
+   :activeExerciseType String
+   :stopHold? Bool
+   :stopHoldStartedAt Number
+   :stopHoldProgress Number})
+
+(type SessionUpdateResult
+  [SessionState (Cmd AppMsg)])

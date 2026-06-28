@@ -1,0 +1,15 @@
+(type TryItMsg
+  (Union
+    {:kind :open-try :id String}
+    {:kind :cancel-try}
+    {:kind :param-input :opId String :name String :value String}
+    {:kind :body-input :opId String :value String}
+    {:kind :request-body-file-selected :opId String :selected? Bool}
+    {:kind :multipart-file-selected :opId String :name String :selected? Bool}
+    {:kind :validate-param :opId String :name String}
+    {:kind :execute :item Js}
+    {:kind :request-finished :id String :value Js}
+    {:kind :request-failed :error String}
+    {:kind :download-response :name String :content String :mime String :blob Js}
+    {:kind :copy-text :value String}
+    {:kind :noop}))

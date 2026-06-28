@@ -1,0 +1,208 @@
+(import "../../domain.clsk" [zone-drag-move-id zone-drag-up-id zone-drag-cancel-id])
+(import "../../zones.clsk" [default-zone-state load-zone-state set-zone-min set-zone-max set-zone-boundary boundary-controls])
+(import "../../model.clsk" [HeartReading HeartZone WorkoutEntry MonitorInfo JsonPayload HeartChartRect WindowEventPayload])
+(import "../../messages.clsk" [AppMsg])
+(import "./model.clsk" [ZonesState ZonesUpdateResult])
+(import "../../ui-effects.clsk" [no-cmd])
+(import "../shared/interactions.clsk" [zone-boundary-track-ref])
+(import "../shared/workflow.clsk" [active-chart-command with-active-chart-command active-chart-result with-active-chart-result set-status persist-zone-command persist-zone-silent-command zone-boundary-key-delta zone-boundary-status zone-drag-measure-command zone-boundary-bpm-from-client-x])
+(ann try-zones-update (Fn [ZonesState AppMsg] (Option ZonesUpdateResult)))
+(defn try-zones-update [state msg]
+  (match msg
+    {:kind :zones-loaded :payload payload}
+      (let [zone-state (load-zone-state payload)]
+        (active-chart-result
+          (set-status
+            (merge state
+                   {:zones zone-state.zones
+                    :targetZoneId zone-state.targetZoneId
+                    :zoneStatus "Zones loaded"})
+            "Ready"
+            "Zones loaded"
+            "muted")))
+    {:kind :zones-load-failed :error error}
+      (active-chart-result
+        (set-status
+          (merge state
+                 {:zones default-zone-state.zones
+                  :targetZoneId default-zone-state.targetZoneId
+                  :zoneStatus "Using default zones"})
+          "Ready"
+          error
+          "warn"))
+    {:kind :target-zone :id id}
+      (with-active-chart-result
+        (merge state
+               {:targetZoneId id
+                :zoneStatus (str "Target " id)})
+        (persist-zone-command state.zones id))
+    {:kind :zone-min-edited :id id :raw raw}
+      (let [zones (set-zone-min state.zones id raw)]
+        (with-active-chart-result
+          (merge state
+                 {:zones zones
+                  :zoneStatus "Zones edited"})
+          (persist-zone-command zones state.targetZoneId)))
+    {:kind :zone-max-edited :id id :raw raw}
+      (let [zones (set-zone-max state.zones id raw)]
+        (with-active-chart-result
+          (merge state
+                 {:zones zones
+                  :zoneStatus "Zones edited"})
+          (persist-zone-command zones state.targetZoneId)))
+    {:kind :zone-boundary :index index :bpm bpm}
+      (let [zones (set-zone-boundary state.zones index bpm)]
+        (with-active-chart-result
+          (merge state
+                 {:zones zones
+                  :zoneStatus "Boundary moved"})
+          (persist-zone-command zones state.targetZoneId)))
+    {:kind :zone-boundary-key :index index :key key}
+      (let [delta (zone-boundary-key-delta key)]
+        (if (= delta 0)
+            (no-cmd state)
+            (let [left (nth state.zones index)
+                  zones (set-zone-boundary state.zones index (+ left.max delta))]
+              (with-active-chart-result
+                (merge state
+                       {:zones zones
+                        :zoneStatus (zone-boundary-status zones index)})
+                (persist-zone-command zones state.targetZoneId)))))
+    {:kind :zone-boundary-drag-start :index index :clientX client-x}
+      [(merge state {:zoneStatus "Measuring boundary"})
+       (zone-drag-measure-command index client-x)]
+    {:kind :zone-boundary-track-measured :index index :clientX client-x :left left :width width}
+      (let [measured-state (merge state
+                                  {:zoneTrackLeft left
+                                   :zoneTrackWidth (max 1 width)
+                                   :zoneDragIndex index})
+            zones (set-zone-boundary measured-state.zones
+                                     index
+                                     (zone-boundary-bpm-from-client-x measured-state client-x))]
+        (with-active-chart-result
+          (merge measured-state
+                 {:zones zones
+                  :zoneStatus (zone-boundary-status zones index)})
+          (persist-zone-silent-command zones state.targetZoneId)))
+    {:kind :zone-boundary-track-error :error error}
+      (no-cmd (merge state
+                     {:zoneDragIndex nil
+                      :zoneStatus error}))
+    {:kind :zone-boundary-drag-move :value event}
+      (if (some? state.zoneDragIndex)
+          (let [zones (set-zone-boundary state.zones
+                                         state.zoneDragIndex
+                                         (zone-boundary-bpm-from-client-x state event.clientX))]
+            (with-active-chart-result
+              (merge state
+                     {:zones zones
+                      :zoneStatus (zone-boundary-status zones state.zoneDragIndex)})
+              (persist-zone-silent-command zones state.targetZoneId)))
+          (no-cmd state))
+    {:kind :zone-boundary-drag-end}
+      (no-cmd (merge state
+                     {:zoneDragIndex nil
+                      :zoneStatus "Boundary set"}))
+    {:kind :zones-saved}
+      (no-cmd (merge state {:zoneStatus "Zones saved"}))
+    {:kind :zones-save-failed :error error}
+      [(set-status
+         (merge state {:zoneStatus error})
+         "Save failed"
+         error
+         "warn")
+       Cmd.none]
+    _ nil))
+
+(ann zone-drag-move-subscription (Fn [ZonesState] (Sub AppMsg)))
+(defn zone-drag-move-subscription [state]
+  (if (some? state.zoneDragIndex)
+      (Sub.window/event-with zone-drag-move-id
+                             "pointermove"
+                             :zone-boundary-drag-move
+                             {:preventDefault true
+                              :options {:passive false}})
+      Sub.none))
+
+(ann zone-drag-up-subscription (Fn [ZonesState] (Sub AppMsg)))
+(defn zone-drag-up-subscription [state]
+  (if (some? state.zoneDragIndex)
+      (Sub.window/event-with zone-drag-up-id
+                             "pointerup"
+                             :zone-boundary-drag-end
+                             {:preventDefault true
+                              :options {:passive false}})
+      Sub.none))
+
+(ann zone-drag-cancel-subscription (Fn [ZonesState] (Sub AppMsg)))
+(defn zone-drag-cancel-subscription [state]
+  (if (some? state.zoneDragIndex)
+      (Sub.window/event-with zone-drag-cancel-id
+                             "pointercancel"
+                             :zone-boundary-drag-end
+                             {:preventDefault true
+                              :options {:passive false}})
+      Sub.none))
+
+(ann zones-subscriptions (Fn [ZonesState] (Sub AppMsg)))
+(defn zones-subscriptions [state]
+  (Sub.batch [(zone-drag-move-subscription state)
+              (zone-drag-up-subscription state)
+              (zone-drag-cancel-subscription state)]))
+
+
+(defn zones-pane [state]
+  #html <section class="zones-pane mt-[18px] max-[820px]:mt-2.5" data-testid="zones-pane" data-status={state.zoneStatus}>
+          <div>
+            {(if state.mobile?
+                 #html <div class="hidden"></div>
+                 #html <p id="zones-title" class="m-0 mb-1.5 text-[0.77rem] font-bold uppercase tracking-normal text-[#617066]">Training zones</p>)}
+          </div>
+          <div class="relative mt-3 pb-12 pt-0 max-[820px]:mt-0.5"
+               ref={zone-boundary-track-ref}
+               data-testid="zone-boundary-track"
+               data-dragging={(some? state.zoneDragIndex)}>
+            <div class="zone-strip flex h-8 overflow-hidden rounded-full border border-[#172019]/20 bg-[#f1f4f1]">
+              {(for [zone state.zones :key zone.id]
+                 #html <button type="button"
+                               class={(str "min-w-[18px] cursor-pointer border-0 p-0 text-transparent "
+                                           (if (= zone.id state.targetZoneId)
+                                               "opacity-100 shadow-[inset_0_0_0_3px_rgba(23,32,25,0.28)]"
+                                               "opacity-75"))}
+                               data-testid={(str "target-zone-" zone.id)}
+                               data-selected={(= zone.id state.targetZoneId)}
+                               style={{:background zone.color
+                                       :flex (str (+ (- zone.max zone.min) 1) " 1 0")}}
+                               on:click={{:kind :target-zone
+                                          :id zone.id}}>{(if (= zone.id state.targetZoneId)
+                                                            (str zone.name " target")
+                                                            zone.name)}</button>)}
+            </div>
+            {(for [control (boundary-controls state.zones) :key control.id]
+               #html <button type="button"
+                             class="boundary-button absolute h-10 w-[18px] -translate-x-1/2 cursor-ew-resize touch-none rounded-full border-2 border-white bg-[#172019] text-white shadow-[0_4px_12px_rgba(23,32,25,0.22)]"
+                             role="slider"
+                             data-testid={(str "boundary-" control.id)}
+                             aria-label={(str control.name " upper boundary")}
+                             aria-valuemin={control.min}
+                             aria-valuemax={control.nextMax}
+                             aria-valuenow={control.max}
+                             style={{:left (str control.leftPercent "%")
+                                     :top "-4px"}}
+                             on:pointerdown={(Event.prevent {:kind :zone-boundary-drag-start
+                                                             :index control.index
+                                                             :clientX event.clientX})}
+                             on:keydown={{:kind :zone-boundary-key
+                                          :index control.index
+                                          :key event.key}}>
+                       <span class="absolute top-[42px] left-1/2 min-w-[34px] -translate-x-1/2 text-center text-[0.72rem] font-extrabold text-[#617066]">{control.max}</span>
+                     </button>)}
+          </div>
+          <div class="sr-only">
+            {(for [zone state.zones :key zone.id]
+             #html <div>
+                      <span data-testid={(str "zone-" zone.id "-min")}>{zone.min}</span>
+                      <span data-testid={(str "zone-" zone.id "-max")}>{zone.max}</span>
+                    </div>)}
+          </div>
+        </section>)

@@ -1,0 +1,17 @@
+(import "../../messages.clsk" [AppMsg])
+(import "../source/model.clsk" [Definition])
+
+(type ShellState
+  {:input String
+   :loading? Bool
+   :error (Option String)
+   :spec Js
+   :definitions (Vector Definition)
+   :selectedDefinition String
+   :currentUrl String
+   :oauthInit Js
+   :theme String
+   :authEntries Js})
+
+(type ShellInitResult
+  [ShellState (Cmd AppMsg)])

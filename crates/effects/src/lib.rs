@@ -15,13 +15,243 @@ pub struct EffectReport {
     pub diagnostics: Vec<Diagnostic>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EffectOptions {
+    command_types: Vec<CommandType>,
+    command_schemas: Vec<EffectCommandSchemaRule>,
+    command_helpers: Vec<String>,
+    subscription_helpers: Vec<String>,
+    subscription_symbols: Vec<String>,
+    subscription_schemas: Vec<EffectSubscriptionSchemaRule>,
+    forbidden_forms: Vec<ForbiddenFormRule>,
+    forbidden_symbols: Vec<ForbiddenSymbolRule>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EffectCommandSchemaRule {
+    kind: String,
+    required_fields: Vec<String>,
+    one_of_field_groups: Vec<Vec<String>>,
+    require_success: bool,
+    reject_success_continuations: bool,
+    payloadless_success: bool,
+    supported_continuations: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EffectSubscriptionSchemaRule {
+    kind: String,
+    required_fields: Vec<String>,
+    collection_fields: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForbiddenFormKind {
+    HtmlTemplate,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForbiddenFormRule {
+    kind: ForbiddenFormKind,
+    message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForbiddenSymbolRule {
+    pattern: SymbolPattern,
+    message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SymbolPattern {
+    Exact(String),
+    Prefix(String),
+}
+
+impl EffectOptions {
+    pub fn command_schema(mut self, rule: EffectCommandSchemaRule) -> Self {
+        self.command_schemas.push(rule);
+        self
+    }
+
+    pub fn command_type(mut self, command_type: CommandType) -> Self {
+        self.command_types.push(command_type);
+        self
+    }
+
+    pub fn command_helper(mut self, name: impl Into<String>) -> Self {
+        self.command_helpers.push(name.into());
+        self
+    }
+
+    pub fn subscription_helper(mut self, name: impl Into<String>) -> Self {
+        self.subscription_helpers.push(name.into());
+        self
+    }
+
+    pub fn subscription_symbol(mut self, name: impl Into<String>) -> Self {
+        self.subscription_symbols.push(name.into());
+        self
+    }
+
+    pub fn subscription_schema(mut self, rule: EffectSubscriptionSchemaRule) -> Self {
+        self.subscription_schemas.push(rule);
+        self
+    }
+
+    pub fn forbid_form(mut self, kind: ForbiddenFormKind, message: impl Into<String>) -> Self {
+        self.forbidden_forms.push(ForbiddenFormRule {
+            kind,
+            message: message.into(),
+        });
+        self
+    }
+
+    pub fn forbid_symbol(mut self, pattern: SymbolPattern, message: impl Into<String>) -> Self {
+        self.forbidden_symbols.push(ForbiddenSymbolRule {
+            pattern,
+            message: message.into(),
+        });
+        self
+    }
+
+    fn forbidden_form_message(&self, kind: ForbiddenFormKind) -> Option<&str> {
+        self.forbidden_forms
+            .iter()
+            .find(|rule| rule.kind == kind)
+            .map(|rule| rule.message.as_str())
+    }
+
+    fn forbidden_symbol_message(&self, name: &str) -> Option<String> {
+        self.forbidden_symbols
+            .iter()
+            .find(|rule| rule.pattern.matches(name))
+            .map(|rule| rule.message.replace("{symbol}", name))
+    }
+
+    fn command_schema_rule(&self, kind: &str) -> Option<&EffectCommandSchemaRule> {
+        self.command_schemas.iter().find(|rule| rule.kind == kind)
+    }
+
+    fn is_command_helper(&self, name: &str) -> bool {
+        self.command_helpers.iter().any(|helper| helper == name)
+    }
+
+    fn is_subscription_helper(&self, name: &str) -> bool {
+        self.subscription_helpers
+            .iter()
+            .any(|helper| helper == name)
+    }
+
+    fn is_subscription_symbol(&self, name: &str) -> bool {
+        self.subscription_symbols
+            .iter()
+            .any(|symbol| symbol == name)
+    }
+
+    fn subscription_schema_rule(&self, kind: &str) -> Option<&EffectSubscriptionSchemaRule> {
+        self.subscription_schemas
+            .iter()
+            .find(|rule| rule.kind == kind)
+    }
+}
+
+impl EffectCommandSchemaRule {
+    pub fn new(kind: impl Into<String>) -> Self {
+        Self {
+            kind: kind.into(),
+            required_fields: Vec::new(),
+            one_of_field_groups: Vec::new(),
+            require_success: false,
+            reject_success_continuations: false,
+            payloadless_success: false,
+            supported_continuations: Vec::new(),
+        }
+    }
+
+    pub fn required_fields(mut self, fields: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.required_fields = fields.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn one_of_fields(mut self, fields: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.one_of_field_groups
+            .push(fields.into_iter().map(Into::into).collect());
+        self
+    }
+
+    pub fn require_success(mut self) -> Self {
+        self.require_success = true;
+        self
+    }
+
+    pub fn reject_success_continuations(mut self) -> Self {
+        self.reject_success_continuations = true;
+        self
+    }
+
+    pub fn payloadless_success(mut self) -> Self {
+        self.payloadless_success = true;
+        self
+    }
+
+    pub fn supported_continuations(
+        mut self,
+        fields: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.supported_continuations = fields.into_iter().map(Into::into).collect();
+        self
+    }
+
+    fn supports_continuation(&self, field: &str) -> bool {
+        self.supported_continuations
+            .iter()
+            .any(|supported| supported == field)
+    }
+}
+
+impl EffectSubscriptionSchemaRule {
+    pub fn new(kind: impl Into<String>) -> Self {
+        Self {
+            kind: kind.into(),
+            required_fields: Vec::new(),
+            collection_fields: Vec::new(),
+        }
+    }
+
+    pub fn required_fields(mut self, fields: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.required_fields = fields.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn collection_fields(
+        mut self,
+        fields: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.collection_fields = fields.into_iter().map(Into::into).collect();
+        self
+    }
+}
+
+impl SymbolPattern {
+    pub fn exact(name: impl Into<String>) -> Self {
+        Self::Exact(name.into())
+    }
+
+    pub fn prefix(prefix: impl Into<String>) -> Self {
+        Self::Prefix(prefix.into())
+    }
+
+    fn matches(&self, name: &str) -> bool {
+        match self {
+            SymbolPattern::Exact(expected) => name == expected,
+            SymbolPattern::Prefix(prefix) => name.starts_with(prefix),
+        }
+    }
+}
+
 pub fn core_command_types() -> Vec<CommandType> {
     vec![
-        CommandType {
-            name: "Bluetooth",
-            payload_type: "BluetoothRequest",
-            message_type: "msg",
-        },
         CommandType {
             name: "Timer",
             payload_type: "TimerRequest",
@@ -35,11 +265,6 @@ pub fn core_command_types() -> Vec<CommandType> {
         CommandType {
             name: "Time",
             payload_type: "TimeRequest",
-            message_type: "msg",
-        },
-        CommandType {
-            name: "Storage",
-            payload_type: "StorageRequest",
             message_type: "msg",
         },
         CommandType {
@@ -57,31 +282,6 @@ pub fn core_command_types() -> Vec<CommandType> {
             payload_type: "RandomRequest",
             message_type: "msg",
         },
-        CommandType {
-            name: "Canvas",
-            payload_type: "CanvasRequest",
-            message_type: "msg",
-        },
-        CommandType {
-            name: "DomRef",
-            payload_type: "DomRefRequest",
-            message_type: "msg",
-        },
-        CommandType {
-            name: "MediaQuery",
-            payload_type: "MediaQueryRequest",
-            message_type: "msg",
-        },
-        CommandType {
-            name: "File",
-            payload_type: "FileRequest",
-            message_type: "msg",
-        },
-        CommandType {
-            name: "Window",
-            payload_type: "WindowRequest",
-            message_type: "msg",
-        },
     ]
 }
 
@@ -93,6 +293,30 @@ pub fn validate_purity_with_imported_command_helpers(
     source: &SourceFile,
     imported_command_helpers: &HashSet<String>,
 ) -> EffectReport {
+    validate_purity_with_options(source, imported_command_helpers, EffectOptions::default())
+}
+
+pub fn validate_purity_with_options(
+    source: &SourceFile,
+    imported_command_helpers: &HashSet<String>,
+    options: EffectOptions,
+) -> EffectReport {
+    validate_purity_with_effect_helpers(
+        source,
+        imported_command_helpers,
+        &HashSet::new(),
+        &HashSet::new(),
+        options,
+    )
+}
+
+pub fn validate_purity_with_effect_helpers(
+    source: &SourceFile,
+    imported_command_helpers: &HashSet<String>,
+    imported_update_result_helpers: &HashSet<String>,
+    imported_subscription_helpers: &HashSet<String>,
+    options: EffectOptions,
+) -> EffectReport {
     let command_helpers = collect_defn_infos(source);
     let command_params_by_helper = collect_command_params_by_helper(source, &command_helpers);
     let mut validator = EffectValidator {
@@ -100,21 +324,26 @@ pub fn validate_purity_with_imported_command_helpers(
         command_values: collect_def_values(source),
         command_params_by_helper,
         imported_command_helpers,
+        imported_update_result_helpers,
+        imported_subscription_helpers,
         validated_helpers: HashSet::new(),
         validating_helpers: HashSet::new(),
         local_command_scopes: Vec::new(),
         validating_local_commands: Vec::new(),
+        options: options.clone(),
         diagnostics: Vec::new(),
     };
     for form in &source.forms {
-        collect_forbidden_browser_access(form, &mut validator.diagnostics);
+        collect_forbidden_access(form, &options, &mut validator.diagnostics);
         validator.validate_init_form(form);
         validator.validate_update_form(form);
         validator.validate_subscriptions_form(form);
     }
 
+    let mut commands = core_command_types();
+    commands.extend(options.command_types);
     EffectReport {
-        commands: core_command_types(),
+        commands,
         diagnostics: validator.diagnostics,
     }
 }
@@ -136,11 +365,32 @@ struct EffectValidator<'a> {
     command_values: HashMap<String, Expr>,
     command_params_by_helper: HashMap<String, HashSet<String>>,
     imported_command_helpers: &'a HashSet<String>,
+    imported_update_result_helpers: &'a HashSet<String>,
+    imported_subscription_helpers: &'a HashSet<String>,
     validated_helpers: HashSet<String>,
     validating_helpers: HashSet<String>,
     local_command_scopes: Vec<HashMap<String, CommandSymbol>>,
     validating_local_commands: Vec<String>,
+    options: EffectOptions,
     diagnostics: Vec<Diagnostic>,
+}
+
+impl EffectValidator<'_> {
+    fn is_known_command_kind(&self, kind: &str) -> bool {
+        is_known_command_kind(kind) || self.options.command_schema_rule(kind).is_some()
+    }
+
+    fn command_schema_rule(&self, kind: &str) -> Option<EffectCommandSchemaRule> {
+        self.options.command_schema_rule(kind).cloned()
+    }
+
+    fn is_known_subscription_kind(&self, kind: &str) -> bool {
+        is_known_subscription_kind(kind) || self.options.subscription_schema_rule(kind).is_some()
+    }
+
+    fn subscription_schema_rule(&self, kind: &str) -> Option<EffectSubscriptionSchemaRule> {
+        self.options.subscription_schema_rule(kind).cloned()
+    }
 }
 
 fn collect_defn_infos(source: &SourceFile) -> HashMap<String, DefnInfo> {
@@ -252,6 +502,51 @@ fn require_success_command_field(
     ));
 }
 
+fn validate_registered_command_schema(
+    validator: &mut EffectValidator<'_>,
+    span: Span,
+    entries: &[(Expr, Expr)],
+    schema: &EffectCommandSchemaRule,
+) {
+    for field in &schema.required_fields {
+        if map_get(entries, field).is_none() {
+            validator.diagnostics.push(Diagnostic::error(
+                span,
+                format!("{} command is missing a :{} field", schema.kind, field),
+            ));
+        }
+    }
+    for fields in &schema.one_of_field_groups {
+        let fields = fields.iter().map(String::as_str).collect::<Vec<_>>();
+        require_one_command_field(
+            span,
+            entries,
+            &fields,
+            &schema.kind,
+            &mut validator.diagnostics,
+        );
+    }
+    if schema.require_success {
+        require_success_command_field(span, entries, &schema.kind, &mut validator.diagnostics);
+    }
+    if schema.reject_success_continuations {
+        reject_change_command_success_continuations(
+            span,
+            entries,
+            &schema.kind,
+            &mut validator.diagnostics,
+        );
+    }
+    if schema.payloadless_success {
+        reject_payloadless_success_continuations(
+            span,
+            entries,
+            &schema.kind,
+            &mut validator.diagnostics,
+        );
+    }
+}
+
 fn reject_conflicting_success_command_fields(
     span: Span,
     entries: &[(Expr, Expr)],
@@ -321,10 +616,6 @@ fn reject_change_command_success_continuations(
     command: &str,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    if !matches!(command, "dom-ref/resize-watch" | "media-query/watch") {
-        return;
-    }
-
     let present = ["msg", "onSuccess", "toMessage"]
         .into_iter()
         .filter(|field| map_get(entries, field).is_some())
@@ -354,13 +645,6 @@ fn reject_payloadless_success_continuations(
     command: &str,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    if !matches!(
-        command,
-        "bluetooth/disconnect" | "timer/after" | "timer/every" | "timer/cancel"
-    ) {
-        return;
-    }
-
     let present = ["onSuccess", "toMessage"]
         .into_iter()
         .filter(|field| map_get(entries, field).is_some())
@@ -382,6 +666,10 @@ fn reject_payloadless_success_continuations(
                 .join(", ")
         ),
     ));
+}
+
+fn is_builtin_payloadless_command(command: &str) -> bool {
+    matches!(command, "timer/after" | "timer/every" | "timer/cancel")
 }
 
 fn require_http_request_url(
@@ -411,26 +699,23 @@ fn reject_unsupported_continuation_fields(
     span: Span,
     entries: &[(Expr, Expr)],
     command: &str,
+    options: &EffectOptions,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    for (field, supported) in [
-        ("onCancel", &["file/import", "file/read-selected"][..]),
-        (
-            "onDisconnected",
-            &["bluetooth/connect-heart-rate", "simulation/heart-rate"][..],
-        ),
-        (
-            "onReading",
-            &["bluetooth/connect-heart-rate", "simulation/heart-rate"][..],
-        ),
+    for (field, builtin_supported) in [
+        ("onCancel", &[][..]),
+        ("onDisconnected", &[][..]),
+        ("onReading", &[][..]),
         ("onFrame", &["animation/frame"][..]),
-        (
-            "onChange",
-            &["dom-ref/resize-watch", "media-query/watch"][..],
-        ),
-        ("onEvent", &["window/event-watch"][..]),
+        ("onChange", &[][..]),
+        ("onEvent", &[][..]),
     ] {
-        if map_get(entries, field).is_some() && !supported.contains(&command) {
+        if map_get(entries, field).is_some() {
+            let supported =
+                command_kinds_supporting_continuation(field, builtin_supported, options);
+            if supported.iter().any(|kind| kind == command) {
+                continue;
+            }
             diagnostics.push(Diagnostic::error(
                 span,
                 format!(
@@ -446,6 +731,24 @@ fn reject_unsupported_continuation_fields(
             ));
         }
     }
+}
+
+fn command_kinds_supporting_continuation(
+    field: &str,
+    builtin_supported: &[&str],
+    options: &EffectOptions,
+) -> Vec<String> {
+    let mut supported = builtin_supported
+        .iter()
+        .map(|kind| (*kind).to_string())
+        .collect::<Vec<_>>();
+    for schema in &options.command_schemas {
+        if schema.supports_continuation(field) && !supported.iter().any(|kind| kind == &schema.kind)
+        {
+            supported.push(schema.kind.clone());
+        }
+    }
+    supported
 }
 
 impl EffectValidator<'_> {
@@ -541,7 +844,7 @@ impl EffectValidator<'_> {
                 self.validate_update_result(&items[3]);
             }
             ExprKind::List(items) if matches_head(items, "match") && items.len() >= 4 => {
-                self.validate_match_bodies(expr, items, "update", Self::validate_update_result);
+                self.validate_update_match_result(expr, items);
             }
             ExprKind::List(items) if matches_head(items, "do") => {
                 if let Some(last) = items.last() {
@@ -549,6 +852,7 @@ impl EffectValidator<'_> {
                 }
             }
             ExprKind::List(items) if matches_head(items, "scope-update") => {}
+            ExprKind::List(items) if self.is_update_result_helper_call(items) => {}
             ExprKind::List(items) if matches_head(items, "let") => {
                 self.with_let_command_scope(items, |validator, body| {
                     validator.validate_update_result(body);
@@ -559,6 +863,36 @@ impl EffectValidator<'_> {
                 "update must return [state cmd] so effects stay explicit command data",
             )),
         }
+    }
+
+    fn validate_update_match_result(&mut self, expr: &Expr, items: &[Expr]) {
+        if items.len() % 2 != 0 {
+            self.diagnostics.push(Diagnostic::error(
+                expr.span,
+                "match in update must contain pattern/body pairs",
+            ));
+            return;
+        }
+
+        let helper_match = match &items[1].kind {
+            ExprKind::List(call_items) => self.is_update_result_helper_call(call_items),
+            _ => false,
+        };
+
+        for arm in items[2..].chunks(2) {
+            let [pattern, body] = arm else {
+                continue;
+            };
+            if helper_match && update_result_binding_returned(pattern, body) {
+                continue;
+            }
+            self.validate_update_result(body);
+        }
+    }
+
+    fn is_update_result_helper_call(&self, items: &[Expr]) -> bool {
+        function_call_name(items)
+            .is_some_and(|name| self.imported_update_result_helpers.contains(name))
     }
 
     fn validate_command_expr(&mut self, expr: &Expr) {
@@ -586,9 +920,14 @@ impl EffectValidator<'_> {
                     self.validate_command_expr(last);
                 }
             }
+            ExprKind::List(items) if matches_head(items, "Cmd.map") => {
+                if let Some(command) = items.get(1) {
+                    self.validate_command_expr(command);
+                }
+            }
             ExprKind::List(items) => {
                 if let Some(name) = function_call_name(items) {
-                    if is_builtin_command_helper(name) {
+                    if is_builtin_command_helper(name) || self.options.is_command_helper(name) {
                         return;
                     }
                     if name == "Task.perform" {
@@ -649,29 +988,23 @@ impl EffectValidator<'_> {
             }
             ExprKind::List(items) => {
                 if let Some(name) = function_call_name(items) {
-                    if matches!(
-                        name,
-                        "Sub.batch"
-                            | "Sub.timer/every"
-                            | "Sub.media-query"
-                            | "Sub.window/event"
-                            | "Sub.window/event-with"
-                            | "Sub.dom-ref/resize"
-                            | "scope-subscriptions"
-                    ) {
+                    if self.options.is_subscription_helper(name) {
+                        return;
+                    }
+                    if self.imported_subscription_helpers.contains(name) {
                         return;
                     }
                 }
                 self.diagnostics.push(Diagnostic::error(
                     expr.span,
-                    "subscriptions must return Sub data such as Sub.none or {:kind :sub/timer/every}",
+                    "subscriptions must return configured subscription data",
                 ));
             }
-            ExprKind::Symbol(name) if name == "Sub.none" => {}
+            ExprKind::Symbol(name) if self.options.is_subscription_symbol(name) => {}
             ExprKind::Symbol(_) => {}
             _ => self.diagnostics.push(Diagnostic::error(
                 expr.span,
-                "subscriptions must return Sub data such as Sub.none or {:kind :sub/timer/every}",
+                "subscriptions must return configured subscription data",
             )),
         }
     }
@@ -818,10 +1151,8 @@ impl EffectValidator<'_> {
 fn is_builtin_command_helper(name: &str) -> bool {
     matches!(
         name,
-        "Cmd.batch"
-            | "Cmd.storage/get"
-            | "Cmd.storage/set"
-            | "Cmd.storage/set-silent"
+        "Cmd.map"
+            | "Cmd.batch"
             | "Cmd.time/now"
             | "Cmd.random/number"
             | "Cmd.timer/every"
@@ -829,17 +1160,6 @@ fn is_builtin_command_helper(name: &str) -> bool {
             | "Cmd.timer/cancel"
             | "Cmd.animation/frame"
             | "Cmd.animation/cancel"
-            | "Cmd.dom-ref/click"
-            | "Cmd.dom-ref/focus"
-            | "Cmd.file/read-selected"
-            | "Cmd.file/download"
-            | "Cmd.canvas/draw"
-            | "Cmd.dom-ref/measure"
-            | "Cmd.dom-ref/resize-watch"
-            | "Cmd.bluetooth/connect-heart-rate"
-            | "Cmd.bluetooth/disconnect"
-            | "Cmd.simulation/heart-rate"
-            | "Cmd.simulation/stop"
     )
 }
 
@@ -856,7 +1176,7 @@ fn validate_command_map(validator: &mut EffectValidator<'_>, span: Span, entries
         return;
     };
 
-    if !is_known_command_kind(&kind) {
+    if !validator.is_known_command_kind(&kind) {
         validator.diagnostics.push(Diagnostic::error(
             kind_expr.span,
             format!("unknown command kind :{}", kind),
@@ -864,20 +1184,49 @@ fn validate_command_map(validator: &mut EffectValidator<'_>, span: Span, entries
         return;
     }
 
+    let registered_schema = validator.command_schema_rule(&kind);
+
     if matches!(kind.as_str(), "none" | "batch") {
         reject_structural_command_continuations(span, entries, &kind, &mut validator.diagnostics);
-    } else if matches!(kind.as_str(), "dom-ref/resize-watch" | "media-query/watch") {
+    } else if registered_schema
+        .as_ref()
+        .is_some_and(|schema| schema.reject_success_continuations)
+    {
         reject_change_command_success_continuations(
             span,
             entries,
             &kind,
             &mut validator.diagnostics,
         );
-        reject_unsupported_continuation_fields(span, entries, &kind, &mut validator.diagnostics);
+        reject_unsupported_continuation_fields(
+            span,
+            entries,
+            &kind,
+            &validator.options,
+            &mut validator.diagnostics,
+        );
     } else {
         reject_conflicting_success_command_fields(span, entries, &kind, &mut validator.diagnostics);
-        reject_payloadless_success_continuations(span, entries, &kind, &mut validator.diagnostics);
-        reject_unsupported_continuation_fields(span, entries, &kind, &mut validator.diagnostics);
+        if is_builtin_payloadless_command(&kind) {
+            reject_payloadless_success_continuations(
+                span,
+                entries,
+                &kind,
+                &mut validator.diagnostics,
+            );
+        }
+        reject_unsupported_continuation_fields(
+            span,
+            entries,
+            &kind,
+            &validator.options,
+            &mut validator.diagnostics,
+        );
+    }
+
+    if let Some(schema) = registered_schema {
+        validate_registered_command_schema(validator, span, entries, &schema);
+        return;
     }
 
     if kind == "batch" {
@@ -899,85 +1248,6 @@ fn validate_command_map(validator: &mut EffectValidator<'_>, span: Span, entries
                 "batch :commands must be a vector of command records",
             )),
         }
-    }
-
-    if kind == "file/download" {
-        require_command_fields(
-            span,
-            entries,
-            &["name", "content"],
-            "file/download",
-            &mut validator.diagnostics,
-        );
-    }
-
-    if kind == "file/import" {
-        require_success_command_field(span, entries, "file/import", &mut validator.diagnostics);
-    }
-
-    if kind == "file/read-selected" {
-        require_command_fields(
-            span,
-            entries,
-            &["ref"],
-            "file/read-selected",
-            &mut validator.diagnostics,
-        );
-        require_success_command_field(
-            span,
-            entries,
-            "file/read-selected",
-            &mut validator.diagnostics,
-        );
-    }
-
-    if kind == "bluetooth/request-device" {
-        require_success_command_field(
-            span,
-            entries,
-            "bluetooth/request-device",
-            &mut validator.diagnostics,
-        );
-        require_one_command_field(
-            span,
-            entries,
-            &["options", "filters", "acceptAllDevices"],
-            "bluetooth/request-device",
-            &mut validator.diagnostics,
-        );
-    }
-
-    if kind == "bluetooth/connect-heart-rate" {
-        require_command_fields(
-            span,
-            entries,
-            &["id", "onReading"],
-            "bluetooth/connect-heart-rate",
-            &mut validator.diagnostics,
-        );
-        require_success_command_field(
-            span,
-            entries,
-            "bluetooth/connect-heart-rate",
-            &mut validator.diagnostics,
-        );
-        require_one_command_field(
-            span,
-            entries,
-            &["options", "filters", "acceptAllDevices"],
-            "bluetooth/connect-heart-rate",
-            &mut validator.diagnostics,
-        );
-    }
-
-    if kind == "bluetooth/disconnect" {
-        require_command_fields(
-            span,
-            entries,
-            &["id"],
-            "bluetooth/disconnect",
-            &mut validator.diagnostics,
-        );
     }
 
     if kind == "task/perform" {
@@ -1027,99 +1297,8 @@ fn validate_command_map(validator: &mut EffectValidator<'_>, span: Span, entries
         "time/now" => {
             require_success_command_field(span, entries, &kind, &mut validator.diagnostics);
         }
-        "storage/get" => {
-            require_command_fields(span, entries, &["key"], &kind, &mut validator.diagnostics);
-            require_success_command_field(span, entries, &kind, &mut validator.diagnostics);
-        }
-        "storage/remove" => {
-            require_command_fields(span, entries, &["key"], &kind, &mut validator.diagnostics);
-        }
-        "storage/set" => {
-            require_command_fields(
-                span,
-                entries,
-                &["key", "value"],
-                &kind,
-                &mut validator.diagnostics,
-            );
-        }
-        "browser/history-replace-search-param" => {
-            require_command_fields(
-                span,
-                entries,
-                &["name", "value"],
-                &kind,
-                &mut validator.diagnostics,
-            );
-        }
-        "browser/history-write-route" => {
-            require_command_fields(
-                span,
-                entries,
-                &["url", "op", "definition"],
-                &kind,
-                &mut validator.diagnostics,
-            );
-        }
-        "browser/theme-load" => {
-            require_command_fields(span, entries, &["key"], &kind, &mut validator.diagnostics);
-            require_success_command_field(span, entries, &kind, &mut validator.diagnostics);
-        }
-        "browser/theme-apply" => {
-            require_command_fields(
-                span,
-                entries,
-                &["theme", "key"],
-                &kind,
-                &mut validator.diagnostics,
-            );
-        }
-        "browser/clipboard-write" => {
-            require_command_fields(span, entries, &["text"], &kind, &mut validator.diagnostics);
-        }
-        "browser/set-cookie" => {
-            require_command_fields(
-                span,
-                entries,
-                &["name", "value"],
-                &kind,
-                &mut validator.diagnostics,
-            );
-        }
-        "auth-storage/load" => {
-            require_command_fields(
-                span,
-                entries,
-                &["sourceUrl"],
-                &kind,
-                &mut validator.diagnostics,
-            );
-            require_success_command_field(span, entries, &kind, &mut validator.diagnostics);
-        }
-        "auth-storage/persist" => {
-            require_command_fields(
-                span,
-                entries,
-                &["sourceUrl", "entries"],
-                &kind,
-                &mut validator.diagnostics,
-            );
-        }
         "random/number" => {
             require_success_command_field(span, entries, &kind, &mut validator.diagnostics);
-        }
-        "simulation/heart-rate" => {
-            require_command_fields(
-                span,
-                entries,
-                &["id", "onReading"],
-                &kind,
-                &mut validator.diagnostics,
-            );
-            require_success_command_field(span, entries, &kind, &mut validator.diagnostics);
-        }
-        "simulation/stop" => {
-            require_command_fields(span, entries, &["id"], &kind, &mut validator.diagnostics);
         }
         "http/request" => {
             require_one_command_field(
@@ -1131,96 +1310,6 @@ fn validate_command_map(validator: &mut EffectValidator<'_>, span: Span, entries
             );
             require_http_request_url(span, entries, &mut validator.diagnostics);
             require_success_command_field(span, entries, &kind, &mut validator.diagnostics);
-        }
-        "canvas/draw" => {
-            require_command_fields(
-                span,
-                entries,
-                &["ref", "ops"],
-                &kind,
-                &mut validator.diagnostics,
-            );
-        }
-        "canvas/measure-text" => {
-            require_command_fields(span, entries, &["ref"], &kind, &mut validator.diagnostics);
-            require_success_command_field(span, entries, &kind, &mut validator.diagnostics);
-            require_one_command_field(
-                span,
-                entries,
-                &["text", "texts"],
-                &kind,
-                &mut validator.diagnostics,
-            );
-        }
-        "dom-ref/focus" | "dom-ref/click" => {
-            require_command_fields(span, entries, &["ref"], &kind, &mut validator.diagnostics);
-        }
-        "dom-ref/measure" => {
-            require_command_fields(span, entries, &["ref"], &kind, &mut validator.diagnostics);
-            require_success_command_field(span, entries, &kind, &mut validator.diagnostics);
-        }
-        "dom/scroll-into-view" => {
-            require_one_command_field(
-                span,
-                entries,
-                &["selector", "testId", "id"],
-                &kind,
-                &mut validator.diagnostics,
-            );
-        }
-        "dom-ref/resize-watch" => {
-            require_command_fields(
-                span,
-                entries,
-                &["ref", "onChange"],
-                &kind,
-                &mut validator.diagnostics,
-            );
-        }
-        "dom-ref/resize-unwatch" => {
-            require_one_command_field(
-                span,
-                entries,
-                &["id", "ref"],
-                &kind,
-                &mut validator.diagnostics,
-            );
-        }
-        "window/event-watch" => {
-            require_command_fields(
-                span,
-                entries,
-                &["type", "onEvent"],
-                &kind,
-                &mut validator.diagnostics,
-            );
-        }
-        "window/event-unwatch" => {
-            require_one_command_field(
-                span,
-                entries,
-                &["id", "type"],
-                &kind,
-                &mut validator.diagnostics,
-            );
-        }
-        "media-query/watch" => {
-            require_command_fields(
-                span,
-                entries,
-                &["query", "onChange"],
-                &kind,
-                &mut validator.diagnostics,
-            );
-        }
-        "media-query/unwatch" => {
-            require_one_command_field(
-                span,
-                entries,
-                &["id", "query"],
-                &kind,
-                &mut validator.diagnostics,
-            );
         }
         _ => {}
     }
@@ -1243,7 +1332,7 @@ fn validate_subscription_map(
         return;
     };
 
-    if !is_known_subscription_kind(&kind) {
+    if !validator.is_known_subscription_kind(&kind) {
         validator.diagnostics.push(Diagnostic::error(
             kind_expr.span,
             format!("unknown subscription kind :{}", kind),
@@ -1251,14 +1340,28 @@ fn validate_subscription_map(
         return;
     }
 
-    match kind.as_str() {
-        "batch" => {
-            let Some(subscriptions) =
-                map_get(entries, "subscriptions").or_else(|| map_get(entries, "subs"))
-            else {
+    if let Some(schema) = validator.subscription_schema_rule(&kind) {
+        let required = schema
+            .required_fields
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        require_command_fields(span, entries, &required, &kind, &mut validator.diagnostics);
+
+        if !schema.collection_fields.is_empty() {
+            let subscriptions = schema
+                .collection_fields
+                .iter()
+                .find_map(|field| map_get(entries, field));
+            let Some(subscriptions) = subscriptions else {
+                let label = schema
+                    .collection_fields
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or("subscriptions");
                 validator.diagnostics.push(Diagnostic::error(
                     span,
-                    "batch subscription is missing a :subscriptions vector",
+                    format!("{} subscription is missing a :{} vector", kind, label),
                 ));
                 return;
             };
@@ -1270,57 +1373,13 @@ fn validate_subscription_map(
                 }
                 _ => validator.diagnostics.push(Diagnostic::error(
                     subscriptions.span,
-                    "batch :subscriptions must be a vector of subscription records",
+                    format!(
+                        "{} subscription collection must be a vector of subscription records",
+                        kind
+                    ),
                 )),
             }
         }
-        "sub/timer/every" => {
-            require_command_fields(
-                span,
-                entries,
-                &["id", "ms", "msg"],
-                &kind,
-                &mut validator.diagnostics,
-            );
-        }
-        "sub/dom-ref/resize" => {
-            require_command_fields(
-                span,
-                entries,
-                &["ref", "onChange"],
-                &kind,
-                &mut validator.diagnostics,
-            );
-        }
-        "sub/window/event" => {
-            require_command_fields(
-                span,
-                entries,
-                &["type", "onEvent"],
-                &kind,
-                &mut validator.diagnostics,
-            );
-        }
-        "sub/media-query" => {
-            require_command_fields(
-                span,
-                entries,
-                &["query", "onChange"],
-                &kind,
-                &mut validator.diagnostics,
-            );
-        }
-        "sub/simulation/heart-rate" | "sub/bluetooth/connect-heart-rate" => {
-            require_command_fields(
-                span,
-                entries,
-                &["id", "onReading"],
-                &kind,
-                &mut validator.diagnostics,
-            );
-        }
-        "none" => {}
-        _ => {}
     }
 }
 
@@ -1567,46 +1626,39 @@ fn type_expr_is_cmd(expr: &Expr) -> bool {
     items.len() == 2 && matches_symbol(&items[0], "Cmd")
 }
 
-fn collect_forbidden_browser_access(expr: &Expr, diagnostics: &mut Vec<Diagnostic>) {
+fn collect_forbidden_access(
+    expr: &Expr,
+    options: &EffectOptions,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
     match &expr.kind {
-        ExprKind::Symbol(name) if event_mutation_symbol(name) => {
-            diagnostics.push(Diagnostic::error(
-                expr.span,
-                format!(
-                    "`{}` mutates a browser event; return Event.prevent/Event.stop data instead",
-                    name
-                ),
-            ));
+        ExprKind::HtmlTemplate(node) => {
+            if let Some(message) = options.forbidden_form_message(ForbiddenFormKind::HtmlTemplate) {
+                diagnostics.push(Diagnostic::error(expr.span, message.to_string()));
+            }
+            collect_forbidden_access_html_node(node, options, diagnostics)
         }
-        ExprKind::Symbol(name) if browser_api_symbol(name) => {
-            diagnostics.push(Diagnostic::error(
-                expr.span,
-                format!(
-                    "`{}` is a browser API; pure code must return typed command data instead",
-                    name
-                ),
-            ));
+        ExprKind::Symbol(name) => {
+            if let Some(message) = options.forbidden_symbol_message(name) {
+                diagnostics.push(Diagnostic::error(expr.span, message));
+            }
         }
         ExprKind::List(items) | ExprKind::Vector(items) | ExprKind::Set(items) => {
             for item in items {
-                collect_forbidden_browser_access(item, diagnostics);
+                collect_forbidden_access(item, options, diagnostics);
             }
         }
         ExprKind::Map(entries) => {
             for (key, value) in entries {
-                collect_forbidden_browser_access(key, diagnostics);
-                collect_forbidden_browser_access(value, diagnostics);
+                collect_forbidden_access(key, options, diagnostics);
+                collect_forbidden_access(value, options, diagnostics);
             }
         }
         ExprKind::Quote(inner)
         | ExprKind::QuasiQuote(inner)
         | ExprKind::Unquote(inner)
-        | ExprKind::UnquoteSplicing(inner) => collect_forbidden_browser_access(inner, diagnostics),
-        ExprKind::HtmlTemplate(node) => {
-            collect_forbidden_browser_access_html_node(node, diagnostics)
-        }
-        ExprKind::Symbol(_)
-        | ExprKind::Nil
+        | ExprKind::UnquoteSplicing(inner) => collect_forbidden_access(inner, options, diagnostics),
+        ExprKind::Nil
         | ExprKind::Bool(_)
         | ExprKind::Number(_)
         | ExprKind::String(_)
@@ -1614,84 +1666,25 @@ fn collect_forbidden_browser_access(expr: &Expr, diagnostics: &mut Vec<Diagnosti
     }
 }
 
-fn collect_forbidden_browser_access_html_node(
+fn collect_forbidden_access_html_node(
     node: &syntax::HtmlNode,
+    options: &EffectOptions,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     match node {
         syntax::HtmlNode::Element(element) => {
             for attr in &element.attrs {
                 if let syntax::HtmlAttrValue::Dynamic { expr, .. } = &attr.value {
-                    collect_forbidden_browser_access(expr, diagnostics);
+                    collect_forbidden_access(expr, options, diagnostics);
                 }
             }
             for child in &element.children {
-                collect_forbidden_browser_access_html_node(child, diagnostics);
+                collect_forbidden_access_html_node(child, options, diagnostics);
             }
         }
-        syntax::HtmlNode::Expr { expr, .. } => collect_forbidden_browser_access(expr, diagnostics),
+        syntax::HtmlNode::Expr { expr, .. } => collect_forbidden_access(expr, options, diagnostics),
         syntax::HtmlNode::Text { .. } => {}
     }
-}
-
-fn browser_api_symbol(name: &str) -> bool {
-    matches!(
-        name,
-        "window"
-            | "document"
-            | "navigator"
-            | "history"
-            | "localStorage"
-            | "sessionStorage"
-            | "fetch"
-            | "setTimeout"
-            | "setInterval"
-            | "clearTimeout"
-            | "clearInterval"
-            | "requestAnimationFrame"
-            | "cancelAnimationFrame"
-            | "browser-current-url"
-            | "browser-theme-initial"
-            | "browser-theme-toggle"
-            | "history-replace-search-param"
-            | "history-write-route"
-            | "auth-storage-load"
-            | "auth-storage-persist"
-            | "clipboard-write"
-            | "browser-set-cookie"
-            | "selected-file-or-blob"
-            | "selected-file-by-test-id"
-            | "has-selected-file"
-            | "multipart-form-body"
-    ) || [
-        "window.",
-        "document.",
-        "navigator.",
-        "location.",
-        "history.",
-        "localStorage.",
-        "sessionStorage.",
-        "fetch.",
-        "setTimeout.",
-        "setInterval.",
-        "clearTimeout.",
-        "clearInterval.",
-        "requestAnimationFrame.",
-        "cancelAnimationFrame.",
-    ]
-    .iter()
-    .any(|prefix| name.starts_with(prefix))
-}
-
-fn event_mutation_symbol(name: &str) -> bool {
-    matches!(
-        name,
-        "event.preventDefault"
-            | "event.stopPropagation"
-            | "event.preventDefault."
-            | "event.stopPropagation."
-    ) || name.starts_with("event.preventDefault.")
-        || name.starts_with("event.stopPropagation.")
 }
 
 fn matches_symbol(expr: &Expr, expected: &str) -> bool {
@@ -1716,6 +1709,19 @@ fn symbol_name(expr: &Expr) -> Option<&str> {
         return None;
     };
     Some(name)
+}
+
+fn update_result_binding_returned(pattern: &Expr, body: &Expr) -> bool {
+    let ExprKind::List(items) = &pattern.kind else {
+        return false;
+    };
+    if items.len() != 2 || !matches_head(items, "some") {
+        return false;
+    }
+    let Some(binding) = symbol_name(&items[1]) else {
+        return false;
+    };
+    symbol_name(body).is_some_and(|body| body == binding)
 }
 
 fn map_get<'a>(entries: &'a [(Expr, Expr)], name: &str) -> Option<&'a Expr> {
@@ -1747,61 +1753,20 @@ pub fn is_known_command_kind(kind: &str) -> bool {
         kind,
         "none"
             | "batch"
-            | "bluetooth/request-device"
-            | "bluetooth/connect-heart-rate"
-            | "bluetooth/disconnect"
             | "timer/after"
             | "timer/every"
             | "timer/cancel"
             | "animation/frame"
             | "animation/cancel"
             | "time/now"
-            | "storage/get"
-            | "storage/set"
-            | "storage/remove"
-            | "browser/history-replace-search-param"
-            | "browser/history-write-route"
-            | "browser/theme-load"
-            | "browser/theme-apply"
-            | "browser/clipboard-write"
-            | "browser/set-cookie"
-            | "auth-storage/load"
-            | "auth-storage/persist"
             | "random/number"
-            | "simulation/heart-rate"
-            | "simulation/stop"
             | "task/perform"
-            | "file/download"
-            | "file/import"
-            | "file/read-selected"
-            | "canvas/draw"
-            | "canvas/measure-text"
-            | "dom-ref/focus"
-            | "dom-ref/click"
-            | "dom-ref/measure"
-            | "dom/scroll-into-view"
-            | "dom-ref/resize-watch"
-            | "dom-ref/resize-unwatch"
-            | "window/event-watch"
-            | "window/event-unwatch"
-            | "media-query/watch"
-            | "media-query/unwatch"
             | "http/request"
     )
 }
 
 pub fn is_known_subscription_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "none"
-            | "batch"
-            | "sub/timer/every"
-            | "sub/dom-ref/resize"
-            | "sub/window/event"
-            | "sub/media-query"
-            | "sub/simulation/heart-rate"
-            | "sub/bluetooth/connect-heart-rate"
-    )
+    matches!(kind, "none")
 }
 
 const COMMAND_CONTINUATION_FIELDS: &[&str] = &[
@@ -1821,12 +1786,270 @@ const COMMAND_CONTINUATION_FIELDS: &[&str] = &[
 mod tests {
     use super::*;
 
-    #[test]
-    fn flags_direct_browser_api_access() {
-        let source = syntax::parse_source("(def bad fetch)");
-        let report = validate_purity(&source);
+    fn validate_with_forbidden_host_access(source: &SourceFile) -> EffectReport {
+        validate_purity_with_options(
+            source,
+            &std::collections::HashSet::new(),
+            forbidden_host_access_options(),
+        )
+    }
 
-        assert_eq!(report.commands.len(), 13);
+    fn forbidden_host_access_options() -> EffectOptions {
+        let mut options = EffectOptions::default();
+        for symbol in [
+            "fetch",
+            "sessionStorage",
+            "setInterval",
+            "requestAnimationFrame",
+            "browser-current-url",
+            "browser-theme-initial",
+            "auth-storage-load",
+            "selected-file-by-test-id",
+            "has-selected-file",
+            "multipart-form-body",
+        ] {
+            options = options.forbid_symbol(
+                SymbolPattern::exact(symbol),
+                "`{symbol}` is a host API; pure code must return typed command data instead",
+            );
+        }
+        for prefix in ["window.", "document.", "location."] {
+            options = options.forbid_symbol(
+                SymbolPattern::prefix(prefix),
+                "`{symbol}` is a host API; pure code must return typed command data instead",
+            );
+        }
+        options = options.forbid_symbol(
+            SymbolPattern::exact("event.preventDefault"),
+            "`{symbol}` mutates host event data; return typed data instead",
+        );
+        options
+    }
+
+    fn browser_command_schema_options() -> EffectOptions {
+        browser_command_type_options()
+            .command_schema(
+                EffectCommandSchemaRule::new("browser/history-replace-search-param")
+                    .required_fields(["name", "value"]),
+            )
+            .command_schema(
+                EffectCommandSchemaRule::new("browser/history-write-route").required_fields([
+                    "url",
+                    "op",
+                    "definition",
+                ]),
+            )
+            .command_schema(
+                EffectCommandSchemaRule::new("browser/theme-load")
+                    .required_fields(["key"])
+                    .require_success(),
+            )
+            .command_schema(
+                EffectCommandSchemaRule::new("browser/theme-apply")
+                    .required_fields(["theme", "key"]),
+            )
+            .command_schema(
+                EffectCommandSchemaRule::new("browser/clipboard-write").required_fields(["text"]),
+            )
+            .command_schema(
+                EffectCommandSchemaRule::new("browser/set-cookie")
+                    .required_fields(["name", "value"]),
+            )
+            .command_schema(
+                EffectCommandSchemaRule::new("storage/get")
+                    .required_fields(["key"])
+                    .require_success(),
+            )
+            .command_schema(
+                EffectCommandSchemaRule::new("storage/set").required_fields(["key", "value"]),
+            )
+            .command_schema(EffectCommandSchemaRule::new("storage/remove").required_fields(["key"]))
+            .command_schema(
+                EffectCommandSchemaRule::new("auth-storage/load")
+                    .required_fields(["sourceUrl"])
+                    .require_success(),
+            )
+            .command_schema(
+                EffectCommandSchemaRule::new("auth-storage/persist")
+                    .required_fields(["sourceUrl", "entries"]),
+            )
+            .command_schema(
+                EffectCommandSchemaRule::new("file/download").required_fields(["name", "content"]),
+            )
+            .command_schema(
+                EffectCommandSchemaRule::new("file/import")
+                    .require_success()
+                    .supported_continuations(["onCancel"]),
+            )
+            .command_schema(
+                EffectCommandSchemaRule::new("file/read-selected")
+                    .required_fields(["ref"])
+                    .require_success()
+                    .supported_continuations(["onCancel"]),
+            )
+            .command_schema(
+                EffectCommandSchemaRule::new("bluetooth/request-device")
+                    .require_success()
+                    .one_of_fields(["options", "filters", "acceptAllDevices"]),
+            )
+            .command_schema(
+                EffectCommandSchemaRule::new("bluetooth/connect-heart-rate")
+                    .required_fields(["id", "onReading"])
+                    .require_success()
+                    .one_of_fields(["options", "filters", "acceptAllDevices"])
+                    .supported_continuations(["onReading", "onDisconnected"]),
+            )
+            .command_schema(
+                EffectCommandSchemaRule::new("bluetooth/disconnect")
+                    .required_fields(["id"])
+                    .payloadless_success(),
+            )
+            .command_schema(
+                EffectCommandSchemaRule::new("simulation/heart-rate")
+                    .required_fields(["id", "onReading"])
+                    .require_success()
+                    .supported_continuations(["onReading", "onDisconnected"]),
+            )
+            .command_schema(EffectCommandSchemaRule::new("simulation/stop").required_fields(["id"]))
+            .command_schema(
+                EffectCommandSchemaRule::new("canvas/draw").required_fields(["ref", "ops"]),
+            )
+            .command_schema(
+                EffectCommandSchemaRule::new("canvas/measure-text")
+                    .required_fields(["ref"])
+                    .require_success()
+                    .one_of_fields(["text", "texts"]),
+            )
+            .command_schema(EffectCommandSchemaRule::new("dom-ref/focus").required_fields(["ref"]))
+            .command_schema(EffectCommandSchemaRule::new("dom-ref/click").required_fields(["ref"]))
+            .command_schema(
+                EffectCommandSchemaRule::new("dom-ref/measure")
+                    .required_fields(["ref"])
+                    .require_success(),
+            )
+            .command_schema(
+                EffectCommandSchemaRule::new("dom/scroll-into-view")
+                    .one_of_fields(["selector", "testId", "id"]),
+            )
+            .command_schema(
+                EffectCommandSchemaRule::new("dom-ref/resize-watch")
+                    .required_fields(["ref", "onChange"])
+                    .reject_success_continuations()
+                    .supported_continuations(["onChange"]),
+            )
+            .command_schema(
+                EffectCommandSchemaRule::new("dom-ref/resize-unwatch").one_of_fields(["id", "ref"]),
+            )
+            .command_schema(
+                EffectCommandSchemaRule::new("window/event-watch")
+                    .required_fields(["type", "onEvent"])
+                    .supported_continuations(["onEvent"]),
+            )
+            .command_schema(
+                EffectCommandSchemaRule::new("window/event-unwatch").one_of_fields(["id", "type"]),
+            )
+            .command_schema(
+                EffectCommandSchemaRule::new("media-query/watch")
+                    .required_fields(["query", "onChange"])
+                    .reject_success_continuations()
+                    .supported_continuations(["onChange"]),
+            )
+            .command_schema(
+                EffectCommandSchemaRule::new("media-query/unwatch").one_of_fields(["id", "query"]),
+            )
+            .command_helper("Cmd.storage/get")
+            .command_helper("Cmd.storage/set")
+            .command_helper("Cmd.storage/set-silent")
+            .command_helper("Cmd.dom-ref/click")
+            .command_helper("Cmd.dom-ref/focus")
+            .command_helper("Cmd.file/read-selected")
+            .command_helper("Cmd.file/download")
+            .command_helper("Cmd.canvas/draw")
+            .command_helper("Cmd.dom-ref/measure")
+            .command_helper("Cmd.dom-ref/resize-watch")
+            .command_helper("Cmd.bluetooth/connect-heart-rate")
+            .command_helper("Cmd.bluetooth/disconnect")
+            .command_helper("Cmd.simulation/heart-rate")
+            .command_helper("Cmd.simulation/stop")
+            .subscription_helper("Sub.batch")
+            .subscription_helper("Sub.timer/every")
+            .subscription_helper("Sub.media-query")
+            .subscription_helper("Sub.window/event")
+            .subscription_helper("Sub.window/event-with")
+            .subscription_helper("Sub.dom-ref/resize")
+            .subscription_symbol("Sub.none")
+            .subscription_schema(EffectSubscriptionSchemaRule::new("none"))
+            .subscription_schema(
+                EffectSubscriptionSchemaRule::new("batch")
+                    .collection_fields(["subscriptions", "subs"]),
+            )
+            .subscription_schema(
+                EffectSubscriptionSchemaRule::new("sub/timer/every")
+                    .required_fields(["id", "ms", "msg"]),
+            )
+            .subscription_schema(
+                EffectSubscriptionSchemaRule::new("sub/dom-ref/resize")
+                    .required_fields(["ref", "onChange"]),
+            )
+            .subscription_schema(
+                EffectSubscriptionSchemaRule::new("sub/window/event")
+                    .required_fields(["type", "onEvent"]),
+            )
+            .subscription_schema(
+                EffectSubscriptionSchemaRule::new("sub/media-query")
+                    .required_fields(["query", "onChange"]),
+            )
+    }
+
+    fn browser_command_type_options() -> EffectOptions {
+        EffectOptions::default()
+            .command_type(CommandType {
+                name: "Bluetooth",
+                payload_type: "BluetoothRequest",
+                message_type: "msg",
+            })
+            .command_type(CommandType {
+                name: "Storage",
+                payload_type: "StorageRequest",
+                message_type: "msg",
+            })
+            .command_type(CommandType {
+                name: "Canvas",
+                payload_type: "CanvasRequest",
+                message_type: "msg",
+            })
+            .command_type(CommandType {
+                name: "DomRef",
+                payload_type: "DomRefRequest",
+                message_type: "msg",
+            })
+            .command_type(CommandType {
+                name: "MediaQuery",
+                payload_type: "MediaQueryRequest",
+                message_type: "msg",
+            })
+            .command_type(CommandType {
+                name: "File",
+                payload_type: "FileRequest",
+                message_type: "msg",
+            })
+            .command_type(CommandType {
+                name: "Window",
+                payload_type: "WindowRequest",
+                message_type: "msg",
+            })
+    }
+
+    fn validate_browser_purity(source: &SourceFile) -> EffectReport {
+        validate_purity_with_options(source, &HashSet::new(), browser_command_schema_options())
+    }
+
+    #[test]
+    fn flags_configured_direct_host_api_access() {
+        let source = syntax::parse_source("(def bad fetch)");
+        let report = validate_with_forbidden_host_access(&source);
+
+        assert_eq!(report.commands.len(), 6);
         assert!(
             report
                 .diagnostics
@@ -1836,9 +2059,9 @@ mod tests {
     }
 
     #[test]
-    fn flags_dotted_browser_api_access() {
+    fn flags_configured_dotted_host_api_access() {
         let source = syntax::parse_source("(def width window.innerWidth)");
-        let report = validate_purity(&source);
+        let report = validate_with_forbidden_host_access(&source);
 
         assert!(
             report
@@ -1851,14 +2074,14 @@ mod tests {
     }
 
     #[test]
-    fn flags_additional_host_globals_as_browser_api_access() {
+    fn flags_additional_configured_host_globals() {
         let source = syntax::parse_source(
             "(def session sessionStorage)\n\
              (def path location.pathname)\n\
              (def timer setInterval)\n\
              (def frame requestAnimationFrame)",
         );
-        let report = validate_purity(&source);
+        let report = validate_with_forbidden_host_access(&source);
 
         for name in [
             "sessionStorage",
@@ -1878,7 +2101,7 @@ mod tests {
     }
 
     #[test]
-    fn flags_deprecated_browser_intrinsics_as_browser_api_access() {
+    fn flags_configured_legacy_host_intrinsics() {
         let source = syntax::parse_source(
             "(def current (browser-current-url))\n\
              (def theme (browser-theme-initial \"theme\"))\n\
@@ -1887,7 +2110,7 @@ mod tests {
              (def has-file (has-selected-file \"upload\"))\n\
              (def form (multipart-form-body [] {}))",
         );
-        let report = validate_purity(&source);
+        let report = validate_with_forbidden_host_access(&source);
 
         for name in [
             "browser-current-url",
@@ -1909,9 +2132,9 @@ mod tests {
     }
 
     #[test]
-    fn flags_browser_api_access_inside_html_expression() {
+    fn flags_configured_host_api_access_inside_html_expression() {
         let source = syntax::parse_source("(defn view [state] #html <p>{document.title}</p>)");
-        let report = validate_purity(&source);
+        let report = validate_with_forbidden_host_access(&source);
 
         assert!(
             report
@@ -1924,11 +2147,11 @@ mod tests {
     }
 
     #[test]
-    fn flags_browser_api_access_inside_html_event_handler() {
+    fn flags_configured_host_api_access_inside_html_event_handler() {
         let source = syntax::parse_source(
             "(defn view [state] #html <button on:click={(fetch \"/api/workouts\")}>Load</button>)",
         );
-        let report = validate_purity(&source);
+        let report = validate_with_forbidden_host_access(&source);
 
         assert!(
             report
@@ -1941,17 +2164,17 @@ mod tests {
     }
 
     #[test]
-    fn flags_event_mutation_inside_html_event_handler() {
+    fn flags_configured_event_mutation_inside_html_event_handler() {
         let source = syntax::parse_source(
             "(defn view [state] #html <button on:click={(do (event.preventDefault) {:kind :clicked})}>Load</button>)",
         );
-        let report = validate_purity(&source);
+        let report = validate_with_forbidden_host_access(&source);
 
         assert!(
             report
                 .diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.message.contains("Event.prevent")),
+                .any(|diagnostic| diagnostic.message.contains("event.preventDefault")),
             "{:?}",
             report.diagnostics
         );
@@ -1962,7 +2185,11 @@ mod tests {
         let source = syntax::parse_source(
             "(defn update [state msg]\n  (if (= msg :start)\n      [state {:kind :timer/after :ms 1000 :msg :tick}]\n      [state {:kind :none}]))",
         );
-        let report = validate_purity(&source);
+        let report = validate_purity_with_options(
+            &source,
+            &std::collections::HashSet::new(),
+            browser_command_schema_options(),
+        );
 
         assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
     }
@@ -1972,7 +2199,11 @@ mod tests {
         let source = syntax::parse_source(
             "(defn update [state msg]\n  [state (Cmd.batch [Cmd.none\n                         (Cmd.dom-ref/measure \"track\" (fn [rect] {:kind :measured :left rect.left}) :measure-failed)\n                         (Cmd.bluetooth/connect-heart-rate \"hr\" {:filters [{:services [\"heart_rate\"]}]} (fn [info] {:kind :connected :info info}) :heart-rate :disconnected :failed)\n                         (Cmd.simulation/heart-rate \"sim\" {:ms 1000 :min 90 :max 160 :jitter 3 :start 120 :deviceName \"Sim\"} (fn [info] {:kind :connected :info info}) :heart-rate :failed)\n                         {:kind :timer/after :id \"tick\" :ms 1000 :msg :tick}])])",
         );
-        let report = validate_purity(&source);
+        let report = validate_purity_with_options(
+            &source,
+            &std::collections::HashSet::new(),
+            browser_command_schema_options(),
+        );
 
         assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
     }
@@ -1982,7 +2213,11 @@ mod tests {
         let source = syntax::parse_source(
             "(defn subscriptions [state]\n  (Sub.batch [(Sub.window/event-with \"drag\" \"pointermove\" :move {:preventDefault true :options {:passive false}})\n              (Sub.window/event \"dev\" \"keydown\" :key {:passive true})]))",
         );
-        let report = validate_purity(&source);
+        let report = validate_purity_with_options(
+            &source,
+            &std::collections::HashSet::new(),
+            browser_command_schema_options(),
+        );
 
         assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
     }
@@ -1992,7 +2227,7 @@ mod tests {
         let source = syntax::parse_source(
             "(defn update [state msg]\n  [state {:kind :bluetooth/request-device :filters [{:services [\"heart_rate\"]}] :optionalServices [\"heart_rate\"] :onSuccess :connected :onError :bluetooth-error}])",
         );
-        let report = validate_purity(&source);
+        let report = validate_browser_purity(&source);
 
         assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
     }
@@ -2002,7 +2237,7 @@ mod tests {
         let source = syntax::parse_source(
             "(defn update [state msg]\n  [state {:kind :bluetooth/request-device :onSuccess :connected}])",
         );
-        let report = validate_purity(&source);
+        let report = validate_browser_purity(&source);
 
         assert!(
             report
@@ -2017,7 +2252,7 @@ mod tests {
         let source = syntax::parse_source(
             "(defn update [state msg]\n  [state {:kind :bluetooth/connect-heart-rate :id \"hr\" :filters [{:services [\"heart_rate\"]}] :optionalServices [\"heart_rate\"] :onSuccess :connected :onReading :heart-rate :onDisconnected :disconnected :onError :bluetooth-error}])",
         );
-        let report = validate_purity(&source);
+        let report = validate_browser_purity(&source);
 
         assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
     }
@@ -2027,7 +2262,7 @@ mod tests {
         let source = syntax::parse_source(
             "(defn update [state msg]\n  [state {:kind :bluetooth/connect-heart-rate :id \"hr\" :filters [{:services [\"heart_rate\"]}] :onSuccess :connected}])",
         );
-        let report = validate_purity(&source);
+        let report = validate_browser_purity(&source);
 
         assert!(
             report
@@ -2042,7 +2277,7 @@ mod tests {
         let source = syntax::parse_source(
             "(defn update [state msg]\n  [state {:kind :bluetooth/disconnect :id \"hr\" :msg :disconnected}])",
         );
-        let report = validate_purity(&source);
+        let report = validate_browser_purity(&source);
 
         assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
     }
@@ -2156,7 +2391,11 @@ mod tests {
         let source = syntax::parse_source(
             "(defn init []\n  [{:width 0} {:kind :dom-ref/resize-watch :ref \"heart-chart\" :onChange :changed :onSuccess :ready}])",
         );
-        let report = validate_purity(&source);
+        let report = validate_purity_with_options(
+            &source,
+            &HashSet::new(),
+            browser_command_schema_options(),
+        );
 
         assert!(report.diagnostics.iter().any(|diagnostic| diagnostic.message.contains(
             "dom-ref/resize-watch command dispatches changes through :onChange and does not support success continuations :onSuccess"
@@ -2165,7 +2404,11 @@ mod tests {
         let source = syntax::parse_source(
             "(defn init []\n  [{:mobile? false} {:kind :media-query/watch :query \"(max-width: 820px)\" :onChange :media-changed :msg :ready}])",
         );
-        let report = validate_purity(&source);
+        let report = validate_purity_with_options(
+            &source,
+            &HashSet::new(),
+            browser_command_schema_options(),
+        );
 
         assert!(report.diagnostics.iter().any(|diagnostic| diagnostic.message.contains(
             "media-query/watch command dispatches changes through :onChange and does not support success continuations :msg"
@@ -2186,7 +2429,7 @@ mod tests {
         let source = syntax::parse_source(
             "(defn update [state msg]\n  [state {:kind :bluetooth/disconnect :id \"hr\" :toMessage (fn [value] {:kind :disconnected})}])",
         );
-        let report = validate_purity(&source);
+        let report = validate_browser_purity(&source);
 
         assert!(report.diagnostics.iter().any(|diagnostic| diagnostic.message.contains(
             "bluetooth/disconnect command has no success payload; use :msg for completion messages instead of :toMessage"
@@ -2256,7 +2499,7 @@ mod tests {
         let source = syntax::parse_source(
             "(defn init []\n  [{:label \"Loading\"} {:kind :storage/get :key \"heartRateExercise.log.v1\" :format :json :onSuccess :log-loaded :onError :log-load-failed}])",
         );
-        let report = validate_purity(&source);
+        let report = validate_browser_purity(&source);
 
         assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
     }
@@ -2265,7 +2508,7 @@ mod tests {
     fn rejects_storage_get_without_key() {
         let source =
             syntax::parse_source("(defn init []\n  [{:label \"Loading\"} {:kind :storage/get}])");
-        let report = validate_purity(&source);
+        let report = validate_browser_purity(&source);
 
         assert!(
             report
@@ -2280,7 +2523,7 @@ mod tests {
         let source = syntax::parse_source(
             "(defn init []\n  [{:label \"Loading\"} {:kind :storage/get :key \"heartRateExercise.log.v1\"}])",
         );
-        let report = validate_purity(&source);
+        let report = validate_browser_purity(&source);
 
         assert!(report.diagnostics.iter().any(|diagnostic| {
             diagnostic
@@ -2357,7 +2600,7 @@ mod tests {
         let source = syntax::parse_source(
             "(defn update [state msg]\n  (match msg\n    {:kind :start} [state {:kind :storage/set :key \"x\" :value \"y\" :msg :stored}]\n    _ [state {:kind :none}]))",
         );
-        let report = validate_purity(&source);
+        let report = validate_browser_purity(&source);
 
         assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
     }
@@ -2367,7 +2610,11 @@ mod tests {
         let source = syntax::parse_source(
             "(defn update [state msg]\n  [state {:kind :batch\n          :commands [{:kind :browser/history-replace-search-param :name \"op\" :value nil}\n                     {:kind :browser/history-write-route :url \"/docs\" :op nil :definition nil}\n                     {:kind :browser/theme-load :key \"theme\" :onSuccess :theme-loaded}\n                     {:kind :browser/theme-apply :theme \"dark\" :key \"theme\"}\n                     {:kind :browser/clipboard-write :text \"copied\"}\n                     {:kind :browser/set-cookie :name \"token\" :value \"secret\"}\n                     {:kind :auth-storage/load :sourceUrl \"/docs\" :onSuccess :auth-loaded}\n                     {:kind :auth-storage/persist :sourceUrl \"/docs\" :entries {}}]}])",
         );
-        let report = validate_purity(&source);
+        let report = validate_purity_with_options(
+            &source,
+            &std::collections::HashSet::new(),
+            browser_command_schema_options(),
+        );
 
         assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
     }
@@ -2406,7 +2653,7 @@ mod tests {
              (defn persist-log-command [entries]\n  {:kind :storage/set :key \"heartRateExercise.log.v1\" :value {:version 2 :entries entries} :msg {:kind :saved}})\n\
              (defn update [state msg]\n  (match msg\n    {:kind :start} [state (start-hold-command)]\n    {:kind :persist} [state (persist-log-command state.entries)]\n    _ [state {:kind :none}]))",
         );
-        let report = validate_purity(&source);
+        let report = validate_browser_purity(&source);
 
         assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
     }
@@ -2589,7 +2836,7 @@ mod tests {
         let source = syntax::parse_source(
             "(defn update [state msg]\n  [state {:kind :file/download :name \"exercise-log.json\" :content \"[]\" :mime \"application/json\" :msg :exported}])",
         );
-        let report = validate_purity(&source);
+        let report = validate_browser_purity(&source);
 
         assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
     }
@@ -2599,7 +2846,7 @@ mod tests {
         let source = syntax::parse_source(
             "(defn update [state msg]\n  [state {:kind :file/download :name \"exercise-log.json\"}])",
         );
-        let report = validate_purity(&source);
+        let report = validate_browser_purity(&source);
 
         assert!(
             report
@@ -2614,7 +2861,7 @@ mod tests {
         let source = syntax::parse_source(
             "(defn update [state msg]\n  [state {:kind :file/import :accept \"application/json,.json\" :format :json :onSuccess :imported :onError :import-failed}])",
         );
-        let report = validate_purity(&source);
+        let report = validate_browser_purity(&source);
 
         assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
     }
@@ -2624,7 +2871,7 @@ mod tests {
         let source = syntax::parse_source(
             "(defn update [state msg]\n  [state {:kind :file/read-selected :ref \"import-file\" :format :json :onSuccess :imported :onError :import-failed}])",
         );
-        let report = validate_purity(&source);
+        let report = validate_browser_purity(&source);
 
         assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
     }
@@ -2634,7 +2881,7 @@ mod tests {
         let source = syntax::parse_source(
             "(defn update [state msg]\n  [state {:kind :file/read-selected :onSuccess :imported}])",
         );
-        let report = validate_purity(&source);
+        let report = validate_browser_purity(&source);
 
         assert!(
             report
@@ -2648,7 +2895,7 @@ mod tests {
     fn rejects_file_import_without_success_message() {
         let source =
             syntax::parse_source("(defn update [state msg]\n  [state {:kind :file/import}])");
-        let report = validate_purity(&source);
+        let report = validate_browser_purity(&source);
 
         assert!(
             report
@@ -2663,7 +2910,7 @@ mod tests {
         let source = syntax::parse_source(
             "(defn update [state msg]\n  [state {:kind :canvas/draw :ref \"heart-chart\" :ops [{:op :clear} {:op :fill-rect :x 0 :y 0 :width 10 :height 10}] :msg :drawn}])",
         );
-        let report = validate_purity(&source);
+        let report = validate_browser_purity(&source);
 
         assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
     }
@@ -2673,7 +2920,7 @@ mod tests {
         let source = syntax::parse_source(
             "(defn update [state msg]\n  [state {:kind :canvas/draw :ops [{:op :clear}]}])",
         );
-        let report = validate_purity(&source);
+        let report = validate_browser_purity(&source);
 
         assert!(
             report
@@ -2688,7 +2935,7 @@ mod tests {
         let source = syntax::parse_source(
             "(defn update [state msg]\n  [state {:kind :canvas/measure-text :ref \"metrics-chart\" :texts [\"Zone 2\" \"TRIMP\"] :font \"700 12px system-ui\" :onSuccess :labels-measured}])",
         );
-        let report = validate_purity(&source);
+        let report = validate_browser_purity(&source);
 
         assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
     }
@@ -2698,7 +2945,7 @@ mod tests {
         let source = syntax::parse_source(
             "(defn update [state msg]\n  [state {:kind :canvas/measure-text :ref \"metrics-chart\" :onSuccess :labels-measured}])",
         );
-        let report = validate_purity(&source);
+        let report = validate_browser_purity(&source);
 
         assert!(report.diagnostics.iter().any(|diagnostic| {
             diagnostic
@@ -2712,7 +2959,7 @@ mod tests {
         let source = syntax::parse_source(
             "(defn update [state msg]\n  [state {:kind :dom-ref/focus :ref \"exercise-type\" :msg :focused}])",
         );
-        let report = validate_purity(&source);
+        let report = validate_browser_purity(&source);
 
         assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
     }
@@ -2722,7 +2969,7 @@ mod tests {
         let source = syntax::parse_source(
             "(defn update [state msg]\n  [state {:kind :dom-ref/click :ref \"import-file\" :msg :clicked}])",
         );
-        let report = validate_purity(&source);
+        let report = validate_browser_purity(&source);
 
         assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
     }
@@ -2732,7 +2979,7 @@ mod tests {
         let source = syntax::parse_source(
             "(defn update [state msg]\n  [state {:kind :dom-ref/measure :ref \"heart-chart\" :onSuccess :chart-measured :onError :measure-failed}])",
         );
-        let report = validate_purity(&source);
+        let report = validate_browser_purity(&source);
 
         assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
     }
@@ -2742,7 +2989,7 @@ mod tests {
         let source = syntax::parse_source(
             "(defn update [state msg]\n  [state {:kind :dom/scroll-into-view :testId \"operation-get:/pets\" :block \"start\" :behavior \"auto\" :msg :scrolled}])",
         );
-        let report = validate_purity(&source);
+        let report = validate_browser_purity(&source);
 
         assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
     }
@@ -2752,7 +2999,7 @@ mod tests {
         let source = syntax::parse_source(
             "(defn update [state msg]\n  [state {:kind :dom-ref/measure :ref \"heart-chart\"}])",
         );
-        let report = validate_purity(&source);
+        let report = validate_browser_purity(&source);
 
         assert!(report.diagnostics.iter().any(|diagnostic| {
             diagnostic
@@ -2766,7 +3013,11 @@ mod tests {
         let source = syntax::parse_source(
             "(defn init []\n  [{:width 0} {:kind :dom-ref/resize-watch :id \"chart\" :ref \"heart-chart\" :onChange :chart-resized :onError :resize-failed}])",
         );
-        let report = validate_purity(&source);
+        let report = validate_purity_with_options(
+            &source,
+            &HashSet::new(),
+            browser_command_schema_options(),
+        );
 
         assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
     }
@@ -2776,7 +3027,11 @@ mod tests {
         let source = syntax::parse_source(
             "(defn init []\n  [{:width 0} {:kind :dom-ref/resize-watch :ref \"heart-chart\"}])",
         );
-        let report = validate_purity(&source);
+        let report = validate_purity_with_options(
+            &source,
+            &HashSet::new(),
+            browser_command_schema_options(),
+        );
 
         assert!(
             report
@@ -2791,7 +3046,11 @@ mod tests {
         let source = syntax::parse_source(
             "(defn update [state msg]\n  [state {:kind :dom-ref/resize-unwatch :id \"chart\" :msg :stopped}])",
         );
-        let report = validate_purity(&source);
+        let report = validate_purity_with_options(
+            &source,
+            &HashSet::new(),
+            browser_command_schema_options(),
+        );
 
         assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
     }
@@ -2801,7 +3060,11 @@ mod tests {
         let source = syntax::parse_source(
             "(defn update [state msg]\n  [state {:kind :window/event-watch :id \"drag\" :type \"pointermove\" :onEvent :pointer-moved :options {:passive true}}])",
         );
-        let report = validate_purity(&source);
+        let report = validate_purity_with_options(
+            &source,
+            &HashSet::new(),
+            browser_command_schema_options(),
+        );
 
         assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
     }
@@ -2811,7 +3074,11 @@ mod tests {
         let source = syntax::parse_source(
             "(defn update [state msg]\n  [state {:kind :window/event-watch :type \"pointermove\"}])",
         );
-        let report = validate_purity(&source);
+        let report = validate_purity_with_options(
+            &source,
+            &HashSet::new(),
+            browser_command_schema_options(),
+        );
 
         assert!(
             report
@@ -2826,7 +3093,11 @@ mod tests {
         let source = syntax::parse_source(
             "(defn update [state msg]\n  [state {:kind :window/event-unwatch :id \"drag\" :msg :stopped}])",
         );
-        let report = validate_purity(&source);
+        let report = validate_purity_with_options(
+            &source,
+            &HashSet::new(),
+            browser_command_schema_options(),
+        );
 
         assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
     }
@@ -2836,7 +3107,11 @@ mod tests {
         let source = syntax::parse_source(
             "(defn init []\n  [{:mobile? false} {:kind :media-query/watch :id \"mobile\" :query \"(max-width: 700px)\" :onChange :media-changed}])",
         );
-        let report = validate_purity(&source);
+        let report = validate_purity_with_options(
+            &source,
+            &HashSet::new(),
+            browser_command_schema_options(),
+        );
 
         assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
     }
@@ -2846,7 +3121,11 @@ mod tests {
         let source = syntax::parse_source(
             "(defn init []\n  [{:mobile? false} {:kind :media-query/watch :query \"(max-width: 700px)\"}])",
         );
-        let report = validate_purity(&source);
+        let report = validate_purity_with_options(
+            &source,
+            &HashSet::new(),
+            browser_command_schema_options(),
+        );
 
         assert!(
             report
@@ -2861,7 +3140,11 @@ mod tests {
         let source = syntax::parse_source(
             "(defn update [state msg]\n  [state {:kind :media-query/unwatch :id \"mobile\" :msg :stopped}])",
         );
-        let report = validate_purity(&source);
+        let report = validate_purity_with_options(
+            &source,
+            &HashSet::new(),
+            browser_command_schema_options(),
+        );
 
         assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
     }
@@ -2895,7 +3178,7 @@ mod tests {
         let source = syntax::parse_source(
             "(defn update [state msg]\n  [state {:kind :simulation/heart-rate :id \"sim\" :ms 1000 :min 120 :max 150 :jitter 3 :onSuccess :connected :onReading :heart-rate :onDisconnected :disconnected :onError :failed}])",
         );
-        let report = validate_purity(&source);
+        let report = validate_browser_purity(&source);
 
         assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
     }
@@ -2905,7 +3188,7 @@ mod tests {
         let source = syntax::parse_source(
             "(defn update [state msg]\n  [state {:kind :simulation/heart-rate :id \"sim\" :onSuccess :connected}])",
         );
-        let report = validate_purity(&source);
+        let report = validate_browser_purity(&source);
 
         assert!(report.diagnostics.iter().any(|diagnostic| {
             diagnostic
@@ -2919,7 +3202,7 @@ mod tests {
         let source = syntax::parse_source(
             "(defn update [state msg]\n  [state {:kind :simulation/stop :id \"sim\" :msg :stopped}])",
         );
-        let report = validate_purity(&source);
+        let report = validate_browser_purity(&source);
 
         assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
     }

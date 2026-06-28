@@ -1,0 +1,86 @@
+(import "../../lib/operations.clsk" [collectOperations tagDescriptions])
+(import "../../lib/browser.clsk" [resolvedSpecUrl setOpQueryParam])
+(import "../../flow.clsk" [hasText? markdownHtml specTitle specVersion specDescription primaryServerUrl])
+(import "../source/flow.clsk" [no-cmd])
+(import "./model.clsk" [DocumentState DocumentUpdateResult])
+(import "../../messages.clsk" [AppMsg])
+(import "../shared/icons.clsk" [iconDownload iconLink2 iconChevronDown iconChevronUp])
+(import "../shared/view.clsk" [tagDescription])
+(import "../try-it/index.clsk" [operationPanel])
+
+(ann try-document-update (Fn [DocumentState AppMsg] (Option DocumentUpdateResult)))
+(defn try-document-update [state msg]
+  (match msg
+    {:kind :toggle-tag :tag tag}
+      (no-cmd (merge state {:expandedTags (if (contains? state.expandedTags tag)
+                                      (disj state.expandedTags tag)
+                                      (conj state.expandedTags tag))}))
+    {:kind :toggle-operation :id id}
+      (let [next (if (= state.expandedOp id) nil id)]
+        [(merge state {:expandedOp next}) (setOpQueryParam next)])
+    _ nil))
+
+
+(defn tagSection [state descriptions entry]
+  (let [expanded? (contains? state.expandedTags entry.key)]
+    #html <section class="border-b border-zinc-200 dark:border-dm-border"
+                   data-testid={(str "tag-section-" entry.key)}>
+            <button type="button"
+                    class="flex w-full items-center gap-3 px-2 py-3 text-left hover:bg-zinc-50 dark:bg-dm-surface dark:hover:bg-dm-surface-hover"
+                    on:click={{:kind :toggle-tag :tag entry.key}}>
+              <span class="text-lg font-medium text-zinc-900 dark:text-dm-text">{entry.key}</span>
+              {(if (hasText? (tagDescription descriptions entry.key))
+                  #html <span class="flex-1 truncate text-sm text-zinc-500 dark:text-dm-muted">{(tagDescription descriptions entry.key)}</span>
+                  #html <span class="hidden"></span>)}
+              <span class="ml-auto shrink-0 text-zinc-400 dark:text-dm-muted">
+                {(if expanded? (iconChevronUp "20" "") (iconChevronDown "20" ""))}
+              </span>
+            </button>
+            {(if expanded?
+                #html <div class="space-y-0 border-t border-zinc-200 p-2 dark:border-t-dm-border">
+                        {(for [item entry.value :key item.id]
+                           #html <div>{(operationPanel state item)}</div>)}
+                      </div>
+                #html <div class="hidden"></div>)}
+          </section>))
+
+(defn documentView [state spec]
+  (let [grouped (collectOperations spec)
+        descriptions (tagDescriptions spec)]
+    #html <main class="mx-auto max-w-5xl px-4 py-4">
+            <section class="mb-6 border-b border-zinc-200 pb-6 dark:border-dm-border">
+              <div class="flex flex-wrap items-start justify-between gap-3">
+                <div class="min-w-0 flex-1">
+                  <h2 class="text-2xl font-semibold text-zinc-900 dark:text-dm-text" data-testid="api-title">{(specTitle spec)}</h2>
+                  {(if (hasText? (specVersion spec))
+                      #html <p class="mt-1 text-sm text-zinc-500 dark:text-dm-muted">{(specVersion spec)}</p>
+                      #html <p class="hidden"></p>)}
+                </div>
+                <div class="flex shrink-0 flex-wrap items-center gap-2">
+                  <button type="button"
+                          data-testid="download-schema"
+                          title="Download OpenAPI schema"
+                          aria-label="Download OpenAPI schema"
+                          class="inline-flex items-center rounded-md border border-zinc-300 p-1.5 text-zinc-700 transition hover:bg-zinc-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900"
+                          on:click={{:kind :download-schema}}>{(iconDownload "14" "")}</button>
+                  <a href={(resolvedSpecUrl state.currentUrl state.specUrl)}
+                     target="_blank"
+                     rel="noopener noreferrer"
+                     data-testid="open-schema"
+                     title="Open schema URL"
+                     aria-label="Open schema URL"
+                     class="inline-flex items-center rounded-md border border-zinc-300 p-1.5 text-zinc-700 transition hover:bg-zinc-50 dark:border-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-900">{(iconLink2 "14" "")}</a>
+                </div>
+              </div>
+              {(if (hasText? (specDescription spec))
+                  #html <div class="mt-4 text-sm"><div class="prose prose-sm max-w-none prose-p:my-2 prose-headings:my-2 dark:prose-invert" innerHTML={(markdownHtml (specDescription spec))}></div></div>
+                  #html <div class="hidden"></div>)}
+              {(if (hasText? (primaryServerUrl spec))
+                  #html <p class="mt-3 font-mono text-sm text-zinc-500 dark:text-dm-muted">{(primaryServerUrl spec)}</p>
+                  #html <p class="hidden"></p>)}
+            </section>
+            <div>
+              {(for [entry (map-entries grouped) :key entry.key]
+                 #html <div>{(tagSection state descriptions entry)}</div>)}
+            </div>
+          </main>))

@@ -58,3 +58,48 @@
    :ctrlKey Bool
    :metaKey Bool
    :shiftKey Bool})
+
+(type AppState
+  {:appStatus String
+   :message String
+   :statusMode String
+   :dev? Bool
+   :mobile? Bool
+   :detailView String
+   :exerciseState String
+   :connected? Bool
+   :simulated? Bool
+   :deviceName String
+   :elapsedMs Number
+    :displayElapsedMs Number
+    :startedAt (Option Number)
+    :sessionStartedAt (Option Number)
+    :idleStartedAt (Option Number)
+    :pendingStoppedAt (Option Number)
+   :latestBpm Number
+   :lastRate (Option Number)
+   :trend String
+   :readings (Vector HeartReading)
+   :entries (Vector WorkoutEntry)
+   :selectedLogId (Option String)
+   :logTypeFilter String
+   :targetZoneId Number
+   :zones (Vector HeartZone)
+   :activeExerciseType String
+   :typeDraft String
+   :typePickerEntryId (Option String)
+   :typePickerDraft String
+   :stopHold? Bool
+   :stopHoldStartedAt Number
+   :stopHoldProgress Number
+   :deleteHold? Bool
+   :deleteHoldStartedAt Number
+   :deleteHoldProgress Number
+   :chartWidth Number
+   :chartHeight Number
+   :zoneTrackLeft Number
+   :zoneTrackWidth Number
+   :zoneDragIndex (Option Number)
+   :zoneStatus String
+   :importStatus String
+   :metricsGrouping String})

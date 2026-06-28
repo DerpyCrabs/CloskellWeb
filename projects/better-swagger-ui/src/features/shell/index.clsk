@@ -1,0 +1,121 @@
+(import "../../lib/auth.clsk" [authEntriesCount hasAuthSchemes?])
+(import "../../lib/browser.clsk" [clipboardText looksLikeSpecContent validHttpUrl? initialDefinitionParam initialOpParam initialUrlInput loadThemeCommand])
+(import "../../flow.clsk" [loadSourceCommand])
+(import "../../state.clsk" [initialState])
+(import "../../messages.clsk" [AppMsg])
+(import "./model.clsk" [ShellState ShellInitResult])
+(import "../shared/icons.clsk" [iconUpload iconSun iconMoon iconLock iconChevronDown iconLoaderCircle iconAlertCircle])
+(import "../document/index.clsk" [documentView])
+(import "../auth/index.clsk" [authorizeDialog])
+
+(ann init (Fn [Js] ShellInitResult))
+(defn init [boot]
+  (let [source (initialUrlInput boot)
+        definition (initialDefinitionParam boot)
+        op (initialOpParam boot)]
+    [(merge initialState {:input source
+                          :currentUrl boot.currentUrl
+                          :pendingDefinition definition
+                          :routeOp (if (= op "") nil op)
+                          :theme "dark"})
+     (Cmd.batch [(loadThemeCommand)
+                 (if (= source "")
+                     Cmd.none
+                     (loadSourceCommand source definition))])]))
+
+(ann subscriptions (Fn [ShellState] (Sub AppMsg)))
+(defn subscriptions [state]
+  {:kind :sub/window/event
+   :id "route-popstate"
+   :type "popstate"
+   :onEvent (fn [payload] {:kind :route-changed :href payload.href})})
+(defn definitionSelect [state]
+  (if (> (count state.definitions) 1)
+      #html <div class="relative shrink-0">
+              <select class="min-w-[11.5rem] max-w-[14rem] appearance-none rounded-md border border-emerald-600 bg-white py-1.5 pr-8 pl-3 text-sm text-zinc-900 outline-none focus:ring-2 focus:ring-emerald-500/40 dark:border-emerald-600 dark:bg-zinc-900 dark:text-zinc-100"
+                      data-testid="definition-select"
+                      aria-label="Select a definition"
+                      title="Select a definition"
+                      value={state.selectedDefinition}
+                      on:change={{:kind :definition-change :name event.currentTarget.value}}>
+                {(for [definition state.definitions :key definition.name]
+                   #html <option value={definition.name}>{definition.name}</option>)}
+              </select>
+              {(iconChevronDown "14" "pointer-events-none absolute top-1/2 right-2.5 -translate-y-1/2 text-zinc-500 dark:text-zinc-400")}
+            </div>
+      #html <div class="hidden"></div>))
+
+(defn themeButtonLabel [state]
+  (if (= state.theme "dark") "Switch to light theme" "Switch to dark theme"))
+
+(ann view (Fn [ShellState] Html))
+(defn view [state]
+  #html <div class="min-h-screen">
+          <header class="sticky top-0 z-40 border-b border-zinc-200 bg-white/90 backdrop-blur dark:border-dm-border dark:bg-dm-base/95">
+            <div class="mx-auto flex max-w-5xl items-center gap-2 px-3 py-2 sm:gap-3 sm:px-4">
+              <span class="hidden shrink-0 text-sm font-semibold text-zinc-900 dark:text-dm-text sm:inline">Better Swagger UI</span>
+              <form class="flex min-w-0 flex-1 items-center gap-2.5 sm:gap-3"
+                    data-testid="load-form"
+                    on:submit={(Event.prevent {:kind :load})}>
+                <div class="relative min-w-0 flex-1">
+                  <input class="w-full rounded-md border border-zinc-300 bg-white py-1.5 pl-3 pr-16 text-sm text-zinc-900 outline-none placeholder:text-zinc-400 focus:ring-2 focus:ring-sky-500/40 dark:border-dm-border dark:bg-dm-input dark:text-dm-text dark:placeholder:text-dm-muted dark:focus:border-sky-500 dark:focus:ring-sky-500/40"
+                         data-testid="url-input"
+                         value={state.input}
+                         placeholder="Swagger UI URL or paste YAML/JSON"
+                         on:input={{:kind :url-input :value event.currentTarget.value}}
+                         on:paste={(let [pasted (clipboardText event)]
+                                     (if (or (validHttpUrl? state.currentUrl pasted) (looksLikeSpecContent pasted))
+                                         (Event.prevent {:kind :url-paste :value pasted})
+                                         {:kind :noop}))}></input>
+                  {(if state.loading?
+                      #html <span class="pointer-events-none absolute inset-y-0 right-9 inline-flex items-center px-2 text-zinc-400 dark:text-dm-muted" data-testid="spec-loading" aria-label="Loading spec">{(iconLoaderCircle "16" "animate-spin")}</span>
+                      #html <span class="hidden"></span>)}
+                  <button type="button"
+                          data-testid="spec-upload-button"
+                          title="Upload OpenAPI YAML or JSON"
+                          aria-label="Upload OpenAPI YAML or JSON"
+                          class="absolute inset-y-0 right-0 inline-flex items-center justify-center rounded-r-md px-2.5 text-zinc-500 hover:text-zinc-700 dark:text-dm-muted dark:hover:text-dm-text"
+                          on:click={{:kind :open-spec-file}}>{(iconUpload "16" "")}</button>
+                </div>
+                <input type="file"
+                       class="hidden"
+                       ref="spec-file-input"
+                       data-testid="spec-file-input"
+                       accept=".yaml,.yml,.json,application/json,application/yaml,text/yaml"
+                       on:change={{:kind :spec-file-selected}}></input>
+                {(definitionSelect state)}
+                <button type="submit" class="hidden"></button>
+              </form>
+              <div class="flex shrink-0 items-center gap-1.5">
+                {(if (and (some? state.spec) (hasAuthSchemes? state.spec state.oauthInit))
+                    #html <button type="button"
+                                  class={(if (> (authEntriesCount state.authEntries) 0)
+                                             "inline-flex shrink-0 items-center rounded-md border border-emerald-600 font-medium text-emerald-700 transition gap-1 px-2 py-1.5 text-xs dark:text-emerald-400"
+                                             "inline-flex shrink-0 items-center rounded-md border border-zinc-300 font-medium text-zinc-700 transition gap-1 px-2 py-1.5 text-xs dark:border-zinc-700 dark:text-zinc-200")}
+                                  data-testid="authorize-button"
+                                  title={(if (> (authEntriesCount state.authEntries) 0) "Authorized" "Authorize")}
+                                  aria-label={(if (> (authEntriesCount state.authEntries) 0) "Authorized" "Authorize")}
+                                  on:click={{:kind :open-auth :id nil}}>{(iconLock "14" "")}<span class="hidden md:inline">{(if (> (authEntriesCount state.authEntries) 0) "Authorized" "Authorize")}</span>{(if (> (authEntriesCount state.authEntries) 0) #html <span class="rounded-full bg-emerald-600/15 px-1 text-[10px] leading-none md:text-xs">{(authEntriesCount state.authEntries)}</span> #html <span class="hidden"></span>)}</button>
+                    #html <button type="button" class="hidden" data-testid="authorize-button"></button>)}
+                <button type="button"
+                        class="inline-flex shrink-0 items-center justify-center rounded-md border border-zinc-300 bg-zinc-100 p-1.5 text-zinc-700 transition hover:bg-zinc-200 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700"
+                        data-testid="theme-toggle"
+                        title={(themeButtonLabel state)}
+                        aria-label={(themeButtonLabel state)}
+                        on:click={{:kind :toggle-theme}}>{(if (= state.theme "dark") (iconSun "16" "") (iconMoon "16" ""))}</button>
+              </div>
+            </div>
+          </header>
+          {(if (some? state.error)
+              #html <div class="mx-auto flex max-w-5xl items-start gap-2 px-4 py-3 text-sm text-rose-700 dark:text-rose-300">{(iconAlertCircle "16" "mt-0.5 shrink-0")}<p>{state.error}</p></div>
+              #html <div class="hidden"></div>)}
+          {(if (and state.loading? (not (some? state.spec)))
+              #html <div class="flex items-center justify-center gap-2 px-4 py-10 text-sm text-zinc-500 dark:text-dm-muted" data-testid="spec-loading-message">{(iconLoaderCircle "16" "animate-spin shrink-0")}<span>Loading spec from URL…</span></div>
+              #html <div class="hidden"></div>)}
+          {(if (some? state.spec)
+              #html <div>{(documentView state state.spec)}</div>
+              (if (and (not state.loading?) (not (some? state.error)))
+                  #html <p class="px-4 py-10 text-center text-sm text-zinc-500">Paste a Swagger UI URL, upload an OpenAPI file, or paste YAML.JSON spec content above.</p>
+                  #html <p class="hidden"></p>))}
+          <div>{(authorizeDialog state)}</div>
+        </div>)

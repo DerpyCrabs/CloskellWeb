@@ -10,16 +10,196 @@ pub struct EmitResult {
     pub diagnostics: Vec<Diagnostic>,
     pub source_mappings: Vec<SourceMapping>,
     pub runtime_effects: BTreeSet<String>,
+    pub exports: BTreeMap<String, EmitExport>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct EmitOptions {
     pub reachable_message_kinds: Option<BTreeSet<String>>,
     pub message_field_reads: BTreeMap<String, MessageFieldReads>,
     pub static_reads: BTreeMap<String, String>,
     pub direct_call_replacements: BTreeMap<String, String>,
+    pub symbol_reads: Vec<SymbolReadEmitRule>,
+    pub intrinsic_calls: Vec<IntrinsicCallEmitRule>,
+    pub custom_calls: Vec<CustomCallEmitRule>,
     pub prelude_code: String,
-    pub browser_app_runtime: bool,
+    pub html_templates: HtmlTemplateEmitOptions,
+    pub omit_replaced_defn_exports: bool,
+    pub export_top_level: bool,
+}
+
+impl Default for EmitOptions {
+    fn default() -> Self {
+        Self {
+            reachable_message_kinds: None,
+            message_field_reads: BTreeMap::new(),
+            static_reads: BTreeMap::new(),
+            direct_call_replacements: BTreeMap::new(),
+            symbol_reads: Vec::new(),
+            intrinsic_calls: Vec::new(),
+            custom_calls: Vec::new(),
+            prelude_code: String::new(),
+            html_templates: HtmlTemplateEmitOptions::default(),
+            omit_replaced_defn_exports: false,
+            export_top_level: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmitExport {
+    pub js_name: String,
+    pub arity: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IntrinsicCallEmitRule {
+    pub name: String,
+    pub html_runtime: bool,
+    pub runtime_imports: Vec<IntrinsicRuntimeImport>,
+    pub runtime_effects: Vec<String>,
+    pub fallback: String,
+    pub forms: Vec<IntrinsicCallEmitForm>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SymbolReadEmitRule {
+    pub name: String,
+    pub replacement: String,
+    pub needs_none_const: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct CustomCallEmitRule {
+    pub name: String,
+    pub emitter: CustomCallEmitter,
+}
+
+pub type CustomCallEmitter = for<'a> fn(&mut CustomCallEmitContext<'a>, &[Expr]) -> String;
+
+pub struct CustomCallEmitContext<'a> {
+    emitter: &'a mut Emitter,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IntrinsicRuntimeImport {
+    pub imported: String,
+    pub alias: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IntrinsicCallEmitForm {
+    pub arity: usize,
+    pub template: String,
+}
+
+impl IntrinsicCallEmitRule {
+    pub fn new(
+        name: impl Into<String>,
+        runtime_effects: Vec<String>,
+        fallback: impl Into<String>,
+        forms: Vec<IntrinsicCallEmitForm>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            html_runtime: false,
+            runtime_imports: Vec::new(),
+            runtime_effects,
+            fallback: fallback.into(),
+            forms,
+        }
+    }
+
+    pub fn html_runtime(mut self) -> Self {
+        self.html_runtime = true;
+        self
+    }
+
+    pub fn runtime_import(mut self, imported: impl Into<String>, alias: impl Into<String>) -> Self {
+        self.runtime_imports.push(IntrinsicRuntimeImport {
+            imported: imported.into(),
+            alias: alias.into(),
+        });
+        self
+    }
+}
+
+impl SymbolReadEmitRule {
+    pub fn new(name: impl Into<String>, replacement: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            replacement: replacement.into(),
+            needs_none_const: false,
+        }
+    }
+
+    pub fn none_const(mut self) -> Self {
+        self.needs_none_const = true;
+        self
+    }
+}
+
+impl CustomCallEmitRule {
+    pub fn new(name: impl Into<String>, emitter: CustomCallEmitter) -> Self {
+        Self {
+            name: name.into(),
+            emitter,
+        }
+    }
+}
+
+impl CustomCallEmitContext<'_> {
+    pub fn emit_expr(&mut self, expr: &Expr) -> String {
+        self.emitter.emit_expr(expr)
+    }
+
+    pub fn add_runtime_effect(&mut self, effect: &str) {
+        self.emitter.add_runtime_effect(effect);
+    }
+
+    pub fn message_field_reads(&self, kind: &str) -> Option<&MessageFieldReads> {
+        self.emitter.message_field_reads.get(kind)
+    }
+}
+
+impl IntrinsicCallEmitForm {
+    pub fn new(arity: usize, template: impl Into<String>) -> Self {
+        Self {
+            arity,
+            template: template.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HtmlTemplateEmitOptions {
+    pub enabled: bool,
+    pub constructor: String,
+    pub disabled_diagnostic: String,
+}
+
+impl Default for HtmlTemplateEmitOptions {
+    fn default() -> Self {
+        Self::disabled("#html templates are not enabled for this JS emission")
+    }
+}
+
+impl HtmlTemplateEmitOptions {
+    pub fn enabled(constructor: impl Into<String>) -> Self {
+        Self {
+            enabled: true,
+            constructor: constructor.into(),
+            disabled_diagnostic: "#html templates are not enabled for this JS emission".to_string(),
+        }
+    }
+
+    pub fn disabled(message: impl Into<String>) -> Self {
+        Self {
+            enabled: false,
+            constructor: String::new(),
+            disabled_diagnostic: message.into(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -61,6 +241,7 @@ pub fn emit_module_with_types_and_options(
     let mut emitter = Emitter::new(source, expr_types, options);
     let mut import_lines = Vec::new();
     let mut lines = Vec::new();
+    let mut exports = BTreeMap::new();
 
     for (index, form) in source.forms.iter().enumerate() {
         if let ExprKind::List(items) = &form.kind {
@@ -85,10 +266,19 @@ pub fn emit_module_with_types_and_options(
             if let [head, name, value] = items.as_slice() {
                 if matches_symbol(head, "def") {
                     if let ExprKind::Symbol(name) = &name.kind {
+                        let js_name = sanitize_identifier(name);
+                        exports.insert(
+                            name.clone(),
+                            EmitExport {
+                                js_name: js_name.clone(),
+                                arity: None,
+                            },
+                        );
                         lines.push(EmittedLine {
                             code: format!(
-                                "export const {} = {};",
-                                sanitize_identifier(name),
+                                "{}const {} = {};",
+                                emitter.export_prefix(),
+                                js_name,
                                 emitter.emit_expr(value)
                             ),
                             source_offset: form.span.start,
@@ -100,6 +290,18 @@ pub fn emit_module_with_types_and_options(
 
             if items.len() >= 4 && matches_symbol(&items[0], "defn") {
                 if let ExprKind::Symbol(name) = &items[1].kind {
+                    if emitter.omit_replaced_defn_exports
+                        && emitter.direct_call_replacements.contains_key(name)
+                    {
+                        continue;
+                    }
+                    exports.insert(
+                        name.clone(),
+                        EmitExport {
+                            js_name: sanitize_identifier(name),
+                            arity: defn_arity(&items[2..]),
+                        },
+                    );
                     lines.push(EmittedLine {
                         code: emitter.emit_defn(name, form, &items[2..]),
                         source_offset: form.span.start,
@@ -110,17 +312,31 @@ pub fn emit_module_with_types_and_options(
         }
 
         lines.push(EmittedLine {
-            code: format!("export const value{} = {};", index, emitter.emit_expr(form)),
+            code: format!(
+                "{}const value{} = {};",
+                emitter.export_prefix(),
+                index,
+                emitter.emit_expr(form)
+            ),
             source_offset: form.span.start,
         });
+        exports.insert(
+            format!("value{}", index),
+            EmitExport {
+                js_name: format!("value{}", index),
+                arity: None,
+            },
+        );
     }
 
     let mut code = String::new();
     let mut source_mappings = Vec::new();
     let mut generated_line = 0;
-    if emitter.needs_html_runtime {
+    if emitter.needs_html_runtime || emitter.needs_cmd_map {
         code.push_str(&compiled_template_runtime_import(&emitter));
         generated_line += 2;
+    }
+    if emitter.needs_html_runtime {
         code.push_str(&format!(
             "const {document} = () => globalThis.document, {element} = (tag) => {document}().createElement(tag), {svg_element} = (tag) => {document}().createElementNS(\"http://www.w3.org/2000/svg\", tag), {text} = (value) => {document}().createTextNode(value), {attr} = (node, name, value) => node.setAttribute(name, value), {append} = (parent, child) => parent.appendChild(child);\n\n",
             document = DOCUMENT_ALIAS,
@@ -162,20 +378,29 @@ pub fn emit_module_with_types_and_options(
         diagnostics: emitter.diagnostics,
         source_mappings,
         runtime_effects: emitter.runtime_effects,
+        exports,
+    }
+}
+
+fn defn_arity(args: &[Expr]) -> Option<usize> {
+    match args.first().map(|expr| &expr.kind) {
+        Some(ExprKind::Vector(params)) => Some(params.len()),
+        _ => None,
     }
 }
 
 fn compiled_template_runtime_import(emitter: &Emitter) -> String {
-    let mut imports = vec![format!("bindCompiledComponent as {}", BIND_COMPONENT_ALIAS)];
+    let mut imports = Vec::new();
+    if emitter.needs_html_runtime {
+        imports.push(format!("bindCompiledComponent as {}", BIND_COMPONENT_ALIAS));
+    }
+    if emitter.needs_cmd_map {
+        imports.push(format!("mapCommand as {}", CMD_MAP_ALIAS));
+    }
     if emitter.needs_template_skeleton {
-        let template_constructor = if emitter.browser_app_runtime {
-            "createBrowserCompiledHtmlTemplateComponent"
-        } else {
-            "createCompiledHtmlTemplateComponent"
-        };
         imports.push(format!(
             "{} as {}",
-            template_constructor, CREATE_HTML_TEMPLATE_ALIAS
+            emitter.html_templates.constructor, CREATE_HTML_TEMPLATE_ALIAS
         ));
     }
     if emitter.needs_render_to_string {
@@ -193,6 +418,7 @@ fn compiled_template_runtime_import(emitter: &Emitter) -> String {
     if emitter.needs_scope_view {
         imports.push(format!("scopeView as {}", SCOPE_VIEW_ALIAS));
     }
+    imports.extend(emitter.runtime_imports.iter().cloned());
     if emitter.needs_template_attr {
         imports.push(format!("setCompiledAttr as {}", SET_ATTR_ALIAS));
     }
@@ -276,8 +502,9 @@ pub fn emit_function_specialization(
     expr_types: BTreeMap<usize, String>,
     original_name: &str,
     specialized_name: &str,
-    options: EmitOptions,
+    mut options: EmitOptions,
 ) -> EmitResult {
+    options.export_top_level = false;
     let mut emitter = Emitter::new(source, expr_types, options);
     let mut code = String::new();
     let mut source_mappings = Vec::new();
@@ -299,9 +526,7 @@ pub fn emit_function_specialization(
         }
 
         found = true;
-        let line = emitter
-            .emit_defn(specialized_name, form, &items[2..])
-            .replacen("export function ", "function ", 1);
+        let line = emitter.emit_defn(specialized_name, form, &items[2..]);
         push_emitter_helpers(&mut code, &mut generated_line, &emitter);
         source_mappings.push(SourceMapping {
             generated_line,
@@ -325,6 +550,7 @@ pub fn emit_function_specialization(
         diagnostics: emitter.diagnostics,
         source_mappings,
         runtime_effects: emitter.runtime_effects,
+        exports: BTreeMap::new(),
     }
 }
 
@@ -352,8 +578,16 @@ fn push_emitter_helpers(code: &mut String, generated_line: &mut usize, emitter: 
         *generated_line += OBJECT_ENTRIES_HELPER.lines().count();
     }
     if emitter.needs_none_const && !code.contains("const __closkellNone") {
-        code.push_str("const __closkellNone = { kind: \"none\" };\n\n");
+        code.push_str("const __closkellNone = { kind: Symbol.for(\"none\") };\n\n");
         *generated_line += 2;
+    }
+    for metadata_const in &emitter.template_metadata_consts {
+        code.push_str(metadata_const);
+        *generated_line += metadata_const.lines().count();
+    }
+    if !emitter.template_metadata_consts.is_empty() {
+        code.push('\n');
+        *generated_line += 1;
     }
 }
 
@@ -554,6 +788,7 @@ struct Emitter {
     needs_scope_update: bool,
     needs_scope_subscriptions: bool,
     needs_scope_view: bool,
+    needs_cmd_map: bool,
     needs_template_attr: bool,
     needs_template_text_attr: bool,
     needs_template_nullable_text_attr: bool,
@@ -572,18 +807,25 @@ struct Emitter {
     needs_template_ref: bool,
     needs_template_text: bool,
     needs_template_skeleton: bool,
+    runtime_imports: BTreeSet<String>,
     runtime_effects: BTreeSet<String>,
     expr_types: BTreeMap<usize, String>,
     local_types: Vec<BTreeMap<String, String>>,
     reachable_message_kinds: Option<BTreeSet<String>>,
     static_reads: BTreeMap<String, String>,
     direct_call_replacements: BTreeMap<String, String>,
-    browser_app_runtime: bool,
+    symbol_reads: Vec<SymbolReadEmitRule>,
+    intrinsic_calls: Vec<IntrinsicCallEmitRule>,
+    custom_calls: Vec<CustomCallEmitRule>,
+    html_templates: HtmlTemplateEmitOptions,
+    omit_replaced_defn_exports: bool,
+    export_top_level: bool,
     current_update_message_param: Option<String>,
     component_fns: BTreeSet<String>,
     function_defs: BTreeMap<String, FunctionDef>,
     read_summaries: BTreeMap<String, ReadSummary>,
     message_field_reads: BTreeMap<String, MessageFieldReads>,
+    template_metadata_consts: Vec<String>,
     next_template_id: usize,
     next_temp_id: usize,
 }
@@ -603,6 +845,7 @@ impl Emitter {
             needs_scope_update: false,
             needs_scope_subscriptions: false,
             needs_scope_view: false,
+            needs_cmd_map: false,
             needs_template_attr: false,
             needs_template_text_attr: false,
             needs_template_nullable_text_attr: false,
@@ -621,13 +864,19 @@ impl Emitter {
             needs_template_ref: false,
             needs_template_text: false,
             needs_template_skeleton: false,
+            runtime_imports: BTreeSet::new(),
             runtime_effects: BTreeSet::new(),
             expr_types,
             local_types: Vec::new(),
             reachable_message_kinds: options.reachable_message_kinds,
             static_reads: options.static_reads,
             direct_call_replacements: options.direct_call_replacements,
-            browser_app_runtime: options.browser_app_runtime,
+            symbol_reads: options.symbol_reads,
+            intrinsic_calls: options.intrinsic_calls,
+            custom_calls: options.custom_calls,
+            html_templates: options.html_templates,
+            omit_replaced_defn_exports: options.omit_replaced_defn_exports,
+            export_top_level: options.export_top_level,
             current_update_message_param: None,
             component_fns: collect_template_defns(source),
             function_defs: collect_function_defs(source),
@@ -636,9 +885,14 @@ impl Emitter {
                 options.message_field_reads,
                 collect_message_field_reads(source),
             ),
+            template_metadata_consts: Vec::new(),
             next_template_id: 0,
             next_temp_id: 0,
         }
+    }
+
+    fn export_prefix(&self) -> &'static str {
+        if self.export_top_level { "export " } else { "" }
     }
 }
 
@@ -659,6 +913,7 @@ const RENDER_TO_STRING_ALIAS: &str = "__closkellRenderToString";
 const SCOPE_SUBSCRIPTIONS_ALIAS: &str = "__closkellScopeSubscriptions";
 const SCOPE_UPDATE_ALIAS: &str = "__closkellScopeUpdate";
 const SCOPE_VIEW_ALIAS: &str = "__closkellScopeView";
+const CMD_MAP_ALIAS: &str = "__closkellMapCommand";
 const SET_TEXT_ALIAS: &str = "__closkellSetText";
 const SET_ATTR_ALIAS: &str = "__closkellSetAttr";
 const SET_TEXT_ATTR_ALIAS: &str = "__closkellSetTextAttr";
@@ -687,7 +942,7 @@ fn primitive_equality_literal(expr: &Expr) -> Option<PrimitiveEqualityLiteral> {
         ExprKind::Bool(value) => value.to_string(),
         ExprKind::Number(value) => value.clone(),
         ExprKind::String(value) => format!("\"{}\"", escape_js(value)),
-        ExprKind::Keyword(name) => format!("\"{}\"", escape_js(name)),
+        ExprKind::Keyword(name) => keyword_literal(name),
         _ => return None,
     };
     Some(PrimitiveEqualityLiteral { code })
@@ -698,6 +953,18 @@ fn literal_string_value(expr: &Expr) -> Option<&str> {
         ExprKind::String(value) | ExprKind::Keyword(value) => Some(value),
         _ => None,
     }
+}
+
+fn keyword_literal(name: &str) -> String {
+    format!("Symbol.for(\"{}\")", escape_js(name))
+}
+
+fn apply_intrinsic_template(template: &str, args: &[String]) -> String {
+    let mut code = template.to_string();
+    for (index, arg) in args.iter().enumerate() {
+        code = code.replace(&format!("{{{}}}", index), arg);
+    }
+    code
 }
 
 fn is_strict_comparable_type(ty: &str) -> bool {
@@ -890,6 +1157,22 @@ fn type_fn_param_types(ty: &str) -> Option<Vec<&str>> {
     Some(split_top_level_terms(&params[1..params.len() - 1]))
 }
 
+fn type_fn_return_type(ty: &str) -> Option<&str> {
+    let args = type_app_args(ty, "Fn")?;
+    match args.as_slice() {
+        [_, ret] => Some(*ret),
+        _ => None,
+    }
+}
+
+fn type_fn_returns_html(ty: &str) -> bool {
+    type_fn_return_type(ty).is_some_and(|ret| ret == "Html")
+}
+
+fn type_is_html(ty: &str) -> bool {
+    ty.trim() == "Html"
+}
+
 fn join_pattern_tests(tests: Vec<String>) -> String {
     let tests = tests
         .into_iter()
@@ -990,6 +1273,23 @@ impl Emitter {
             return self.local_type(name);
         }
         None
+    }
+
+    fn call_callee_type(&self, expr: &Expr) -> Option<&str> {
+        let ExprKind::List(items) = &expr.kind else {
+            return None;
+        };
+        let head = items.first()?;
+        self.expr_type(head)
+    }
+
+    fn expr_is_typed_component_call(&self, expr: &Expr) -> bool {
+        if !matches!(&expr.kind, ExprKind::List(_)) {
+            return false;
+        }
+        self.call_callee_type(expr)
+            .is_some_and(type_fn_returns_html)
+            || self.expr_type(expr).is_some_and(type_is_html)
     }
 
     fn local_type(&self, name: &str) -> Option<&str> {
@@ -1115,7 +1415,7 @@ impl Emitter {
             ExprKind::Bool(value) => value.to_string(),
             ExprKind::Number(value) => value.clone(),
             ExprKind::String(value) => format!("\"{}\"", escape_js(value)),
-            ExprKind::Keyword(name) => format!("\"{}\"", escape_js(name)),
+            ExprKind::Keyword(name) => keyword_literal(name),
             ExprKind::Symbol(name) => self.emit_symbol_read(name),
             ExprKind::Vector(items) => self.emit_array(items),
             ExprKind::Set(items) => format!("new Set({})", self.emit_array(items)),
@@ -1127,6 +1427,12 @@ impl Emitter {
                 format!("undefined /* syntax {} */", escape_js(&format_expr(expr)))
             }
             ExprKind::HtmlTemplate(node) => {
+                if !self.html_templates.enabled {
+                    self.diagnostics.push(Diagnostic::error(
+                        expr.span,
+                        self.html_templates.disabled_diagnostic.clone(),
+                    ));
+                }
                 self.needs_html_runtime = true;
                 self.emit_template_component(node)
             }
@@ -1146,7 +1452,18 @@ impl Emitter {
     }
 
     fn emit_symbol_read(&mut self, name: &str) -> String {
-        if name == "Cmd.none" || name == "Sub.none" {
+        if let Some(rule) = self
+            .symbol_reads
+            .iter()
+            .find(|rule| rule.name == name)
+            .cloned()
+        {
+            if rule.needs_none_const {
+                self.needs_none_const = true;
+            }
+            return rule.replacement;
+        }
+        if name == "Cmd.none" {
             self.needs_none_const = true;
             return "__closkellNone".to_string();
         }
@@ -1166,6 +1483,23 @@ impl Emitter {
         };
 
         if let ExprKind::Symbol(name) = &head.kind {
+            if let Some(rule) = self
+                .custom_calls
+                .iter()
+                .find(|rule| rule.name == *name)
+                .cloned()
+            {
+                let mut context = CustomCallEmitContext { emitter: self };
+                return (rule.emitter)(&mut context, args);
+            }
+            if let Some(rule) = self
+                .intrinsic_calls
+                .iter()
+                .find(|rule| rule.name == *name)
+                .cloned()
+            {
+                return self.emit_intrinsic_call(&rule, args);
+            }
             match name.as_str() {
                 "fn" => return self.emit_fn(expr, args),
                 "let" => return self.emit_let(expr, args),
@@ -1180,10 +1514,8 @@ impl Emitter {
                 "Event.prevent" => return self.emit_event_control(args, true, false),
                 "Event.stop" => return self.emit_event_control(args, false, true),
                 "Event.prevent-stop" => return self.emit_event_control(args, true, true),
+                "Cmd.map" => return self.emit_cmd_map(args),
                 "Cmd.batch" => return self.emit_cmd_batch(args),
-                "Cmd.storage/get" => return self.emit_cmd_storage_get(args),
-                "Cmd.storage/set" => return self.emit_cmd_storage_set(args),
-                "Cmd.storage/set-silent" => return self.emit_cmd_storage_set_silent(args),
                 "Cmd.time/now" => return self.emit_cmd_time_now(args),
                 "Cmd.random/number" => return self.emit_cmd_random_number(args),
                 "Cmd.timer/every" => return self.emit_cmd_timer(args, "timer/every"),
@@ -1191,19 +1523,6 @@ impl Emitter {
                 "Cmd.timer/cancel" => return self.emit_cmd_timer_cancel(args),
                 "Cmd.animation/frame" => return self.emit_cmd_animation_frame(args),
                 "Cmd.animation/cancel" => return self.emit_cmd_animation_cancel(args),
-                "Cmd.dom-ref/click" => return self.emit_cmd_dom_ref_action(args, "dom-ref/click"),
-                "Cmd.dom-ref/focus" => return self.emit_cmd_dom_ref_action(args, "dom-ref/focus"),
-                "Cmd.file/read-selected" => return self.emit_cmd_file_read_selected(args),
-                "Cmd.file/download" => return self.emit_cmd_file_download(args),
-                "Cmd.canvas/draw" => return self.emit_cmd_canvas_draw(args),
-                "Cmd.dom-ref/measure" => return self.emit_cmd_dom_ref_measure(args),
-                "Cmd.dom-ref/resize-watch" => return self.emit_cmd_resize_watch(args),
-                "Cmd.bluetooth/connect-heart-rate" => {
-                    return self.emit_cmd_bluetooth_connect_heart_rate(args);
-                }
-                "Cmd.bluetooth/disconnect" => return self.emit_cmd_bluetooth_disconnect(args),
-                "Cmd.simulation/heart-rate" => return self.emit_cmd_simulation_heart_rate(args),
-                "Cmd.simulation/stop" => return self.emit_cmd_simulation_stop(args),
                 "Task.succeed" => return self.emit_task_succeed(args),
                 "Task.fail" => return self.emit_task_fail(args),
                 "Task.map" => return self.emit_task_combinator(args, "task/map", "mapper"),
@@ -1216,21 +1535,6 @@ impl Emitter {
                 "Http.get-json" => return self.emit_http_task(args, "task/http/get-json"),
                 "scope-update" => return self.emit_scope_update(args),
                 "scope-subscriptions" => return self.emit_scope_subscriptions(args),
-                "scope-view" => return self.emit_scope_view(args),
-                "render-to-string" => return self.emit_render_to_string(args),
-                "Sub.batch" => return self.emit_sub_batch(args),
-                "Sub.timer/every" => return self.emit_sub_timer_every(args),
-                "Sub.media-query" => return self.emit_sub_media_query(args),
-                "Sub.window/event" => return self.emit_sub_window_event(args),
-                "Sub.window/event-with" => return self.emit_sub_window_event_with(args),
-                "Sub.dom-ref/resize" => {
-                    return self.emit_sub_change(
-                        args,
-                        "dom-ref/resize-watch",
-                        "ref",
-                        "dom-ref/resize-unwatch",
-                    );
-                }
                 "+" | "-" | "*" | "/" | "<" | ">" | "<=" | ">=" => {
                     return self.emit_infix(name, args);
                 }
@@ -1333,36 +1637,14 @@ impl Emitter {
                 "url-origin" => return self.emit_url_part(args, "origin", false),
                 "url-hostname" => return self.emit_url_part(args, "hostname", false),
                 "url-pathname" => return self.emit_url_part(args, "pathname", false),
-                "browser-current-url" => {
-                    return self.emit_zero_arg_expr(args, "globalThis.location?.href ?? \"\"");
-                }
                 "url-search-param" => return self.emit_url_search_param(args),
                 "url-set-search-param" => return self.emit_url_set_search_param(args),
                 "url-set-deep-object-param" => return self.emit_url_set_deep_object_param(args),
-                "history-replace-search-param" => {
-                    return self.emit_history_replace_search_param(args);
-                }
-                "history-write-route" => return self.emit_history_write_route(args),
-                "browser-theme-initial" => return self.emit_browser_theme_initial(args),
-                "browser-theme-toggle" => return self.emit_browser_theme_toggle(args),
-                "auth-storage-load" => return self.emit_auth_storage_load(args),
-                "auth-storage-persist" => return self.emit_auth_storage_persist(args),
                 "resolve-token-expiry" => return self.emit_resolve_token_expiry(args),
-                "clipboard-text" => return self.emit_clipboard_text(args),
-                "clipboard-write" => return self.emit_clipboard_write(args),
-                "browser-set-cookie" => return self.emit_browser_set_cookie(args),
                 "path-fill-params" => return self.emit_path_fill_params(args),
                 "path-fill-param" => return self.emit_path_fill_param(args),
-                "selected-file-or-blob" => return self.emit_selected_file_or_blob(args),
-                "selected-file-by-test-id" => return self.emit_selected_file_by_test_id(args),
-                "has-selected-file" => return self.emit_has_selected_file(args),
-                "multipart-form-body" => return self.emit_multipart_form_body(args),
-                "urlencoded-form-body" => return self.emit_urlencoded_form_body(args),
                 "regex-capture" => return self.emit_regex_capture(args),
                 "regex-capture-all" => return self.emit_regex_capture_all(args),
-                "install-virtual-json-viewer" => {
-                    return self.emit_install_virtual_json_viewer(args);
-                }
                 "base64-encode" => return self.emit_base64(true, args),
                 "base64-decode" => return self.emit_base64(false, args),
                 "fail" => return self.emit_fail(args),
@@ -1414,6 +1696,27 @@ impl Emitter {
         format!("{}({})", callee, args)
     }
 
+    fn emit_intrinsic_call(&mut self, rule: &IntrinsicCallEmitRule, args: &[Expr]) -> String {
+        if rule.html_runtime {
+            self.needs_html_runtime = true;
+        }
+        for import in &rule.runtime_imports {
+            self.runtime_imports
+                .insert(format!("{} as {}", import.imported, import.alias));
+        }
+        for effect in &rule.runtime_effects {
+            self.add_runtime_effect(effect);
+        }
+        let Some(form) = rule.forms.iter().find(|form| form.arity == args.len()) else {
+            return rule.fallback.clone();
+        };
+        let arg_codes = args
+            .iter()
+            .map(|arg| self.emit_expr(arg))
+            .collect::<Vec<_>>();
+        apply_intrinsic_template(&form.template, &arg_codes)
+    }
+
     fn emit_str(&mut self, args: &[Expr]) -> String {
         if args.is_empty() {
             return "\"\"".to_string();
@@ -1430,8 +1733,17 @@ impl Emitter {
 
     fn emit_str_part(&mut self, expr: &Expr, first: bool) -> String {
         let code = self.emit_expr(expr);
-        if matches!(expr.kind, ExprKind::String(_) | ExprKind::Keyword(_)) {
+        if matches!(expr.kind, ExprKind::String(_)) {
             return code;
+        }
+        if let ExprKind::Keyword(name) = &expr.kind {
+            return format!("\"{}\"", escape_js(name));
+        }
+        if self.expr_type(expr).is_some_and(type_is_keyword) {
+            return format!(
+                "((__value) => typeof __value === \"symbol\" ? (Symbol.keyFor(__value) ?? __value.description ?? String(__value)) : String(__value))({})",
+                code
+            );
         }
         if self.expr_is_str_raw_string(expr) || (!first && self.expr_is_str_concat_safe(expr)) {
             return parenthesize_expression(code);
@@ -1465,30 +1777,30 @@ impl Emitter {
 
     fn emit_task_succeed(&mut self, args: &[Expr]) -> String {
         if args.len() != 1 {
-            return "{ kind: \"task/succeed\", value: undefined }".to_string();
+            return "{ kind: Symbol.for(\"task/succeed\"), value: undefined }".to_string();
         }
         format!(
-            "{{ kind: \"task/succeed\", value: {} }}",
+            "{{ kind: Symbol.for(\"task/succeed\"), value: {} }}",
             self.emit_expr(&args[0])
         )
     }
 
     fn emit_task_fail(&mut self, args: &[Expr]) -> String {
         if args.len() != 1 {
-            return "{ kind: \"task/fail\", error: undefined }".to_string();
+            return "{ kind: Symbol.for(\"task/fail\"), error: undefined }".to_string();
         }
         format!(
-            "{{ kind: \"task/fail\", error: {} }}",
+            "{{ kind: Symbol.for(\"task/fail\"), error: {} }}",
             self.emit_expr(&args[0])
         )
     }
 
     fn emit_task_combinator(&mut self, args: &[Expr], kind: &str, fn_field: &str) -> String {
         if args.len() != 2 {
-            return "{ kind: \"task/fail\", error: \"invalid task\" }".to_string();
+            return "{ kind: Symbol.for(\"task/fail\"), error: \"invalid task\" }".to_string();
         }
         format!(
-            "{{ kind: \"{}\", task: {}, {}: {} }}",
+            "{{ kind: Symbol.for(\"{}\"), task: {}, {}: {} }}",
             kind,
             self.emit_expr(&args[0]),
             fn_field,
@@ -1500,28 +1812,28 @@ impl Emitter {
         self.add_runtime_effect("task/perform");
         match args.len() {
             3 => format!(
-                "{{ kind: \"task/perform\", task: {}, onSuccess: {}, onError: {} }}",
+                "{{ kind: Symbol.for(\"task/perform\"), task: {}, onSuccess: {}, onError: {} }}",
                 self.emit_expr(&args[0]),
                 self.emit_expr(&args[1]),
                 self.emit_expr(&args[2])
             ),
             4 => format!(
-                "{{ kind: \"task/perform\", task: {}({}), onSuccess: {}, onError: {} }}",
+                "{{ kind: Symbol.for(\"task/perform\"), task: {}({}), onSuccess: {}, onError: {} }}",
                 self.emit_expr(&args[0]),
                 self.emit_expr(&args[1]),
                 self.emit_expr(&args[2]),
                 self.emit_expr(&args[3])
             ),
-            _ => "{ kind: \"none\" }".to_string(),
+            _ => "{ kind: Symbol.for(\"none\") }".to_string(),
         }
     }
 
     fn emit_http_task(&mut self, args: &[Expr], kind: &str) -> String {
         if args.len() != 1 {
-            return "{ kind: \"task/fail\", error: \"invalid HTTP task\" }".to_string();
+            return "{ kind: Symbol.for(\"task/fail\"), error: \"invalid HTTP task\" }".to_string();
         }
         format!(
-            "{{ kind: \"{}\", url: {} }}",
+            "{{ kind: Symbol.for(\"{}\"), url: {} }}",
             kind,
             self.emit_expr(&args[0])
         )
@@ -1529,66 +1841,21 @@ impl Emitter {
 
     fn emit_cmd_batch(&mut self, args: &[Expr]) -> String {
         if args.len() != 1 {
-            return "{ kind: \"none\" }".to_string();
+            return "{ kind: Symbol.for(\"none\") }".to_string();
         }
         format!(
-            "{{ kind: \"batch\", commands: {} }}",
+            "{{ kind: Symbol.for(\"batch\"), commands: {} }}",
             self.emit_expr(&args[0])
-        )
-    }
-
-    fn emit_cmd_storage_get(&mut self, args: &[Expr]) -> String {
-        self.add_runtime_effect("storage/get");
-        if args.len() != 4 {
-            return "{ kind: \"none\" }".to_string();
-        }
-        format!(
-            "{{ kind: \"storage/get\", key: {}, format: {}, toMessage: {}, onError: {} }}",
-            self.emit_expr(&args[0]),
-            self.emit_expr(&args[1]),
-            self.emit_expr(&args[2]),
-            self.emit_expr(&args[3])
-        )
-    }
-
-    fn emit_cmd_storage_set(&mut self, args: &[Expr]) -> String {
-        self.add_runtime_effect("storage/set");
-        if args.len() != 3 && args.len() != 4 {
-            return "{ kind: \"none\" }".to_string();
-        }
-        let on_error = args
-            .get(3)
-            .map(|arg| format!(", onError: {}", self.emit_expr(arg)))
-            .unwrap_or_default();
-        format!(
-            "{{ kind: \"storage/set\", key: {}, value: {}, msg: {}{} }}",
-            self.emit_expr(&args[0]),
-            self.emit_expr(&args[1]),
-            self.emit_expr(&args[2]),
-            on_error
-        )
-    }
-
-    fn emit_cmd_storage_set_silent(&mut self, args: &[Expr]) -> String {
-        self.add_runtime_effect("storage/set");
-        if args.len() != 3 {
-            return "{ kind: \"none\" }".to_string();
-        }
-        format!(
-            "{{ kind: \"storage/set\", key: {}, value: {}, onError: {} }}",
-            self.emit_expr(&args[0]),
-            self.emit_expr(&args[1]),
-            self.emit_expr(&args[2])
         )
     }
 
     fn emit_cmd_time_now(&mut self, args: &[Expr]) -> String {
         self.add_runtime_effect("time/now");
         if args.len() != 1 {
-            return "{ kind: \"none\" }".to_string();
+            return "{ kind: Symbol.for(\"none\") }".to_string();
         }
         format!(
-            "{{ kind: \"time/now\", toMessage: {} }}",
+            "{{ kind: Symbol.for(\"time/now\"), toMessage: {} }}",
             self.emit_expr(&args[0])
         )
     }
@@ -1596,10 +1863,10 @@ impl Emitter {
     fn emit_cmd_random_number(&mut self, args: &[Expr]) -> String {
         self.add_runtime_effect("random/number");
         if args.len() != 3 {
-            return "{ kind: \"none\" }".to_string();
+            return "{ kind: Symbol.for(\"none\") }".to_string();
         }
         format!(
-            "{{ kind: \"random/number\", min: {}, max: {}, toMessage: {} }}",
+            "{{ kind: Symbol.for(\"random/number\"), min: {}, max: {}, toMessage: {} }}",
             self.emit_expr(&args[0]),
             self.emit_expr(&args[1]),
             self.emit_expr(&args[2])
@@ -1609,10 +1876,10 @@ impl Emitter {
     fn emit_cmd_timer(&mut self, args: &[Expr], kind: &str) -> String {
         self.add_runtime_effect(kind);
         if args.len() != 3 {
-            return "{ kind: \"none\" }".to_string();
+            return "{ kind: Symbol.for(\"none\") }".to_string();
         }
         format!(
-            "{{ kind: \"{}\", id: {}, ms: {}, msg: {} }}",
+            "{{ kind: Symbol.for(\"{}\"), id: {}, ms: {}, msg: {} }}",
             kind,
             self.emit_expr(&args[0]),
             self.emit_expr(&args[1]),
@@ -1623,10 +1890,10 @@ impl Emitter {
     fn emit_cmd_timer_cancel(&mut self, args: &[Expr]) -> String {
         self.add_runtime_effect("timer/cancel");
         if args.len() != 1 {
-            return "{ kind: \"none\" }".to_string();
+            return "{ kind: Symbol.for(\"none\") }".to_string();
         }
         format!(
-            "{{ kind: \"timer/cancel\", id: {} }}",
+            "{{ kind: Symbol.for(\"timer/cancel\"), id: {} }}",
             self.emit_expr(&args[0])
         )
     }
@@ -1634,10 +1901,10 @@ impl Emitter {
     fn emit_cmd_animation_frame(&mut self, args: &[Expr]) -> String {
         self.add_runtime_effect("animation/frame");
         if args.len() != 2 {
-            return "{ kind: \"none\" }".to_string();
+            return "{ kind: Symbol.for(\"none\") }".to_string();
         }
         format!(
-            "{{ kind: \"animation/frame\", id: {}, onFrame: {} }}",
+            "{{ kind: Symbol.for(\"animation/frame\"), id: {}, onFrame: {} }}",
             self.emit_expr(&args[0]),
             self.emit_expr(&args[1])
         )
@@ -1646,175 +1913,12 @@ impl Emitter {
     fn emit_cmd_animation_cancel(&mut self, args: &[Expr]) -> String {
         self.add_runtime_effect("animation/cancel");
         if args.len() != 2 {
-            return "{ kind: \"none\" }".to_string();
+            return "{ kind: Symbol.for(\"none\") }".to_string();
         }
         format!(
-            "{{ kind: \"animation/cancel\", id: {}, msg: {} }}",
+            "{{ kind: Symbol.for(\"animation/cancel\"), id: {}, msg: {} }}",
             self.emit_expr(&args[0]),
             self.emit_expr(&args[1])
-        )
-    }
-
-    fn emit_cmd_dom_ref_action(&mut self, args: &[Expr], kind: &str) -> String {
-        self.add_runtime_effect(kind);
-        if args.len() != 2 && args.len() != 3 {
-            return "{ kind: \"none\" }".to_string();
-        }
-        let on_error = args
-            .get(2)
-            .map(|arg| format!(", onError: {}", self.emit_expr(arg)))
-            .unwrap_or_default();
-        format!(
-            "{{ kind: \"{}\", ref: {}, msg: {}{} }}",
-            kind,
-            self.emit_expr(&args[0]),
-            self.emit_expr(&args[1]),
-            on_error
-        )
-    }
-
-    fn emit_cmd_file_read_selected(&mut self, args: &[Expr]) -> String {
-        self.add_runtime_effect("file/read-selected");
-        if args.len() != 5 {
-            return "{ kind: \"none\" }".to_string();
-        }
-        format!(
-            "{{ kind: \"file/read-selected\", ref: {}, format: {}, toMessage: {}, onError: {}, onCancel: {} }}",
-            self.emit_expr(&args[0]),
-            self.emit_expr(&args[1]),
-            self.emit_expr(&args[2]),
-            self.emit_expr(&args[3]),
-            self.emit_expr(&args[4])
-        )
-    }
-
-    fn emit_cmd_file_download(&mut self, args: &[Expr]) -> String {
-        self.add_runtime_effect("file/download");
-        if args.len() != 5 {
-            return "{ kind: \"none\" }".to_string();
-        }
-        format!(
-            "{{ kind: \"file/download\", name: {}, content: {}, mime: {}, msg: {}, onError: {} }}",
-            self.emit_expr(&args[0]),
-            self.emit_expr(&args[1]),
-            self.emit_expr(&args[2]),
-            self.emit_expr(&args[3]),
-            self.emit_expr(&args[4])
-        )
-    }
-
-    fn emit_cmd_canvas_draw(&mut self, args: &[Expr]) -> String {
-        self.add_runtime_effect("canvas/draw");
-        if args.len() != 5 {
-            return "{ kind: \"none\" }".to_string();
-        }
-        format!(
-            "{{ kind: \"canvas/draw\", ref: {}, cssWidth: {}, cssHeight: {}, devicePixelRatio: true, ops: {}, onError: {} }}",
-            self.emit_expr(&args[0]),
-            self.emit_expr(&args[1]),
-            self.emit_expr(&args[2]),
-            self.emit_expr(&args[3]),
-            self.emit_expr(&args[4])
-        )
-    }
-
-    fn emit_cmd_resize_watch(&mut self, args: &[Expr]) -> String {
-        if args.len() == 4 {
-            if let Some(to_message) = self.emit_resize_to_message(&args[2]) {
-                self.add_runtime_effect("dom-ref/resize-watch/direct");
-                return format!(
-                    "{{ kind: \"dom-ref/resize-watch/direct\", id: {}, ref: {}, m: {}, onError: {} }}",
-                    self.emit_expr(&args[0]),
-                    self.emit_expr(&args[1]),
-                    to_message,
-                    self.emit_expr(&args[3])
-                );
-            }
-        }
-        self.add_runtime_effect("dom-ref/resize-watch");
-        if args.len() != 4 {
-            return "{ kind: \"none\" }".to_string();
-        }
-        format!(
-            "{{ kind: \"dom-ref/resize-watch\", id: {}, ref: {}, onChange: {}, onError: {} }}",
-            self.emit_expr(&args[0]),
-            self.emit_expr(&args[1]),
-            self.emit_expr(&args[2]),
-            self.emit_expr(&args[3])
-        )
-    }
-
-    fn emit_cmd_dom_ref_measure(&mut self, args: &[Expr]) -> String {
-        self.add_runtime_effect("dom-ref/measure");
-        if args.len() != 3 {
-            return "{ kind: \"none\" }".to_string();
-        }
-        format!(
-            "{{ kind: \"dom-ref/measure\", ref: {}, toMessage: {}, onError: {} }}",
-            self.emit_expr(&args[0]),
-            self.emit_expr(&args[1]),
-            self.emit_expr(&args[2])
-        )
-    }
-
-    fn emit_cmd_bluetooth_connect_heart_rate(&mut self, args: &[Expr]) -> String {
-        self.add_runtime_effect("bluetooth/connect-heart-rate");
-        if args.len() != 6 {
-            return "{ kind: \"none\" }".to_string();
-        }
-        format!(
-            "{{ kind: \"bluetooth/connect-heart-rate\", id: {}, ...{}, toMessage: {}, onReading: {}, onDisconnected: {}, onError: {} }}",
-            self.emit_expr(&args[0]),
-            self.emit_expr(&args[1]),
-            self.emit_expr(&args[2]),
-            self.emit_expr(&args[3]),
-            self.emit_expr(&args[4]),
-            self.emit_expr(&args[5])
-        )
-    }
-
-    fn emit_cmd_bluetooth_disconnect(&mut self, args: &[Expr]) -> String {
-        self.add_runtime_effect("bluetooth/disconnect");
-        if args.len() != 2 {
-            return "{ kind: \"none\" }".to_string();
-        }
-        format!(
-            "{{ kind: \"bluetooth/disconnect\", id: {}, msg: {} }}",
-            self.emit_expr(&args[0]),
-            self.emit_expr(&args[1])
-        )
-    }
-
-    fn emit_cmd_simulation_heart_rate(&mut self, args: &[Expr]) -> String {
-        self.add_runtime_effect("simulation/heart-rate");
-        if args.len() != 5 && args.len() != 6 {
-            return "{ kind: \"none\" }".to_string();
-        }
-        let on_disconnected = if args.len() == 6 {
-            format!(", onDisconnected: {}", self.emit_expr(&args[4]))
-        } else {
-            String::new()
-        };
-        let error_arg = if args.len() == 6 { &args[5] } else { &args[4] };
-        format!(
-            "{{ kind: \"simulation/heart-rate\", id: {}, ...{}, toMessage: {}, onReading: {}{}, onError: {} }}",
-            self.emit_expr(&args[0]),
-            self.emit_expr(&args[1]),
-            self.emit_expr(&args[2]),
-            self.emit_expr(&args[3]),
-            on_disconnected,
-            self.emit_expr(error_arg)
-        )
-    }
-
-    fn emit_cmd_simulation_stop(&mut self, args: &[Expr]) -> String {
-        self.add_runtime_effect("simulation/stop");
-        if args.len() != 1 {
-            return "{ kind: \"none\" }".to_string();
-        }
-        format!(
-            "{{ kind: \"simulation/stop\", id: {} }}",
-            self.emit_expr(&args[0])
         )
     }
 
@@ -1866,11 +1970,24 @@ impl Emitter {
         )
     }
 
+    fn emit_cmd_map(&mut self, args: &[Expr]) -> String {
+        self.needs_cmd_map = true;
+        if args.len() != 2 {
+            return "{ kind: Symbol.for(\"none\") }".to_string();
+        }
+        format!(
+            "{}({}, {})",
+            CMD_MAP_ALIAS,
+            self.emit_expr(&args[0]),
+            self.emit_expr(&args[1])
+        )
+    }
+
     fn emit_scope_update(&mut self, args: &[Expr]) -> String {
         self.needs_html_runtime = true;
         self.needs_scope_update = true;
         if args.len() != 5 {
-            return "[undefined, { kind: \"none\" }]".to_string();
+            return "[undefined, { kind: Symbol.for(\"none\") }]".to_string();
         }
         format!(
             "{}({}, {}, {}, {}, {})",
@@ -1887,7 +2004,7 @@ impl Emitter {
         self.needs_html_runtime = true;
         self.needs_scope_subscriptions = true;
         if args.len() != 3 {
-            return "{ kind: \"none\" }".to_string();
+            return "{ kind: Symbol.for(\"none\") }".to_string();
         }
         format!(
             "{}({}, {}, {})",
@@ -1898,285 +2015,17 @@ impl Emitter {
         )
     }
 
-    fn emit_scope_view(&mut self, args: &[Expr]) -> String {
-        self.needs_html_runtime = true;
-        self.needs_scope_view = true;
-        if args.len() != 3 {
-            return format!(
-                "{}(\"scope\", () => ({{ mount() {{}}, update() {{}}, dispose() {{}}, root: null }}), undefined)",
-                SCOPE_VIEW_ALIAS
-            );
-        }
-        format!(
-            "{}({}, {}, {})",
-            SCOPE_VIEW_ALIAS,
-            self.emit_expr(&args[0]),
-            self.emit_expr(&args[1]),
-            self.emit_expr(&args[2])
-        )
-    }
-
-    fn emit_render_to_string(&mut self, args: &[Expr]) -> String {
-        self.needs_html_runtime = true;
-        self.needs_render_to_string = true;
-        match args.len() {
-            1 => format!("{}({})", RENDER_TO_STRING_ALIAS, self.emit_expr(&args[0])),
-            2 => format!(
-                "{}({}, {})",
-                RENDER_TO_STRING_ALIAS,
-                self.emit_expr(&args[0]),
-                self.emit_expr(&args[1])
-            ),
-            _ => format!("{}(null)", RENDER_TO_STRING_ALIAS),
-        }
-    }
-
-    fn emit_sub_batch(&mut self, args: &[Expr]) -> String {
-        if args.len() != 1 {
-            return "{ kind: \"batch\", subscriptions: [] }".to_string();
-        }
-        format!(
-            "{{ kind: \"batch\", subscriptions: {} }}",
-            self.emit_expr(&args[0])
-        )
-    }
-
-    fn emit_sub_timer_every(&mut self, args: &[Expr]) -> String {
-        self.add_runtime_effect("timer/every");
-        self.add_runtime_effect("timer/cancel");
-        if args.len() != 3 {
-            return "{ kind: \"none\" }".to_string();
-        }
-        format!(
-            "{{ kind: \"timer/every\", s: \"timer/cancel\", id: {}, ms: {}, msg: {} }}",
-            self.emit_expr(&args[0]),
-            self.emit_expr(&args[1]),
-            self.emit_expr(&args[2])
-        )
-    }
-
-    fn emit_sub_media_query(&mut self, args: &[Expr]) -> String {
-        if args.len() == 3 {
-            if let Some(to_message) = self.emit_media_query_to_message(&args[2]) {
-                self.add_runtime_effect("media-query/watch/direct");
-                self.add_runtime_effect("media-query/unwatch/direct");
-                return format!(
-                    "{{ kind: \"media-query/watch/direct\", s: \"media-query/unwatch/direct\", id: {}, query: {}, m: {} }}",
-                    self.emit_expr(&args[0]),
-                    self.emit_expr(&args[1]),
-                    to_message
-                );
-            }
-        }
-        self.emit_sub_change(args, "media-query/watch", "query", "media-query/unwatch")
-    }
-
-    fn emit_sub_change(
-        &mut self,
-        args: &[Expr],
-        kind: &str,
-        target_field: &str,
-        stop_kind: &str,
-    ) -> String {
-        self.add_runtime_effect(kind);
-        self.add_runtime_effect(stop_kind);
-        if args.len() != 3 {
-            return "{ kind: \"none\" }".to_string();
-        }
-        format!(
-            "{{ kind: \"{}\", s: \"{}\", id: {}, {}: {}, onChange: {} }}",
-            kind,
-            stop_kind,
-            self.emit_expr(&args[0]),
-            target_field,
-            self.emit_expr(&args[1]),
-            self.emit_expr(&args[2])
-        )
-    }
-
-    fn emit_sub_window_event(&mut self, args: &[Expr]) -> String {
-        if args.len() == 3 {
-            if let Some(to_message) = self.emit_window_event_to_message(&args[2]) {
-                return self.emit_direct_window_event_subscription(
-                    &args[0], &args[1], to_message, None, false, false,
-                );
-            }
-        }
-        self.add_runtime_effect("window/event-watch");
-        self.add_runtime_effect("window/event-unwatch");
-        if args.len() != 3 && args.len() != 4 {
-            return "{ kind: \"none\" }".to_string();
-        }
-        let options = args
-            .get(3)
-            .map(|arg| format!(", options: {}", self.emit_expr(arg)))
-            .unwrap_or_default();
-        format!(
-            "{{ kind: \"window/event-watch\", s: \"window/event-unwatch\", id: {}, type: {}, onEvent: {}{} }}",
-            self.emit_expr(&args[0]),
-            self.emit_expr(&args[1]),
-            self.emit_expr(&args[2]),
-            options
-        )
-    }
-
-    fn emit_sub_window_event_with(&mut self, args: &[Expr]) -> String {
-        if args.len() == 4 {
-            if let (Some(to_message), Some(options)) = (
-                self.emit_window_event_to_message(&args[2]),
-                static_window_event_options(&args[3]),
-            ) {
-                return self.emit_direct_window_event_subscription(
-                    &args[0],
-                    &args[1],
-                    to_message,
-                    options.options,
-                    options.prevent_default,
-                    options.stop_propagation,
-                );
-            }
-        }
-        self.add_runtime_effect("window/event-watch");
-        self.add_runtime_effect("window/event-unwatch");
-        if args.len() != 4 {
-            return "{ kind: \"none\" }".to_string();
-        }
-        format!(
-            "{{ ...{}, kind: \"window/event-watch\", s: \"window/event-unwatch\", id: {}, type: {}, onEvent: {} }}",
-            self.emit_expr(&args[3]),
-            self.emit_expr(&args[0]),
-            self.emit_expr(&args[1]),
-            self.emit_expr(&args[2])
-        )
-    }
-
-    fn emit_direct_window_event_subscription(
-        &mut self,
-        id: &Expr,
-        event_type: &Expr,
-        to_message: String,
-        options: Option<&Expr>,
-        prevent_default: bool,
-        stop_propagation: bool,
-    ) -> String {
-        self.add_runtime_effect("window/event-watch/direct");
-        self.add_runtime_effect("window/event-unwatch/direct");
-        let options = options
-            .map(|expr| format!(", options: {}", self.emit_expr(expr)))
-            .unwrap_or_default();
-        let prevent_default = if prevent_default { ", p: true" } else { "" };
-        let stop_propagation = if stop_propagation { ", q: true" } else { "" };
-        format!(
-            "{{ kind: \"window/event-watch/direct\", s: \"window/event-unwatch/direct\", id: {}, type: {}, m: {}{}{}{} }}",
-            self.emit_expr(id),
-            self.emit_expr(event_type),
-            to_message,
-            options,
-            prevent_default,
-            stop_propagation
-        )
-    }
-
-    fn emit_window_event_to_message(&mut self, message: &Expr) -> Option<String> {
-        let kind = literal_string_value(message)?;
-        let reads = self.message_field_reads.get(kind)?;
-        if reads.value_escapes || reads.top_fields.contains("id") {
-            return None;
-        }
-        let body = self.emit_window_event_message_object(kind, reads)?;
-        Some(format!("(event) => ({})", body))
-    }
-
-    fn emit_window_event_message_object(
-        &self,
-        kind: &str,
-        reads: &MessageFieldReads,
-    ) -> Option<String> {
-        let mut fields = vec![format!("kind: \"{}\"", escape_js(kind))];
-        for field in &reads.top_fields {
-            if field == "id" {
-                fields.push("id".to_string());
-            } else {
-                fields.push(format!(
-                    "{}: {}",
-                    property_key(field),
-                    window_event_field_expr(field)?
-                ));
-            }
-        }
-        if !reads.value_fields.is_empty() {
-            let mut value_fields = Vec::new();
-            for field in &reads.value_fields {
-                value_fields.push(format!(
-                    "{}: {}",
-                    property_key(field),
-                    window_event_field_expr(field)?
-                ));
-            }
-            fields.push(format!("value: {{ {} }}", value_fields.join(", ")));
-        }
-        Some(format!("{{ {} }}", fields.join(", ")))
-    }
-
-    fn emit_media_query_to_message(&mut self, message: &Expr) -> Option<String> {
-        let kind = literal_string_value(message)?;
-        let reads = self.message_field_reads.get(kind)?;
-        if reads.value_escapes || !reads.value_fields.is_empty() || reads.top_fields.contains("id")
-        {
-            return None;
-        }
-        let mut fields = vec![format!("kind: \"{}\"", escape_js(kind))];
-        for field in &reads.top_fields {
-            let value = match field.as_str() {
-                "media" => "mediaQuery.media",
-                "matches" => "mediaQuery.matches",
-                _ => return None,
-            };
-            fields.push(format!("{}: {}", property_key(field), value));
-        }
-        Some(format!("(mediaQuery) => ({{ {} }})", fields.join(", ")))
-    }
-
-    fn emit_resize_to_message(&mut self, message: &Expr) -> Option<String> {
-        let kind = literal_string_value(message)?;
-        let reads = self.message_field_reads.get(kind)?;
-        if reads.value_escapes {
-            return None;
-        }
-        let mut fields = vec![format!("kind: \"{}\"", escape_js(kind))];
-        for field in &reads.top_fields {
-            let value = match field.as_str() {
-                "id" => "id",
-                _ => resize_field_expr(field)?,
-            };
-            fields.push(format!("{}: {}", property_key(field), value));
-        }
-        if !reads.value_fields.is_empty() {
-            let mut value_fields = Vec::new();
-            for field in &reads.value_fields {
-                value_fields.push(format!(
-                    "{}: {}",
-                    property_key(field),
-                    resize_field_expr(field)?
-                ));
-            }
-            fields.push(format!("value: {{ {} }}", value_fields.join(", ")));
-        }
-        let params = if reads.top_fields.contains("id") {
-            "entry, node, id"
-        } else {
-            "entry, node"
-        };
-        Some(format!("({}) => ({{ {} }})", params, fields.join(", ")))
-    }
-
     fn emit_defn(&mut self, name: &str, expr: &Expr, args: &[Expr]) -> String {
         let ExprKind::Vector(params) = &args[0].kind else {
             self.diagnostics.push(Diagnostic::error(
                 args[0].span,
                 "defn params must be a vector",
             ));
-            return format!("export const {} = undefined;", sanitize_identifier(name));
+            return format!(
+                "{}const {} = undefined;",
+                self.export_prefix(),
+                sanitize_identifier(name)
+            );
         };
         let param_types = self
             .expr_type(expr)
@@ -2260,7 +2109,8 @@ impl Emitter {
         self.local_types.pop();
         let params = js_params.join(", ");
         let result = format!(
-            "export function {}({}) {{ {} }}",
+            "{}function {}({}) {{ {} }}",
+            self.export_prefix(),
             sanitize_identifier(name),
             params,
             body
@@ -2309,7 +2159,8 @@ impl Emitter {
             .map(|(name, ty)| (name.clone(), ty.clone()))
             .collect::<BTreeMap<_, _>>();
         self.local_types.push(local_type_bindings);
-        let component_expr = self.emit_template_component(node);
+        let component_expr =
+            self.emit_template_component_with_params(node, &ReadAliases::new(), param_names);
         self.local_types.pop();
         let update_params = params
             .iter()
@@ -2328,7 +2179,8 @@ impl Emitter {
         };
 
         format!(
-            "export function {}({}) {{ const __closkellComponent = {}; return {}(__closkellComponent, {}, {}); }}",
+            "{}function {}({}) {{ const __closkellComponent = {}; return {}(__closkellComponent, {}, {}); }}",
+            self.export_prefix(),
             sanitize_identifier(name),
             param_list,
             component_expr,
@@ -2413,7 +2265,8 @@ impl Emitter {
             .collect::<Vec<_>>()
             .join(" ");
         let refresh_body = refresh_lines.join(" ");
-        let component_expr = self.emit_template_component_with_read_aliases(node, &read_aliases);
+        let component_expr =
+            self.emit_template_component_with_params(node, &read_aliases, param_names);
         self.local_types.pop();
         let update_params = params
             .iter()
@@ -2436,7 +2289,8 @@ impl Emitter {
         };
 
         format!(
-            "export function {}({}) {{ {} const __closkellRefresh = () => {{ {} }}; __closkellRefresh(); const __closkellComponent = {}; return {}(__closkellComponent, {}, {}); }}",
+            "{}function {}({}) {{ {} const __closkellRefresh = () => {{ {} }}; __closkellRefresh(); const __closkellComponent = {}; return {}(__closkellComponent, {}, {}); }}",
+            self.export_prefix(),
             sanitize_identifier(name),
             param_list,
             declarations,
@@ -2702,8 +2556,8 @@ impl Emitter {
             let bindings = self.emit_kind_pattern_bindings(arm.pattern, &value_name)?;
             let body = self.emit_expr(arm.body);
             lines.push(format!(
-                "case \"{}\": {{ {} return {}; }}",
-                escape_js(&arm.kind),
+                "case {}: {{ {} return {}; }}",
+                keyword_literal(&arm.kind),
                 bindings,
                 body
             ));
@@ -4677,13 +4531,6 @@ impl Emitter {
         format!("{}({})", callee, self.emit_expr(&args[0]))
     }
 
-    fn emit_zero_arg_expr(&mut self, args: &[Expr], expr: &str) -> String {
-        if !args.is_empty() {
-            return "undefined".to_string();
-        }
-        expr.to_string()
-    }
-
     fn emit_url_resolve(&mut self, args: &[Expr]) -> String {
         if args.len() != 2 {
             return "undefined".to_string();
@@ -4749,105 +4596,6 @@ impl Emitter {
         )
     }
 
-    fn emit_history_replace_search_param(&mut self, args: &[Expr]) -> String {
-        if args.len() != 2 {
-            return "undefined".to_string();
-        }
-        format!(
-            "((__name, __value) => {{ try {{ const __next = new URL(globalThis.location?.href ?? \"http://localhost/\"); if (__value === null || __value === undefined || String(__value) === \"\") __next.searchParams.delete(__name); else __next.searchParams.set(__name, String(__value)); globalThis.history?.replaceState?.(null, \"\", `${{__next.pathname}}${{__next.search}}${{__next.hash}}`); }} catch {{}} return null; }})({}, {})",
-            self.emit_expr(&args[0]),
-            self.emit_expr(&args[1])
-        )
-    }
-
-    fn emit_history_write_route(&mut self, args: &[Expr]) -> String {
-        if args.len() != 3 {
-            return "undefined".to_string();
-        }
-        format!(
-            r#"((__url, __op, __definition) => {{
-  try {{
-    const __params = new URLSearchParams();
-    if (__url !== null && __url !== undefined && String(__url) !== "") __params.set("url", String(__url));
-    if (__definition !== null && __definition !== undefined && String(__definition) !== "") __params.set("definition", String(__definition));
-    if (__op !== null && __op !== undefined && String(__op) !== "") __params.set("op", String(__op));
-    const __query = __params.toString();
-    const __next = __query ? `${{globalThis.location?.pathname ?? "/"}}?${{__query}}` : (globalThis.location?.pathname ?? "/");
-    if (__next !== `${{globalThis.location?.pathname ?? "/"}}${{globalThis.location?.search ?? ""}}`) globalThis.history?.replaceState?.(null, "", __next);
-  }} catch {{}}
-  return null;
-}})({}, {}, {})"#,
-            self.emit_expr(&args[0]),
-            self.emit_expr(&args[1]),
-            self.emit_expr(&args[2])
-        )
-    }
-
-    fn emit_browser_theme_initial(&mut self, args: &[Expr]) -> String {
-        if args.len() != 1 {
-            return "undefined".to_string();
-        }
-        format!(
-            "((__key) => {{ const __stored = globalThis.sessionStorage?.getItem(__key) ?? globalThis.localStorage?.getItem(__key); const __theme = __stored === \"light\" ? \"light\" : \"dark\"; globalThis.document?.documentElement?.classList?.toggle(\"dark\", __theme === \"dark\"); try {{ globalThis.sessionStorage?.setItem(__key, __theme); globalThis.localStorage?.setItem(__key, __theme); }} catch {{}} return __theme; }})({})",
-            self.emit_expr(&args[0])
-        )
-    }
-
-    fn emit_browser_theme_toggle(&mut self, args: &[Expr]) -> String {
-        if args.len() != 2 {
-            return "undefined".to_string();
-        }
-        format!(
-            "((__current, __key) => {{ const __theme = __current === \"dark\" ? \"light\" : \"dark\"; globalThis.document?.documentElement?.classList?.toggle(\"dark\", __theme === \"dark\"); try {{ globalThis.sessionStorage?.setItem(__key, __theme); globalThis.localStorage?.setItem(__key, __theme); }} catch {{}} return __theme; }})({}, {})",
-            self.emit_expr(&args[0]),
-            self.emit_expr(&args[1])
-        )
-    }
-
-    fn emit_auth_storage_load(&mut self, args: &[Expr]) -> String {
-        if args.len() != 1 {
-            return "undefined".to_string();
-        }
-        format!(
-            r#"((__sourceUrl) => {{
-  const __key = `better-swagger-auth:${{String(__sourceUrl)}}`;
-  const __raw = globalThis.localStorage?.getItem(__key) ?? globalThis.sessionStorage?.getItem(__key);
-  if (!__raw) return {{}};
-  try {{
-    const __parsed = JSON.parse(__raw);
-    const __now = Date.now();
-    const __valid = (Array.isArray(__parsed) ? __parsed : []).filter((__entry) => !__entry?.expiresAt || __entry.expiresAt > __now);
-    const __entries = Object.fromEntries(__valid.map((__entry) => [__entry.schemeId, __entry]));
-    if (__valid.length !== (Array.isArray(__parsed) ? __parsed.length : 0) || globalThis.sessionStorage?.getItem(__key)) {{
-      globalThis.localStorage?.setItem(__key, JSON.stringify(Object.values(__entries)));
-      globalThis.sessionStorage?.removeItem(__key);
-    }}
-    return __entries;
-  }} catch {{
-    return {{}};
-  }}
-}})({})"#,
-            self.emit_expr(&args[0])
-        )
-    }
-
-    fn emit_auth_storage_persist(&mut self, args: &[Expr]) -> String {
-        if args.len() != 2 {
-            return "undefined".to_string();
-        }
-        format!(
-            r#"((__sourceUrl, __entries) => {{
-  const __key = `better-swagger-auth:${{String(__sourceUrl)}}`;
-  try {{
-    globalThis.localStorage?.setItem(__key, JSON.stringify(Object.values(__entries ?? {{}})));
-  }} catch {{}}
-  return null;
-}})({}, {})"#,
-            self.emit_expr(&args[0]),
-            self.emit_expr(&args[1])
-        )
-    }
-
     fn emit_resolve_token_expiry(&mut self, args: &[Expr]) -> String {
         if args.len() != 2 {
             return "undefined".to_string();
@@ -4867,38 +4615,6 @@ impl Emitter {
   if (__fromResponse && __fromJwt) return Math.min(__fromResponse, __fromJwt);
   return __fromResponse ?? __fromJwt;
 }})({}, {})"#,
-            self.emit_expr(&args[0]),
-            self.emit_expr(&args[1])
-        )
-    }
-
-    fn emit_clipboard_text(&mut self, args: &[Expr]) -> String {
-        if args.len() != 1 {
-            return "undefined".to_string();
-        }
-        format!(
-            "({}?.clipboardData?.getData?.(\"text/plain\") ?? {})",
-            self.emit_expr(&args[0]),
-            "\"\""
-        )
-    }
-
-    fn emit_clipboard_write(&mut self, args: &[Expr]) -> String {
-        if args.len() != 1 {
-            return "undefined".to_string();
-        }
-        format!(
-            "((__text) => {{ void globalThis.navigator?.clipboard?.writeText?.(String(__text)); return null; }})({})",
-            self.emit_expr(&args[0])
-        )
-    }
-
-    fn emit_browser_set_cookie(&mut self, args: &[Expr]) -> String {
-        if args.len() != 2 {
-            return "undefined".to_string();
-        }
-        format!(
-            "((__name, __value) => {{ if (globalThis.document) globalThis.document.cookie = `${{encodeURIComponent(__name)}}=${{encodeURIComponent(__value)}}; path=/`; return null; }})({}, {})",
             self.emit_expr(&args[0]),
             self.emit_expr(&args[1])
         )
@@ -4924,61 +4640,6 @@ impl Emitter {
             self.emit_expr(&args[0]),
             self.emit_expr(&args[1]),
             self.emit_expr(&args[2])
-        )
-    }
-
-    fn emit_selected_file_or_blob(&mut self, args: &[Expr]) -> String {
-        if args.len() != 4 {
-            return "undefined".to_string();
-        }
-        format!(
-            "((__testId, __content, __name, __type) => {{ const __input = globalThis.document?.querySelector?.(`[data-testid=\"${{__testId}}\"]`); const __selected = __input?.files?.[0]; if (__selected) return __selected; if (typeof File === \"function\") return new File([String(__content)], String(__name), {{ type: String(__type) }}); return new Blob([String(__content)], {{ type: String(__type) }}); }})({}, {}, {}, {})",
-            self.emit_expr(&args[0]),
-            self.emit_expr(&args[1]),
-            self.emit_expr(&args[2]),
-            self.emit_expr(&args[3])
-        )
-    }
-
-    fn emit_selected_file_by_test_id(&mut self, args: &[Expr]) -> String {
-        if args.len() != 1 {
-            return "undefined".to_string();
-        }
-        format!(
-            r#"((__testId) => {{ const __safe = String(__testId).replace(/\\/g, "\\\\").replace(/"/g, "\\\""); return globalThis.document?.querySelector?.(`[data-testid="${{__safe}}"]`)?.files?.[0] ?? null; }})({})"#,
-            self.emit_expr(&args[0])
-        )
-    }
-
-    fn emit_has_selected_file(&mut self, args: &[Expr]) -> String {
-        if args.len() != 1 {
-            return "undefined".to_string();
-        }
-        format!(
-            r#"((__testId) => {{ const __safe = String(__testId).replace(/\\/g, "\\\\").replace(/"/g, "\\\""); return Boolean(globalThis.document?.querySelector?.(`[data-testid="${{__safe}}"]`)?.files?.[0]); }})({})"#,
-            self.emit_expr(&args[0])
-        )
-    }
-
-    fn emit_multipart_form_body(&mut self, args: &[Expr]) -> String {
-        if args.len() != 2 {
-            return "undefined".to_string();
-        }
-        format!(
-            r#"((__fields, __values) => {{ const __form = new FormData(); const __attr = (__value) => String(__value).replace(/\\/g, "\\\\").replace(/"/g, "\\\""); const __byTestId = (__id) => globalThis.document?.querySelector?.(`[data-testid="${{__attr(__id)}}"]`); for (const __field of Array.isArray(__fields) ? __fields : []) {{ const __name = String(__field?.name ?? ""); if (!__name) continue; if (__field?.kind === "file") {{ const __file = __byTestId(`request-body-multipart-${{__name}}`)?.files?.[0]; if (__file) __form.append(__name, __file, __file.name); }} else {{ const __value = (__values && Object.prototype.hasOwnProperty.call(__values, __name)) ? __values[__name] : (__byTestId(`request-body-field-${{__name}}`)?.value ?? ""); const __text = String(__value ?? "").trim(); if (__text) __form.append(__name, __text); }} }} return __form; }})({}, {})"#,
-            self.emit_expr(&args[0]),
-            self.emit_expr(&args[1])
-        )
-    }
-
-    fn emit_urlencoded_form_body(&mut self, args: &[Expr]) -> String {
-        if args.len() != 2 {
-            return "undefined".to_string();
-        }
-        format!(
-            r#"((__fields, __values) => {{ const __params = new URLSearchParams(); for (const __field of Array.isArray(__fields) ? __fields : []) {{ if (__field?.kind === "file") continue; const __name = String(__field?.name ?? ""); if (!__name) continue; const __text = String((__values && Object.prototype.hasOwnProperty.call(__values, __name)) ? __values[__name] : "").trim(); if (__text) __params.append(__name, __text); }} return __params.toString(); }})({}, {})"#,
-            self.emit_expr(&args[0]),
-            self.emit_expr(&args[1])
         )
     }
 
@@ -5012,98 +4673,6 @@ impl Emitter {
             self.emit_expr(&args[1]),
             flags
         )
-    }
-
-    fn emit_install_virtual_json_viewer(&mut self, args: &[Expr]) -> String {
-        if !args.is_empty() {
-            return "undefined".to_string();
-        }
-        r#"(() => {
-  if (globalThis.customElements?.get?.("virtual-json-viewer")) return null;
-  const LINE_HEIGHT = 20;
-  const OVERSCAN = 15;
-  const escapeHtml = (__text) => String(__text)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-  const prettyText = (__raw) => {
-    const __trimmed = String(__raw ?? "").trim();
-    if (!__trimmed) return "";
-    try { return JSON.stringify(JSON.parse(__trimmed), null, 2); }
-    catch { return String(__raw ?? ""); }
-  };
-  const highlightLine = (__line) => {
-    const __tokens = [];
-    const __pattern = /("(?:\\.|[^"\\])*")(\s*:)?|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|\btrue\b|\bfalse\b|\bnull\b/g;
-    let __last = 0;
-    for (const __match of String(__line).matchAll(__pattern)) {
-      __tokens.push(escapeHtml(String(__line).slice(__last, __match.index)));
-      const __token = __match[0];
-      const __escaped = escapeHtml(__token);
-      if (__match[1] && __match[2]) __tokens.push(`<span class="hljs-attr">${escapeHtml(__match[1])}</span>${escapeHtml(__match[2])}`);
-      else if (__match[1]) __tokens.push(`<span class="hljs-string">${__escaped}</span>`);
-      else if (/^-?\d/.test(__token)) __tokens.push(`<span class="hljs-number">${__escaped}</span>`);
-      else __tokens.push(`<span class="hljs-literal">${__escaped}</span>`);
-      __last = (__match.index ?? 0) + __token.length;
-    }
-    __tokens.push(escapeHtml(String(__line).slice(__last)));
-    return __tokens.join("");
-  };
-  class VirtualJsonViewer extends HTMLElement {
-    constructor() {
-      super();
-      this.__lines = [""];
-      this.__scroll = null;
-      this.__spacer = null;
-      this.__rows = null;
-      this.__onScroll = () => this.__updateRows();
-    }
-    static get observedAttributes() { return ["data-json", "data-version", "max-height", "highlight"]; }
-    connectedCallback() { this.__renderShell(); this.__rebuild(); }
-    disconnectedCallback() { this.__scroll?.removeEventListener("scroll", this.__onScroll); }
-    attributeChangedCallback() { if (this.isConnected) this.__rebuild(); }
-    __bindScroll() {
-      if (!this.__scroll) return;
-      this.__scroll.removeEventListener("scroll", this.__onScroll);
-      this.__scroll.addEventListener("scroll", this.__onScroll, { passive: true });
-    }
-    __renderShell() {
-      if (this.__scroll) return;
-      this.classList.add("block");
-      this.innerHTML = `<div class="virtual-json-scroll overflow-auto rounded-lg border border-zinc-200 bg-zinc-50 font-mono text-[13px] dark:border-zinc-800 dark:bg-zinc-900/80"><div class="virtual-json-spacer relative w-full"><div class="virtual-json-rows absolute inset-x-0 top-0"></div></div></div>`;
-      this.__scroll = this.querySelector(".virtual-json-scroll");
-      this.__spacer = this.querySelector(".virtual-json-spacer");
-      this.__rows = this.querySelector(".virtual-json-rows");
-      this.__scroll.style.maxHeight = this.getAttribute("max-height") || "24rem";
-      this.__bindScroll();
-    }
-    __rebuild() {
-      this.__renderShell();
-      this.__bindScroll();
-      this.__scroll.style.maxHeight = this.getAttribute("max-height") || "24rem";
-      this.__scroll.scrollTop = 0;
-      const __text = prettyText(this.getAttribute("data-json") ?? "");
-      const __highlight = this.getAttribute("highlight") !== "false";
-      this.__lines = (__text ? __text.split("\n") : [""]).map((__line) => __highlight ? highlightLine(__line) : escapeHtml(__line));
-      this.__spacer.style.height = `${this.__lines.length * LINE_HEIGHT}px`;
-      this.__updateRows();
-    }
-    __updateRows() {
-      if (!this.__scroll || !this.__rows) return;
-      const __height = this.__scroll.clientHeight || 384;
-      const __first = Math.max(0, Math.floor(this.__scroll.scrollTop / LINE_HEIGHT) - OVERSCAN);
-      const __count = Math.ceil(__height / LINE_HEIGHT) + OVERSCAN * 2;
-      const __last = Math.min(this.__lines.length, __first + __count);
-      let __html = "";
-      for (let __index = __first; __index < __last; __index += 1) {
-        __html += `<div class="absolute left-0 top-0 flex w-full px-3 leading-5 whitespace-pre" style="height:${LINE_HEIGHT}px;transform:translateY(${__index * LINE_HEIGHT}px)"><span class="mr-3 w-8 shrink-0 text-right text-zinc-400 select-none dark:text-zinc-600">${__index + 1}</span><span>${this.__lines[__index] ?? ""}</span></div>`;
-      }
-      this.__rows.innerHTML = __html;
-    }
-  }
-  globalThis.customElements?.define?.("virtual-json-viewer", VirtualJsonViewer);
-  return null;
-})()"#.to_string()
     }
 
     fn emit_base64(&mut self, encode: bool, args: &[Expr]) -> String {
@@ -5544,8 +5113,8 @@ impl Emitter {
             let body = self.emit_tail_expr(self_name, params, arm.body);
             has_tail_call |= body.has_tail_call;
             lines.push(format!(
-                "case \"{}\": {{ {} {} }}",
-                escape_js(&arm.kind),
+                "case {}: {{ {} {} }}",
+                keyword_literal(&arm.kind),
                 bindings,
                 body.code
             ));
@@ -5604,7 +5173,7 @@ impl Emitter {
                 self.emit_data_constructor_pattern(pattern, items, value, value_type)
             }
             ExprKind::Keyword(name) => CompiledPattern {
-                test: format!("{} === \"{}\"", value, escape_js(name)),
+                test: format!("{} === {}", value, keyword_literal(name)),
                 bindings: String::new(),
             },
             ExprKind::String(value_pattern) => CompiledPattern {
@@ -5886,13 +5455,14 @@ impl Emitter {
     }
 
     fn emit_template_component(&mut self, root: &HtmlNode) -> String {
-        self.emit_template_component_with_read_aliases(root, &ReadAliases::new())
+        self.emit_template_component_with_params(root, &ReadAliases::new(), &[])
     }
 
-    fn emit_template_component_with_read_aliases(
+    fn emit_template_component_with_params(
         &mut self,
         root: &HtmlNode,
-        _read_aliases: &ReadAliases,
+        read_aliases: &ReadAliases,
+        params: &[String],
     ) -> String {
         self.needs_html_runtime = true;
         let template_id = self.next_template_id;
@@ -5904,6 +5474,8 @@ impl Emitter {
             nodes: Vec::new(),
             slots: Vec::new(),
             create_lines: Vec::new(),
+            read_aliases: read_aliases.clone(),
+            params: params.to_vec(),
         };
         template.emit_node(root);
         let skeleton = build_template_skeleton(root, template.owner);
@@ -5942,12 +5514,19 @@ impl Emitter {
         }
         let update_body = template.emit_update_body();
 
+        let metadata_const = format!("__closkellTemplateMetadata{}", template_id);
+        let metadata = template.metadata_expr();
+        template
+            .owner
+            .template_metadata_consts
+            .push(format!("const {} = {};\n", metadata_const, metadata));
         let skeleton_expr = format!(
-            "{}(\"{}\", \"{}\", (i, d) => {{ {} }})",
+            "{}(\"{}\", \"{}\", (i, d, c) => {{ {} }}, {})",
             CREATE_HTML_TEMPLATE_ALIAS,
             escape_js(&skeleton.html),
             escape_js(&skeleton_paths),
-            update_body
+            update_body,
+            metadata_const
         );
         template.owner.needs_template_skeleton = true;
         skeleton_expr
@@ -5961,6 +5540,8 @@ struct TemplateEmitter<'a> {
     nodes: Vec<String>,
     slots: Vec<TemplateSlot>,
     create_lines: Vec<String>,
+    read_aliases: ReadAliases,
+    params: Vec<String>,
 }
 
 struct CompiledPattern {
@@ -6287,6 +5868,7 @@ struct TemplateSlot {
     node_id: usize,
     kind: TemplateSlotKind,
     expr: String,
+    reads: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -6316,6 +5898,45 @@ enum TemplateSlotKind {
         render: String,
         stable_item_update: bool,
     },
+}
+
+fn template_slot_metadata_expr(slot: &TemplateSlot) -> String {
+    let reads = slot
+        .reads
+        .iter()
+        .map(|read| format!("\"{}\"", escape_js(read)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{{ id: {}, kind: {}, reads: [{}] }}",
+        slot.id,
+        template_slot_kind_metadata_expr(&slot.kind),
+        reads
+    )
+}
+
+fn template_slot_kind_metadata_expr(kind: &TemplateSlotKind) -> String {
+    match kind {
+        TemplateSlotKind::Text => "\"text\"".to_string(),
+        TemplateSlotKind::Attr { name, .. } => {
+            format!("{{ attr: \"{}\" }}", escape_js(name))
+        }
+        TemplateSlotKind::Event(event) => {
+            format!("{{ event: \"{}\" }}", escape_js(event))
+        }
+        TemplateSlotKind::Ref => "\"ref\"".to_string(),
+        TemplateSlotKind::Conditional { .. } => "{ conditional: true }".to_string(),
+        TemplateSlotKind::Component { name, .. } => {
+            format!("{{ component: \"{}\" }}", escape_js(name))
+        }
+        TemplateSlotKind::KeyedList { item, index, .. } => {
+            let index = index
+                .as_ref()
+                .map(|index| format!(", index: \"{}\"", escape_js(index)))
+                .unwrap_or_default();
+            format!("{{ keyed: \"{}\"{} }}", escape_js(item), index)
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6404,7 +6025,7 @@ fn emit_skeleton_node(
             1
         }
         HtmlNode::Expr { expr, .. } => {
-            if template_expr_uses_structural_marker(expr, &owner.component_fns) {
+            if template_expr_uses_structural_marker(expr, owner) {
                 skeleton.node_paths.push(path.clone());
                 skeleton.html.push_str("<!---->");
                 1
@@ -6421,10 +6042,11 @@ fn emit_skeleton_node(
     }
 }
 
-fn template_expr_uses_structural_marker(expr: &Expr, component_fns: &BTreeSet<String>) -> bool {
+fn template_expr_uses_structural_marker(expr: &Expr, owner: &Emitter) -> bool {
+    let is_typed_component_call = |expr: &Expr| owner.expr_is_typed_component_call(expr);
     ForSpec::parse(expr).is_some()
-        || IfSpec::parse(expr, component_fns).is_some()
-        || ComponentSpec::parse(expr, component_fns).is_some()
+        || IfSpec::parse(expr, &owner.component_fns, &is_typed_component_call).is_some()
+        || ComponentSpec::parse(expr, &owner.component_fns, is_typed_component_call(expr)).is_some()
 }
 
 fn escape_html_text(value: &str) -> String {
@@ -6469,10 +6091,18 @@ impl TemplateEmitter<'_> {
                 if let Some(spec) = ForSpec::parse(expr) {
                     return self.emit_keyed_for(expr, spec);
                 }
-                if let Some(spec) = IfSpec::parse(expr, &self.owner.component_fns) {
+                let is_typed_component_call =
+                    |expr: &Expr| self.owner.expr_is_typed_component_call(expr);
+                if let Some(spec) =
+                    IfSpec::parse(expr, &self.owner.component_fns, &is_typed_component_call)
+                {
                     return self.emit_conditional(expr, spec);
                 }
-                if let Some(spec) = ComponentSpec::parse(expr, &self.owner.component_fns) {
+                if let Some(spec) = ComponentSpec::parse(
+                    expr,
+                    &self.owner.component_fns,
+                    is_typed_component_call(expr),
+                ) {
                     return self.emit_component_call(expr, spec);
                 }
 
@@ -6632,6 +6262,11 @@ impl TemplateEmitter<'_> {
             keyed_item_update_reads(&spec, &self.owner.component_fns, &self.owner.read_summaries)
                 .into_iter()
                 .all(|read| keyed_item_local_read(&read, spec.item, spec.index));
+        let reads = self.expand_reads(collect_keyed_reads(
+            &spec,
+            &self.owner.component_fns,
+            &self.owner.read_summaries,
+        ));
         let arity = if index.is_some() { 2 } else { 1 };
         let bind = format!(
             "({}) => {{ {} = {};{} }}",
@@ -6661,6 +6296,7 @@ impl TemplateEmitter<'_> {
                 stable_item_update,
             },
             expr: format_expr(expr),
+            reads,
         });
         var
     }
@@ -6675,6 +6311,11 @@ impl TemplateEmitter<'_> {
         let else_component = self.emit_branch_component(&spec.else_branch);
         let render_then = format!("() => {}", then_component);
         let render_else = format!("() => {}", else_component);
+        let reads = self.expand_reads(collect_conditional_reads(
+            &spec,
+            &self.owner.component_fns,
+            &self.owner.read_summaries,
+        ));
         let id = self.slots.len();
         self.slots.push(TemplateSlot {
             id,
@@ -6685,6 +6326,7 @@ impl TemplateEmitter<'_> {
                 render_else,
             },
             expr: format_expr(expr),
+            reads,
         });
         var
     }
@@ -6713,7 +6355,7 @@ impl TemplateEmitter<'_> {
         };
 
         format!(
-            "(() => {{ const {component} = {render}; return {{ mount(parent, dispatch) {{ return {component}.mount(parent, dispatch); }}, update(dispatch) {{ return {component}.update({update_args}dispatch); }}, dispose() {{ {component}.dispose?.(); }}, get root() {{ return {component}.root; }} }}; }})()"
+            "(() => {{ const {component} = {render}; return {{ mount(parent, dispatch) {{ return {component}.mount(parent, dispatch); }}, update(dispatch, updateContext = null) {{ return {component}.update({update_args}dispatch, updateContext); }}, dispose() {{ {component}.dispose?.(); }}, get root() {{ return {component}.root; }}, get definition() {{ return {component}.definition; }} }}; }})()"
         )
     }
 
@@ -6721,12 +6363,13 @@ impl TemplateEmitter<'_> {
         let branch = self.owner.next_temp("__closkellBranch");
         let component = self.owner.next_temp("__closkellComponent");
         let placeholder = self.owner.next_temp("__closkellPlaceholder");
+        let fresh = self.owner.next_temp("__closkellFresh");
         let condition = self.owner.emit_expr(spec.condition);
         let then_component = self.emit_branch_component(&spec.then_branch);
         let else_component = self.emit_branch_component(&spec.else_branch);
 
         format!(
-            "(() => {{ let {branch} = null; let {component} = null; const {placeholder} = {text}(\"\"); const __closkellDispose = () => {{ if ({component}?.root?.parentNode) {component}.root.parentNode.removeChild({component}.root); {component}?.dispose?.(); }}; return {{ update(dispatch) {{ const __closkellCondition = {condition}; const __closkellNextBranch = __closkellCondition ? \"then\" : \"else\"; if ({branch} !== __closkellNextBranch) {{ __closkellDispose(); {component} = __closkellCondition ? {then_component} : {else_component}; {branch} = __closkellNextBranch; }} {component}?.update?.(dispatch); return {component}?.root ?? {placeholder}; }}, get root() {{ return {component}?.root ?? {placeholder}; }}, dispose() {{ __closkellDispose(); {component} = null; {branch} = null; }} }}; }})()",
+            "(() => {{ let {branch} = null; let {component} = null; let {fresh} = false; const {placeholder} = {text}(\"\"); const __closkellDispose = () => {{ if ({component}?.root?.parentNode) {component}.root.parentNode.removeChild({component}.root); {component}?.dispose?.(); }}; const __closkellForceContext = (context) => context ? {{ ...context, force: true }} : null; return {{ update(dispatch, updateContext = null) {{ const __closkellCondition = {condition}; const __closkellNextBranch = __closkellCondition ? \"then\" : \"else\"; if ({branch} !== __closkellNextBranch) {{ __closkellDispose(); {component} = __closkellCondition ? {then_component} : {else_component}; {branch} = __closkellNextBranch; {fresh} = true; }} {component}?.update?.(dispatch, {fresh} ? __closkellForceContext(updateContext) : updateContext); {fresh} = false; return {component}?.root ?? {placeholder}; }}, get root() {{ return {component}?.root ?? {placeholder}; }}, dispose() {{ __closkellDispose(); {component} = null; {branch} = null; {fresh} = false; }} }}; }})()",
             text = CREATE_TEXT_ALIAS
         )
     }
@@ -6743,6 +6386,7 @@ impl TemplateEmitter<'_> {
             .map(|arg| self.owner.emit_expr(arg))
             .collect::<Vec<_>>()
             .join(", ");
+        let reads = self.expand_reads(component_call_reads(&spec, &self.owner.read_summaries));
         let id = self.slots.len();
         self.slots.push(TemplateSlot {
             id,
@@ -6753,6 +6397,7 @@ impl TemplateEmitter<'_> {
                 args: format!("[{}]", args),
             },
             expr: format_expr(expr),
+            reads,
         });
         var
     }
@@ -6773,12 +6418,14 @@ impl TemplateEmitter<'_> {
 
     fn push_slot(&mut self, node_id: usize, kind: TemplateSlotKind, expr: &Expr) {
         let id = self.slots.len();
+        let reads = self.expr_reads(expr);
         let expr = self.owner.emit_expr(expr);
         self.slots.push(TemplateSlot {
             id,
             node_id,
             kind,
             expr,
+            reads,
         });
     }
 
@@ -6789,7 +6436,35 @@ impl TemplateEmitter<'_> {
             node_id,
             kind,
             expr,
+            reads: Vec::new(),
         });
+    }
+
+    fn expr_reads(&self, expr: &Expr) -> Vec<String> {
+        self.expand_reads(collect_template_reads(expr, &self.owner.read_summaries))
+    }
+
+    fn expand_reads(&self, reads: Vec<String>) -> Vec<String> {
+        expand_reads(reads, &self.read_aliases)
+    }
+
+    fn metadata_expr(&self) -> String {
+        let slots = self
+            .slots
+            .iter()
+            .map(template_slot_metadata_expr)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let params = self
+            .params
+            .iter()
+            .map(|param| format!("\"{}\"", escape_js(param)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "{{ name: \"template{}\", params: [{}], slots: [{}] }}",
+            self.template_id, params, slots
+        )
     }
 
     fn attr_setter(&self, name: &str, expr: &Expr, in_svg_tree: bool) -> TemplateAttrSetter {
@@ -6835,12 +6510,12 @@ impl TemplateEmitter<'_> {
         for slot in &self.slots {
             let update = match &slot.kind {
                 TemplateSlotKind::Text => format!(
-                    "{}(i, {}, i.nodes[{}], {});",
+                    "{}(i, {}, i.nodes[{}], {}, c);",
                     SET_TEXT_ALIAS, slot.id, slot.node_id, slot.expr
                 ),
                 TemplateSlotKind::Attr { name, setter } => match setter {
                     TemplateAttrSetter::Simple => format!(
-                        "{}(i, {}, i.nodes[{}], \"{}\", {});",
+                        "{}(i, {}, i.nodes[{}], \"{}\", {}, c);",
                         SET_ATTR_ALIAS,
                         slot.id,
                         slot.node_id,
@@ -6848,7 +6523,7 @@ impl TemplateEmitter<'_> {
                         slot.expr
                     ),
                     TemplateAttrSetter::Text => format!(
-                        "{}(i, {}, i.nodes[{}], \"{}\", {});",
+                        "{}(i, {}, i.nodes[{}], \"{}\", {}, c);",
                         SET_TEXT_ATTR_ALIAS,
                         slot.id,
                         slot.node_id,
@@ -6856,7 +6531,7 @@ impl TemplateEmitter<'_> {
                         slot.expr
                     ),
                     TemplateAttrSetter::NullableText => format!(
-                        "{}(i, {}, i.nodes[{}], \"{}\", {});",
+                        "{}(i, {}, i.nodes[{}], \"{}\", {}, c);",
                         SET_NULLABLE_TEXT_ATTR_ALIAS,
                         slot.id,
                         slot.node_id,
@@ -6864,7 +6539,7 @@ impl TemplateEmitter<'_> {
                         slot.expr
                     ),
                     TemplateAttrSetter::TextProperty => format!(
-                        "{}(i, {}, i.nodes[{}], \"{}\", {});",
+                        "{}(i, {}, i.nodes[{}], \"{}\", {}, c);",
                         SET_TEXT_PROPERTY_ALIAS,
                         slot.id,
                         slot.node_id,
@@ -6872,7 +6547,7 @@ impl TemplateEmitter<'_> {
                         slot.expr
                     ),
                     TemplateAttrSetter::NullableTextProperty => format!(
-                        "{}(i, {}, i.nodes[{}], \"{}\", {});",
+                        "{}(i, {}, i.nodes[{}], \"{}\", {}, c);",
                         SET_NULLABLE_TEXT_PROPERTY_ALIAS,
                         slot.id,
                         slot.node_id,
@@ -6880,7 +6555,7 @@ impl TemplateEmitter<'_> {
                         slot.expr
                     ),
                     TemplateAttrSetter::Presence => format!(
-                        "{}(i, {}, i.nodes[{}], \"{}\", {});",
+                        "{}(i, {}, i.nodes[{}], \"{}\", {}, c);",
                         SET_PRESENCE_ATTR_ALIAS,
                         slot.id,
                         slot.node_id,
@@ -6888,7 +6563,7 @@ impl TemplateEmitter<'_> {
                         slot.expr
                     ),
                     TemplateAttrSetter::BooleanProperty => format!(
-                        "{}(i, {}, i.nodes[{}], \"{}\", {});",
+                        "{}(i, {}, i.nodes[{}], \"{}\", {}, c);",
                         SET_BOOLEAN_PROPERTY_ALIAS,
                         slot.id,
                         slot.node_id,
@@ -6896,24 +6571,24 @@ impl TemplateEmitter<'_> {
                         slot.expr
                     ),
                     TemplateAttrSetter::ClassName => format!(
-                        "{}(i, {}, i.nodes[{}], {});",
+                        "{}(i, {}, i.nodes[{}], {}, c);",
                         SET_CLASS_NAME_ALIAS, slot.id, slot.node_id, slot.expr
                     ),
                     TemplateAttrSetter::Class => format!(
-                        "{}(i, {}, i.nodes[{}], {});",
+                        "{}(i, {}, i.nodes[{}], {}, c);",
                         SET_CLASS_ALIAS, slot.id, slot.node_id, slot.expr
                     ),
                     TemplateAttrSetter::Style => format!(
-                        "{}(i, {}, i.nodes[{}], {});",
+                        "{}(i, {}, i.nodes[{}], {}, c);",
                         SET_STYLE_ALIAS, slot.id, slot.node_id, slot.expr
                     ),
                     TemplateAttrSetter::StyleRecord => format!(
-                        "{}(i, {}, i.nodes[{}], {});",
+                        "{}(i, {}, i.nodes[{}], {}, c);",
                         SET_STYLE_RECORD_ALIAS, slot.id, slot.node_id, slot.expr
                     ),
                 },
                 TemplateSlotKind::Event(event) => format!(
-                    "{}(i, {}, i.nodes[{}], \"{}\", (event) => {}, d);",
+                    "{}(i, {}, i.nodes[{}], \"{}\", (event) => {}, d, c);",
                     SET_EVENT_ALIAS,
                     slot.id,
                     slot.node_id,
@@ -6921,7 +6596,7 @@ impl TemplateEmitter<'_> {
                     parenthesize_arrow_body(&slot.expr)
                 ),
                 TemplateSlotKind::Ref => format!(
-                    "{}(i, {}, i.nodes[{}], {}, d);",
+                    "{}(i, {}, i.nodes[{}], {}, d, c);",
                     SET_REF_ALIAS, slot.id, slot.node_id, slot.expr
                 ),
                 TemplateSlotKind::Conditional {
@@ -6929,7 +6604,7 @@ impl TemplateEmitter<'_> {
                     render_then,
                     render_else,
                 } => format!(
-                    "{}(i, {}, i.nodes[{}], {}, {}, {}, d);",
+                    "{}(i, {}, i.nodes[{}], {}, {}, {}, d, c);",
                     SET_CONDITIONAL_ALIAS,
                     slot.id,
                     slot.node_id,
@@ -6938,7 +6613,7 @@ impl TemplateEmitter<'_> {
                     render_else
                 ),
                 TemplateSlotKind::Component { name, render, args } => format!(
-                    "{}(i, {}, i.nodes[{}], () => {}, {}, d, \"{}\");",
+                    "{}(i, {}, i.nodes[{}], () => {}, {}, d, c, \"{}\");",
                     SET_COMPONENT_ALIAS,
                     slot.id,
                     slot.node_id,
@@ -6960,7 +6635,7 @@ impl TemplateEmitter<'_> {
                         item.clone()
                     };
                     format!(
-                        "{}(i, {}, i.nodes[{}], {}, ({}) => {}, {}, d, {});",
+                        "{}(i, {}, i.nodes[{}], {}, ({}) => {}, {}, d, c, {});",
                         SET_KEYED_LIST_ALIAS,
                         slot.id,
                         slot.node_id,
@@ -7051,13 +6726,20 @@ enum TemplateBranch<'a> {
 }
 
 impl<'a> TemplateBranch<'a> {
-    fn parse(expr: &'a Expr, components: &BTreeSet<String>) -> Option<Self> {
+    fn parse<F>(
+        expr: &'a Expr,
+        components: &BTreeSet<String>,
+        is_typed_component_call: &F,
+    ) -> Option<Self>
+    where
+        F: Fn(&Expr) -> bool,
+    {
         match &expr.kind {
             ExprKind::HtmlTemplate(template) => Some(Self::Html(template)),
-            ExprKind::List(_) => IfSpec::parse(expr, components)
+            ExprKind::List(_) => IfSpec::parse(expr, components, is_typed_component_call)
                 .map(|spec| Self::If(Box::new(spec)))
                 .or_else(|| {
-                    ComponentSpec::parse(expr, components)
+                    ComponentSpec::parse(expr, components, is_typed_component_call(expr))
                         .map(|spec| Self::Component { expr, spec })
                 }),
             _ => None,
@@ -7066,7 +6748,14 @@ impl<'a> TemplateBranch<'a> {
 }
 
 impl<'a> IfSpec<'a> {
-    fn parse(expr: &'a Expr, components: &BTreeSet<String>) -> Option<Self> {
+    fn parse<F>(
+        expr: &'a Expr,
+        components: &BTreeSet<String>,
+        is_typed_component_call: &F,
+    ) -> Option<Self>
+    where
+        F: Fn(&Expr) -> bool,
+    {
         let ExprKind::List(items) = &expr.kind else {
             return None;
         };
@@ -7074,8 +6763,8 @@ impl<'a> IfSpec<'a> {
             return None;
         }
 
-        let then_branch = TemplateBranch::parse(&items[2], components)?;
-        let else_branch = TemplateBranch::parse(&items[3], components)?;
+        let then_branch = TemplateBranch::parse(&items[2], components, is_typed_component_call)?;
+        let else_branch = TemplateBranch::parse(&items[3], components, is_typed_component_call)?;
 
         Some(Self {
             condition: &items[1],
@@ -7091,7 +6780,11 @@ struct ComponentSpec<'a> {
 }
 
 impl<'a> ComponentSpec<'a> {
-    fn parse(expr: &'a Expr, components: &BTreeSet<String>) -> Option<Self> {
+    fn parse(
+        expr: &'a Expr,
+        components: &BTreeSet<String>,
+        is_typed_component_call: bool,
+    ) -> Option<Self> {
         let ExprKind::List(items) = &expr.kind else {
             return None;
         };
@@ -7101,12 +6794,16 @@ impl<'a> ComponentSpec<'a> {
         let ExprKind::Symbol(name) = &head.kind else {
             return None;
         };
-        if name != "scope-view" && !components.contains(name) {
+        if name != "scope-view" && !components.contains(name) && !is_typed_component_call {
             return None;
         }
 
         Some(Self { name, args })
     }
+}
+
+fn expr_is_never_typed_component_call(_expr: &Expr) -> bool {
+    false
 }
 
 fn matches_symbol(expr: &Expr, expected: &str) -> bool {
@@ -7213,7 +6910,7 @@ fn is_template_component_expr(expr: &Expr, components: &BTreeSet<String>) -> boo
                 return is_template_component_expr(&items[2], components)
                     && is_template_component_expr(&items[3], components);
             }
-            ComponentSpec::parse(expr, components).is_some()
+            ComponentSpec::parse(expr, components, false).is_some()
         }
         _ => false,
     }
@@ -8104,11 +7801,12 @@ fn collect_keyed_item_html_reads(
                 symbols.extend(collect_keyed_reads(&spec, components, read_summaries));
                 return;
             }
-            if let Some(spec) = IfSpec::parse(expr, components) {
+            if let Some(spec) = IfSpec::parse(expr, components, &expr_is_never_typed_component_call)
+            {
                 symbols.extend(collect_conditional_reads(&spec, components, read_summaries));
                 return;
             }
-            if let Some(spec) = ComponentSpec::parse(expr, components) {
+            if let Some(spec) = ComponentSpec::parse(expr, components, false) {
                 symbols.extend(component_call_reads(&spec, read_summaries));
                 return;
             }
@@ -8143,11 +7841,12 @@ fn collect_html_node_reads(
                 symbols.extend(collect_keyed_reads(&spec, components, read_summaries));
                 return;
             }
-            if let Some(spec) = IfSpec::parse(expr, components) {
+            if let Some(spec) = IfSpec::parse(expr, components, &expr_is_never_typed_component_call)
+            {
                 symbols.extend(collect_conditional_reads(&spec, components, read_summaries));
                 return;
             }
-            if let Some(spec) = ComponentSpec::parse(expr, components) {
+            if let Some(spec) = ComponentSpec::parse(expr, components, false) {
                 symbols.extend(component_call_reads(&spec, read_summaries));
                 return;
             }
@@ -8342,11 +8041,7 @@ fn sanitize_identifier(name: &str) -> String {
 
 fn emit_symbol_read(name: &str) -> String {
     if name == "Cmd.none" {
-        return "{ kind: \"none\" }".to_string();
-    }
-
-    if name == "Sub.none" {
-        return "{ kind: \"none\" }".to_string();
+        return "{ kind: Symbol.for(\"none\") }".to_string();
     }
 
     let parts = name.split('.').collect::<Vec<_>>();
@@ -8385,93 +8080,6 @@ fn object_key_name(expr: &Expr) -> Option<String> {
         ExprKind::Keyword(name) | ExprKind::Symbol(name) | ExprKind::String(name) => {
             Some(name.clone())
         }
-        _ => None,
-    }
-}
-
-struct StaticWindowEventOptions<'a> {
-    options: Option<&'a Expr>,
-    prevent_default: bool,
-    stop_propagation: bool,
-}
-
-fn static_window_event_options(expr: &Expr) -> Option<StaticWindowEventOptions<'_>> {
-    let ExprKind::Map(entries) = &expr.kind else {
-        return None;
-    };
-    let mut options = None;
-    let mut prevent_default = false;
-    let mut stop_propagation = false;
-    for (key, value) in entries {
-        let key = object_key_name(key)?;
-        match key.as_str() {
-            "options" => options = Some(value),
-            "preventDefault" => {
-                let ExprKind::Bool(value) = &value.kind else {
-                    return None;
-                };
-                prevent_default = *value;
-            }
-            "stopPropagation" => {
-                let ExprKind::Bool(value) = &value.kind else {
-                    return None;
-                };
-                stop_propagation = *value;
-            }
-            _ => return None,
-        }
-    }
-    Some(StaticWindowEventOptions {
-        options,
-        prevent_default,
-        stop_propagation,
-    })
-}
-
-fn window_event_field_expr(field: &str) -> Option<&'static str> {
-    match field {
-        "type" => Some("event.type || \"\""),
-        "clientX" => Some("event.clientX || 0"),
-        "clientY" => Some("event.clientY || 0"),
-        "pageX" => Some("event.pageX || 0"),
-        "pageY" => Some("event.pageY || 0"),
-        "screenX" => Some("event.screenX || 0"),
-        "screenY" => Some("event.screenY || 0"),
-        "movementX" => Some("event.movementX || 0"),
-        "movementY" => Some("event.movementY || 0"),
-        "button" => Some("event.button || 0"),
-        "buttons" => Some("event.buttons || 0"),
-        "pointerId" => Some("event.pointerId || 0"),
-        "pointerType" => Some("event.pointerType || \"\""),
-        "isPrimary" => Some("!!event.isPrimary"),
-        "key" => Some("event.key || \"\""),
-        "code" => Some("event.code || \"\""),
-        "altKey" => Some("!!event.altKey"),
-        "ctrlKey" => Some("!!event.ctrlKey"),
-        "metaKey" => Some("!!event.metaKey"),
-        "shiftKey" => Some("!!event.shiftKey"),
-        _ => None,
-    }
-}
-
-fn resize_field_expr(field: &str) -> Option<&'static str> {
-    match field {
-        "x" => Some("entry?.contentRect?.x ?? 0"),
-        "y" => Some("entry?.contentRect?.y ?? 0"),
-        "width" => Some(
-            "entry?.contentRect?.width ?? node.clientWidth ?? node.offsetWidth ?? node.width ?? 0",
-        ),
-        "height" => Some(
-            "entry?.contentRect?.height ?? node.clientHeight ?? node.offsetHeight ?? node.height ?? 0",
-        ),
-        "top" => Some("entry?.contentRect?.top ?? entry?.contentRect?.y ?? 0"),
-        "left" => Some("entry?.contentRect?.left ?? entry?.contentRect?.x ?? 0"),
-        "right" => Some(
-            "entry?.contentRect?.right ?? ((entry?.contentRect?.x ?? 0) + (entry?.contentRect?.width ?? node.clientWidth ?? node.offsetWidth ?? node.width ?? 0))",
-        ),
-        "bottom" => Some(
-            "entry?.contentRect?.bottom ?? ((entry?.contentRect?.y ?? 0) + (entry?.contentRect?.height ?? node.clientHeight ?? node.offsetHeight ?? node.height ?? 0))",
-        ),
         _ => None,
     }
 }
@@ -8566,6 +8174,29 @@ fn escape_js(value: &str) -> String {
 mod tests {
     use super::*;
 
+    fn html_template_emit_options() -> HtmlTemplateEmitOptions {
+        HtmlTemplateEmitOptions::enabled("createCompiledHtmlTemplateComponent")
+    }
+
+    fn emit_module_with_html(source: &SourceFile) -> EmitResult {
+        let options = EmitOptions {
+            html_templates: html_template_emit_options(),
+            ..EmitOptions::default()
+        };
+        emit_module_with_types_and_options(source, BTreeMap::new(), options)
+    }
+
+    fn emit_module_with_html_types(
+        source: &SourceFile,
+        expr_types: BTreeMap<usize, String>,
+    ) -> EmitResult {
+        let options = EmitOptions {
+            html_templates: html_template_emit_options(),
+            ..EmitOptions::default()
+        };
+        emit_module_with_types_and_options(source, expr_types, options)
+    }
+
     fn first_call_span(expr: &Expr, name: &str) -> usize {
         if let ExprKind::List(items) = &expr.kind {
             if items.first().is_some_and(|head| matches_symbol(head, name)) {
@@ -8601,7 +8232,7 @@ mod tests {
             | ExprKind::QuasiQuote(inner)
             | ExprKind::Unquote(inner)
             | ExprKind::UnquoteSplicing(inner) => find_call_span(inner, name),
-            ExprKind::HtmlTemplate(_) => None,
+            ExprKind::HtmlTemplate(node) => find_call_span_in_html(node, name),
             ExprKind::Symbol(_)
             | ExprKind::Nil
             | ExprKind::Bool(_)
@@ -8611,13 +8242,121 @@ mod tests {
         }
     }
 
+    fn find_call_span_in_html(node: &HtmlNode, name: &str) -> Option<usize> {
+        match node {
+            HtmlNode::Element(element) => {
+                for attr in &element.attrs {
+                    if let HtmlAttrValue::Dynamic { expr, .. } = &attr.value {
+                        if let Some(span) = find_call_span(expr, name) {
+                            return Some(span);
+                        }
+                    }
+                }
+                element
+                    .children
+                    .iter()
+                    .find_map(|child| find_call_span_in_html(child, name))
+            }
+            HtmlNode::Expr { expr, .. } => find_call_span(expr, name),
+            HtmlNode::Text { .. } => None,
+        }
+    }
+
+    fn first_call_head_span(expr: &Expr, name: &str) -> usize {
+        find_call_head_span(expr, name).unwrap_or_else(|| panic!("missing `{}` call head", name))
+    }
+
+    fn find_call_head_span(expr: &Expr, name: &str) -> Option<usize> {
+        match &expr.kind {
+            ExprKind::List(items) => {
+                if let Some(head) = items.first() {
+                    if matches_symbol(head, name) {
+                        return Some(head.span.start);
+                    }
+                }
+                items
+                    .iter()
+                    .find_map(|item| find_call_head_span(item, name))
+            }
+            ExprKind::Vector(items) | ExprKind::Set(items) => items
+                .iter()
+                .find_map(|item| find_call_head_span(item, name)),
+            ExprKind::Map(entries) => entries.iter().find_map(|(key, value)| {
+                find_call_head_span(key, name).or_else(|| find_call_head_span(value, name))
+            }),
+            ExprKind::Quote(inner)
+            | ExprKind::QuasiQuote(inner)
+            | ExprKind::Unquote(inner)
+            | ExprKind::UnquoteSplicing(inner) => find_call_head_span(inner, name),
+            ExprKind::HtmlTemplate(node) => find_call_head_span_in_html(node, name),
+            ExprKind::Symbol(_)
+            | ExprKind::Nil
+            | ExprKind::Bool(_)
+            | ExprKind::Number(_)
+            | ExprKind::String(_)
+            | ExprKind::Keyword(_) => None,
+        }
+    }
+
+    fn find_call_head_span_in_html(node: &HtmlNode, name: &str) -> Option<usize> {
+        match node {
+            HtmlNode::Element(element) => {
+                for attr in &element.attrs {
+                    if let HtmlAttrValue::Dynamic { expr, .. } = &attr.value {
+                        if let Some(span) = find_call_head_span(expr, name) {
+                            return Some(span);
+                        }
+                    }
+                }
+                element
+                    .children
+                    .iter()
+                    .find_map(|child| find_call_head_span_in_html(child, name))
+            }
+            HtmlNode::Expr { expr, .. } => find_call_head_span(expr, name),
+            HtmlNode::Text { .. } => None,
+        }
+    }
+
     #[test]
     fn emits_definitions_as_esm_exports() {
         let source = syntax::parse_source("(def answer (+ 40 2))");
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert_eq!(emitted.code.trim(), "export const answer = 40 + 2;");
+        assert_eq!(
+            emitted.exports.get("answer").map(|export| export.arity),
+            Some(None)
+        );
+    }
+
+    #[test]
+    fn emits_private_top_level_bindings_with_export_metadata() {
+        let source = syntax::parse_source(
+            "(def banner \"export function text should stay literal\")\n\
+             (defn init [boot] [{:boot boot} Cmd.none])\n\
+             (defn subscriptions [state] Sub.none)",
+        );
+        let mut options = EmitOptions::default();
+        options.export_top_level = false;
+        let emitted = emit_module_with_types_and_options(&source, BTreeMap::new(), options);
+
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        assert!(
+            emitted
+                .code
+                .contains("const banner = \"export function text should stay literal\";")
+        );
+        assert!(emitted.code.contains("function init(boot)"));
+        assert!(emitted.code.contains("function subscriptions(state)"));
+        assert!(!emitted.code.contains("export const banner"));
+        assert!(!emitted.code.contains("export function init"));
+        assert_eq!(
+            emitted.exports.get("init").map(|export| export.arity),
+            Some(Some(1))
+        );
+        assert!(emitted.exports.contains_key("subscriptions"));
     }
 
     #[test]
@@ -8625,7 +8364,7 @@ mod tests {
         let source = syntax::parse_source(
             "(defn sum-down [n total]\n  (if (<= n 0)\n      total\n      (sum-down (- n 1) (+ total n))))",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains("while (true)"));
@@ -8639,7 +8378,7 @@ mod tests {
     fn emits_source_mappings_for_top_level_forms() {
         let source =
             syntax::parse_source("(def answer (+ 40 2))\n(defn label [value] (str value))");
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert_eq!(emitted.source_mappings.len(), 2);
@@ -8659,12 +8398,12 @@ mod tests {
     fn source_mappings_account_for_import_and_runtime_preamble() {
         let source =
             syntax::parse_source("(import \"./dep.clsk\" [value])\n#html <div>{value}</div>");
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert_eq!(emitted.source_mappings.len(), 2);
         assert_eq!(emitted.source_mappings[0].generated_line, 4);
-        assert_eq!(emitted.source_mappings[1].generated_line, 6);
+        assert_eq!(emitted.source_mappings[1].generated_line, 8);
     }
 
     #[test]
@@ -8673,7 +8412,7 @@ mod tests {
             "(import \"./hrweb_metrics.clsk\" [calculate-trimp matches-hrr-type?])\n\
              (defn summarize [entry] (calculate-trimp entry))",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains(
@@ -8689,7 +8428,7 @@ mod tests {
             "(import \"closkell/test\" [describe test expect= expect-not= expect-match expect-throws])\n\
              (describe \"math\" (test \"adds\" (expect= (+ 1 1) 2) (expect-not= 2 3) (expect-match {:kind :ok :value 2} {:kind :ok}) (expect-throws (fn [] (fail \"boom\")) \"boom\")))",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains("import { describe, test, expect_, expect_not_, expect_match, expect_throws } from \"@closkell/runtime\";"));
@@ -8705,7 +8444,7 @@ mod tests {
             "(import \"./chart.clsk\" [HeartReading HeartZone heart-chart-command])\n\
              (defn draw [state] (heart-chart-command state))",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(
@@ -8723,7 +8462,7 @@ mod tests {
             "(import \"./chart.clsk\" [HeartReading HeartZone])\n\
              (def answer 42)",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(!emitted.code.contains("import"));
@@ -8737,7 +8476,7 @@ mod tests {
              (ann api-type-count Number)\n\
              (def api-type-count 1)",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert_eq!(emitted.code.trim(), "export const api_type_count = 1;");
@@ -8749,51 +8488,19 @@ mod tests {
     }
 
     #[test]
-    fn emits_subscription_helpers_as_plain_data() {
-        let source = syntax::parse_source(
-            "(defn subscriptions [state]\n  (Sub.batch [(if state.running?\n                   (Sub.timer/every \"clock\" 250 {:kind :tick})\n                   Sub.none)\n              (Sub.media-query \"mobile\" \"(max-width: 700px)\" :media-changed)\n              (Sub.window/event \"dev\" \"keydown\" :key {:passive true})]))",
-        );
-        let emitted = emit_module(&source);
-
-        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
-        assert!(emitted.code.contains("kind: \"batch\""));
-        assert!(emitted.code.contains("timer/every"));
-        assert!(emitted.code.contains("media-query"));
-        assert!(emitted.code.contains("window/event"));
-        assert!(emitted.code.contains("kind: \"none\""));
-        assert!(!emitted.code.contains("Sub."));
-
-        let source = syntax::parse_source(
-            "(defn subscriptions [state]\n  (Sub.window/event-with \"drag\" \"pointermove\" :move {:preventDefault true :options {:passive false}}))",
-        );
-        let emitted = emit_module(&source);
-
-        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
-        assert!(emitted.code.contains("window/event"));
-        assert!(emitted.code.contains("preventDefault: true"));
-        assert!(emitted.code.contains("options:"));
-        assert!(!emitted.code.contains("Sub."));
-    }
-
-    #[test]
     fn emits_command_helpers_as_plain_data() {
         let source = syntax::parse_source(
-            "(defn update [state msg]\n  [state (Cmd.batch [Cmd.none\n                         (Cmd.dom-ref/measure \"track\" (fn [rect] {:kind :measured :left rect.left}) :measure-failed)\n                         (Cmd.bluetooth/connect-heart-rate \"hr\" {:filters [{:services [\"heart_rate\"]}]} (Msg.mapper :connected :info) :heart-rate :disconnected :failed)\n                         (Cmd.simulation/heart-rate \"sim\" {:ms 1000 :min 90 :max 160 :jitter 3 :start 120 :deviceName \"Sim\"} (Msg.mapper :connected :info) :heart-rate :failed)\n                         {:kind :timer/after :id \"tick\" :ms 1000 :msg {:kind :tick}}])])",
+            "(defn update [state msg]\n  [state (Cmd.batch [Cmd.none\n                         (Cmd.time/now (Msg.mapper :started :timestamp))\n                         (Cmd.random/number 1 10 (Msg.mapper :rolled :value))\n                         {:kind :timer/after :id \"tick\" :ms 1000 :msg {:kind :tick}}])])",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
-        assert!(emitted.code.contains("kind: \"batch\""));
+        assert!(emitted.code.contains("kind: Symbol.for(\"batch\")"));
         assert!(emitted.code.contains("commands: ["));
-        assert!(emitted.code.contains("kind: \"none\""));
-        assert!(emitted.code.contains("kind: \"dom-ref/measure\""));
-        assert!(
-            emitted
-                .code
-                .contains("kind: \"bluetooth/connect-heart-rate\"")
-        );
-        assert!(emitted.code.contains("kind: \"simulation/heart-rate\""));
-        assert!(emitted.code.contains("kind: \"timer/after\""));
+        assert!(emitted.code.contains("kind: Symbol.for(\"none\")"));
+        assert!(emitted.code.contains("kind: Symbol.for(\"time/now\")"));
+        assert!(emitted.code.contains("kind: Symbol.for(\"random/number\")"));
+        assert!(emitted.code.contains("kind: Symbol.for(\"timer/after\")"));
         assert!(!emitted.code.contains("Cmd."));
         assert!(!emitted.code.contains("Msg."));
     }
@@ -8804,13 +8511,17 @@ mod tests {
             "(defn decode [text]\n  (Task.succeed {:title text}))\n\
              (defn load [url]\n  (Task.perform\n    (Task.and-then (Http.get-text url) decode)\n    (fn [spec] {:kind :loaded :value spec})\n    (fn [error] {:kind :failed :error error})))",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
-        assert!(emitted.code.contains("kind: \"task/perform\""));
-        assert!(emitted.code.contains("kind: \"task/and-then\""));
-        assert!(emitted.code.contains("kind: \"task/http/get-text\""));
-        assert!(emitted.code.contains("kind: \"task/succeed\""));
+        assert!(emitted.code.contains("kind: Symbol.for(\"task/perform\")"));
+        assert!(emitted.code.contains("kind: Symbol.for(\"task/and-then\")"));
+        assert!(
+            emitted
+                .code
+                .contains("kind: Symbol.for(\"task/http/get-text\")")
+        );
+        assert!(emitted.code.contains("kind: Symbol.for(\"task/succeed\")"));
         assert!(!emitted.code.contains("Task."));
         assert!(!emitted.code.contains("Http.get"));
     }
@@ -8823,38 +8534,13 @@ mod tests {
              (defn child-subscriptions [state]\n  Sub.none)\n\
              (defn update [state msg]\n  (scope-update state :log msg child-update :log))\n\
              (defn subscriptions [state]\n  (scope-subscriptions state.log child-subscriptions :log))\n\
-             (defn view [state]\n  #html <main>{(scope-view :log child-view state.log)}</main>)",
+             (defn view [state]\n  #html <main>{state.log.count}</main>)",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains("__closkellScopeUpdate"));
         assert!(emitted.code.contains("__closkellScopeSubscriptions"));
-        assert!(emitted.code.contains("__closkellScopeView"));
-        assert!(emitted.code.contains("__closkellSetComponent"));
-        assert!(
-            emitted
-                .code
-                .contains("() => __closkellScopeView(\"log\", child_view, state.log)")
-        );
-        assert!(emitted.code.contains("[\"log\", child_view, state.log]"));
-    }
-
-    #[test]
-    fn emits_render_to_string_helper() {
-        let source = syntax::parse_source(
-            "(defn view [state]\n  #html <main>{state.title}</main>)\n\
-             (def html (render-to-string view {:title \"Pulse\"}))",
-        );
-        let emitted = emit_module(&source);
-
-        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
-        assert!(
-            emitted
-                .code
-                .contains("renderToString as __closkellRenderToString")
-        );
-        assert!(emitted.code.contains("__closkellRenderToString(view,"));
     }
 
     #[test]
@@ -8867,7 +8553,7 @@ mod tests {
              (def decoded\n\
                (decode spec-decoder (json-parse \"{\\\"title\\\":\\\"Pulse\\\",\\\"tags\\\":[\\\"zone\\\"]}\")))",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains(
@@ -8893,9 +8579,101 @@ mod tests {
     }
 
     #[test]
+    fn emits_typed_imported_html_calls_as_component_slots() {
+        let input = "(import \"./child.clsk\" [child-view])\n\
+             (defn view [state]\n  #html <main>{(child-view state.child)}</main>)";
+        let source = syntax::parse_source(input);
+        let mut expr_types = BTreeMap::new();
+        expr_types.insert(
+            first_call_head_span(&source.forms[1], "child-view"),
+            "(Fn [{:count Number}] Html)".to_string(),
+        );
+        let emitted = emit_module_with_html_types(&source, expr_types);
+
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        assert!(
+            emitted.code.contains("__closkellSetComponent"),
+            "typed Html call should mount as a component:\n{}",
+            emitted.code
+        );
+        assert!(
+            !emitted.code.contains("__closkellSetText(i, 0"),
+            "typed Html call must not be emitted as text:\n{}",
+            emitted.code
+        );
+    }
+
+    #[test]
+    fn emits_typed_imported_html_calls_inside_conditionals_as_conditional_slots() {
+        let input = "(import \"./session.clsk\" [live-pane])\n\
+             (import \"./logbook.clsk\" [log-pane])\n\
+             (defn view [state]\n  #html <main>{(if (= state.detailView \"live\") (live-pane state) (log-pane state))}</main>)";
+        let source = syntax::parse_source(input);
+        let mut expr_types = BTreeMap::new();
+        expr_types.insert(
+            first_call_head_span(&source.forms[2], "live-pane"),
+            "(Fn [{:detailView String}] Html)".to_string(),
+        );
+        expr_types.insert(
+            first_call_head_span(&source.forms[2], "log-pane"),
+            "(Fn [{:detailView String}] Html)".to_string(),
+        );
+        let emitted = emit_module_with_html_types(&source, expr_types);
+
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        assert!(
+            emitted.code.contains("__closkellSetConditional"),
+            "typed Html branches should lower as a conditional slot:\n{}",
+            emitted.code
+        );
+        assert!(emitted.code.contains("live_pane(state)"));
+        assert!(emitted.code.contains("log_pane(state)"));
+        assert!(
+            !emitted
+                .code
+                .contains("state.detailView === \"live\", live_pane(state)"),
+            "conditional Html branches must not be emitted as eager component args:\n{}",
+            emitted.code
+        );
+    }
+
+    #[test]
+    fn emits_typed_html_result_calls_inside_keyed_lists_as_component_slots() {
+        let input = "(import \"./operation.clsk\" [operationPanel])\n\
+             (defn view [state]\n  #html <section>{(for [item state.items :key item.id] #html <div>{(operationPanel state item)}</div>)}</section>)";
+        let source = syntax::parse_source(input);
+        let mut expr_types = BTreeMap::new();
+        expr_types.insert(
+            first_call_span(&source.forms[1], "operationPanel"),
+            "Html".to_string(),
+        );
+        let emitted = emit_module_with_html_types(&source, expr_types);
+
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        assert!(
+            emitted.code.contains("__closkellSetKeyedList"),
+            "keyed list should still lower as a list slot:\n{}",
+            emitted.code
+        );
+        assert!(
+            emitted.code.contains("__closkellSetComponent")
+                && emitted.code.contains("operationPanel(state, item)"),
+            "typed Html call in a keyed item should mount as a component:\n{}",
+            emitted.code
+        );
+        assert!(
+            !emitted
+                .code
+                .contains("__closkellSetText(i, 0, i.nodes[0], operationPanel(state, item)"),
+            "typed Html call in a keyed item must not be emitted as text:\n{}",
+            emitted.code
+        );
+    }
+
+    #[test]
     fn imports_runtime_for_templates() {
         let source = syntax::parse_source("#html <div>{label}</div>");
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.code.contains("@closkell/runtime"));
         assert!(emitted.code.contains("__closkellCreateHtmlTemplate"));
@@ -8903,16 +8681,36 @@ mod tests {
     }
 
     #[test]
-    fn browser_app_templates_import_browser_runtime_constructor() {
+    fn default_emission_rejects_html_templates() {
         let source = syntax::parse_source("#html <div>{label}</div>");
-        let mut options = EmitOptions::default();
-        options.browser_app_runtime = true;
+        let emitted = emit_module(&source);
+
+        assert!(
+            emitted.diagnostics.iter().any(|diagnostic| diagnostic
+                .message
+                .contains("#html templates are not enabled")),
+            "{:?}",
+            emitted.diagnostics
+        );
+    }
+
+    #[test]
+    fn templates_import_configured_runtime_constructor() {
+        let source = syntax::parse_source("#html <div>{label}</div>");
+        let options = EmitOptions {
+            html_templates: HtmlTemplateEmitOptions::enabled(
+                "createCustomCompiledHtmlTemplateComponent",
+            ),
+            ..EmitOptions::default()
+        };
         let emitted = emit_module_with_types_and_options(&source, BTreeMap::new(), options);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
-        assert!(emitted.code.contains(
-            "createBrowserCompiledHtmlTemplateComponent as __closkellCreateHtmlTemplate"
-        ));
+        assert!(
+            emitted.code.contains(
+                "createCustomCompiledHtmlTemplateComponent as __closkellCreateHtmlTemplate"
+            )
+        );
         assert!(
             !emitted
                 .code
@@ -8925,7 +8723,7 @@ mod tests {
         let source = syntax::parse_source(
             "(defn status-view [state] #html <button class={state.buttonClass} disabled={not state.connected?} on:click={:start}>{state.label}</button>)",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains("export function status_view(state)"));
@@ -8944,7 +8742,7 @@ mod tests {
         let source = syntax::parse_source(
             "(defn icon [] #html <span><svg viewBox=\"0 0 24 24\"><path d=\"M12 3v18\"></path></svg></span>)",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains("__closkellCreateHtmlTemplate"));
@@ -8958,7 +8756,7 @@ mod tests {
         let source = syntax::parse_source(
             "(defn view [state]\n  #html <section>{(for [zone state.zones index :key zone.id] #html <button data-index={index} on:click={{:kind :select :rank (+ index 1)}}>{(str index zone.name)}</button>)}</section>)",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains("__closkellSetKeyedList"));
@@ -8982,7 +8780,7 @@ mod tests {
         let source = syntax::parse_source(
             "(defn view [state] (let [label state.label] #html <p>{label}</p>))",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains("export function view(state)"));
@@ -9007,7 +8805,7 @@ mod tests {
             "(defn stat-tile [label value] #html <strong>{value}</strong>)\n\
              (defn view [state]\n  (let [avg (average-bpm state.readings)\n        entry (selected-log state.entries state.selectedLogId)]\n    #html <section>\n            {(stat-tile \"Avg\" avg)}\n            <p>{entry.durationMs}</p>\n            {(for [item state.entries :key item.id]\n               #html <button on:click={{:kind :select :id item.id}}>{item.label}</button>)}\n          </section>))",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains("avg = average_bpm(state.readings)"));
@@ -9029,7 +8827,7 @@ mod tests {
                       :samples (cons head rest)} state.payload]\n\
                  #html <section data-bpm={bpm} data-head={head} data-count={(count rest)}></section>))",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains("let bpm;"));
@@ -9065,7 +8863,7 @@ mod tests {
                      reading payload.reading]\n\
                  #html <section data-bpm={payload.reading.bpm} data-zone={reading.zone}></section>))",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains("payload = state.payload"));
@@ -9082,7 +8880,7 @@ mod tests {
                      (some current) state.latest]\n\
                  #html <section data-count={(count entries)} data-bpm={current.bpm}></section>))",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(
@@ -9104,7 +8902,7 @@ mod tests {
                      details entry.details]\n\
                  #html <section data-duration={entry.durationMs} data-kind={details.kind}></section>))",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(
@@ -9137,7 +8935,7 @@ mod tests {
                          {(row (first state.entries))}\n\
                        </section>))",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(
@@ -9174,7 +8972,7 @@ mod tests {
                (let [entry (nth state.entries state.selectedIndex)]\n\
                  #html <section data-label={entry.label}></section>))",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(
@@ -9194,7 +8992,7 @@ mod tests {
     fn emits_template_ref_slots() {
         let source =
             syntax::parse_source("(defn view [state] #html <canvas ref=\"heart-chart\"></canvas>)");
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains("__closkellSetRef"));
@@ -9208,7 +9006,7 @@ mod tests {
         let source = syntax::parse_source(
             "(defn summary-card [summary] #html <article>{summary.label}</article>)\n(defn view [state] #html <section>{(summary-card state.summary)}</section>)",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains("__closkellSetComponent"));
@@ -9236,7 +9034,7 @@ mod tests {
                #html <section>{(for [scheme state.schemes :key scheme.id]\n\
                                 #html <div>{(scheme-card scheme)}</div>)}</section>)",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains("__closkellSetComponent"));
@@ -9251,7 +9049,7 @@ mod tests {
             "(defn connection-label [state]\n  (if state.connected? (if state.simulated? \"Simulated\" \"Bluetooth\") \"Disconnected\"))\n\
              (defn view [state] #html <h2>{(connection-label state)}</h2>)",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(
@@ -9267,7 +9065,7 @@ mod tests {
             "(defn live-pane [state]\n  (let [avg (average-bpm state.readings)]\n    #html <section>\n            <strong>{state.latestBpm}</strong>\n            <button disabled={(= state.exerciseState \"running\")}>Start</button>\n            <em>{avg}</em>\n          </section>))\n\
              (defn view [state] #html <main>{(live-pane state)}</main>)",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains("avg = average_bpm(state.readings)"));
@@ -9281,7 +9079,7 @@ mod tests {
         let source = syntax::parse_source(
             "(defn in-zone? [zone bpm] (and (>= bpm zone.min) (<= bpm zone.max)))",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert_eq!(
@@ -9295,7 +9093,7 @@ mod tests {
         let source = syntax::parse_source(
             "(defn bar-width [plot-width gap count] (/ (- plot-width (* gap (+ count 1))) count))",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(
@@ -9311,7 +9109,7 @@ mod tests {
     fn emits_keyword_maps_as_plain_objects() {
         let source =
             syntax::parse_source("(def sample {:durationMs 60000 :readings [{:bpm 120 :time 0}]})");
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert_eq!(
@@ -9324,7 +9122,7 @@ mod tests {
     fn emits_keyword_match() {
         let source =
             syntax::parse_source("(defn label [msg] (match msg :start \"Start\" _ \"Other\"))");
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains("\"start\""));
@@ -9336,7 +9134,7 @@ mod tests {
     fn emits_record_pattern_match_bindings() {
         let source =
             syntax::parse_source("(defn next [msg] (match msg {:kind :rate :bpm bpm} bpm _ 0))");
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains("kind"));
@@ -9350,7 +9148,7 @@ mod tests {
         let source = syntax::parse_source(
             "(defn normalize [msg]\n  (match msg\n    (as {:kind :rate :bpm bpm} whole) (assoc whole :bpm (+ bpm 1))\n    _ msg))",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains("kind"));
@@ -9369,7 +9167,7 @@ mod tests {
                      (cons second tail) rest]\n\
                  {:bpm bpm :delta (- second first) :tailCount (count tail)}))",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains("let pattern did not match"));
@@ -9392,7 +9190,7 @@ mod tests {
                        :delta (- (first rest) head)\n\
                        :tailCount (count rest)})))",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains("fn parameter pattern did not match"));
@@ -9411,7 +9209,7 @@ mod tests {
                 :delta (- (first rest) head)\n\
                 :tailCount (count rest)})",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(
@@ -9433,7 +9231,7 @@ mod tests {
     #[test]
     fn rejects_template_defn_parameter_destructuring_for_metadata() {
         let source = syntax::parse_source("(defn view [{:label label}] #html <p>{label}</p>)");
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(
             emitted.diagnostics.iter().any(|diagnostic| diagnostic
@@ -9449,10 +9247,14 @@ mod tests {
         let source = syntax::parse_source(
             "(defn view [state] #html <button on:click={{:kind :start}}>Go</button>)",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
-        assert!(emitted.code.contains("(event) => ({ kind: \"start\" })"));
+        assert!(
+            emitted
+                .code
+                .contains("(event) => ({ kind: Symbol.for(\"start\") })")
+        );
     }
 
     #[test]
@@ -9460,20 +9262,18 @@ mod tests {
         let source = syntax::parse_source(
             "(defn view [state] #html <input value={state.draft} on:input={{:kind :draft :value event.currentTarget.value}}></input>)",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
-        assert!(
-            emitted
-                .code
-                .contains("(event) => ({ kind: \"draft\", value: event.currentTarget.value })")
-        );
+        assert!(emitted.code.contains(
+            "(event) => ({ kind: Symbol.for(\"draft\"), value: event.currentTarget.value })"
+        ));
     }
 
     #[test]
     fn emits_str_as_string_conversion() {
         let source = syntax::parse_source("(defn label [bpm] (str bpm))");
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains("return String(bpm);"));
@@ -9485,7 +9285,7 @@ mod tests {
             "(defn export-log [entries]\n  (json-stringify {:version 2 :entries entries} 2))\n\
              (defn imported-count [text]\n  (count (let [parsed (json-parse text)] parsed.entries)))",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(
@@ -9501,7 +9301,7 @@ mod tests {
         let source = syntax::parse_source(
             "(defn valid-entry? [entry]\n  (and (string? (get entry :id))\n       (number? (get entry :durationMs))\n       (vector? (get entry :readings))\n       (nil? (get entry :hiddenAt))))",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains("entry?.id ?? null"));
@@ -9519,7 +9319,7 @@ mod tests {
             source.forms[0].span.start,
             "(Fn [{:entries (Vector Number)}] (Vector Number))".to_string(),
         );
-        let emitted = emit_module_with_types(&source, expr_types);
+        let emitted = emit_module_with_html_types(&source, expr_types);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains("return state.entries;"));
@@ -9544,7 +9344,7 @@ mod tests {
             first_call_span(&source.forms[0], "last"),
             "{:max Number}".to_string(),
         );
-        let emitted = emit_module_with_types(&source, expr_types);
+        let emitted = emit_module_with_html_types(&source, expr_types);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(
@@ -9573,7 +9373,7 @@ mod tests {
             source.forms[0].span.start,
             "(Fn [{:spec Nil}] Html)".to_string(),
         );
-        let emitted = emit_module_with_types(&source, expr_types);
+        let emitted = emit_module_with_html_types(&source, expr_types);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(
@@ -9592,7 +9392,7 @@ mod tests {
             source.forms[0].span.start,
             "(Fn [(Option {:max Number})] (Option Number))".to_string(),
         );
-        let emitted = emit_module_with_types(&source, expr_types);
+        let emitted = emit_module_with_html_types(&source, expr_types);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains("return (zone?.max ?? null);"));
@@ -9613,7 +9413,7 @@ mod tests {
             "(Fn [Number] Number)".to_string(),
         );
         expr_types.insert(source.forms[2].span.start, "(Fn [Number] Bool)".to_string());
-        let emitted = emit_module_with_types(&source, expr_types);
+        let emitted = emit_module_with_html_types(&source, expr_types);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains("Number.isFinite(value)"));
@@ -9628,7 +9428,7 @@ mod tests {
              (defn iso [timestamp] (date-format timestamp :iso-date))\n\
              (defn log-label [timestamp] (date-format timestamp :month-day-time))",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains("const __day = __date.getDay();"));
@@ -9651,7 +9451,7 @@ mod tests {
              (def sample-tail (rest sample-list))\n\
              (def list-summary {:list (list? sample-list) :tail-count (count sample-tail)})",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains(".find("));
@@ -9677,7 +9477,7 @@ mod tests {
             "(def equal-records (= {:items [1 2] :tag :ok} {:tag :ok :items [1 2]}))\n\
              (def shared-identity (let [value {:items [1 2]}] (identical? value value)))",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains("const __eq = (__left, __right)"));
@@ -9691,7 +9491,7 @@ mod tests {
         let source = syntax::parse_source(
             "(defn sample [entries]\n  {:visible (filter entries (fn [entry] (not (some? entry.hiddenAt))))\n   :bars (map (take-last (sort-by entries (fn [entry] entry.stoppedAt)) 2)\n              (fn [entry] {:label entry.id :value entry.durationMs}))\n   :ranked (map-indexed (sort-by-desc entries (fn [entry] entry.stoppedAt))\n              (fn [entry index] {:id entry.id :rank (+ index 1)}))\n   :custom (sort-with entries (fn [first second] (- second.stoppedAt first.stoppedAt)))\n   :types (sort-with [\"Strength\" \"LISS\"] (fn [first second] (locale-compare first second)))\n   :allTyped (every? entries (fn [entry] (some? entry.exerciseType)))\n   :page (slice entries 0 2)\n   :hasSelected (any? entries (fn [entry] (= entry.id \"warmup\")))\n   :appended (conj entries {:id \"next\"})})",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains(".filter((entry) =>"));
@@ -9716,7 +9516,7 @@ mod tests {
                (map (range start (+ start count))\n\
                     (fn [id] {:id id :label (str \"row \" id)})))",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains("const __closkell_range_result"));
@@ -9736,7 +9536,7 @@ mod tests {
                             row\n\
                             (assoc row :selected next-selected))))))",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains(".map((row) => { const next_selected"));
@@ -9759,7 +9559,7 @@ mod tests {
             source.forms[0].span.start,
             "(Fn [(Vector Number) (Vector Number)] (Vector Number))".to_string(),
         );
-        let emitted = emit_module_with_types(&source, expr_types);
+        let emitted = emit_module_with_html_types(&source, expr_types);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains("__acc.concat(__items)"));
@@ -9802,7 +9602,7 @@ mod tests {
                          total (+ previous item)]\n\
                      (conj ops {:index index :total total} item)))))",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains("for (let __closkell_reduce_index"));
@@ -9832,7 +9632,7 @@ mod tests {
                  (fn [ops item index]\n\
                    (append-segment ops items item index))))",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains("for (let __closkell_reduce_index"));
@@ -9862,6 +9662,7 @@ mod tests {
             "append-segment".to_string(),
             "append_segment_fast".to_string(),
         );
+        options.omit_replaced_defn_exports = true;
         let emitted = emit_module_with_types_and_options(&source, BTreeMap::new(), options);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
@@ -9878,6 +9679,11 @@ mod tests {
             "specialized reducer must not inline the stale generic helper body:\n{}",
             emitted.code
         );
+        assert!(
+            !emitted.code.contains("export function append_segment"),
+            "replaced generic helper should not be emitted as dead export:\n{}",
+            emitted.code
+        );
     }
 
     #[test]
@@ -9892,7 +9698,7 @@ mod tests {
                            :empty (empty? fewer)\n\
                            :set (set? fewer)})",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(
@@ -9925,7 +9731,7 @@ mod tests {
              (defn view [state]\n\
                #html <button>{(str \"Tags \" (count state.tags) \" \" (if (contains? state.tags \"tempo\") \"tempo\" \"steady\") \" \" (set? state.tags))}</button>)",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(
@@ -9969,7 +9775,7 @@ mod tests {
                    payload\n\
                    (get payload :entries)))",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(
@@ -9996,7 +9802,7 @@ mod tests {
                            :empty (empty? trimmed)\n\
                            :map (map? trimmed)})",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains(
@@ -10023,7 +9829,7 @@ mod tests {
              (def keys (map-keys durations))\n\
              (def values (map-values durations))",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains(
@@ -10039,7 +9845,7 @@ mod tests {
             "(def method \"get\")\n\
              (def operation (object-get {:get {:id \"listPets\"}} method))",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(
@@ -10058,7 +9864,7 @@ mod tests {
              (def message (result-error failed))\n\
              (def flags {:ok (ok? parsed) :err (err? failed) :value (result-value parsed)})",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(
@@ -10091,7 +9897,7 @@ mod tests {
             "(defn summarize [result]\n  (match result\n    (ok entries) (str \"Imported \" (count entries))\n    (err message) message))\n\
              (defn selected-id [entry]\n  (match entry\n    (some selected) selected.id\n    nil \"none\"))",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains(".ok === true"));
@@ -10109,7 +9915,7 @@ mod tests {
         let source = syntax::parse_source(
             "(defn delta [samples]\n  (match samples\n    (list first second _) (- second first)\n    _ 0))",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains("Array.isArray(__closkell_match"));
@@ -10127,7 +9933,7 @@ mod tests {
                  (cons head tail) (+ head (count tail))\n\
                  (list) 0))",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains("Array.isArray(__closkell_match"));
@@ -10146,7 +9952,7 @@ mod tests {
              (defn summary-value [state] (get-in state [:summary :value]))\n\
              (defn bump-summary [state] (update-in state [:summary :value] (fn [value] (+ value 1))))",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(
@@ -10169,7 +9975,7 @@ mod tests {
         let source = syntax::parse_source(
             "(defn view [state]\n  #html <section>{(if state.connected? #html <strong>{state.label}</strong> #html <em>Offline</em>)}</section>)",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains("__closkellSetConditional"));
@@ -10183,7 +9989,7 @@ mod tests {
             "(defn pane [state]\n  #html <article>{state.label}</article>)\n\
              (defn view [state]\n  #html <main>{(if (= state.view \"metrics\") #html <section>{(pane state)}</section> (if (= state.view \"log\") #html <aside>Log</aside> #html <div>Live</div>))}</main>)",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains("__closkellSetConditional"));
@@ -10203,7 +10009,7 @@ mod tests {
              (defn log-pane [state]\n  #html <section>{state.selectedLogId}</section>)\n\
              (defn view [state]\n  #html <main>{(if (= state.detailView \"live\") (live-pane state) (log-pane state))}</main>)",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains("__closkellSetConditional"));
@@ -10223,7 +10029,7 @@ mod tests {
         let source = syntax::parse_source(
             "(defn view [state]\n  #html <section>{(if state.show? #html <div>{(for [zone state.zones :key zone.id] #html <i>{zone.name}</i>)}</div> #html <p>None</p>)}</section>)",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains("state[\"show?\"]"));
@@ -10243,7 +10049,7 @@ mod tests {
              (defn metric-visible? [enabled]\n  (includes? enabled \"zone2\"))\n\
              (defn id-suffix [roll]\n  (string-slice (to-radix roll 36) 2 9))",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains(".trim()"));
@@ -10260,7 +10066,7 @@ mod tests {
         let source = syntax::parse_source(
             "(def dev-enabled? (env-dev?))\n(defn label [] (if (env-dev?) \"Dev\" \"Prod\"))",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(
@@ -10275,7 +10081,7 @@ mod tests {
         let source = syntax::parse_source(
             "(def mode (env-mode))\n(defn pairs [text]\n  (regex-capture-all text \"name=([^;]+);url=([^;]+)\" \"g\"))",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(
@@ -10295,7 +10101,7 @@ mod tests {
                 :max (max-of values 170)\n\
                 :total (sum values)})",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains("let __result = Infinity"));
@@ -10317,7 +10123,7 @@ mod tests {
              (defn stored-number [value]\n  (to-number value))\n\
              (def recovery-ms 60_000)",
         );
-        let emitted = emit_module(&source);
+        let emitted = emit_module_with_html(&source);
 
         assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
         assert!(emitted.code.contains(".padStart(2, \"0\")"));

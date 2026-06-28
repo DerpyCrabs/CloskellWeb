@@ -1,0 +1,490 @@
+(import "../../domain.clsk" [clock-timer-id stop-hold-frame-id simulated-monitor-id])
+(import "../../log.clsk" [current-elapsed workout-entry newest-first])
+(import "../../metrics.clsk" [zone-display-stats])
+(import "../../model.clsk" [HeartReading HeartZone WorkoutEntry MonitorInfo JsonPayload HeartChartRect WindowEventPayload])
+(import "../../messages.clsk" [AppMsg])
+(import "./model.clsk" [SessionState SessionUpdateResult])
+(import "../../zones.clsk" [zone-for-bpm])
+(import "../../ui-effects.clsk" [no-cmd])
+(import "../shared/interactions.clsk" [hold-key? progress-width])
+(import "../shared/workflow.clsk" [active-chart-command with-active-chart-command active-chart-result with-active-chart-result set-status clock-command cancel-clock-command live-elapsed add-heart-rate-at start-stop-hold-state cancel-stop-hold-state stop-hold-allowed? start-stop-progress-command cancel-stop-command stop-progress-for selected-type-draft log-and-persist-command focus-type-picker-command disconnected-status-state disconnect-monitor-command pause-for-disconnect-state stop-connections-command target-zone-from-roll low-zone-bpm high-zone-bpm])
+(import "../shared/style.clsk" [card-class primary-button-class secondary-button-class mobile-button-class])
+(import "../zones/summary.clsk" [live-stats-entry zone-time-stats])
+(import "../zones/index.clsk" [zones-pane])
+
+(ann dev-hotkey? (Fn [WindowEventPayload] Bool))
+(defn dev-hotkey? [payload]
+  (and (= (lower-case payload.key) "h")
+       payload.ctrlKey
+       payload.shiftKey
+       (not payload.altKey)
+       (not payload.metaKey)))
+
+(ann disconnect-monitor-result (Fn [SessionState] SessionUpdateResult))
+(defn disconnect-monitor-result [state]
+  [(if (= state.exerciseState "running")
+       (set-status state "Disconnecting" "Pausing workout" "warn")
+       (disconnected-status-state state))
+   (disconnect-monitor-command state)])
+
+(ann connect-simulated-result (Fn [SessionState] SessionUpdateResult))
+(defn connect-simulated-result [state]
+  (if (or (not (env-dev?)) state.connected?)
+      (no-cmd state)
+      [(set-status state "Pairing" "Choosing simulated zone" "warn")
+       (Cmd.random/number 0 (count state.zones) (Msg.mapper :sim-zone-picked :roll))]))
+
+(ann try-monitor-update (Fn [SessionState AppMsg] (Option SessionUpdateResult)))
+(defn try-monitor-update [state msg]
+  (match msg
+    {:kind :connect-monitor}
+      (if state.connected?
+          (no-cmd state)
+          [(set-status state "Pairing" "Pairing heart-rate monitor" "warn")
+           (Cmd.bluetooth/connect-heart-rate "hrm"
+                                             {:filters [{:services ["heart_rate"]}]
+                                              :optionalServices ["heart_rate"]}
+                                             (Msg.mapper :monitor-connected :info)
+                                             :heart-rate
+                                             :monitor-disconnected
+                                             :monitor-error)])
+    {:kind :monitor-connected :info info}
+      (with-active-chart-result
+        (set-status
+          (merge state
+                 {:connected? true
+                  :simulated? false
+                  :deviceName info.deviceName})
+          "Live"
+          "Heart-rate monitor connected"
+          "live")
+        (if (= state.exerciseState "idle")
+            (Cmd.time/now (Msg.mapper :idle-started-at :timestamp))
+            Cmd.none))
+    {:kind :monitor-error :error error}
+      [(set-status
+         (merge state {:connected? false})
+         "Unavailable"
+         error
+         "warn")
+       Cmd.none]
+    {:kind :monitor-disconnected}
+      [(disconnected-status-state state)
+       (cancel-clock-command)]
+    {:kind :disconnect-monitor}
+      (disconnect-monitor-result state)
+    {:kind :disconnect-paused-at :timestamp timestamp}
+      [(pause-for-disconnect-state state timestamp)
+       (stop-connections-command)]
+    {:kind :connect-simulated}
+      (connect-simulated-result state)
+    {:kind :dev-key :value payload}
+      (if (dev-hotkey? payload)
+          (if state.simulated?
+              (disconnect-monitor-result state)
+              (connect-simulated-result state))
+          (no-cmd state))
+    {:kind :sim-zone-picked :roll roll}
+      (let [zone (target-zone-from-roll state.zones roll)]
+        [(set-status
+           (merge state {:targetZoneId zone.id})
+           "Pairing"
+           "Choosing simulated BPM"
+           "warn")
+         (Cmd.random/number zone.min zone.max (Msg.mapper :sim-bpm-picked :bpm))])
+    {:kind :sim-bpm-picked :bpm bpm}
+      (with-active-chart-result
+        (set-status
+          (merge state
+                 {:connected? true
+                  :simulated? true
+                  :deviceName "Simulated HRM"})
+          "Live"
+          "Simulated monitor"
+          "live")
+        (Cmd.batch [(Cmd.time/now (fn [timestamp] (Msg.with2 :heart-rate-at :bpm (round bpm) :timestamp timestamp)))
+                    (Cmd.simulation/heart-rate simulated-monitor-id
+                                               {:ms 1000
+                                                :min (low-zone-bpm state.zones)
+                                                :max (high-zone-bpm state.zones)
+                                                :jitter 3.5
+                                                :start (round bpm)
+                                                :deviceName "Simulated HRM"}
+                                               (Msg.mapper :sim-connected :info)
+                                               :heart-rate
+                                               :monitor-error)]))
+    {:kind :sim-connected}
+      (no-cmd state)
+    _ nil))
+
+
+(ann try-workout-update (Fn [SessionState AppMsg] (Option SessionUpdateResult)))
+(defn try-workout-update [state msg]
+  (match msg
+    {:kind :start}
+      (if (or (not (= state.exerciseState "idle"))
+              (not state.connected?))
+           [(if state.connected?
+                state
+                (set-status state "Disconnected" "Not connected" "warn"))
+           Cmd.none]
+          [(set-status state "Starting" "Starting workout" "warn")
+           (Cmd.time/now (Msg.mapper :started-at :timestamp))])
+    {:kind :started-at :timestamp now}
+      (with-active-chart-result
+        (set-status
+          (merge state
+                 {:exerciseState "running"
+                  :elapsedMs 0
+                  :displayElapsedMs 0
+                  :startedAt now
+                  :sessionStartedAt now
+                  :idleStartedAt nil
+                  :lastRate nil
+                  :detailView "live"
+                  :readings []})
+          "Recording"
+          "Workout in progress"
+          "live")
+        (clock-command))
+    {:kind :pause}
+      (if (= state.exerciseState "running")
+          [(set-status state "Pausing" "Pausing workout" "warn")
+           (Cmd.time/now (Msg.mapper :paused-at :timestamp))]
+          (no-cmd state))
+    {:kind :paused-at :timestamp now}
+      (with-active-chart-result
+        (set-status
+          (merge state
+                 {:exerciseState "paused"
+                  :elapsedMs (current-elapsed state now)
+                  :displayElapsedMs (current-elapsed state now)
+                  :startedAt nil})
+          "Paused"
+          "Workout paused"
+          "warn")
+        (cancel-clock-command))
+    {:kind :resume}
+      (if (and (= state.exerciseState "paused")
+               state.connected?)
+          [(set-status state "Resuming" "Resuming workout" "warn")
+           (Cmd.time/now (Msg.mapper :resumed-at :timestamp))]
+          [(if state.connected?
+               state
+               (set-status state "Disconnected" "Not connected" "warn"))
+           Cmd.none])
+    {:kind :resumed-at :timestamp now}
+      (with-active-chart-result
+        (set-status
+          (merge state
+                 {:exerciseState "running"
+                  :startedAt now})
+          "Recording"
+          "Workout in progress"
+          "live")
+        (clock-command))
+    {:kind :clock-tick}
+      [state (Cmd.time/now (Msg.mapper :clocked-at :timestamp))]
+    {:kind :clocked-at :timestamp now}
+      (active-chart-result (merge state {:displayElapsedMs (live-elapsed state now)}))
+    {:kind :heart-rate :bpm bpm}
+      [state (Cmd.time/now (fn [timestamp] (Msg.with2 :heart-rate-at :bpm bpm :timestamp timestamp)))]
+    {:kind :heart-rate-at :bpm bpm :timestamp timestamp}
+      (with-active-chart-result
+        (add-heart-rate-at state bpm timestamp)
+        (if (and (= state.exerciseState "idle")
+                 (not (some? state.idleStartedAt)))
+            (clock-command)
+            Cmd.none))
+    {:kind :idle-started-at :timestamp timestamp}
+      (with-active-chart-result
+        (if (and (= state.exerciseState "idle")
+                 state.connected?)
+            (merge state
+                   {:idleStartedAt timestamp
+                    :displayElapsedMs 0})
+            state)
+        (if (and (= state.exerciseState "idle")
+                 state.connected?)
+            (clock-command)
+            Cmd.none))
+    {:kind :stop-hold-start}
+      (if (stop-hold-allowed? state)
+          [(start-stop-hold-state state)
+           (Cmd.time/now (Msg.mapper :stop-hold-started :timestamp))]
+          (no-cmd state))
+    {:kind :stop-hold-key-down :key key}
+      (if (and (hold-key? key)
+               (stop-hold-allowed? state))
+          [(start-stop-hold-state state)
+           (Cmd.time/now (Msg.mapper :stop-hold-started :timestamp))]
+          (no-cmd state))
+    {:kind :stop-hold-started :timestamp timestamp}
+      (if state.stopHold?
+          [(merge state {:stopHoldStartedAt timestamp})
+           (start-stop-progress-command)]
+          (no-cmd state))
+    {:kind :stop-hold-frame :timestamp timestamp}
+      (if state.stopHold?
+          (let [progress (stop-progress-for state.stopHoldStartedAt timestamp)]
+            [(merge state
+                    {:stopHoldProgress progress
+                     :message (str "Stopping " (progress-width progress))})
+             (if (< progress 1)
+                 (Cmd.animation/frame stop-hold-frame-id :stop-hold-frame)
+                 Cmd.none)])
+          (no-cmd state))
+    {:kind :stop-hold-cancel}
+      (if state.stopHold?
+          [(cancel-stop-hold-state state)
+           (cancel-stop-command)]
+          (no-cmd state))
+    {:kind :stop-hold-key-up :key key}
+      (if (and (hold-key? key)
+               state.stopHold?)
+          [(cancel-stop-hold-state state)
+           (cancel-stop-command)]
+          (no-cmd state))
+    {:kind :stop-hold-cancelled}
+      (no-cmd state)
+    {:kind :stop-hold-complete}
+      (if state.stopHold?
+          [(set-status
+             (merge state {:stopHoldProgress 1})
+             "Stopping"
+             "Finalizing workout"
+             "warn")
+           (Cmd.batch [(Cmd.animation/cancel stop-hold-frame-id (Msg.of :stop-hold-cancelled))
+                       (Cmd.time/now (Msg.mapper :stopped-at :timestamp))])]
+          (no-cmd state))
+    {:kind :stop}
+      (if (or (= state.exerciseState "running")
+              (= state.exerciseState "paused"))
+          [(set-status state "Stopping" "Finalizing workout" "warn")
+           (Cmd.time/now (Msg.mapper :stopped-at :timestamp))]
+          (no-cmd state))
+    {:kind :stopped-at :timestamp stopped-at}
+      [(merge state {:pendingStoppedAt stopped-at})
+       (Cmd.random/number 0 1 (Msg.mapper :id-roll :roll))]
+    {:kind :id-roll :roll roll}
+      (let [stopped-at (if (some? state.pendingStoppedAt)
+                           state.pendingStoppedAt
+                           0)
+            entry (workout-entry state stopped-at roll)
+            entries (newest-first (conj state.entries entry))]
+        (let [next-state (set-status
+                           (merge state
+                                  {:exerciseState "idle"
+                                   :elapsedMs 0
+                                    :displayElapsedMs 0
+                                    :startedAt nil
+                                    :sessionStartedAt nil
+                                    :idleStartedAt nil
+                                    :pendingStoppedAt nil
+                                    :readings []
+                                   :entries entries
+                                   :selectedLogId entry.id
+                                   :typeDraft (selected-type-draft entries entry.id)
+                                   :typePickerEntryId entry.id
+                                   :typePickerDraft state.activeExerciseType
+                                   :stopHold? false
+                                   :stopHoldStartedAt 0
+                                   :stopHoldProgress 0
+                                   :detailView "log"})
+                           "Saved"
+                           "Workout added to log"
+                           "muted")]
+          [next-state
+           (Cmd.batch [(log-and-persist-command entries)
+                       (active-chart-command next-state)
+                       (focus-type-picker-command)])]))
+    _ nil))
+
+
+(defn latest-bpm-label [state]
+  (if (> state.latestBpm 0)
+      (str state.latestBpm)
+      "--"))
+
+(defn connection-label [state]
+  (if state.connected?
+      (if state.simulated?
+          "Simulated"
+          "Bluetooth")
+      "Disconnected"))
+
+
+(defn control-grid-class [state]
+  (str "grid "
+       (if state.connected? "grid-cols-3" "grid-cols-2")
+       " gap-2.5 "
+       (if state.mobile? "!gap-1.5" "")))
+
+(defn exercise-button-label [state]
+  (if (= state.exerciseState "running")
+      "Pause"
+      (if (= state.exerciseState "paused")
+          "Resume"
+          "Start")))
+
+(defn exercise-button-msg [state]
+  (if (= state.exerciseState "running")
+      {:kind :pause}
+      (if (= state.exerciseState "paused")
+          {:kind :resume}
+          {:kind :start})))
+
+(defn exercise-button-class [state]
+  (mobile-button-class
+    state
+    (if (= state.exerciseState "running")
+        (str secondary-button-class " border-[#986b00]/35 bg-[#986b00]/10 text-[#986b00]")
+        primary-button-class)
+    "text-[0.95rem]"))
+
+(defn stop-button-class [state]
+  (mobile-button-class
+    state
+    (str secondary-button-class
+         " hold-stop relative overflow-hidden"
+         (if (> state.stopHoldProgress 0)
+             " border-[#d9184b]/45 text-[#d9184b]"
+             ""))
+    "text-[0.95rem]"))
+
+(defn connection-pane-class [state]
+  (str card-class
+       " connection-pane flex min-h-[560px] flex-col p-6 max-[820px]:min-h-0 "
+       (if state.mobile?
+           "!min-h-0 !p-[10px_12px_8px]"
+           "")))
+
+(defn monitor-head-class [state]
+  (str "flex items-start justify-between gap-4 "
+       (if state.mobile? "hidden" "")))
+
+(defn latest-bpm-wrap-class [state]
+  (str "my-auto mb-8 max-[820px]:my-[34px] max-[820px]:mb-7 "
+       (if state.mobile? "!m-0 !mb-2.5" "")))
+
+(defn latest-bpm-number-class [state]
+  (str "text-[clamp(5.5rem,18vw,10.5rem)] font-extrabold leading-[0.9] tracking-normal tabular-nums "
+       (if state.mobile?
+           "!text-[clamp(8.8rem,38vw,12rem)] !leading-[0.82]"
+           "")))
+
+(defn bpm-unit-class [state]
+  (str "font-extrabold text-[#617066] "
+       (if state.mobile? "text-[1.05rem]" "")))
+
+(defn trend-line-class [state]
+  (str "mt-3.5 min-h-[26px] font-semibold text-[#617066] "
+       (if state.mobile? "!mt-0.5 min-h-[18px] text-[0.95rem]" "")))
+
+(defn status-pill-class [state]
+  (str "status-pill flex-none rounded-full border px-2.5 py-1.5 text-[0.78rem] font-bold "
+       (if (= state.statusMode "live")
+           "border-[#087f5b]/25 bg-[#087f5b]/10 text-[#087f5b]"
+           (if (= state.statusMode "warn")
+               "border-[#986b00]/30 bg-[#986b00]/10 text-[#986b00]"
+               "border-[#dbe2dc] bg-[#f9faf8] text-[#617066]"))))
+
+(defn latest-bpm-color [state]
+  (let [zone (zone-for-bpm state.zones state.latestBpm)]
+    (if (some? zone)
+        zone.color
+        "#172019")))
+
+(defn monitor-status-label [state]
+  (if state.connected?
+      (connection-label state)
+      (if (= state.statusMode "warn")
+          state.appStatus
+          "Idle")))
+
+(defn monitor-card [state]
+  #html <section class={(connection-pane-class state)}
+                 data-testid="connection-pane"
+                 aria-labelledby="app-title">
+          <div class={(monitor-head-class state)} data-testid="monitor-heading">
+            <div>
+              <h1 id="app-title"
+                  class="m-0 max-w-[250px] text-[clamp(2rem,5vw,3.5rem)] leading-[0.98] tracking-normal">Heart Rate Monitor</h1>
+            </div>
+            <span class={(status-pill-class state)} data-testid="status-pill">
+              <span data-testid="connection-status">{(monitor-status-label state)}</span>
+            </span>
+          </div>
+
+          <div class={(latest-bpm-wrap-class state)} data-testid="latest-bpm" aria-live="polite">
+            <div>
+              <strong class={(latest-bpm-number-class state)}
+                      style={{:color (latest-bpm-color state)}}>{(latest-bpm-label state)}</strong>
+              <span class={(bpm-unit-class state)}>bpm</span>
+            </div>
+            <div class={(trend-line-class state)}>{state.trend}</div>
+          </div>
+
+          <div class={(control-grid-class state)} aria-label="Bluetooth and exercise controls">
+            <button type="button"
+                    class="sr-only"
+                    tabindex="-1"
+                    ref="simulate-monitor"
+                    data-testid="simulate-monitor"
+                    on:click={{:kind :connect-simulated}}
+                    disabled={(or state.connected? (not state.dev?))}>Simulate</button>
+            {(if state.connected?
+                 #html <button type="button"
+                               class={(mobile-button-class state secondary-button-class "text-[0.9rem]")}
+                               on:click={{:kind :disconnect-monitor}}>Disconnect</button>
+                 #html <button type="button"
+                               class={(str (mobile-button-class state primary-button-class "text-[0.95rem]") " col-span-full")}
+                               on:click={{:kind :connect-monitor}}>Connect monitor</button>)}
+            <button type="button"
+                    class={(exercise-button-class state)}
+                    disabled={not state.connected?}
+                    on:click={(exercise-button-msg state)}>{(exercise-button-label state)}</button>
+            <button type="button"
+                    class={(stop-button-class state)}
+                    data-testid="stop-workout"
+                    data-holding={state.stopHold?}
+                    disabled={(and (not (= state.exerciseState "running"))
+                                   (not (= state.exerciseState "paused")))}
+                    on:pointerdown={(Event.prevent {:kind :stop-hold-start})}
+                    on:pointerup={{:kind :stop-hold-cancel}}
+                    on:pointerleave={{:kind :stop-hold-cancel}}
+                    on:pointercancel={{:kind :stop-hold-cancel}}
+                    on:keydown={(if (hold-key? event.key)
+                                    (Event.prevent {:kind :stop-hold-key-down
+                                                    :key event.key})
+                                    {:kind :stop-hold-key-down
+                                     :key event.key})}
+                    on:keyup={{:kind :stop-hold-key-up
+                                :key event.key}}>
+              <span class="absolute inset-y-0 left-0 bg-[#d9184b]/12"
+                    style={{:width (progress-width state.stopHoldProgress)}}></span>
+              <strong class="relative">{(if state.stopHold? "Hold..." "Stop")}</strong>
+            </button>
+          </div>
+        </section>)
+
+(defn live-pane [state]
+  (let [zone-stats (zone-display-stats (live-stats-entry state))]
+    #html <section class="live-pane" data-testid="live-pane">
+            <div class={(str "heart-chart-wrap mt-5 w-full aspect-[16/9] min-h-[360px] "
+                             (if state.mobile? "!mt-2" ""))}>
+              <canvas ref="live-heart-chart"
+                      class="heart-chart block h-full w-full rounded-lg border border-[#dbe2dc] bg-[#fffdfa]"
+                      data-testid="live-heart-chart"
+                      aria-label="Heart rate line chart"></canvas>
+            </div>
+            {(zone-time-stats zone-stats state.mobile?)}
+            {(zones-pane state)}
+          </section>))
+(ann try-session-update (Fn [SessionState AppMsg] (Option SessionUpdateResult)))
+(defn try-session-update [state msg]
+  (match (try-monitor-update state msg)
+    (some result) result
+    nil (match (try-workout-update state msg)
+          (some result) result
+          nil nil)))

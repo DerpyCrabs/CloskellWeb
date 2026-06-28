@@ -1,0 +1,22 @@
+(import "../../model.clsk" [HeartReading HeartZone WorkoutEntry])
+(import "../../messages.clsk" [AppMsg])
+
+(type ShellState
+  {:message String
+   :statusMode String
+   :dev? Bool
+   :mobile? Bool
+   :detailView String
+   :exerciseState String
+   :displayElapsedMs Number
+   :readings (Vector HeartReading)
+   :entries (Vector WorkoutEntry)
+   :selectedLogId (Option String)
+   :targetZoneId Number
+   :zones (Vector HeartZone)
+   :activeExerciseType String
+   :chartWidth Number
+   :chartHeight Number})
+
+(type ShellUpdateResult
+  [ShellState (Cmd AppMsg)])

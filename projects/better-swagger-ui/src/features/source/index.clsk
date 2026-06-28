@@ -1,0 +1,321 @@
+(import "../../lib/operations.clsk" [collectOperations])
+(import "../../lib/auth.clsk" [authEntriesCount])
+(import "../../lib/browser.clsk" [analyzeSourceResponse append-all applyThemeCommand definitionUrlByName discovery-error-message discoveryQueueFor looksLikeSpecContent parseInitOAuth parseInitializerResponse parseSpecDocument parseSwaggerConfigResponse routeDefinitionParam routeOpParam routeUrlParam loadStoredAuthEntries toggleTheme validHttpUrl? writeRoute])
+(import "../../flow.clsk" [loadSourceCommand loadConfigCommand loadSpecDocumentCommand loadDiscoveryCommand loadOauthInitCommand readSpecFileCommand openSpecFileCommand downloadSpecCommand validSpec? hasText? optionalText scrollOperationCommand])
+(import "./flow.clsk" [completed-spec continue-discovery follow-config-url follow-spec-url load-failed no-cmd])
+(import "./model.clsk" [Definition SourceState SourceUpdateResult])
+(import "../../messages.clsk" [AppMsg])
+
+(ann defaultDefinitionList (Fn [String] (Vector Definition)))
+(defn defaultDefinitionList [url]
+  [{:name "default" :url url}])
+
+(defn chooseText [value fallback]
+  (if (hasText? value) value fallback))
+
+(ann definitionsOrDefault (Fn [(Vector Definition) String] (Vector Definition)))
+(defn definitionsOrDefault [definitions specUrl]
+  (if (> (count definitions) 0)
+      definitions
+      (defaultDefinitionList specUrl)))
+
+(defn allTagSet [spec]
+  (reduce (map-keys (collectOperations spec))
+          (set)
+          (fn [tags tag] (conj tags tag))))
+
+(defn routeOperationState [state routeOp]
+  (merge state {:expandedOp routeOp
+                :tryActiveOp routeOp
+                :expandedTags (if (and (some? routeOp) (some? state.spec)) (allTagSet state.spec) state.expandedTags)
+                :routeOp nil}))
+
+(ann source-subscriptions (Fn [SourceState] (Sub AppMsg)))
+(defn source-subscriptions [state]
+  {:kind :sub/window/event
+   :id "route-popstate"
+   :type "popstate"
+   :onEvent (fn [payload] {:kind :route-changed :href payload.href})})
+
+(ann completedSpecState (Fn [SourceState Js String String (Vector Definition) String] SourceState))
+(defn completedSpecState [state spec specUrl sourceUrl definitions selectedDefinition]
+  (let [routeOp state.routeOp
+        expandedTags (if (some? routeOp) (allTagSet spec) (set))]
+    (merge state {:loading? false
+                  :error nil
+                  :spec spec
+                  :sourceUrl sourceUrl
+                  :specUrl specUrl
+                  :oauthInit {}
+                  :definitions definitions
+                  :selectedDefinition selectedDefinition
+                  :expandedOp routeOp
+                  :expandedTags expandedTags
+                  :tryActiveOp routeOp
+                  :executingOp nil
+                  :responses {}
+                  :paramValues {}
+                  :bodyValues {}
+                  :requestBodyFiles {}
+                  :multipartFiles {}
+                  :formError nil
+                  :authEntries {}
+                  :authorized? false
+                  :authFormValues {}
+                  :authLoadingScheme nil
+                  :authError nil
+                  :pendingDefinition ""
+                  :pendingDefinitions []
+                  :pendingSelectedDefinition ""
+                  :pendingSourceUrl ""
+                  :pendingSpecUrl ""
+                  :discoveryQueue []
+                  :discoveryActiveEntry nil
+                  :routeOp nil})))
+
+(ann completedSpecCommand (Fn [String String (Option String) (Vector Definition) String] (Cmd AppMsg)))
+(defn completedSpecCommand [currentUrl sourceUrl routeOp definitions selectedDefinition]
+  (let [routeDefinition (if (and (> (count definitions) 1) (hasText? selectedDefinition)) selectedDefinition nil)]
+    (Cmd.batch [(if (validHttpUrl? currentUrl sourceUrl) (writeRoute sourceUrl routeOp routeDefinition) Cmd.none)
+                (loadStoredAuthEntries sourceUrl)
+                (loadOauthInitCommand currentUrl sourceUrl)
+                (scrollOperationCommand routeOp)])))
+
+(defn prependDiscoveryEntry [state entry]
+  (merge state {:discoveryQueue (append-all [entry] state.discoveryQueue)}))
+
+(defn pastedSpecLabel [value]
+  (if (starts-with? (trim value) "{")
+      "pasted-spec/json"
+      "pasted-spec/yaml"))
+
+(ann try-source-update (Fn [SourceState AppMsg] (Option SourceUpdateResult)))
+(defn try-source-update [state msg]
+  (match msg
+    {:kind :url-input :value value}
+      (no-cmd (merge state {:input value :error nil}))
+    {:kind :url-paste :value value}
+      (if (validHttpUrl? state.currentUrl value)
+          [(merge state {:input (trim value)
+                         :loading? true
+                         :error nil
+                         :pendingDefinition ""
+                         :pendingDefinitions []
+                         :pendingSelectedDefinition ""
+                         :pendingSourceUrl (trim value)
+                         :pendingSpecUrl ""
+                         :discoveryQueue []})
+           (loadSourceCommand (trim value) "")]
+          (if (looksLikeSpecContent value)
+          (let [label (pastedSpecLabel value)
+                decision (parseSpecDocument label value)]
+            (if (get decision :ok)
+                (no-cmd (completedSpecState (merge state {:input label
+                                                   :pendingDefinitions (defaultDefinitionList label)
+                                                   :pendingSelectedDefinition "default"
+                                                   :pendingSourceUrl label
+                                                   :discoveryQueue []})
+                                     decision.spec
+                                     decision.specUrl
+                                     label
+                                     (defaultDefinitionList label)
+                                     "default"))
+                (no-cmd (merge state {:loading? false :error decision.error}))))
+          (no-cmd (merge state {:input value :error nil}))))
+    {:kind :load}
+      (if (not (validHttpUrl? state.currentUrl (trim state.input)))
+          (no-cmd state)
+          [(merge state {:loading? true
+                         :error nil
+                         :pendingDefinition ""
+                         :pendingDefinitions []
+                         :pendingSelectedDefinition ""
+                         :pendingSourceUrl (trim state.input)
+                         :pendingSpecUrl ""
+                         :discoveryQueue []})
+           (loadSourceCommand (trim state.input) "")])
+    {:kind :source-loaded :source source :value response}
+      (if (get response :ok)
+          (let [decision (analyzeSourceResponse state.currentUrl source (get response :body) state.pendingDefinition)
+                nextState (merge state {:pendingSourceUrl (chooseText decision.sourceUrl state.pendingSourceUrl)})]
+            (let [kind (get decision :kind)]
+              (if (= kind "spec")
+                  (completed-spec nextState
+                                  decision.spec
+                                  decision.specUrl
+                                  decision.sourceUrl
+                                  (definitionsOrDefault decision.definitions decision.specUrl)
+                                  (chooseText decision.selectedDefinition "default"))
+                  (if (= kind "spec-url")
+                      (follow-spec-url nextState decision)
+                      (if (= kind "config-url")
+                          (follow-config-url nextState decision)
+                          (if (= kind "discover")
+                              (continue-discovery (merge nextState {:discoveryQueue decision.queue}))
+                              (load-failed nextState decision.error)))))))
+          (continue-discovery (merge state {:pendingSourceUrl source
+                                            :discoveryQueue (discoveryQueueFor source)})))
+    {:kind :source-load-failed :error error}
+      (let [source (chooseText state.pendingSourceUrl state.input)]
+        (continue-discovery (merge state {:pendingSourceUrl source
+                                          :discoveryQueue (discoveryQueueFor source)})))
+    {:kind :config-loaded :url url :value response}
+      (if (get response :ok)
+          (let [decision (parseSwaggerConfigResponse url (get response :body) state.pendingDefinition)
+                kind (get decision :kind)]
+            (if (= kind "spec-url")
+                (follow-spec-url state decision)
+                (continue-discovery state)))
+          (continue-discovery state))
+    {:kind :config-failed :error error}
+      (continue-discovery state)
+    {:kind :discovery-response :entry entry :value response}
+      (if (get response :ok)
+          (let [entryKind (get entry :kind)
+                body (get response :body)]
+            (if (= entryKind "config")
+                (let [decision (parseSwaggerConfigResponse entry.url body state.pendingDefinition)
+                      kind (get decision :kind)]
+                  (if (= kind "spec-url")
+                      (follow-spec-url state decision)
+                      (if (= kind "config-url")
+                          (continue-discovery (prependDiscoveryEntry state {:kind "config" :url decision.configUrl}))
+                          (continue-discovery state))))
+                (if (= entryKind "initializer")
+                    (let [decision (parseInitializerResponse entry.url body state.pendingDefinition)
+                          kind (get decision :kind)]
+                      (if (= kind "spec-url")
+                          (follow-spec-url state decision)
+                          (if (= kind "config-url")
+                              (continue-discovery (prependDiscoveryEntry state {:kind "config" :url decision.configUrl}))
+                              (continue-discovery state))))
+                    (if (and (= entryKind "candidate") (looksLikeSpecContent body))
+                        (let [decision (parseSpecDocument entry.url body)]
+                          (if (get decision :ok)
+                              (completed-spec state
+                                              decision.spec
+                                              decision.specUrl
+                                              (chooseText state.pendingSourceUrl entry.url)
+                                              (defaultDefinitionList entry.url)
+                                              "default")
+                              (continue-discovery state)))
+                        (continue-discovery state)))))
+          (continue-discovery state))
+    {:kind :discovery-failed :error error}
+      (continue-discovery state)
+    {:kind :spec-document-loaded :url url :value response}
+      (if (get response :ok)
+          (let [decision (parseSpecDocument url (get response :body))]
+            (if (get decision :ok)
+                [(completedSpecState state
+                                     decision.spec
+                                     decision.specUrl
+                                     (chooseText state.pendingSourceUrl decision.specUrl)
+                                     (definitionsOrDefault state.pendingDefinitions decision.specUrl)
+                                     (chooseText state.pendingSelectedDefinition "default"))
+                 (completedSpecCommand state.currentUrl
+                                       (chooseText state.pendingSourceUrl decision.specUrl)
+                                       state.routeOp
+                                       (definitionsOrDefault state.pendingDefinitions decision.specUrl)
+                                       (chooseText state.pendingSelectedDefinition "default"))]
+                (load-failed state decision.error)))
+          (load-failed state "Failed to load spec"))
+    {:kind :pasted-spec :label label :value value}
+      (let [decision (parseSpecDocument label value)]
+        (if (get decision :ok)
+            (no-cmd (completedSpecState (merge state {:input label
+                                               :pendingDefinitions (defaultDefinitionList label)
+                                               :pendingSelectedDefinition "default"
+                                               :pendingSourceUrl label
+                                               :discoveryQueue []})
+                                 decision.spec
+                                 decision.specUrl
+                                 label
+                                 (defaultDefinitionList label)
+                                 "default"))
+            (no-cmd (merge state {:loading? false :error decision.error}))))
+    {:kind :spec-file-selected}
+      [(merge state {:loading? true :error nil :discoveryQueue []}) (readSpecFileCommand)]
+    {:kind :open-spec-file}
+      [state (openSpecFileCommand)]
+    {:kind :download-schema}
+      [state (downloadSpecCommand state.spec)]
+    {:kind :definition-change :name name}
+      (let [specUrl (definitionUrlByName state.definitions name)
+            routeDefinition (if (and (> (count state.definitions) 1) (hasText? name)) name nil)]
+        [(merge state {:loading? true
+                       :error nil
+                       :pendingDefinitions state.definitions
+                       :pendingSelectedDefinition name
+                       :pendingSourceUrl (chooseText state.sourceUrl state.input)
+                       :pendingSpecUrl specUrl
+                       :discoveryQueue []})
+         (Cmd.batch [(writeRoute state.sourceUrl nil routeDefinition)
+                     (loadSpecDocumentCommand specUrl)])])
+    {:kind :route-changed :href href}
+      (let [url (routeUrlParam href)
+            definition (routeDefinitionParam href)
+            routeOp (optionalText (routeOpParam href))]
+        (if (not (hasText? url))
+            (no-cmd state)
+            (if (not (= url state.sourceUrl))
+            [(merge state {:input url
+                           :loading? true
+                           :error nil
+                           :pendingDefinition definition
+                           :pendingDefinitions []
+                           :pendingSelectedDefinition ""
+                           :pendingSourceUrl url
+                           :pendingSpecUrl ""
+                           :discoveryQueue []
+                           :routeOp routeOp})
+             (loadSourceCommand url definition)]
+            (if (> (count state.definitions) 1)
+                (let [targetName (chooseText definition (get (first state.definitions) :name))
+                      specUrl (definitionUrlByName state.definitions targetName)]
+                  (if (not (= targetName state.selectedDefinition))
+                      [(merge state {:loading? true
+                                     :error nil
+                                     :pendingDefinitions state.definitions
+                                     :pendingSelectedDefinition targetName
+                                     :pendingSourceUrl (chooseText state.sourceUrl state.input)
+                                     :pendingSpecUrl specUrl
+                                     :discoveryQueue []
+                                     :routeOp routeOp})
+                       (loadSpecDocumentCommand specUrl)]
+                      [(routeOperationState state routeOp) (scrollOperationCommand routeOp)]))
+                [(routeOperationState state routeOp) (scrollOperationCommand routeOp)]))))
+    {:kind :toggle-theme}
+      (let [theme (toggleTheme state.theme)]
+        [(merge state {:theme theme}) (applyThemeCommand theme)])
+    {:kind :theme-loaded :theme theme}
+      (no-cmd (merge state {:theme theme}))
+    {:kind :auth-storage-loaded :entries entries}
+      (no-cmd (merge state {:authEntries entries
+                     :authorized? (> (authEntriesCount entries) 0)}))
+    {:kind :spec-loaded :value response}
+      (let [body (get response :body)]
+        (if (and (get response :ok) (validSpec? body))
+            (no-cmd (merge state {:loading? false
+                           :error nil
+                           :spec body
+                           :expandedOp nil
+                           :expandedTags (set)
+                           :tryActiveOp nil
+                           :executingOp nil
+                           :responses {}
+                           :paramValues {}
+                           :bodyValues {}
+                           :requestBodyFiles {}
+                           :multipartFiles {}
+                           :formError nil}))
+            (no-cmd (merge state {:loading? false :error "Response is not an OpenAPI document"}))))
+    {:kind :spec-failed :error error}
+      (load-failed state (str "Failed to load spec: " error))
+    {:kind :oauth-init-loaded :value response}
+      (if (get response :ok)
+          (no-cmd (merge state {:oauthInit (parseInitOAuth (get response :body))}))
+          (no-cmd state))
+    {:kind :oauth-init-failed :error error}
+      (no-cmd state)
+    _ nil))

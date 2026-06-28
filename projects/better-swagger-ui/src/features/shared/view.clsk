@@ -1,0 +1,82 @@
+(import "../../flow.clsk" [hasText?])
+(import "./icons.clsk" [iconCopy])
+(defn operationSummary [operation]
+  (let [summary (get operation :summary)]
+    (if (string? summary) summary "")))
+
+(defn copyTextButton [testId label text visible? extraClass]
+  #html <button type="button"
+                class={(if visible?
+                            (str "inline-flex items-center rounded border border-zinc-400 p-1 text-zinc-700 hover:bg-white disabled:opacity-40 dark:border-dm-border dark:text-dm-text dark:hover:bg-dm-surface-hover " extraClass)
+                            "hidden")}
+                title={label}
+                aria-label={label}
+                data-testid={testId}
+                disabled={(not (hasText? text))}
+                on:click={{:kind :copy-text :value text}}>{(iconCopy "12" "")}</button>)
+
+(defn tagDescription [descriptions tag]
+  (let [description (map-get descriptions tag)]
+    (if (string? description) description "")))
+
+(defn schemaDescription [value]
+  (if (string? value) value "-"))
+
+(defn schemaEnumLabel [property]
+  (let [values (get property :enum)]
+    (if (and (vector? values) (> (count values) 0))
+        (str "enum: " (join (map values (fn [value] (str value))) ", "))
+        "")))
+
+(defn schemaRowDescription [property]
+  (let [enumLabel (schemaEnumLabel property)
+        description (get property :description)]
+    (if (hasText? enumLabel)
+        (if (string? description) (str description " - " enumLabel) enumLabel)
+        (schemaDescription description))))
+
+(defn schemaModel [properties plain?]
+  #html <div class={(if (> (count properties) 0)
+                       (if plain?
+                           "overflow-x-auto"
+                           "overflow-x-auto rounded border border-zinc-300 bg-white dark:border-dm-border dark:bg-dm-surface")
+                       "hidden")}>
+          <div class="grid grid-cols-[minmax(8rem,26%)_minmax(6rem,18%)_1fr] gap-x-3 px-2 py-1 text-[11px] font-semibold text-zinc-700 dark:text-dm-muted">
+            <span>Name</span>
+            <span>Type</span>
+            <span>Description</span>
+          </div>
+          {(for [property properties :key property.name]
+             #html <div class={(if plain?
+                                   "grid grid-cols-[minmax(8rem,26%)_minmax(6rem,18%)_1fr] gap-x-3 border-t border-zinc-200 py-1 text-[13px] dark:border-dm-border"
+                                   "grid grid-cols-[minmax(8rem,26%)_minmax(6rem,18%)_1fr] gap-x-3 border-t border-zinc-300 py-1 text-[13px] dark:border-dm-border")}>
+                     <span class="px-2 font-semibold text-zinc-900 dark:text-dm-text">
+                       {property.name}
+                       {(if property.required
+                           #html <span class="text-rose-600 dark:text-rose-400"> *</span>
+                           #html <span class="hidden"></span>)}
+                     </span>
+                     <span class="px-2 font-mono text-[11px] font-medium text-zinc-800 dark:text-dm-muted">{property.type}</span>
+                     <span class="px-2 text-zinc-700 dark:text-dm-muted">{(schemaRowDescription property)}</span>
+                   </div>)}
+        </div>)
+
+(defn virtualJsonViewer [value maxHeight version]
+  #html <virtual-json-viewer data-json={(if (string? value) value (json-stringify value))}
+                             data-version={version}
+                             max-height={maxHeight}></virtual-json-viewer>)
+
+(defn schemaSection [media plain?]
+  #html <div class="space-y-1/5">
+          <div class="flex flex-wrap items-center gap-2 text-xs">
+            <span class="rounded bg-zinc-200 px-1/5 py-0/5 font-mono text-zinc-800 dark:bg-dm-surface dark:text-dm-text dark:ring-1 dark:ring-dm-border">{media.contentType}</span>
+            {(if (some? media.schemaName)
+                #html <span class="font-mono text-sky-700 dark:text-[#60a5fa]">{media.schemaName}</span>
+                #html <span class="hidden"></span>)}
+          </div>
+          {(if (> (count media.properties) 0)
+              #html <div>{(schemaModel media.properties plain?)}</div>
+              (if (some? media.example)
+                  #html <div>{(virtualJsonViewer media.example "16rem" (str media.contentType ":" media.schemaName))}</div>
+                  #html <p class="text-xs text-zinc-600 dark:text-dm-muted">No content</p>))}
+        </div>)

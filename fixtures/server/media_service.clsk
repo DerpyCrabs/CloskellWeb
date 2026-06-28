@@ -1,0 +1,63 @@
+(type ServerState
+  {:root String})
+
+(type ServerMsg
+  (Union
+    {:kind :files-changed :path String}))
+
+(type InitResult
+  [ServerState (Cmd ServerMsg)])
+
+(type MediaRequest
+  {:params {:path String}
+   :headers {:range (Option String)}})
+
+(ann init (Fn [ServerBoot] InitResult))
+(defn init [boot]
+  [{:root boot.cwd} Cmd.none])
+
+(ann update (Fn [ServerState ServerMsg] InitResult))
+(defn update [state msg]
+  (match msg
+    {:kind :files-changed :path path}
+      [(merge state {:root path}) Cmd.none]
+    _ [state Cmd.none]))
+
+(ann health-handler (Fn [Request] (Task HttpError Response)))
+(defn health-handler [request]
+  (Task.succeed (Response.json {:ok true})))
+
+(ann status-handler (Fn [Request] (Task HttpError Response)))
+(defn status-handler [request]
+  (Task.succeed (Response.status 201 (Response.json {:ok true}))))
+
+(ann media-handler (Fn [Request] (Task HttpError Response)))
+(defn media-handler [request]
+  (let [media (unsafe-cast MediaRequest request)]
+    (Task.succeed
+      (Response.file media.params.path
+                     {:range media.headers.range
+                      :cacheControl "public, max-age=60"}))))
+
+(def media-request
+  (unsafe-cast MediaRequest {:params {:path ""}
+                             :headers {:range nil}}))
+
+(def typed-media-route
+  (Route.route "GET"
+               "/typed-media/*"
+               media-request
+               (fn [request] (Task.succeed (Response.file request.params.path)))))
+
+(ann routes (Fn [ServerState] (Vector (Route Request (Task HttpError Response)))))
+(defn routes [state]
+  [(Route.get "/health" health-handler)
+   (Route.get "/status" status-handler)
+   (Route.get "/media/*" media-handler)])
+
+(ann resources (Fn [ServerState] (ServerResources ServerMsg)))
+(defn resources [state]
+  (Server.resources
+    [(Server.resource "file-watch"
+                      {:root state.root}
+                      (fn [event] {:kind :files-changed :path state.root}))]))

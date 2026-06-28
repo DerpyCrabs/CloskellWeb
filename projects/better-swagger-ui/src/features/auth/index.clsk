@@ -1,0 +1,309 @@
+(import "../../lib/auth.clsk" [authEntriesCount])
+(import "../../lib/browser.clsk" [persistAuthEntries resolveTokenExpiry setCookie])
+(import "../../flow.clsk" [afterAuthorizedState authFieldKey clearAuthState oauthTokenCommand simpleAuthEntry hasText? authSchemes authFieldValue clientCredentialsLocation authFormId schemeAuthorized? oauthClientId oauthClientSecret])
+(import "../source/flow.clsk" [no-cmd])
+(import "./model.clsk" [AuthState AuthUpdateResult])
+(import "../../messages.clsk" [AppMsg])
+(import "../shared/icons.clsk" [iconX iconLoaderCircle])
+(ann try-auth-update (Fn [AuthState AppMsg] (Option AuthUpdateResult)))
+(defn try-auth-update [state msg]
+  (match msg
+    {:kind :open-auth :id id}
+      (no-cmd (merge state {:authDialog? true :pendingAuthOp id}))
+    {:kind :close-auth}
+      (no-cmd (merge state {:authDialog? false :pendingAuthOp nil}))
+    {:kind :auth-input :scheme scheme :field field :value value}
+      (no-cmd (merge state {:authFormValues (object-assoc state.authFormValues (authFieldKey scheme field) value)
+                     :authError nil}))
+    {:kind :authorize-scheme :scheme scheme}
+      (if (or (= scheme.kind "oauth2-password") (= scheme.kind "oauth2-client-credentials"))
+          [(merge state {:authLoadingScheme scheme.id :authError nil}) (oauthTokenCommand state scheme)]
+          (let [entry (simpleAuthEntry state scheme)
+                entries (object-assoc state.authEntries scheme.id entry)]
+            [(afterAuthorizedState state entries)
+             (Cmd.batch [(persistAuthEntries state.sourceUrl entries)
+                         (if (and (= entry.type "apiKey") (= entry.apiKeyIn "cookie"))
+                             (setCookie entry.apiKeyName entry.token)
+                             Cmd.none)])]))
+    {:kind :oauth-token-loaded :schemeId schemeId :value response}
+      (if (and (get response :ok) (hasText? (get (get response :body) :access_token)))
+          (let [token (get (get response :body) :access_token)
+                entries (object-assoc state.authEntries schemeId {:schemeId schemeId
+                                                                  :type "bearer"
+                                                                  :token token
+                                                                  :expiresAt (resolveTokenExpiry (get response :body) token)})]
+            [(afterAuthorizedState state entries) (persistAuthEntries state.sourceUrl entries)])
+          (no-cmd (merge state {:authLoadingScheme nil :authError "Authorization failed"})))
+    {:kind :auth-failed :error error}
+      (no-cmd (merge state {:authLoadingScheme nil :authError (str error)}))
+    {:kind :logout-scheme :scheme scheme}
+      (let [entries (object-dissoc state.authEntries scheme.id)]
+        [(merge state {:authEntries entries
+                       :authorized? (> (authEntriesCount entries) 0)
+                       :authError nil}) (persistAuthEntries state.sourceUrl entries)])
+    {:kind :logout}
+      [(merge (clearAuthState state) {:authDialog? true}) (persistAuthEntries state.sourceUrl {})]
+    _ nil))
+
+
+(def authFieldInputClass
+  "w-full rounded-md border border-zinc-400 bg-white px-3 py-2 text-sm text-zinc-900 placeholder:text-zinc-500 outline-none focus:border-sky-500 focus:ring-2 focus:ring-sky-500/30 dark:border-zinc-600 dark:bg-zinc-950 dark:text-zinc-100 dark:placeholder:text-zinc-500")
+
+(def authFieldLabelClass
+  "text-sm font-medium text-zinc-800 dark:text-zinc-200")
+
+(def authMetaTextClass
+  "text-[11px] leading-snug text-zinc-500 dark:text-zinc-500")
+
+(def authSectionHeadingClass
+  "text-[11px] font-semibold tracking-wide text-zinc-600 uppercase dark:text-zinc-400")
+
+(def authPrimaryButtonClass
+  "inline-flex items-center justify-center gap-2 rounded-md bg-emerald-600 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-500 disabled:opacity-60 dark:bg-emerald-600 dark:hover:bg-emerald-500")
+
+(def authSecondaryButtonClass
+  "rounded-md border border-zinc-400 bg-white px-4 py-2 text-sm font-medium text-zinc-700 hover:bg-zinc-50 dark:border-zinc-600 dark:bg-transparent dark:text-zinc-300 dark:hover:bg-zinc-800")
+
+(def authLogoutButtonClass
+  "inline-flex items-center justify-center rounded-md border border-rose-300 bg-white px-4 py-2 text-sm font-semibold text-rose-700 hover:bg-rose-50 dark:border-rose-800 dark:bg-transparent dark:text-rose-400 dark:hover:bg-rose-950/40")
+
+(defn authorizedBadge []
+  #html <p class="text-xs font-medium text-emerald-700 dark:text-emerald-400">Authorized</p>)
+
+(defn authErrorText [state]
+  (if (some? state.authError)
+      #html <p class="text-xs text-rose-600 dark:text-rose-400">{state.authError}</p>
+      #html <p class="hidden"></p>))
+
+(defn apiKeySchemeForm [state scheme]
+  #html <div class="space-y-4 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900/60">
+          <div class="space-y-1">
+            <h3 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">{scheme.id} (apiKey, {scheme.in}: {scheme.name})</h3>
+          </div>
+          {(if (schemeAuthorized? state scheme)
+              (authorizedBadge)
+              #html <form id={(authFormId scheme)}
+                          on:submit={(Event.prevent {:kind :authorize-scheme :scheme scheme})}>
+                      <label class="block space-y-1.5">
+                        <span class={authFieldLabelClass}>{scheme.name}</span>
+                        <input type="text"
+                               value={(authFieldValue state scheme "value" "")}
+                               placeholder={scheme.name}
+                               class={authFieldInputClass}
+                               on:input={{:kind :auth-input :scheme scheme :field "value" :value event.currentTarget.value}}></input>
+                      </label>
+                    </form>)}
+        </div>)
+
+(defn bearerSchemeForm [state scheme]
+  #html <div class="space-y-4 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900/60">
+          <h3 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">{scheme.id} (HTTP Bearer)</h3>
+          {(if (schemeAuthorized? state scheme)
+              (authorizedBadge)
+              #html <form id={(authFormId scheme)}
+                          on:submit={(Event.prevent {:kind :authorize-scheme :scheme scheme})}>
+                      <label class="block space-y-1.5">
+                        <span class={authFieldLabelClass}>Bearer token</span>
+                        <input type="text"
+                               value={(authFieldValue state scheme "token" "")}
+                               placeholder="Bearer token"
+                               class={authFieldInputClass}
+                               on:input={{:kind :auth-input :scheme scheme :field "token" :value event.currentTarget.value}}></input>
+                      </label>
+                    </form>)}
+        </div>)
+
+(defn basicSchemeForm [state scheme]
+  #html <div class="space-y-4 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900/60">
+          <h3 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">{scheme.id} (HTTP Basic)</h3>
+          {(if (schemeAuthorized? state scheme)
+              (authorizedBadge)
+              #html <form id={(authFormId scheme)}
+                          class="space-y-4"
+                          autocomplete="on"
+                          on:submit={(Event.prevent {:kind :authorize-scheme :scheme scheme})}>
+                      <label class="block space-y-1.5">
+                        <span class={authFieldLabelClass}>Username</span>
+                        <input type="text"
+                               name="basic_username"
+                               autocomplete="username"
+                               value={(authFieldValue state scheme "username" "")}
+                               class={authFieldInputClass}
+                               on:input={{:kind :auth-input :scheme scheme :field "username" :value event.currentTarget.value}}></input>
+                      </label>
+                      <label class="block space-y-1.5">
+                        <span class={authFieldLabelClass}>Password</span>
+                        <input type="password"
+                               name="basic_password"
+                               autocomplete="current-password"
+                               value={(authFieldValue state scheme "password" "")}
+                               class={authFieldInputClass}
+                               on:input={{:kind :auth-input :scheme scheme :field "password" :value event.currentTarget.value}}></input>
+                      </label>
+                    </form>)}
+        </div>)
+
+(defn oauthClientFields [state scheme divider?]
+  #html <div class="space-y-3">
+          {(if divider?
+              #html <div class="border-t border-zinc-200 pt-4 dark:border-zinc-700"></div>
+              #html <div class="hidden"></div>)}
+          <h4 class={authSectionHeadingClass}>Client Application</h4>
+          <div class="space-y-3">
+            <label class="block space-y-1.5">
+              <span class={authFieldLabelClass}>Client ID</span>
+              {(if divider?
+                  #html <input type="text"
+                               name="client_id"
+                               autocomplete="off"
+                               value={(oauthClientId state scheme)}
+                               class={(str authFieldInputClass " font-mono")}
+                               on:input={{:kind :auth-input :scheme scheme :field "clientId" :value event.currentTarget.value}}></input>
+                  #html <input type="text"
+                               autocomplete="off"
+                               value={(oauthClientId state scheme)}
+                               class={(str authFieldInputClass " font-mono")}
+                               on:input={{:kind :auth-input :scheme scheme :field "clientId" :value event.currentTarget.value}}></input>)}
+            </label>
+            <label class="block space-y-1.5">
+              <span class={authFieldLabelClass}>Client secret</span>
+              <input type="text"
+                     name="client_secret"
+                     autocomplete="off"
+                     data-lpignore="true"
+                     data-1p-ignore="true"
+                     data-form-type="other"
+                     value={(oauthClientSecret state scheme)}
+                     class={(str authFieldInputClass " font-mono [-webkit-text-security:disc]")}
+                     on:input={{:kind :auth-input :scheme scheme :field "clientSecret" :value event.currentTarget.value}}></input>
+            </label>
+            <label class="block space-y-1.5">
+              <span class={authFieldLabelClass}>Client credentials location</span>
+              <select value={(clientCredentialsLocation state scheme)}
+                      autocomplete="off"
+                      class={authFieldInputClass}
+                      on:change={{:kind :auth-input :scheme scheme :field "clientCredentialsLocation" :value event.currentTarget.value}}>
+                <option value="body">Request body</option>
+                <option value="header">Authorization header</option>
+              </select>
+            </label>
+          </div>
+        </div>)
+
+(defn oauthPasswordSchemeForm [state scheme]
+  #html <div class="space-y-4 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900/60">
+          <div class="space-y-1">
+            <h3 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">{scheme.id} (OAuth2, password)</h3>
+            <p class={authMetaTextClass}>Token URL: <span class="font-mono">{scheme.tokenUrl}</span></p>
+            <p class={authMetaTextClass}>Flow: password</p>
+          </div>
+          {(if (schemeAuthorized? state scheme)
+              (authorizedBadge)
+              #html <form id={(authFormId scheme)}
+                          class="space-y-4"
+                          autocomplete="on"
+                          on:submit={(Event.prevent {:kind :authorize-scheme :scheme scheme})}>
+                      <div class="space-y-3">
+                        <h4 class={authSectionHeadingClass}>User Credentials</h4>
+                        <div class="space-y-3">
+                          <label class="block space-y-1.5">
+                            <span class={authFieldLabelClass}>Username</span>
+                            <input type="text"
+                                   name="username"
+                                   autocomplete="username"
+                                   value={(authFieldValue state scheme "username" "")}
+                                   class={authFieldInputClass}
+                                   on:input={{:kind :auth-input :scheme scheme :field "username" :value event.currentTarget.value}}></input>
+                          </label>
+                          <label class="block space-y-1.5">
+                            <span class={authFieldLabelClass}>Password</span>
+                            <input type="password"
+                                   name="password"
+                                   autocomplete="current-password"
+                                   value={(authFieldValue state scheme "password" "")}
+                                   class={authFieldInputClass}
+                                   on:input={{:kind :auth-input :scheme scheme :field "password" :value event.currentTarget.value}}></input>
+                          </label>
+                        </div>
+                      </div>
+                      {(oauthClientFields state scheme true)}
+                      {(authErrorText state)}
+                    </form>)}
+        </div>)
+
+(defn oauthClientCredentialsSchemeForm [state scheme]
+  #html <div class="space-y-4 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900/60">
+          <div class="space-y-1">
+            <h3 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">{scheme.id} (OAuth2, client credentials)</h3>
+            <p class={authMetaTextClass}>Token URL: <span class="font-mono">{scheme.tokenUrl}</span></p>
+          </div>
+          {(if (schemeAuthorized? state scheme)
+              (authorizedBadge)
+              #html <form id={(authFormId scheme)}
+                          class="space-y-4"
+                          on:submit={(Event.prevent {:kind :authorize-scheme :scheme scheme})}>
+                      {(oauthClientFields state scheme false)}
+                      {(authErrorText state)}
+                    </form>)}
+        </div>)
+
+(defn schemeForm [state scheme]
+  (if (= scheme.kind "oauth2-password")
+      (oauthPasswordSchemeForm state scheme)
+      (if (= scheme.kind "oauth2-client-credentials")
+          (oauthClientCredentialsSchemeForm state scheme)
+          (if (= scheme.kind "apiKey")
+              (apiKeySchemeForm state scheme)
+              (if (= scheme.kind "http-bearer")
+                  (bearerSchemeForm state scheme)
+                  (if (= scheme.kind "http-basic")
+                      (basicSchemeForm state scheme)
+                      #html <div class="hidden"></div>))))))
+
+(defn authFooterButton [state scheme]
+  (if (schemeAuthorized? state scheme)
+      #html <button type="button"
+                    data-testid={(str scheme.id "-authorize-logout")}
+                    class={authLogoutButtonClass}
+                    on:click={{:kind :logout-scheme :scheme scheme}}>Logout</button>
+      (if (= state.authLoadingScheme scheme.id)
+          #html <button type="submit"
+                        form={(authFormId scheme)}
+                        data-testid={(str scheme.id "-authorize")}
+                        disabled={true}
+                        class={authPrimaryButtonClass}>{(iconLoaderCircle "14" "animate-spin")}Authorizing…</button>
+          #html <button type="submit"
+                        form={(authFormId scheme)}
+                        data-testid={(str scheme.id "-authorize")}
+                        disabled={false}
+                        class={authPrimaryButtonClass}>Authorize</button>)))
+
+(defn authorizeDialog [state]
+  (let [schemes (authSchemes state)]
+    #html <div class={(if state.authDialog? "fixed inset-0 z-[100] flex items-start justify-center bg-black/40 p-4 pt-16" "hidden")}
+               data-testid="authorize-dialog">
+            <div role="dialog"
+                 aria-modal="true"
+                 class="flex max-h-[80vh] w-full max-w-lg flex-col overflow-hidden rounded-lg border border-zinc-200 bg-white shadow-xl dark:border-zinc-700 dark:bg-zinc-900">
+              <div class="flex items-center justify-between border-b border-zinc-200 px-4 py-3 dark:border-zinc-700">
+                <h2 class="text-lg font-semibold text-zinc-900 dark:text-zinc-100">Available authorizations</h2>
+                <button type="button"
+                        aria-label="Close"
+                        class="rounded p-1 text-zinc-500 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800"
+                        on:click={{:kind :close-auth}}>{(iconX "18" "")}</button>
+              </div>
+              <div class="space-y-4 overflow-auto p-4">
+                  {(for [scheme schemes :key (str scheme.id ":" (schemeAuthorized? state scheme))]
+                   #html <div>{(schemeForm state scheme)}</div>)}
+              </div>
+              <div class="flex items-center justify-between gap-3 border-t border-zinc-200 px-4 py-3 dark:border-zinc-700">
+                <button type="button"
+                        class={authSecondaryButtonClass}
+                        on:click={{:kind :close-auth}}>Close</button>
+                <div class="flex flex-wrap items-center justify-end gap-2">
+                  {(for [scheme schemes :key (str scheme.id ":" (schemeAuthorized? state scheme) ":" (= state.authLoadingScheme scheme.id))]
+                     #html <div>{(authFooterButton state scheme)}</div>)}
+                </div>
+              </div>
+            </div>
+          </div>))

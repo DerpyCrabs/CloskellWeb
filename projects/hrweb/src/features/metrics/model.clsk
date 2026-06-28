@@ -1,0 +1,10 @@
+(import "../../model.clsk" [WorkoutEntry])
+(import "../../messages.clsk" [AppMsg])
+
+(type MetricsState
+  {:entries (Vector WorkoutEntry)
+   :metricsGrouping String
+   :mobile? Bool})
+
+(type MetricsUpdateResult
+  [MetricsState (Cmd AppMsg)])

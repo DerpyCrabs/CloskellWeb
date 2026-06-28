@@ -1,0 +1,589 @@
+(import "../../lib/operations.clsk" [methodColor methodExpandedBg methodHeaderBg])
+(import "../../lib/schema.clsk" [formatRequestBodySchemaForCopy formatResponseSchemaForCopy getRequestBodySchema getResponseSchemas hasCopyableSchema])
+(import "../../lib/auth.clsk" [hasAuthSchemes?])
+(import "../../lib/param-schema.clsk" [resolveParameterMeta])
+(import "../../lib/request-body.clsk" [hasTryItOutRequestBody? primaryTryItOutMedia requestBodyMode])
+(import "../../lib/browser.clsk" [copyText setOpQueryParam validUuid])
+(import "../../flow.clsk" [bodyKey executeCommand invalidExecuteMessage multipartFileKey paramKey paramValueByName hasText? markdownHtml bodyFieldKey bodyFieldValue requestBodyInfoFor requestBodyFormFields requestBodyValue paramValue])
+(import "../source/flow.clsk" [no-cmd])
+(import "./model.clsk" [TryItState TryItUpdateResult])
+(import "../../messages.clsk" [AppMsg])
+(import "../shared/icons.clsk" [iconLock iconPlay iconChevronRight iconChevronDown iconChevronUp iconDownload])
+(import "../shared/view.clsk" [operationSummary copyTextButton schemaSection virtualJsonViewer schemaDescription])
+
+(ann try-request-update (Fn [TryItState AppMsg] (Option TryItUpdateResult)))
+(defn try-request-update [state msg]
+  (match msg
+    {:kind :open-try :id id}
+      [(merge state {:expandedOp id
+                     :tryActiveOp id
+                     :formError nil
+                     :requestBodyFiles {}
+                     :multipartFiles {}}) (setOpQueryParam id)]
+    {:kind :cancel-try}
+      (no-cmd (merge state {:tryActiveOp nil
+                     :formError nil
+                     :requestBodyFiles {}
+                     :multipartFiles {}}))
+    {:kind :param-input :opId opId :name name :value value}
+      (no-cmd (merge state {:paramValues (object-assoc state.paramValues (paramKey opId name) value)
+                     :formError nil}))
+    {:kind :body-input :opId opId :value value}
+      (no-cmd (merge state {:bodyValues (object-assoc state.bodyValues (bodyKey opId) value)
+                     :formError nil}))
+    {:kind :request-body-file-selected :opId opId :selected? selected?}
+      (no-cmd (merge state {:requestBodyFiles (object-assoc state.requestBodyFiles opId selected?)
+                     :formError nil}))
+    {:kind :multipart-file-selected :opId opId :name name :selected? selected?}
+      (no-cmd (merge state {:multipartFiles (object-assoc state.multipartFiles (multipartFileKey opId name) selected?)
+                     :formError nil}))
+    {:kind :validate-param :opId opId :name name}
+      (let [value (paramValueByName state opId name "")]
+        (if (and (= name "id") (not (validUuid value)))
+            (no-cmd (merge state {:formError "Enter a valid UUID"}))
+            (no-cmd state)))
+    {:kind :execute :item item}
+      (let [message (invalidExecuteMessage state item)]
+        (if (some? message)
+            (no-cmd (merge state {:formError message}))
+            [(merge state {:executingOp item.id
+                           :formError nil
+                           :responses (object-assoc state.responses item.id {:status "Loading" :body ""})})
+             (executeCommand state item)]))
+    {:kind :request-finished :id id :value response}
+      (no-cmd (merge state {:responses (object-assoc state.responses id response)
+                     :executingOp nil}))
+    {:kind :request-failed :error error}
+      (no-cmd (merge state {:responses (object-assoc state.responses state.executingOp {:status "Error" :body error})
+                     :executingOp nil}))
+    {:kind :download-response :name name :content content :mime mime :blob blob}
+      [state {:kind :file/download
+              :name name
+              :content content
+              :blob blob
+              :mime mime
+              :msg {:kind :noop}}]
+    {:kind :copy-text :value value}
+      [state (copyText value)]
+    {:kind :noop}
+      (no-cmd state)
+    _ nil))
+
+
+(def requestBodyTextInputClass
+  "w-full max-w-sm rounded-md border border-zinc-400 bg-white px-2 py-1 text-[13px] text-zinc-900 outline-none focus:border-sky-500 focus:ring-2 focus:ring-sky-500/30 dark:border-dm-border dark:bg-dm-input dark:text-dm-text")
+
+(def requestBodyFileInputClass
+  "block max-w-lg text-[13px] text-zinc-800 file:mr-3 file:rounded-md file:border file:border-zinc-300 file:bg-white file:px-3 file:py-1 file:text-xs file:font-semibold file:text-zinc-800 hover:file:bg-zinc-50 dark:text-dm-text dark:file:border-dm-border dark:file:bg-dm-surface dark:file:text-dm-text dark:hover:file:bg-dm-surface-hover")
+
+(defn requestBodyFormFieldInput [state item field multipart?]
+  #html <div class="space-y-0.5">
+          <label class="block text-[11px] font-medium text-zinc-950 dark:text-dm-text">
+            {field.name}
+            {(if field.required
+                #html <span class="text-rose-600 dark:text-rose-400"> *</span>
+                #html <span class="hidden"></span>)}
+          </label>
+          {(if (hasText? field.description)
+              #html <p class="text-[11px] text-zinc-600 dark:text-dm-muted">{field.description}</p>
+              #html <span class="hidden"></span>)}
+          {(if (and multipart? (= field.kind "file"))
+              #html <input type="file"
+                           data-testid={(str "request-body-multipart-" field.name)}
+                           class={requestBodyFileInputClass}
+                           on:change={{:kind :multipart-file-selected
+                                       :opId item.id
+                                       :name field.name
+                                       :selected? (> event.currentTarget.files.length 0)}}></input>
+              #html <input type="text"
+                           data-testid={(str "request-body-field-" field.name)}
+                           class={requestBodyTextInputClass}
+                           value={(bodyFieldValue state item field.name)}
+                           on:input={{:kind :param-input :opId item.id :name (bodyFieldKey field.name) :value event.currentTarget.value}}></input>)}
+        </div>)
+
+(defn requestBodyInput [state item operation]
+  (let [info (getRequestBodySchema state.spec (get operation :requestBody))
+        media (primaryTryItOutMedia info)
+        mode (requestBodyMode media)
+        fields (requestBodyFormFields state item mode media)]
+    #html <div class={(if (some? mode) "grid gap-2" "hidden")}>
+            {(if (= mode "file")
+                #html <input type="file"
+                             data-testid="request-body-file"
+                             class={requestBodyFileInputClass}
+                             on:change={{:kind :request-body-file-selected
+                                         :opId item.id
+                                         :selected? (> event.currentTarget.files.length 0)}}></input>
+                #html <span class="hidden"></span>)}
+            {(if (= mode "multipart")
+                #html <div class="space-y-2">
+                        {(for [field fields :key field.name]
+                           #html <div>{(requestBodyFormFieldInput state item field true)}</div>)}
+                      </div>
+                #html <span class="hidden"></span>)}
+            {(if (= mode "urlencoded")
+                #html <div class="space-y-2">
+                        {(for [field fields :key field.name]
+                           #html <div>{(requestBodyFormFieldInput state item field false)}</div>)}
+                      </div>
+                #html <span class="hidden"></span>)}
+            {(if (or (= mode "json") (= mode "text"))
+                #html <textarea class="min-h-32 w-full max-w-lg rounded-md border border-zinc-300 bg-white px-2 py-1 font-mono text-[13px] text-zinc-900 outline-none focus:border-sky-500 focus:ring-2 focus:ring-sky-500/30 dark:border-dm-border dark:bg-dm-input dark:text-dm-text"
+                                value={(requestBodyValue state item)}
+                                on:input={{:kind :body-input :opId item.id :value event.currentTarget.value}}></textarea>
+                #html <span class="hidden"></span>)}
+          </div>))
+
+(defn requestBodyPanel [state item operation tryActive?]
+  (let [info (getRequestBodySchema state.spec (get operation :requestBody))
+        copyTextValue (if (some? info) (formatRequestBodySchemaForCopy info) "")]
+    #html <section class={(if (some? info) "mt-2 space-y-1.5 pt-1" "hidden")}>
+            <div class="flex flex-wrap items-center gap-2">
+              <h4 class="text-xs font-bold tracking-wide text-zinc-900 uppercase dark:text-dm-text">Request body</h4>
+              {(if (and (some? info) info.required)
+                  #html <span class="text-[11px] text-rose-600 dark:text-rose-400">required</span>
+                  #html <span class="hidden"></span>)}
+            </div>
+            {(if (and (some? info) (string? info.description))
+                #html <p class="text-xs text-zinc-600 dark:text-dm-muted">{info.description}</p>
+                #html <p class="hidden"></p>)}
+            <div class="flex gap-1 border-b border-zinc-200 dark:border-b-dm-border">
+              <button type="button"
+                      data-testid="request-body-tab-example"
+                      class={(if tryActive?
+                                  "border-b-2 border-zinc-900 px-3 py-1.5 text-xs font-semibold text-zinc-900 dark:border-white dark:text-white"
+                                  "border-b-2 border-transparent px-3 py-1.5 text-xs font-semibold text-zinc-600 hover:text-zinc-800 dark:text-dm-muted dark:hover:text-dm-text")}>Example Value</button>
+              <button type="button"
+                      data-testid="request-body-tab-model"
+                      class={(if tryActive?
+                                  "border-b-2 border-transparent px-3 py-1.5 text-xs font-semibold text-zinc-600 hover:text-zinc-800 dark:text-dm-muted dark:hover:text-dm-text"
+                                  "border-b-2 border-zinc-900 px-3 py-1.5 text-xs font-semibold text-zinc-900 dark:border-white dark:text-white")}>Model</button>
+            </div>
+            <div class="rounded-md bg-white/80 p-2 dark:bg-dm-surface">
+              {(if tryActive?
+                  #html <div>{(requestBodyInput state item operation)}</div>
+                  #html <div class="flex items-start gap-2">
+                          <div class="min-w-0 flex-1 space-y-2">
+                            {(for [media (if (some? info) info.media []) :key media.contentType]
+                               #html <div>{(schemaSection media false)}</div>)}
+                          </div>
+                          <div>{(copyTextButton "copy-request-body-schema" "Copy schema" copyTextValue (and (some? info) (hasCopyableSchema info)) "shrink-0")}</div>
+                        </div>)}
+            </div>
+          </section>))
+
+(defn isErrorResponseStatus? [status]
+  (or (starts-with? status "4") (starts-with? status "5")))
+
+(defn statusBadgeClass [status]
+  (if (starts-with? status "2")
+      "bg-emerald-600/15 text-emerald-800 dark:bg-[rgba(46,204,113,0.15)] dark:text-[#4ade80]"
+      (if (isErrorResponseStatus? status)
+          "bg-rose-600/15 text-rose-800 dark:bg-[rgba(231,76,60,0.15)] dark:text-[#f87171]"
+          "bg-zinc-200 text-zinc-800 dark:bg-dm-surface dark:text-dm-muted")))
+
+(defn responseHeader [response]
+  #html <div class="flex flex-wrap items-center gap-2"><span class={(str "rounded px-1.5 py-0.5 text-xs font-semibold " (statusBadgeClass response.status))}>{response.status}</span>{(if (string? response.description) #html <span class="text-xs text-zinc-600 dark:text-dm-muted">{response.description}</span> #html <span class="hidden"></span>)}</div>)
+
+(defn responseSchemaBody [response]
+  (let [copyTextValue (formatResponseSchemaForCopy response)]
+    #html <div class="pt-2">
+            {(if (> (count response.media) 0)
+                #html <div class="rounded-md bg-white/80 p-2 dark:bg-dm-surface">
+                        <div class="flex items-start gap-2">
+                          <div class="min-w-0 flex-1 space-y-2">
+                            {(for [media response.media :key media.contentType]
+                               #html <div>{(schemaSection media true)}</div>)}
+                          </div>
+                          <div>{(copyTextButton (str "copy-response-schema-" response.status) "Copy schema" copyTextValue (hasCopyableSchema response) "shrink-0")}</div>
+                        </div>
+                      </div>
+                #html <p class="text-xs text-zinc-600 dark:text-dm-muted">No content</p>)}
+          </div>))
+
+(defn responseBlock [response]
+  #html <div>
+          {(if (isErrorResponseStatus? response.status)
+              #html <details class="group -mx-1 rounded-md px-1 transition-colors hover:bg-zinc-100/90 dark:hover:bg-dm-surface-hover"><summary class="cursor-pointer list-none rounded-md py-1.5 [&::-webkit-details-marker]:hidden"><div class="flex items-center gap-2">{(iconChevronRight "16" "shrink-0 text-zinc-500 transition-transform group-open:rotate-90 dark:text-dm-muted")}{(responseHeader response)}</div></summary><div class="pb-1 pl-6">{(responseSchemaBody response)}</div></details>
+              #html <div class="space-y-1">
+                      {(responseHeader response)}
+                      {(responseSchemaBody response)}
+                    </div>)}
+        </div>)
+
+(defn responsesSchemaView [state operation]
+  (let [responses (getResponseSchemas state.spec (get operation :responses))]
+    #html <section class={(if (> (count responses) 0) "mt-2 space-y-2 pt-1" "hidden")}>
+            <h4 class="text-xs font-bold tracking-wide text-zinc-900 uppercase dark:text-dm-text">Responses</h4>
+            {(for [response responses :key response.status]
+               #html <div>{(responseBlock response)}</div>)}
+          </section>))
+
+(defn optionStrings [values]
+  (if (vector? values)
+      (map values (fn [value] (str value)))
+      []))
+
+(defn parameterOptions [meta]
+  (if (and (vector? meta.enumValues) (> (count meta.enumValues) 0))
+      (optionStrings meta.enumValues)
+      (if (= meta.kind "boolean")
+          ["true" "false"]
+          [])))
+
+(defn parameterTypeLabel [meta]
+  (if (string? meta.schemaType) meta.schemaType "string"))
+
+(defn parameterPlaceholder [meta]
+  (if (string? meta.example)
+      meta.example
+      (if (= meta.kind "array")
+          (if (and (vector? meta.arrayItemEnum) (> (count meta.arrayItemEnum) 0))
+              (join (optionStrings meta.arrayItemEnum) ", ")
+              "value1, value2")
+          (if (= meta.kind "object")
+              "{\"key\":\"value\"}"
+              meta.name))))
+
+(defn parameterInputType [meta]
+  (if (= meta.kind "integer")
+      "number"
+      (if (= meta.kind "number")
+          "number"
+          (if (= meta.format "date")
+              "date"
+              (if (= meta.format "date-time") "datetime-local" "text")))))
+
+(defn parameterInput [state item meta]
+  (let [name (get meta :name)
+        visible? (string? name)
+        value (if visible? (paramValue state item meta) "")
+        placeholder (if visible? (parameterPlaceholder meta) "")
+        options (parameterOptions meta)]
+    #html <div>
+            {(if (and visible? (= meta.kind "object"))
+                #html <textarea rows="3"
+                                class="w-full max-w-sm rounded-md border border-zinc-400 bg-white px-2 py-1 text-[13px] text-zinc-900 placeholder:text-zinc-500 outline-none focus:border-sky-500 focus:ring-2 focus:ring-sky-500/30 dark:border-dm-border dark:bg-dm-input dark:text-dm-text dark:placeholder:text-dm-muted dark:focus:border-sky-500 dark:focus:ring-sky-500/40"
+                                placeholder={placeholder}
+                                value={value}
+                                on:input={{:kind :param-input :opId item.id :name name :value event.currentTarget.value}}
+                                on:blur={{:kind :validate-param :opId item.id :name name}}></textarea>
+                (if (> (count options) 0)
+                    #html <select class="w-full max-w-sm rounded-md border border-zinc-400 bg-white px-2 py-1 text-[13px] text-zinc-900 outline-none focus:border-sky-500 focus:ring-2 focus:ring-sky-500/30 dark:border-dm-border dark:bg-dm-input dark:text-dm-text dark:focus:border-sky-500 dark:focus:ring-sky-500/40"
+                                  value={value}
+                                  on:change={{:kind :param-input :opId item.id :name name :value event.currentTarget.value}}
+                                  on:blur={{:kind :validate-param :opId item.id :name name}}>
+                            <option value="">{(if meta.required "Select…" "—")}</option>
+                            {(for [option options :key option]
+                               #html <option value={option}>{option}</option>)}
+                          </select>
+                    #html <input type={(parameterInputType meta)}
+                                 class={(if visible?
+                                            "w-full max-w-sm rounded-md border border-zinc-400 bg-white px-2 py-1 text-[13px] text-zinc-900 placeholder:text-zinc-500 outline-none focus:border-sky-500 focus:ring-2 focus:ring-sky-500/30 dark:border-dm-border dark:bg-dm-input dark:text-dm-text dark:placeholder:text-dm-muted dark:focus:border-sky-500 dark:focus:ring-sky-500/40"
+                                            "hidden")}
+                                 placeholder={placeholder}
+                                 value={value}
+                                 on:input={{:kind :param-input :opId item.id :name name :value event.currentTarget.value}}
+                                 on:blur={{:kind :validate-param :opId item.id :name name}}></input>))}
+          </div>))
+
+(defn parameterInputs [state item operation tryActive?]
+  (let [params (resolveParameterMeta state.spec item)]
+    #html <div class={(if (> (count params) 0) "overflow-x-auto rounded-md bg-white/70 dark:bg-dm-surface" "hidden")}>
+            <table class="w-full border-collapse text-[13px]">
+              <thead>
+                <tr class="text-left text-zinc-700 dark:text-dm-muted">
+                  <th class="w-[26%] px-2 py-1.5 text-xs font-semibold">Name</th>
+                  <th class="px-2 py-1.5 text-xs font-semibold">Description</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(for [param params :key (str item.id ":" (get param :name))]
+                   #html <tr class="border-t border-zinc-200/80 align-top dark:border-t-dm-border">
+                           <td class="px-2 py-2 pr-3">
+                             <div class="font-bold text-zinc-950 dark:text-dm-text">
+                               {param.name}
+                               {(if param.required
+                                   #html <span class="text-rose-600 dark:text-rose-400"> *</span>
+                                   #html <span class="hidden"></span>)}
+                             </div>
+                             <div class="mt-px font-mono text-[11px] text-zinc-600 dark:text-dm-muted">{(parameterTypeLabel param)}</div>
+                             <div class="mt-px text-[10px] text-zinc-600 dark:text-dm-muted">{param.in}</div>
+                           </td>
+                           <td class="px-2 py-2">
+                             {(if tryActive?
+                                 (if (hasText? param.description)
+                                     #html <p class="mb-1 text-[11px] leading-tight text-zinc-600 dark:text-dm-muted">{param.description}</p>
+                                     #html <span class="hidden"></span>)
+                                 #html <p class="text-zinc-700 dark:text-dm-muted">{(schemaDescription param.description)}</p>)}
+                             {(if tryActive?
+                                 #html <div>{(parameterInput state item param)}</div>
+                                 #html <div class="hidden"></div>)}
+                           </td>
+                         </tr>)}
+              </tbody>
+            </table>
+          </div>))
+
+(defn responseStatusText [response]
+  (let [status (get response :status)]
+    (if (number? status)
+        (let [statusText (get response :statusText)]
+          (if (hasText? statusText) (str status " " statusText) (str status)))
+        (if (string? status) status ""))))
+
+(defn responseOk? [response]
+  (let [status (get response :status)]
+    (and (number? status) (>= status 200) (< status 300))))
+
+(defn responseHeaderValue [response name]
+  (let [headers (get response :headers)
+        value (object-get headers name)]
+    (if (string? value) value "")))
+
+(defn responseContentType [response]
+  (let [contentType (get response :contentType)]
+    (if (string? contentType) contentType (responseHeaderValue response "content-type"))))
+
+(defn responseContentDisposition [response]
+  (let [contentDisposition (get response :contentDisposition)]
+    (if (string? contentDisposition) contentDisposition (responseHeaderValue response "content-disposition"))))
+
+(defn responseBaseMime [response]
+  (lower-case (trim (first (split (responseContentType response) ";")))))
+
+(defn responseJson? [response]
+  (let [mime (responseBaseMime response)]
+    (or (includes? mime "json") (ends-with? mime "+json"))))
+
+(defn responseBodyText [response]
+  (let [copyText (get response :copyText)
+        body (get response :body)]
+    (if (some? response)
+        (if (string? copyText)
+            copyText
+            (if (string? body) body (json-stringify body)))
+        "")))
+
+(defn responseDisplayText [response]
+  (let [raw (responseBodyText response)
+        parsed (json-parse-result raw)]
+    (if (and (responseJson? response) (ok? parsed))
+        (json-stringify (unwrap-or parsed raw) 2)
+        raw)))
+
+(defn responseCopyText [response]
+  (responseDisplayText response))
+
+(defn responseDurationText [response]
+  (let [duration (get response :durationMs)]
+    (if (number? duration) (str duration " ms") "")))
+
+(defn attachmentDisposition? [response]
+  (includes? (lower-case (responseContentDisposition response)) "attachment"))
+
+(defn responseFile? [response]
+  (let [isFile (get response :isFile)
+        mime (responseBaseMime response)]
+    (if (bool? isFile)
+        isFile
+        (or (attachmentDisposition? response)
+            (= mime "application/octet-stream")
+            (includes? mime "csv")
+            (starts-with? mime "image/")
+            (starts-with? mime "audio/")
+            (starts-with? mime "video/")
+            (= mime "application/pdf")
+            (includes? mime "zip")
+            (includes? mime "excel")
+            (includes? mime "spreadsheet")
+            (includes? mime "msword")
+            (includes? mime "officedocument")))))
+
+(defn extensionFromContentType [contentType]
+  (let [mime (lower-case contentType)]
+    (if (includes? mime "csv")
+        "csv"
+        (if (= mime "application/pdf")
+            "pdf"
+            (if (includes? mime "json")
+                "json"
+                (if (includes? mime "xml")
+                    "xml"
+                    (if (starts-with? mime "image/")
+                        (second (split mime "/"))
+                        (if (includes? mime "zip")
+                            "zip"
+                            (if (or (includes? mime "excel") (includes? mime "spreadsheet"))
+                                "xlsx"
+                                (if (or (includes? mime "word") (includes? mime "msword"))
+                                    "docx"
+                                    "bin"))))))))))
+
+(defn fileNameFromDisposition [header]
+  (let [star (regex-capture header "filename\\*\\s*=\\s*(?:UTF-8''|utf-8'')([^;\\n]+)" "i")
+        quoted (regex-capture header "filename\\s*=\\s*\"([^\"]*)\"" "i")
+        plain (regex-capture header "filename\\s*=\\s*([^;\\n]+)" "i")]
+    (if (hasText? star)
+        (decode-uri-component (trim star))
+        (if (hasText? quoted)
+            quoted
+            (trim plain)))))
+
+(defn responseFileName [response]
+  (let [fileName (get response :fileName)]
+    (if (string? fileName) fileName "")))
+
+(defn responseFileNameFromUrl [response]
+  (let [requestUrl (get response :url)
+        pathName (if (string? requestUrl) (url-pathname requestUrl) "")
+        parts (filter (split pathName "/") hasText?)
+        lastPart (if (> (count parts) 0) (last parts) "")
+        extension (extensionFromContentType (responseBaseMime response))]
+    (if (= lastPart "")
+        ""
+        (if (includes? lastPart ".")
+            lastPart
+            (if (= lastPart "csv")
+                (if (> (count parts) 1) (str (nth parts (- (count parts) 2)) ".csv") "download.csv")
+                (if (not (= extension "bin")) (str lastPart "." extension) ""))))))
+
+(defn responseDownloadName [item response]
+  (let [fromRuntime (responseFileName response)
+        fromDisposition (fileNameFromDisposition (responseContentDisposition response))
+        fromUrl (responseFileNameFromUrl response)
+        mime (responseBaseMime response)]
+    (if (hasText? fromRuntime)
+        fromRuntime
+        (if (hasText? fromDisposition)
+            fromDisposition
+            (if (hasText? fromUrl)
+                fromUrl
+                (str "download." (extensionFromContentType mime)))))))
+
+(defn responseBlob [response]
+  (get response :blob))
+
+(defn responsePreviewUrl [response]
+  (let [previewUrl (get response :previewUrl)]
+    (if (string? previewUrl) previewUrl "")))
+
+(defn responseViewerKey [response]
+  (str (responseStatusText response) ":" (responseDurationText response) ":" (responseContentType response) ":" (count (responseBodyText response))))
+
+(defn responsePanel [item response]
+  #html <section class={(if (some? response)
+                            "mt-2 space-y-1.5 rounded-md bg-white/80 p-2 dark:bg-dm-surface"
+                            "hidden")}>
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <div class="text-xs font-bold tracking-wide text-zinc-900 uppercase dark:text-dm-text">Response</div>
+            <div class="flex items-center gap-2">
+              {(if (responseFile? response)
+                  #html <button type="button"
+                                data-testid="download-response"
+                                title="Download"
+                                aria-label="Download"
+                                class="inline-flex items-center rounded border border-zinc-400 p-1 text-zinc-700 hover:bg-white dark:border-dm-border dark:text-dm-text dark:hover:bg-dm-surface-hover"
+                                on:click={{:kind :download-response
+                                           :name (responseDownloadName item response)
+                                           :content (responseCopyText response)
+                                           :mime (responseContentType response)
+                                           :blob (responseBlob response)}}>{(iconDownload "12" "")}</button>
+                  #html <span class="hidden"></span>)}
+              {(copyTextButton "copy-response" "Copy" (responseCopyText response) (or (not (responseFile? response)) (hasText? (responseCopyText response))) "")}
+            </div>
+          </div>
+          <div class="flex flex-wrap items-center gap-3 text-sm">
+            <span class={(if (responseOk? response)
+                             "rounded bg-emerald-600/20 px-2 py-0.5 font-medium text-emerald-700 dark:text-emerald-400"
+                             "rounded bg-rose-600/20 px-2 py-0.5 font-medium text-rose-700 dark:text-rose-400")}
+                  data-testid="response-status">{(responseStatusText response)}</span>
+            {(if (hasText? (responseDurationText response))
+                #html <span class="text-zinc-600 dark:text-dm-muted">{(responseDurationText response)}</span>
+                #html <span class="hidden"></span>)}
+            {(if (hasText? (responseContentType response))
+                #html <span class="font-mono text-xs text-zinc-600 dark:text-dm-muted">{(responseContentType response)}</span>
+                #html <span class="hidden"></span>)}
+          </div>
+          {(if (responseFile? response)
+              #html <div class="rounded-lg bg-zinc-50 px-3 py-2 text-sm dark:bg-dm-surface" data-testid="response-body">
+                      <p class="text-zinc-700 dark:text-dm-text">File response
+                        <span class="ml-1 font-mono text-zinc-600 dark:text-dm-muted">({(responseDownloadName item response)})</span>
+                      </p>
+                      {(if (starts-with? (responseBaseMime response) "image/")
+                          #html <img alt={(responseDownloadName item response)}
+                                     src={(responsePreviewUrl response)}
+                                     class="mt-2 max-h-64 max-w-full rounded border border-zinc-200 dark:border-dm-border"></img>
+                          #html <span class="hidden"></span>)}
+                    </div>
+              #html <div data-testid="response-body">{(virtualJsonViewer (responseDisplayText response) "32rem" (responseViewerKey response))}</div>)}
+        </section>)
+
+(defn operationPanel [state item]
+  (let [expanded? (or (= state.expandedOp item.id) (= state.tryActiveOp item.id))
+        tryActive? (= state.tryActiveOp item.id)
+        operation item.operation
+        response (object-get state.responses item.id)]
+    #html <article class="scroll-mt-24 mb-[10px] overflow-hidden rounded border border-zinc-200 dark:border-dm-border"
+                   data-testid={(str "operation-" item.id)}>
+            <div class={(str "flex w-full items-stretch transition " (methodHeaderBg item.method expanded?) (if expanded? " border-b border-zinc-300/70 shadow-[inset_0_-1px_0_rgba(0,0,0,0.05)] dark:border-dm-border dark:shadow-none" ""))}
+                 data-op-header>
+              <button type="button"
+                      class="flex min-w-0 flex-1 flex-nowrap items-center gap-2.5 px-3 py-2 text-left sm:gap-3"
+                      on:click={{:kind :toggle-operation :id item.id}}>
+                <span class={(str "inline-flex w-[4.75rem] shrink-0 items-center justify-center rounded px-2 py-0.5 text-[11px] font-bold uppercase ring-1 ring-inset " (methodColor item.method))}>{item.method}</span>
+                <span class="shrink-0 whitespace-nowrap font-mono text-sm text-zinc-800 dark:text-dm-text">{item.path}</span>
+                <span class="min-w-0 flex-1 truncate text-sm text-zinc-600 dark:text-dm-muted">{(operationSummary operation)}</span>
+                <span class="ml-auto shrink-0 text-zinc-400 dark:text-dm-muted">
+                  {(if expanded? (iconChevronUp "18" "") (iconChevronDown "18" ""))}
+                </span>
+              </button>
+              {(if (hasAuthSchemes? state.spec state.oauthInit)
+                  #html <button type="button"
+                                class="shrink-0 px-2.5 text-zinc-400 transition hover:text-zinc-700 dark:text-dm-muted dark:hover:text-dm-text"
+                                title="Authorize"
+                                aria-label="Authorize"
+                                data-testid="operation-authorize-lock"
+                                on:click={{:kind :open-auth :id item.id}}>{(iconLock "15" "")}</button>
+                  #html <button type="button" class="hidden" data-testid="operation-authorize-lock"></button>)}
+            </div>
+            {(if expanded?
+                #html <div class={(str "px-3 py-3 " (methodExpandedBg item.method))}>
+                        {(if (and (hasText? (get operation :description)) (hasText? (operationSummary operation)))
+                            #html <div class="mb-2 text-sm"><div class="prose prose-sm max-w-none prose-p:my-2 prose-headings:my-2 dark:prose-invert" innerHTML={(markdownHtml (get operation :description))}></div></div>
+                            #html <div class="hidden"></div>)}
+                        <div class="mb-1 flex items-center justify-between">
+                          <span class="text-xs font-bold tracking-wide text-zinc-900 uppercase dark:text-dm-text">Parameters</span>
+                          {(if tryActive?
+                              #html <button type="button"
+                                            class="rounded-md border border-zinc-300 bg-transparent px-3 py-1 text-xs font-medium text-zinc-700 hover:bg-white/80 dark:border-dm-border dark:text-dm-muted dark:hover:bg-dm-surface-hover"
+                                            data-testid="cancel-try-it-out"
+                                            on:click={{:kind :cancel-try}}>Cancel</button>
+                              #html <button type="button"
+                                            class="rounded-md border border-zinc-300 bg-white px-3 py-1 text-xs font-semibold text-zinc-800 hover:bg-zinc-50 dark:border-dm-border dark:bg-dm-surface dark:text-dm-text dark:hover:bg-dm-surface-hover"
+                                            data-testid="try-it-out"
+                                            on:click={{:kind :open-try :id item.id}}>Try it out</button>)}
+                        </div>
+                        {(if (> (count (resolveParameterMeta state.spec item)) 0)
+                            #html <div>{(parameterInputs state item operation tryActive?)}</div>
+                            (if (hasTryItOutRequestBody? (requestBodyInfoFor state item))
+                                #html <span class="hidden"></span>
+                                #html <p class="py-1 text-xs text-zinc-600 dark:text-dm-muted">No parameters</p>))}
+                        <div>{(requestBodyPanel state item operation tryActive?)}</div>
+                        {(if tryActive?
+                            #html <div class="mt-2">
+                                    <button type="button"
+                                            class="inline-flex items-center gap-2 rounded-md bg-emerald-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-emerald-500 dark:bg-emerald-600 dark:hover:bg-emerald-500"
+                                            data-testid="execute"
+                                            on:click={{:kind :execute :item item}}>{(iconPlay "16" "")}Execute</button>
+                                  </div>
+                            #html <div class="hidden"></div>)}
+                        {(if (some? state.formError)
+                            #html <p class="mt-2 rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700 dark:border-rose-900/50 dark:bg-rose-950/30 dark:text-rose-300">{state.formError}</p>
+                            #html <div class="hidden"></div>)}
+                        <div>{(responsePanel item response)}</div>
+                        <div>{(responsesSchemaView state operation)}</div>
+                      </div>
+                #html <div class="hidden"></div>)}
+          </article>))

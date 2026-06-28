@@ -1,0 +1,39 @@
+(import "../../model.clsk" [HeartReading HeartZone WorkoutEntry])
+(import "../../messages.clsk" [AppMsg])
+
+(type WorkflowState
+  {:appStatus String
+   :message String
+   :statusMode String
+   :exerciseState String
+   :elapsedMs Number
+   :displayElapsedMs Number
+   :startedAt (Option Number)
+   :sessionStartedAt (Option Number)
+   :idleStartedAt (Option Number)
+   :pendingStoppedAt (Option Number)
+   :latestBpm Number
+   :lastRate (Option Number)
+   :trend String
+   :readings (Vector HeartReading)
+   :entries (Vector WorkoutEntry)
+   :selectedLogId (Option String)
+   :logTypeFilter String
+   :targetZoneId Number
+   :zones (Vector HeartZone)
+   :activeExerciseType String
+   :stopHold? Bool
+   :stopHoldStartedAt Number
+   :stopHoldProgress Number
+   :deleteHold? Bool
+   :deleteHoldStartedAt Number
+   :deleteHoldProgress Number
+   :zoneTrackLeft Number
+   :zoneTrackWidth Number
+   :zoneStatus String
+   :typeDraft String
+   :typePickerEntryId (Option String)
+   :typePickerDraft String})
+
+(type WorkflowUpdateResult
+  [WorkflowState (Cmd AppMsg)])

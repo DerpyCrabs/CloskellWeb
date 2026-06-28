@@ -10,7 +10,9 @@ export default defineConfig({
   testDir: './e2e',
   fullyParallel: true,
   forbidOnly: Boolean(process.env.CI),
+  maxFailures: 1,
   retries: process.env.CI ? 2 : 0,
+  timeout: 20_000,
   workers: 1,
   use: {
     baseURL: 'http://127.0.0.1:5180',
@@ -21,6 +23,6 @@ export default defineConfig({
     command: 'npm run dev -- --port 5180 --strictPort',
     url: 'http://127.0.0.1:5180',
     reuseExistingServer: false,
-    timeout: 120_000,
+    timeout: 30_000,
   },
 })
