@@ -1,0 +1,42 @@
+(import "./source-context.clsk" [normalizeSlashes])
+
+(ann trimMediaPathSlashes (Fn [String] String))
+(defn trimMediaPathSlashes [value]
+  (regex-capture (normalizeSlashes value) "^/*(.*?)/*$" ""))
+
+(ann isMediaPathUnderKb (Fn [String String] Bool))
+(defn isMediaPathUnderKb [mediaPath kbRoot]
+  (let [path (trimMediaPathSlashes mediaPath)
+        kb (trimMediaPathSlashes kbRoot)]
+    (if (= kb "")
+        false
+        (or (= path kb)
+            (starts-with? path (str kb "/"))))))
+
+(ann resolveMediaPathForKbChat (Fn [String (Option String)] String))
+(defn resolveMediaPathForKbChat [pathRaw kbRoot]
+  (let [normalized (trimMediaPathSlashes pathRaw)]
+    (match kbRoot
+      nil normalized
+      (some root)
+        (if (= (trim root) "")
+            normalized
+            (let [kb (trimMediaPathSlashes root)]
+              (if (= kb "")
+                  normalized
+                  (if (or (= normalized kb) (starts-with? normalized (str kb "/")))
+                      normalized
+                      (if (= normalized "") kb (str kb "/" normalized)))))))))
+
+(ann twoDigitFraction (Fn [Number] String))
+(defn twoDigitFraction [value]
+  (if (< value 10) (str "0" value) (str value)))
+
+(ann formatAnswerSeconds (Fn [Js] String))
+(defn formatAnswerSeconds [sec]
+  (if (or (not (number? sec)) (< sec 0))
+      ""
+      (let [scaled (round (* sec 100))
+            whole (floor (/ scaled 100))
+            fraction (mod scaled 100)]
+        (str whole "." (twoDigitFraction fraction) "s"))))

@@ -1,0 +1,163 @@
+(import "node:perf_hooks" [performance])
+(import "../../http-routes.clsk" [HttpRoute registerHttpRoutes])
+(import "../../../lib/config.clsk" [config getMediaRoots])
+(import "../../../lib/file-system.clsk" [getEditableFolders])
+(import "../../../lib/auth.clsk" [createAuthSessionValue
+                                verifyPassword
+                                verifySessionValue
+                                SESSION_COOKIE])
+
+(def loginAttempts (unsafe-cast Js (hash-map)))
+(def MAX_ATTEMPTS 10)
+(def WINDOW_MS (* 15 60 1000))
+
+(ann headerString (Fn [Js String] (Option String)))
+(defn headerString [headers name]
+  (let [value (object-get headers name)]
+    (if (string? value) value nil)))
+
+(ann firstCommaValue (Fn [String] String))
+(defn firstCommaValue [value]
+  (trim (first (split value ","))))
+
+(ann getClientIp (Fn [Js] String))
+(defn getClientIp [req]
+  (let [forwarded (headerString req.headers "x-forwarded-for")
+        realIp (headerString req.headers "x-real-ip")]
+    (if (some? forwarded)
+        (firstCommaValue forwarded)
+        (if (some? realIp) realIp "unknown"))))
+
+(ann nowMs (Fn [] Number))
+(defn nowMs []
+  (performance.now))
+
+(ann checkRateLimit (Fn [String] Bool))
+(defn checkRateLimit [ip]
+  (let [now (nowMs)
+        entryRaw (loginAttempts.get ip)]
+    (if (not (object? entryRaw))
+        (do
+          (loginAttempts.set ip {:count 1 :resetAt (+ now WINDOW_MS)})
+          true)
+        (let [entry (unsafe-cast Js entryRaw)]
+          (if (> now entry.resetAt)
+              (do
+                (loginAttempts.set ip {:count 1 :resetAt (+ now WINDOW_MS)})
+                true)
+              (if (>= entry.count MAX_ATTEMPTS)
+                  false
+                  (do
+                    (loginAttempts.set ip {:count (+ entry.count 1)
+                                           :resetAt entry.resetAt})
+                    true)))))))
+
+(ann getRequestHost (Fn [Js] String))
+(defn getRequestHost [req]
+  (let [forwarded (headerString req.headers "x-forwarded-host")
+        forwardedHost (if (some? forwarded) (firstCommaValue forwarded) nil)
+        rawHost (headerString req.headers "host")
+        hostHeader (if (some? forwardedHost) forwardedHost rawHost)]
+    (if (some? hostHeader)
+        (let [hostname (lower-case (trim (first (split hostHeader ":"))))]
+          (if (= hostname "") "" hostname))
+        (if (string? req.hostname) (lower-case req.hostname) ""))))
+
+(ann authEnabled? (Fn [] Bool))
+(defn authEnabled? []
+  (and (object? config.auth) (= config.auth.enabled true)))
+
+(ann configuredPassword? (Fn [] Bool))
+(defn configuredPassword? []
+  (and (object? config.auth)
+       (string? config.auth.password)
+       (not (= config.auth.password ""))))
+
+(ann authSessionValue (Fn [Js] Js))
+(defn authSessionValue [request]
+  (if (object? request.cookies)
+      (object-get request.cookies SESSION_COOKIE)
+      nil))
+
+(ann codeSend (Fn [Js Number Js] Js))
+(defn codeSend [reply code payload]
+  (let [codedReply (reply.code code)]
+    (codedReply.send payload)))
+
+(ann mediaRootSummary (Fn [Js] Js))
+(defn mediaRootSummary [root]
+  {:name root.name :editableFolders root.editableFolders})
+
+(ann authConfigPayload (Fn [Bool Js Js] Js))
+(defn authConfigPayload [enabled editableFolders mediaRoots]
+  (let [base {:enabled enabled
+              :editableFolders editableFolders
+              :mediaRoots mediaRoots}]
+    (if (string? config.shareLinkDomain)
+        (object-assoc base "shareLinkDomain" config.shareLinkDomain)
+        base)))
+
+(ann handleAuthConfig (Fn [Js Js] Js))
+(defn handleAuthConfig [request reply]
+  (let [enabled (authEnabled?)]
+    (if (and enabled (not (verifySessionValue (authSessionValue request))))
+        (codeSend reply 401 {:error "Unauthorized"})
+        (let [editableFolders (getEditableFolders)
+              mediaRoots (map (getMediaRoots) mediaRootSummary)]
+          (reply.send (authConfigPayload enabled editableFolders mediaRoots))))))
+
+(ann adminDomainAllowed? (Fn [Js] Bool))
+(defn adminDomainAllowed? [request]
+  (let [domains config.auth.adminAccessDomains]
+    (if (and (vector? domains) (> (count domains) 0))
+        (let [host (getRequestHost request)]
+          (and (not (= host "")) (includes? domains host)))
+        true)))
+
+(ann setAuthSessionCookie (Fn [Js] Nil))
+(defn setAuthSessionCookie [reply]
+  (let [session (createAuthSessionValue)]
+    (if (some? session)
+        (let [cookie (unsafe-cast Js session)]
+          (do
+            (reply.setCookie cookie.name cookie.value cookie.options)
+            nil))
+        nil)))
+
+(ann handleLoginResult (Fn [Js Bool] Js))
+(defn handleLoginResult [reply valid]
+  (if (not valid)
+      (codeSend reply 401 {:error "Invalid password"})
+      (do
+        (setAuthSessionCookie reply)
+        (reply.send {:success true}))))
+
+(ann handleAuthLogin (Fn [Js Js] Js))
+(defn handleAuthLogin [request reply]
+  (let [body request.body]
+    (if (or (not (authEnabled?)) (not (configuredPassword?)))
+        (codeSend reply 400 {:error "Auth not enabled"})
+        (if (not (adminDomainAllowed? request))
+            (codeSend reply 403 {:error "Admin access not allowed from this domain"})
+            (let [ip (getClientIp request)]
+              (if (not (checkRateLimit ip))
+                  (codeSend reply 429 {:error "Too many attempts. Try again in 15 minutes."})
+                  (let [validPromise (verifyPassword body.password)]
+                    (validPromise.then
+                     (fn [valid] (handleLoginResult reply valid))))))))))
+
+(ann handleAuthLogout (Fn [Js Js] Js))
+(defn handleAuthLogout [_request reply]
+  (do
+    (reply.clearCookie SESSION_COOKIE {:path "/"})
+    (reply.send {:success true})))
+
+(ann authApiRouteDefinitions (Fn [] (Vector HttpRoute)))
+(defn authApiRouteDefinitions []
+  [{:method "GET" :path "/api/auth/config" :handler handleAuthConfig}
+   {:method "POST" :path "/api/auth/login" :handler handleAuthLogin}
+   {:method "POST" :path "/api/auth/logout" :handler handleAuthLogout}])
+
+(ann registerAuthApiRoutes (Fn [Js] Js))
+(defn registerAuthApiRoutes [app]
+  (registerHttpRoutes app (authApiRouteDefinitions)))

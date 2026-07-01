@@ -1,0 +1,37 @@
+(import "node:path" [posix])
+(import "./source-context.clsk" [normalizeSlashes])
+
+(foreign pure posix {:normalize (Fn [String] String)})
+
+(type ShareLink
+  {:path String
+   :isDirectory Bool})
+
+(ann pathSegmentParent? (Fn [String] Bool))
+(defn pathSegmentParent? [segment]
+  (= segment ".."))
+
+(ann rootedInShare? (Fn [String String] Bool))
+(defn rootedInShare? [shareRoot candidate]
+  (or (= candidate shareRoot)
+      (starts-with? candidate (str shareRoot "/"))))
+
+(ann resolveShareSubPath (Fn [ShareLink String] (Option String)))
+(defn resolveShareSubPath [share subPath]
+  (if (not share.isDirectory)
+      (if (or (= subPath "") (= subPath "."))
+          share.path
+          nil)
+      (let [shareRoot (normalizeSlashes share.path)
+            normalizedSub (normalizeSlashes subPath)]
+        (if (or (= normalizedSub "") (= normalizedSub "."))
+            shareRoot
+            (if (any? (split normalizedSub "/") pathSegmentParent?)
+                nil
+                (let [fullPath (if (rootedInShare? shareRoot normalizedSub)
+                                   normalizedSub
+                                   (str shareRoot "/" normalizedSub))
+                      normalized (posix.normalize fullPath)]
+                  (if (not (rootedInShare? shareRoot normalized))
+                      nil
+                      normalized)))))))

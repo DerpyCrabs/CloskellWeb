@@ -1643,6 +1643,7 @@ fn collect_forbidden_access(
                 diagnostics.push(Diagnostic::error(expr.span, message));
             }
         }
+        ExprKind::List(items) if matches_head(items, "js-global") => {}
         ExprKind::List(items) | ExprKind::Vector(items) | ExprKind::Set(items) => {
             for item in items {
                 collect_forbidden_access(item, options, diagnostics);
@@ -1854,6 +1855,9 @@ mod tests {
             .command_schema(
                 EffectCommandSchemaRule::new("browser/set-cookie")
                     .required_fields(["name", "value"]),
+            )
+            .command_schema(
+                EffectCommandSchemaRule::new("browser/document-title").required_fields(["title"]),
             )
             .command_schema(
                 EffectCommandSchemaRule::new("storage/get")
@@ -2098,6 +2102,14 @@ mod tests {
                 report.diagnostics
             );
         }
+    }
+
+    #[test]
+    fn allows_configured_host_global_through_js_global_interop() {
+        let source = syntax::parse_source("(def timer (js-global setInterval))");
+        let report = validate_with_forbidden_host_access(&source);
+
+        assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
     }
 
     #[test]

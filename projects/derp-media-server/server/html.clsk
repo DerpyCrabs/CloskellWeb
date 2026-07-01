@@ -1,0 +1,645 @@
+(import "path" [(default path)])
+(import "node:console" [(error as consoleError)])
+(import "./fs-tasks.clsk" [readFileUtf8 statPath])
+(import "../lib/file-system.clsk" [listDirectory
+                                 getEditableFolders
+                                 resolveMediaPath
+                                 toLogicalMediaPath])
+(import "../lib/config.clsk" [config getDataFilePath getMediaRoots])
+(import "../lib/constants.clsk" [VIRTUAL_FOLDERS])
+(import "../src/features/media-utils.clsk" [getMediaType])
+(import "../lib/types.clsk" [MediaType])
+(import "./lib/thumbnails.clsk" [hasCachedThumbnail])
+(import "../lib/shares.clsk" [getShare
+                            isShareAccessAuthorized
+                            getEffectiveRestrictions
+                            getSharesAsFileItems
+                            getAllShares
+                            resolveShareSubPath])
+(import "../lib/knowledge-base.clsk" [getKnowledgeBases getKnowledgeBaseRootForPath])
+(import "./lib/audio-helpers.clsk" [extractAudioMetadata])
+(import "../lib/query-keys.clsk" [queryKeys])
+(import "./routes/api/kb.clsk" [walkMarkdownFiles modifiedAtIso])
+
+(def SETTINGS_FILE (getDataFilePath "settings.json"))
+(def STATS_FILE (getDataFilePath "stats.json"))
+(def KB_RECENT_LIMIT 10)
+(def jsPromise (js-global Promise))
+(def jsObject (js-global Object))
+(def jsUndefined (js-global undefined))
+
+(ann preloadQuery (Fn [Js Js] Js))
+(defn preloadQuery [entries options]
+  (let [queryFn options.queryFn
+        queryKey options.queryKey
+        resultPromise (try
+                      (jsPromise.resolve (queryFn))
+                      (catch err (jsPromise.reject err)))]
+    (resultPromise.then
+     (fn [data]
+       (do
+         (entries.push {:queryKey queryKey :data data})
+         data)))))
+
+(ann createPreloadClient (Fn [] Js))
+(defn createPreloadClient []
+  (let [entries (unsafe-cast Js [])]
+    {:entries entries
+     :prefetchQuery (fn [options] (preloadQuery entries options))
+     :clear (fn [] nil)}))
+
+(ann normalizeSlashes (Fn [String] String))
+(defn normalizeSlashes [value]
+  (join (split value "\\") "/"))
+
+(ann defaultSettings (Fn [] Js))
+(defn defaultSettings []
+  {:viewModes {}
+   :favorites []
+   :knowledgeBases []
+   :customIcons {}
+   :autoSave {}
+   :kbChatSystemPrompts {}})
+
+(ann readSettings (Fn [] Js))
+(defn readSettings []
+  (let [readPromise (readFileUtf8 SETTINGS_FILE)
+        parsed (readPromise.then
+                (fn [data]
+                  (let [allSettings (json-parse data)
+                        settings (object-get allSettings config.libraryKey)]
+                    (if (some? settings) settings (defaultSettings)))))]
+    (parsed.catch (fn [_error] (defaultSettings)))))
+
+(ann readStats (Fn [] Js))
+(defn readStats []
+  (let [readPromise (readFileUtf8 STATS_FILE)
+        parsed (readPromise.then
+                (fn [data]
+                  (let [allStats (json-parse data)
+                        stats (object-get allStats config.libraryKey)
+                        viewsValue (object-get stats "views")
+                        shareViewsValue (object-get stats "shareViews")
+                        views (if (some? viewsValue) viewsValue {})
+                        shareViews (if (some? shareViewsValue) shareViewsValue {})]
+                    {:views views :shareViews shareViews})))]
+    (parsed.catch (fn [_error] {:views {} :shareViews {}}))))
+
+(ann extensionOf (Fn [String] String))
+(defn extensionOf [filePath]
+  (let [ext (path.extname filePath)]
+    (lower-case (string-slice ext 1 (count ext)))))
+
+(ann fileThumbnailGenerated (Fn [String Js Js] Js))
+(defn fileThumbnailGenerated [fullPath stat mediaType]
+  (if (or (= mediaType MediaType.IMAGE) (= mediaType MediaType.VIDEO))
+      (hasCachedThumbnail fullPath stat.mtime)
+      jsUndefined))
+
+(ann mostPlayedEntryItem (Fn [Js] Js))
+(defn mostPlayedEntryItem [entry]
+  (try
+   (let [filePath entry.key
+         viewCount entry.value
+         resolved (resolveMediaPath filePath)
+         statPromise (statPath resolved.fullPath)
+         itemPromise (statPromise.then
+                      (fn [stat]
+                        (if (stat.isDirectory)
+                            nil
+                            (let [fileName (path.basename filePath)
+                                  extension (extensionOf fileName)
+                                  mediaType (getMediaType extension)]
+                              {:name fileName
+                               :path filePath
+                               :type mediaType
+                               :size stat.size
+                               :extension extension
+                               :isDirectory false
+                               :viewCount viewCount
+                               :thumbnailGenerated (fileThumbnailGenerated
+                                                    resolved.fullPath
+                                                    stat
+                                                    mediaType)}))))]
+     (itemPromise.catch (fn [_error] nil)))
+   (catch _error (jsPromise.resolve nil))))
+
+(ann getMostPlayedFiles (Fn [] Js))
+(defn getMostPlayedFiles []
+  (let [readPromise (readFileUtf8 STATS_FILE)
+        parsed (readPromise.then
+                (fn [data]
+                  (let [allStats (json-parse data)
+                        stats (object-get allStats config.libraryKey)
+                        viewsValue (object-get stats "views")
+                        views (if (some? viewsValue) viewsValue {})
+                        sortedFiles (slice (sort-with
+                                            (object-entries views)
+                                            (fn [left right] (- right.value left.value)))
+                                           0
+                                           50)
+                        resultsPromise (jsPromise.all (map sortedFiles mostPlayedEntryItem))]
+                    (resultsPromise.then
+                     (fn [results] (filter results (fn [item] (some? item))))))))]
+    (parsed.catch (fn [_error] []))))
+
+(ann favoriteEntryItem (Fn [String] Js))
+(defn favoriteEntryItem [filePath]
+  (try
+   (let [resolved (resolveMediaPath filePath)
+         statPromise (statPath resolved.fullPath)
+         itemPromise (statPromise.then
+                      (fn [stat]
+                        (let [fileName (path.basename filePath)
+                              extension (extensionOf fileName)
+                              directory? (stat.isDirectory)
+                              mediaType (if directory?
+                                            MediaType.FOLDER
+                                            (getMediaType extension))]
+                          {:name fileName
+                           :path filePath
+                           :type mediaType
+                           :size (if directory? 0 stat.size)
+                           :extension extension
+                           :isDirectory directory?
+                           :thumbnailGenerated (fileThumbnailGenerated
+                                                resolved.fullPath
+                                                stat
+                                                mediaType)})))]
+     (itemPromise.catch (fn [_error] nil)))
+   (catch _error (jsPromise.resolve nil))))
+
+(ann getFavoriteFiles (Fn [] Js))
+(defn getFavoriteFiles []
+  (let [readPromise (readFileUtf8 SETTINGS_FILE)
+        parsed (readPromise.then
+                (fn [data]
+                  (let [allSettings (json-parse data)
+                        settings (object-get allSettings config.libraryKey)
+                        favoritesValue (object-get settings "favorites")
+                        favorites (if (some? favoritesValue) favoritesValue [])
+                        resultsPromise (jsPromise.all (map favorites favoriteEntryItem))]
+                    (resultsPromise.then
+                     (fn [results] (filter results (fn [item] (some? item))))))))]
+    (parsed.catch (fn [_error] []))))
+
+(ann fetchFiles (Fn [String] Js))
+(defn fetchFiles [dir]
+  (if (= dir VIRTUAL_FOLDERS.MOST_PLAYED)
+      (getMostPlayedFiles)
+      (if (= dir VIRTUAL_FOLDERS.FAVORITES)
+          (getFavoriteFiles)
+          (if (= dir VIRTUAL_FOLDERS.SHARES)
+              (getSharesAsFileItems)
+              (listDirectory dir)))))
+
+(ann recentFilePayload (Fn [Js] Js))
+(defn recentFilePayload [file]
+  {:path file.path
+   :name (path.basename file.path)
+   :modifiedAt (modifiedAtIso file.mtime)})
+
+(ann getKnowledgeBaseRecentFiles (Fn [String] Js))
+(defn getKnowledgeBaseRecentFiles [root]
+  (let [resolvedRoot (resolveMediaPath root)
+        files (unsafe-cast Js [])
+        walked (walkMarkdownFiles resolvedRoot.fullPath resolvedRoot.root files)]
+    (walked.then
+     (fn [_]
+       {:results (map (slice (sort-by-desc files (fn [file] file.mtime))
+                             0
+                             KB_RECENT_LIMIT)
+                      recentFilePayload)}))))
+
+(ann normalizePath (Fn [String] String))
+(defn normalizePath [filePath]
+  (normalizeSlashes filePath))
+
+(ann getParentDirectory (Fn [String] String))
+(defn getParentDirectory [filePath]
+  (let [normalized (normalizePath filePath)
+        parts (filter (split normalized "/") (fn [part] (not (= part ""))))]
+    (if (<= (count parts) 1)
+        ""
+        (join (slice parts 0 (- (count parts) 1)) "/"))))
+
+(ann getTextFileContent (Fn [String] Js))
+(defn getTextFileContent [filePath]
+  (let [resolved (resolveMediaPath filePath)]
+    (readFileUtf8 resolved.fullPath)))
+
+(ann getAudioFileMetadata (Fn [String] Js))
+(defn getAudioFileMetadata [filePath]
+  (let [resolved (resolveMediaPath filePath)]
+    (extractAudioMetadata resolved.fullPath)))
+
+(ann getSharedFiles (Fn [String] Js))
+(defn getSharedFiles [dir]
+  (let [filesPromise (listDirectory dir)]
+    (filesPromise.then
+     (fn [allFiles]
+       {:files (filter allFiles (fn [file] (not file.isVirtual)))}))))
+
+(ann resolveShareFilePath (Fn [Js String] Js))
+(defn resolveShareFilePath [share requestedPath]
+  (let [normalizedSharePath (normalizePath share.path)
+        normalizedRequestedPath (normalizePath requestedPath)]
+    (if (not share.isDirectory)
+        (if (= normalizedRequestedPath normalizedSharePath) normalizedSharePath nil)
+        (if (or (= normalizedRequestedPath normalizedSharePath)
+                (starts-with? normalizedRequestedPath (str normalizedSharePath "/")))
+            normalizedRequestedPath
+            (let [resolved (resolveShareSubPath share normalizedRequestedPath)]
+              (if (some? resolved) (normalizePath resolved) nil))))))
+
+(ann getShareListingDir (Fn [Js Js String] String))
+(defn getShareListingDir [share dirParam filePath]
+  (if (some? dirParam)
+      (normalizePath dirParam)
+      (let [resolvedPath (resolveShareFilePath share filePath)]
+        (if (not (some? resolvedPath))
+            ""
+            (let [sharePath (normalizePath share.path)
+                  prefix (str sharePath "/")
+                  resolvedText (unsafe-cast String resolvedPath)
+                  relativePath (if (starts-with? resolvedText prefix)
+                                   (string-slice resolvedText (count prefix))
+                                   "")]
+              (getParentDirectory relativePath))))))
+
+(ann filesQueryResult (Fn [String] Js))
+(defn filesQueryResult [dir]
+  (let [filesPromise (fetchFiles dir)]
+    (filesPromise.then (fn [files] {:files files}))))
+
+(ann allSharesResult (Fn [] Js))
+(defn allSharesResult []
+  (let [sharesPromise (getAllShares)]
+    (sharesPromise.then (fn [shares] {:shares shares}))))
+
+(ann optionalUndefined (Fn [Js] Js))
+(defn optionalUndefined [value]
+  (if (some? value) value jsUndefined))
+
+(ann authConfigResult (Fn [] Js))
+(defn authConfigResult []
+  (let [auth (object-get config "auth")
+        enabledValue (object-get auth "enabled")
+        enabled (if (some? enabledValue) enabledValue false)]
+    {:enabled enabled
+     :shareLinkDomain (optionalUndefined config.shareLinkDomain)
+     :editableFolders (getEditableFolders)
+     :mediaRoots (map (getMediaRoots)
+                      (fn [root]
+                        {:name root.name
+                         :editableFolders root.editableFolders}))}))
+
+(ann addDirectViewingPrefetches (Fn [Js Js Js Js] Js))
+(defn addDirectViewingPrefetches [prefetchPromises queryClient dirParam viewingPath]
+  (if (some? viewingPath)
+      (let [viewingType (getMediaType (extensionOf viewingPath))
+            viewingDir (if (some? dirParam) dirParam (getParentDirectory viewingPath))]
+        (do
+          (if (= viewingType MediaType.TEXT)
+              (prefetchPromises.push
+               (queryClient.prefetchQuery
+                {:queryKey (queryKeys.textContent viewingPath)
+                 :queryFn (fn [] (getTextFileContent viewingPath))}))
+              nil)
+          (if (and (some? viewingDir)
+                   (not (= viewingType MediaType.TEXT))
+                   (not (= viewingType MediaType.PDF)))
+              (prefetchPromises.push
+               (queryClient.prefetchQuery
+                {:queryKey (queryKeys.files viewingDir)
+                 :queryFn (fn [] (filesQueryResult viewingDir))}))
+              nil)))
+      nil))
+
+(ann addDirectPlayingPrefetches (Fn [Js Js Js Js] Js))
+(defn addDirectPlayingPrefetches [prefetchPromises queryClient dirParam playingPath]
+  (if (some? playingPath)
+      (let [playingType (getMediaType (extensionOf playingPath))
+            playingDir (if (some? dirParam) dirParam (getParentDirectory playingPath))]
+        (do
+          (if (= playingType MediaType.AUDIO)
+              (prefetchPromises.push
+               (queryClient.prefetchQuery
+                {:queryKey (queryKeys.audioMetadata playingPath)
+                 :queryFn (fn [] (getAudioFileMetadata playingPath))}))
+              nil)
+          (if (and (some? playingDir)
+                   (or (= playingType MediaType.AUDIO) (= playingType MediaType.VIDEO)))
+              (prefetchPromises.push
+               (queryClient.prefetchQuery
+                {:queryKey (queryKeys.files playingDir)
+                 :queryFn (fn [] (filesQueryResult playingDir))}))
+              nil)))
+      nil))
+
+(ann prefetchDirectViewerQueries (Fn [Js Js Js Js] Js))
+(defn prefetchDirectViewerQueries [queryClient dirParam viewingPath playingPath]
+  (let [prefetchPromises (unsafe-cast Js [])]
+    (do
+      (addDirectViewingPrefetches prefetchPromises queryClient dirParam viewingPath)
+      (addDirectPlayingPrefetches prefetchPromises queryClient dirParam playingPath)
+      (jsPromise.all prefetchPromises))))
+
+(ann addShareViewingPrefetches (Fn [Js Js Js Js Js Js] Js))
+(defn addShareViewingPrefetches [prefetchPromises queryClient share shareDirParam viewingPath _playingPath]
+  (if (some? viewingPath)
+      (let [resolvedViewingPath (resolveShareFilePath share viewingPath)
+            viewingType (getMediaType (extensionOf viewingPath))]
+        (do
+          (if (and (some? resolvedViewingPath) (= viewingType MediaType.TEXT))
+              (prefetchPromises.push
+               (queryClient.prefetchQuery
+                {:queryKey (queryKeys.shareText share.token viewingPath)
+                 :queryFn (fn [] (getTextFileContent resolvedViewingPath))}))
+              nil)
+          (if (and share.isDirectory
+                   (not (= viewingType MediaType.TEXT))
+                   (not (= viewingType MediaType.PDF)))
+              (let [viewingDir (getShareListingDir share shareDirParam viewingPath)
+                    resolvedViewingDir (resolveShareSubPath share viewingDir)]
+                (if (some? resolvedViewingDir)
+                    (prefetchPromises.push
+                     (queryClient.prefetchQuery
+                      {:queryKey (queryKeys.shareFiles share.token viewingDir)
+                       :queryFn (fn [] (getSharedFiles resolvedViewingDir))}))
+                    nil))
+              nil)))
+      nil))
+
+(ann addSharePlayingPrefetches (Fn [Js Js Js Js Js] Js))
+(defn addSharePlayingPrefetches [prefetchPromises queryClient share shareDirParam playingPath]
+  (if (some? playingPath)
+      (let [resolvedPlayingPath (resolveShareFilePath share playingPath)
+            playingType (getMediaType (extensionOf playingPath))]
+        (do
+          (if (and (some? resolvedPlayingPath) (= playingType MediaType.AUDIO))
+              (prefetchPromises.push
+               (queryClient.prefetchQuery
+                {:queryKey (queryKeys.audioMetadata playingPath)
+                 :queryFn (fn [] (getAudioFileMetadata resolvedPlayingPath))}))
+              nil)
+          (if (and share.isDirectory
+                   (or (= playingType MediaType.AUDIO) (= playingType MediaType.VIDEO)))
+              (let [playingDir (getShareListingDir share shareDirParam playingPath)
+                    resolvedPlayingDir (resolveShareSubPath share playingDir)]
+                (if (some? resolvedPlayingDir)
+                    (prefetchPromises.push
+                     (queryClient.prefetchQuery
+                      {:queryKey (queryKeys.shareFiles share.token playingDir)
+                       :queryFn (fn [] (getSharedFiles resolvedPlayingDir))}))
+                    nil))
+              nil)))
+      nil))
+
+(ann prefetchShareViewerQueries (Fn [Js Js Js Js Js] Js))
+(defn prefetchShareViewerQueries [queryClient share shareDirParam viewingPath playingPath]
+  (let [prefetchPromises (unsafe-cast Js [])]
+    (do
+      (addShareViewingPrefetches prefetchPromises
+                                 queryClient
+                                 share
+                                 shareDirParam
+                                 viewingPath
+                                 playingPath)
+      (addSharePlayingPrefetches prefetchPromises queryClient share shareDirParam playingPath)
+      (jsPromise.all prefetchPromises))))
+
+(ann rootRoute? (Fn [String] Bool))
+(defn rootRoute? [urlPath]
+  (or (= urlPath "/") (= urlPath "")))
+
+(ann directRoute? (Fn [String] Bool))
+(defn directRoute? [urlPath]
+  (or (rootRoute? urlPath) (= urlPath "/workspace")))
+
+(ann stringOrEmpty (Fn [Js] String))
+(defn stringOrEmpty [value]
+  (if (and (some? value) (not (= value ""))) value ""))
+
+(ann preloadDirectRoute (Fn [Js String Js] Js))
+(defn preloadDirectRoute [queryClient urlPath searchParams]
+  (let [dirParam (searchParams.get "dir")
+        dir (stringOrEmpty dirParam)
+        viewingPath (searchParams.get "viewing")
+        playingPath (searchParams.get "playing")
+        isVirtualFolder (includes? (jsObject.values VIRTUAL_FOLDERS) dir)
+        knowledgeBasesPromise (if (= dir "") (jsPromise.resolve []) (getKnowledgeBases))]
+    (knowledgeBasesPromise.then
+     (fn [knowledgeBases]
+       (let [isKnowledgeBase (and (not (= dir ""))
+                                  (some? (getKnowledgeBaseRootForPath
+                                          (normalizeSlashes dir)
+                                          knowledgeBases)))
+             prefetchPromises (unsafe-cast Js [])]
+         (do
+           (if (and (rootRoute? urlPath) (not isVirtualFolder))
+               (prefetchPromises.push
+                (queryClient.prefetchQuery
+                 {:queryKey (queryKeys.files dir)
+                  :queryFn (fn [] (filesQueryResult dir))}))
+               nil)
+           (prefetchPromises.push
+            (queryClient.prefetchQuery {:queryKey (queryKeys.settings) :queryFn readSettings}))
+           (prefetchPromises.push
+            (queryClient.prefetchQuery {:queryKey (queryKeys.shares) :queryFn allSharesResult}))
+           (prefetchPromises.push
+            (queryClient.prefetchQuery {:queryKey (queryKeys.stats) :queryFn readStats}))
+           (prefetchPromises.push
+            (queryClient.prefetchQuery
+             {:queryKey (queryKeys.authConfig)
+              :queryFn authConfigResult}))
+           (if (and (rootRoute? urlPath) isKnowledgeBase)
+               (prefetchPromises.push
+                (queryClient.prefetchQuery
+                 {:queryKey (queryKeys.kbRecent dir)
+                  :queryFn (fn [] (getKnowledgeBaseRecentFiles dir))}))
+               nil)
+           (let [allPrefetched (jsPromise.all prefetchPromises)]
+             (allPrefetched.then
+              (fn [_]
+                (if (rootRoute? urlPath)
+                    (prefetchDirectViewerQueries queryClient dirParam viewingPath playingPath)
+                    jsUndefined))))))))))
+
+(ann cookieAdapter (Fn [Js] Js))
+(defn cookieAdapter [cookies]
+  {:get (fn [name]
+          (let [value (object-get cookies name)]
+            (if (some? value) {:value value} jsUndefined)))})
+
+(ann readAdminViewMode (Fn [String] Js))
+(defn readAdminViewMode [sharePath]
+  (let [readPromise (readFileUtf8 SETTINGS_FILE)
+        parsed (readPromise.then
+                (fn [data]
+                  (let [allSettings (json-parse data)
+                        settings (object-get allSettings config.libraryKey)
+                        viewModes (object-get settings "viewModes")
+                        mode (object-get viewModes sharePath)]
+                    (if (some? mode) mode "list"))))]
+    (parsed.catch (fn [_error] "list"))))
+
+(ann shareKbContext (Fn [Js Bool] Js))
+(defn shareKbContext [share authorized]
+  (if (and authorized share.isDirectory)
+      (let [knowledgeBasesPromise (getKnowledgeBases)]
+        (knowledgeBasesPromise.then
+         (fn [knowledgeBasesList]
+           (let [knowledgeBaseRoot (getKnowledgeBaseRootForPath
+                                    (normalizeSlashes share.path)
+                                    knowledgeBasesList)
+                 adminModePromise (readAdminViewMode share.path)]
+             (adminModePromise.then
+              (fn [adminViewMode]
+                {:isKnowledgeBase (some? knowledgeBaseRoot)
+                 :knowledgeBaseRoot knowledgeBaseRoot
+                 :adminViewMode adminViewMode}))))))
+      (jsPromise.resolve {:isKnowledgeBase false
+                          :knowledgeBaseRoot nil
+                          :adminViewMode "list"})))
+
+(ann optionalAssoc (Fn [Js Bool String Js] Js))
+(defn optionalAssoc [target condition key value]
+  (if condition (object-assoc target key value) target))
+
+(ann shareInfoPayload (Fn [Js Bool Js Js] Js))
+(defn shareInfoPayload [share authorized restrictions context]
+  (let [name (let [base (path.basename share.path)] (if (= base "") share.path base))
+        extension (if share.isDirectory "" (extensionOf share.path))
+        mediaType (if share.isDirectory "folder" (getMediaType extension))
+        needsPasscode (some? share.passcode)
+        base {:name name
+              :isDirectory share.isDirectory
+              :editable share.editable
+              :mediaType mediaType
+              :extension extension
+              :needsPasscode needsPasscode
+              :authorized authorized}
+        withPath (optionalAssoc base authorized "path" share.path)
+        withRestrictions (optionalAssoc withPath
+                                        (some? restrictions)
+                                        "restrictions"
+                                        restrictions)
+        withKb (optionalAssoc withRestrictions
+                              authorized
+                              "isKnowledgeBase"
+                              context.isKnowledgeBase)
+        withKbRoot (optionalAssoc withKb
+                                  (and authorized (some? context.knowledgeBaseRoot))
+                                  "knowledgeBaseRoot"
+                                  context.knowledgeBaseRoot)]
+    (optionalAssoc withKbRoot
+                   (and authorized share.isDirectory)
+                   "adminViewMode"
+                   context.adminViewMode)))
+
+(ann prefetchShareInfo (Fn [Js String Js Bool Js Js] Js))
+(defn prefetchShareInfo [queryClient token share authorized restrictions context]
+  (let [payload (shareInfoPayload share authorized restrictions context)]
+    (queryClient.prefetchQuery
+     {:queryKey (queryKeys.shareInfo token)
+      :queryFn (fn [] payload)})))
+
+(ann addAuthorizedSharePrefetches (Fn [Js Js Js String Js Bool] Js))
+(defn addAuthorizedSharePrefetches [queryClient share searchParams token context isKnowledgeBase]
+  (let [shareDirParam (searchParams.get "dir")
+        shareDir (stringOrEmpty shareDirParam)
+        viewingPath (searchParams.get "viewing")
+        playingPath (searchParams.get "playing")
+        prefetchPromises (unsafe-cast Js [])]
+    (do
+      (if share.isDirectory
+          (let [resolvedShareDir (resolveShareSubPath share shareDir)]
+            (if (some? resolvedShareDir)
+                (prefetchPromises.push
+                 (queryClient.prefetchQuery
+                  {:queryKey (queryKeys.shareFiles token shareDir)
+                   :queryFn (fn [] (getSharedFiles resolvedShareDir))}))
+                nil))
+          nil)
+      (if isKnowledgeBase
+          (let [resolvedScopePath (resolveShareSubPath share shareDir)]
+            (if (some? resolvedScopePath)
+                (prefetchPromises.push
+                 (queryClient.prefetchQuery
+                  {:queryKey (queryKeys.shareKbRecent
+                              token
+                              (if (= shareDir "") jsUndefined shareDir))
+                   :queryFn (fn [] (getKnowledgeBaseRecentFiles resolvedScopePath))}))
+                nil))
+          nil)
+      (let [basePrefetched (jsPromise.all prefetchPromises)]
+        (basePrefetched.then
+         (fn [_]
+           (prefetchShareViewerQueries queryClient
+                                       share
+                                       shareDirParam
+                                       viewingPath
+                                       playingPath)))))))
+
+(ann preloadExistingShare (Fn [Js String Js Js] Js))
+(defn preloadExistingShare [queryClient token searchParams cookies]
+  (let [sharePromise (getShare token)]
+    (sharePromise.then
+     (fn [share]
+       (if (not (some? share))
+           jsUndefined
+           (let [authorized (isShareAccessAuthorized share (cookieAdapter cookies))
+                 restrictions (if share.editable (getEffectiveRestrictions share) nil)
+                 contextPromise (shareKbContext share authorized)]
+             (contextPromise.then
+              (fn [context]
+                (let [infoPrefetched (prefetchShareInfo queryClient
+                                                        token
+                                                        share
+                                                        authorized
+                                                        restrictions
+                                                        context)]
+                  (infoPrefetched.then
+                   (fn [_]
+                     (if authorized
+                         (addAuthorizedSharePrefetches queryClient
+                                                       share
+                                                       searchParams
+                                                       token
+                                                       context
+                                                       context.isKnowledgeBase)
+                         jsUndefined))))))))))))
+
+(ann preloadShareRoute (Fn [Js String Js Js] Js))
+(defn preloadShareRoute [queryClient urlPath searchParams cookies]
+  (let [token (regex-capture urlPath "^/share/([^/]+)" "")]
+    (if (= token "")
+        (jsPromise.resolve jsUndefined)
+        (preloadExistingShare queryClient token searchParams cookies))))
+
+(ann preloadRoute (Fn [Js String Js Js] Js))
+(defn preloadRoute [queryClient urlPath searchParams cookies]
+  (if (directRoute? urlPath)
+      (preloadDirectRoute queryClient urlPath searchParams)
+      (preloadShareRoute queryClient urlPath searchParams cookies)))
+
+(ann finalizePreload (Fn [Js] String))
+(defn finalizePreload [queryClient]
+  (json-stringify {:queries queryClient.entries}))
+
+(ann preloadForRoute (Fn [String Js Js] Js))
+(defn preloadForRoute [urlPath searchParams cookies]
+  (let [queryClient (createPreloadClient)
+        routePrefetch (try
+                       (preloadRoute queryClient urlPath searchParams cookies)
+                       (catch err
+                         (do
+                           (consoleError "Error during route preload:" err)
+                           (jsPromise.resolve jsUndefined))))
+        handled (routePrefetch.catch
+                 (fn [err]
+                   (do
+                     (consoleError "Error during route preload:" err)
+                     jsUndefined)))]
+    (handled.then (fn [_] (finalizePreload queryClient)))))

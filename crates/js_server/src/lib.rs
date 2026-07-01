@@ -514,39 +514,30 @@ fn response_emit_rule(
     )
 }
 
-pub fn wrap_server_app_module(emitted: &mut js_emit::EmitResult, init_takes_boot: bool) {
-    let prelude = "import { startServerService as __closkellStartServerService } from \"@closkell/runtime\";\n".to_string();
-    let postlude = server_app_bootstrap_postlude(init_takes_boot);
-    let inserted_lines = prelude.lines().count();
-    for mapping in &mut emitted.source_mappings {
-        mapping.generated_line += inserted_lines;
-    }
+pub fn wrap_server_app_module(emitted: &mut js_emit::EmitResult, main_takes_boot: bool) {
+    let postlude = server_app_bootstrap_postlude(main_takes_boot);
     if !emitted.code.ends_with('\n') {
         emitted.code.push('\n');
     }
-    emitted.code = format!("{}{}{}", prelude, emitted.code, postlude);
+    emitted.code.push_str(&postlude);
 }
 
-fn server_app_bootstrap_postlude(init_takes_boot: bool) -> String {
+fn server_app_bootstrap_postlude(main_takes_boot: bool) -> String {
     let mut code = String::new();
-    code.push_str("const __closkellServerBoot = {\n");
+    code.push_str("export const __closkellServerBoot = {\n");
     code.push_str("  argv: globalThis.process?.argv ?? [],\n");
     code.push_str("  env: globalThis.process?.env ?? {},\n");
     code.push_str("  cwd: globalThis.process?.cwd?.() ?? \"\",\n");
     code.push_str("  mode: globalThis.process?.env?.NODE_ENV ?? \"development\",\n");
-    code.push_str("  runtime: globalThis.Bun ? \"bun\" : \"node\"\n");
+    code.push_str("  runtime: \"node\"\n");
     code.push_str("};\n");
-    code.push_str("export const __closkellService = __closkellStartServerService({\n");
-    code.push_str("  init,\n");
-    code.push_str("  update,\n");
-    code.push_str("  routes,\n");
-    code.push_str("  resources,\n");
-    if init_takes_boot {
-        code.push_str("  boot: __closkellServerBoot\n");
+    if main_takes_boot {
+        code.push_str(
+            "export const __closkellServerResult = await main(__closkellServerBoot);\n\n",
+        );
     } else {
-        code.push_str("  boot: undefined\n");
+        code.push_str("export const __closkellServerResult = await main();\n\n");
     }
-    code.push_str("});\n\n");
     code
 }
 
@@ -664,9 +655,9 @@ mod tests {
     }
 
     #[test]
-    fn server_app_wrapper_injects_service_bootstrap() {
+    fn server_app_wrapper_invokes_direct_main() {
         let mut emitted = js_emit::EmitResult {
-            code: "function init(boot) { return [{}, { kind: Symbol.for(\"none\") }]; }\nfunction update(state, msg) { return [state, { kind: Symbol.for(\"none\") }]; }\nfunction routes(state) { return []; }\nfunction resources(state) { return { kind: Symbol.for(\"server/resources\"), resources: [] }; }\nconst banner = \"export const text should stay literal\";\n".to_string(),
+            code: "function main(boot) { return startFastify(boot); }\nconst banner = \"export const text should stay literal\";\n".to_string(),
             diagnostics: Vec::new(),
             source_mappings: vec![js_emit::SourceMapping {
                 generated_line: 1,
@@ -679,20 +670,19 @@ mod tests {
 
         wrap_server_app_module(&mut emitted, true);
 
+        assert!(!emitted.code.contains("__closkellService"));
+        assert!(emitted.code.contains("export const __closkellServerBoot"));
         assert!(
-            emitted
-                .code
-                .contains("startServerService as __closkellStartServerService")
+            emitted.code.contains(
+                "export const __closkellServerResult = await main(__closkellServerBoot);"
+            )
         );
-        assert!(emitted.code.contains("export const __closkellService"));
-        assert!(emitted.code.contains("  update,"));
-        assert!(emitted.code.contains("boot: __closkellServerBoot"));
         assert!(!emitted.code.contains("export function init"));
         assert!(
             emitted
                 .code
                 .contains("\"export const text should stay literal\"")
         );
-        assert!(emitted.source_mappings[0].generated_line > 1);
+        assert_eq!(emitted.source_mappings[0].generated_line, 1);
     }
 }

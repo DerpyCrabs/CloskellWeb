@@ -1,0 +1,64 @@
+(def defaultMaxUploadBytes (* 2 1024 1024 1024))
+(def positiveInfinity (/ 1 0))
+
+(type ShareRestrictions
+  {:allowDelete (Option Bool)
+   :allowUpload (Option Bool)
+   :allowEdit (Option Bool)
+   :maxUploadBytes (Option Number)})
+
+(type EffectiveShareRestrictions
+  {:allowDelete Bool
+   :allowUpload Bool
+   :allowEdit Bool
+   :maxUploadBytes Number})
+
+(type ShareLink
+  {:token String
+   :path String
+   :isDirectory Bool
+   :editable Bool
+   :passcode (Option String)
+   :createdAt Number
+   :restrictions (Option ShareRestrictions)
+   :usedBytes (Option Number)})
+
+(type UploadQuota
+  {:allowed Bool
+   :remaining Number})
+
+(def defaultRestrictions
+  {:allowDelete nil
+   :allowUpload nil
+   :allowEdit nil
+   :maxUploadBytes nil})
+
+(ann boolNotFalse (Fn [(Option Bool)] Bool))
+(defn boolNotFalse [value]
+  (not (= value false)))
+
+(ann optionNumberOr (Fn [(Option Number) Number] Number))
+(defn optionNumberOr [value fallback]
+  (match value
+    nil fallback
+    (some current) current))
+
+(ann getEffectiveRestrictions (Fn [ShareLink] EffectiveShareRestrictions))
+(defn getEffectiveRestrictions [share]
+  (let [restrictions (match share.restrictions
+                       nil defaultRestrictions
+                       (some current) current)]
+    {:allowDelete (boolNotFalse restrictions.allowDelete)
+     :allowUpload (boolNotFalse restrictions.allowUpload)
+     :allowEdit (boolNotFalse restrictions.allowEdit)
+     :maxUploadBytes (optionNumberOr restrictions.maxUploadBytes defaultMaxUploadBytes)}))
+
+(ann checkUploadQuota (Fn [ShareLink Number] UploadQuota))
+(defn checkUploadQuota [share contentSizeBytes]
+  (let [restrictions (getEffectiveRestrictions share)]
+    (if (= restrictions.maxUploadBytes 0)
+        {:allowed true :remaining positiveInfinity}
+        (let [used (optionNumberOr share.usedBytes 0)
+              remaining (max 0 (- restrictions.maxUploadBytes used))]
+          {:allowed (<= contentSizeBytes remaining)
+           :remaining remaining}))))

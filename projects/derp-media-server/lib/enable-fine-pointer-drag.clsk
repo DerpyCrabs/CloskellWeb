@@ -1,0 +1,31 @@
+(def jsGlobalThis (js-global globalThis))
+
+(ann browserWindow (Fn [] Js))
+(defn browserWindow []
+  jsGlobalThis.window)
+
+(ann finePointerDragEnabled (Fn [] Bool))
+(defn finePointerDragEnabled []
+  (let [win (browserWindow)]
+    (if (not (some? win))
+        false
+        (let [mqHover (win.matchMedia "(hover: hover)")
+              mqFine (win.matchMedia "(pointer: fine)")]
+          (or mqHover.matches mqFine.matches)))))
+
+(ann subscribeFinePointerDragEnabled (Fn [Js] Js))
+(defn subscribeFinePointerDragEnabled [cb]
+  (let [win (browserWindow)]
+    (if (not (some? win))
+        (fn [] nil)
+        (let [mqHover (win.matchMedia "(hover: hover)")
+              mqFine (win.matchMedia "(pointer: fine)")
+              sync (fn [] (cb (or mqHover.matches mqFine.matches)))]
+          (do
+            (mqHover.addEventListener "change" sync)
+            (mqFine.addEventListener "change" sync)
+            (fn []
+              (do
+                (mqHover.removeEventListener "change" sync)
+                (mqFine.removeEventListener "change" sync)
+                nil)))))))

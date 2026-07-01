@@ -1,0 +1,27 @@
+(import "../src/features/workspace/layout-presets.clsk" [parseWorkspaceLayoutPresetsListWithNow
+                                                         (sanitizeAdminWorkspaceLayoutPresets as closkellSanitizeAdminWorkspaceLayoutPresets)
+                                                         (sanitizeShareWorkspaceLayoutPresets as closkellSanitizeShareWorkspaceLayoutPresets)])
+
+(ann currentIso (Fn [] String))
+(defn currentIso []
+  (let [date (new (js-global Date))]
+    (date.toISOString)))
+
+(ann normalizeParsedPresetShape (Fn [Js] Js))
+(defn normalizeParsedPresetShape [preset]
+  (if (some? preset.updatedAt)
+      preset
+      (object-assoc preset "updatedAt" nil)))
+
+(ann parseWorkspaceLayoutPresetsList (Fn [Js] Js))
+(defn parseWorkspaceLayoutPresetsList [raw]
+  (map (parseWorkspaceLayoutPresetsListWithNow raw (currentIso))
+       normalizeParsedPresetShape))
+
+(ann sanitizeAdminWorkspaceLayoutPresets (Fn [Js] Js))
+(defn sanitizeAdminWorkspaceLayoutPresets [presets]
+  (closkellSanitizeAdminWorkspaceLayoutPresets presets))
+
+(ann sanitizeShareWorkspaceLayoutPresets (Fn [String String Js] Js))
+(defn sanitizeShareWorkspaceLayoutPresets [sharePath token presets]
+  (closkellSanitizeShareWorkspaceLayoutPresets sharePath token presets))

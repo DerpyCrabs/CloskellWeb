@@ -1,0 +1,229 @@
+(import "path" [(default path)])
+(import "node:console" [(log as consoleLog) (error as consoleError)])
+(import "./html.clsk" [preloadForRoute])
+(import "./http-routes.clsk" [registerHttpRoutes])
+(import "../lib/host-env.clsk" [hostEnv hostExit readTextFileSync])
+
+(def jsUndefined (js-global undefined))
+
+(ann errorStatusCode (Fn [Js] Number))
+(defn errorStatusCode [error]
+  (if (and (object? error) (number? error.statusCode))
+      error.statusCode
+      0))
+
+(ann errorMessage (Fn [Js String] String))
+(defn errorMessage [error fallback]
+  (if (and (object? error) (string? error.message))
+      error.message
+      fallback))
+
+(ann registerErrorHandler (Fn [Js] Js))
+(defn registerErrorHandler [app]
+  (do
+    (app.setErrorHandler
+     (fn [error _request reply]
+       (let [statusCode (errorStatusCode error)]
+         (if (> statusCode 0)
+             (let [codedReply (reply.code statusCode)]
+               (codedReply.send {:error (errorMessage error "Error")}))
+             (do
+               (consoleError error)
+               (let [codedReply (reply.code 500)]
+                 (codedReply.send {:error "Internal Server Error"})))))))
+    app))
+
+(ann envObject (Fn [ServerBoot] Js))
+(defn envObject [boot]
+  (if (object? boot.env) boot.env (hostEnv)))
+
+(ann envString (Fn [Js String] Js))
+(defn envString [env name]
+  (let [value (object-get env name)]
+    (if (string? value) value nil)))
+
+(ann serverMode (Fn [ServerBoot] String))
+(defn serverMode [boot]
+  (if (string? boot.mode)
+      boot.mode
+      (let [nodeEnv (envString (hostEnv) "NODE_ENV")]
+        (if (string? nodeEnv) nodeEnv "development"))))
+
+(ann serverPort (Fn [Js] Number))
+(defn serverPort [env]
+  (let [parsed (to-number (object-get env "PORT"))]
+    (if (> parsed 0) parsed 3000)))
+
+(ann requestHost (Fn [Js] String))
+(defn requestHost [request]
+  (let [host request.headers.host]
+    (if (string? host) host "localhost")))
+
+(ann requestUrl (Fn [Js] Js))
+(defn requestUrl [request]
+  (new (js-global URL) request.url (str "http://" (requestHost request))))
+
+(ann requestCookies (Fn [Js] Js))
+(defn requestCookies [request]
+  (if (object? request.cookies) request.cookies {}))
+
+(ann injectPreloaded (Fn [String String] String))
+(defn injectPreloaded [template preloaded]
+  (join (split template "<!--PRELOADED-->")
+        (str "<script>window.__PRELOADED_STATE__=" preloaded "</script>")))
+
+(ann preloadedHtmlPromise (Fn [Js Js String] Js))
+(defn preloadedHtmlPromise [request url template]
+  (let [preloadedPromise (preloadForRoute
+                          url.pathname
+                          url.searchParams
+                          (requestCookies request))]
+    (preloadedPromise.then
+     (fn [preloaded] (injectPreloaded template preloaded)))))
+
+(ann sendHtmlError (Fn [Js Js] Js))
+(defn sendHtmlError [reply err]
+  (do
+    (consoleError "Error serving HTML:" err)
+    (let [codedReply (reply.code 500)]
+      (codedReply.send "Internal Server Error"))))
+
+(ann sendHtmlPromise (Fn [Js Js] Js))
+(defn sendHtmlPromise [reply htmlPromise]
+  (let [sent (htmlPromise.then
+              (fn [html]
+                (let [typedReply (reply.type "text/html")]
+                  (typedReply.send html))))]
+    (sent.catch (fn [err] (sendHtmlError reply err)))))
+
+(ann sendDevHtml (Fn [Js String Js Js] Js))
+(defn sendDevHtml [vite devIndexHtml request reply]
+  (try
+   (let [url (requestUrl request)
+         template (readTextFileSync devIndexHtml)
+         transformedPromise (vite.transformIndexHtml url.pathname template)
+         htmlPromise (transformedPromise.then
+                      (fn [transformed]
+                        (preloadedHtmlPromise request url transformed)))]
+     (sendHtmlPromise reply htmlPromise))
+   (catch err (sendHtmlError reply err))))
+
+(ann sendStaticHtml (Fn [String Js Js] Js))
+(defn sendStaticHtml [templateHtml request reply]
+  (try
+   (let [url (requestUrl request)
+         htmlPromise (preloadedHtmlPromise request url templateHtml)]
+     (sendHtmlPromise reply htmlPromise))
+   (catch err (sendHtmlError reply err))))
+
+(ann viteCacheDir (Fn [Js] Js))
+(defn viteCacheDir [env]
+  (let [batchId (envString env "BATCH_ID")]
+    (if (string? batchId)
+        (str "node_modules/.vite-test-" batchId)
+        "node_modules/.vite-test")))
+
+(ann viteOptions (Fn [Bool Number Js] Js))
+(defn viteOptions [isTest port env]
+  {:server {:middlewareMode true
+            :hmr (if isTest {:port (+ port 1000)} jsUndefined)
+            :forwardConsole false
+            :watch {:ignored ["**/test-media/**"
+                              "**/test-media-*/**"
+                              "**/test-data-*/**"
+                              "**/tests/fixtures/.auth/**"
+                              "**/tests/fixtures/test-config-*"
+                              "**/test-results/**"
+                              "**/playwright-report/**"
+                              "**/tests/**"
+                              "**/kb-chats.json"
+                              "**/shares.json"
+                              "**/settings.json"
+                              "**/stats.json"]}}
+   :appType "custom"
+   :cacheDir (if isTest (viteCacheDir env) jsUndefined)})
+
+(ann requestPathnameFromUrl (Fn [Js] String))
+(defn requestPathnameFromUrl [url]
+  (if (string? url)
+      (first (split url "?"))
+      "/"))
+
+(ann shouldBypassViteMiddleware? (Fn [Js] Bool))
+(defn shouldBypassViteMiddleware? [url]
+  (let [pathname (requestPathnameFromUrl url)]
+    (or (= pathname "/api") (starts-with? pathname "/api/"))))
+
+(ann viteMiddleware (Fn [Js] Js))
+(defn viteMiddleware [vite]
+  (fn [req res next]
+    (if (shouldBypassViteMiddleware? req.url)
+        (next)
+        (vite.middlewares req res next))))
+
+(ann registerViteHtmlRoutes (Fn [Js Js] Js))
+(defn registerViteHtmlRoutes [app vite]
+  (let [devIndexHtml (path.resolve "index.html")]
+    (do
+      (app.use (viteMiddleware vite))
+      (registerHttpRoutes
+       app
+       [{:method "GET"
+         :path "*"
+         :handler (fn [request reply]
+                    (sendDevHtml vite devIndexHtml request reply))}]))))
+
+(ann createAndRegisterVite (Fn [Js Js Bool Number Js] Js))
+(defn createAndRegisterVite [app viteModule isTest port env]
+  (let [createViteServer viteModule.createServer
+        vitePromise (createViteServer (viteOptions isTest port env))]
+    (vitePromise.then (fn [vite] (registerViteHtmlRoutes app vite)))))
+
+(ann registerDevHtmlRoutes (Fn [Js Js Bool Number Js] Js))
+(defn registerDevHtmlRoutes [app fastifyMiddie isTest port env]
+  (let [registered (app.register fastifyMiddie)]
+    (registered.then
+     (fn [_]
+       (let [viteModulePromise (js-import "vite")]
+         (viteModulePromise.then
+          (fn [viteModule]
+            (createAndRegisterVite app viteModule isTest port env))))))))
+
+(ann registerProductionHtmlRoutes (Fn [Js Js] Js))
+(defn registerProductionHtmlRoutes [app fastifyStatic]
+  (let [staticRoot "dist/client"
+        registered (app.register fastifyStatic
+                                 {:root (path.resolve staticRoot)
+                                  :prefix "/"
+                                  :wildcard false})]
+    (registered.then
+     (fn [_]
+       (let [templateHtml (readTextFileSync
+                           (path.resolve staticRoot "index.html"))]
+        (registerHttpRoutes
+         app
+         [{:method "GET"
+           :path "*"
+           :handler (fn [request reply]
+                      (sendStaticHtml templateHtml request reply))}]))))))
+
+(ann registerHtmlRoutes (Fn [Js ServerBoot Js Js] Js))
+(defn registerHtmlRoutes [app boot fastifyMiddie fastifyStatic]
+  (let [mode (serverMode boot)
+        env (envObject boot)
+        isDev (not (= mode "production"))
+        isTest (= mode "test")
+        port (serverPort env)]
+    (if isDev
+        (registerDevHtmlRoutes app fastifyMiddie isTest port env)
+        (registerProductionHtmlRoutes app fastifyStatic))))
+
+(ann logServerStarted (Fn [Number] Nil))
+(defn logServerStarted [port]
+  (consoleLog (str "Server listening on http://localhost:" port)))
+
+(ann handleServerStartFailure (Fn [Js] Js))
+(defn handleServerStartFailure [err]
+  (do
+    (consoleError "Failed to start server:" err)
+    (hostExit 1)))

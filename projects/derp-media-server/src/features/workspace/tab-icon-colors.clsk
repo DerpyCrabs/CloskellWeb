@@ -1,0 +1,56 @@
+(type WorkspaceTabIconSwatch {:key String :twBg String})
+
+(ann workspaceTabIconSwatches (Vector WorkspaceTabIconSwatch))
+(def workspaceTabIconSwatches
+  [{:key "slate-500" :twBg "bg-slate-500"}
+   {:key "zinc-500" :twBg "bg-zinc-500"}
+   {:key "neutral-500" :twBg "bg-neutral-500"}
+   {:key "stone-500" :twBg "bg-stone-500"}
+   {:key "red-500" :twBg "bg-red-500"}
+   {:key "orange-500" :twBg "bg-orange-500"}
+   {:key "amber-500" :twBg "bg-amber-500"}
+   {:key "yellow-500" :twBg "bg-yellow-500"}
+   {:key "lime-500" :twBg "bg-lime-500"}
+   {:key "green-500" :twBg "bg-green-500"}
+   {:key "emerald-500" :twBg "bg-emerald-500"}
+   {:key "teal-500" :twBg "bg-teal-500"}
+   {:key "cyan-500" :twBg "bg-cyan-500"}
+   {:key "sky-500" :twBg "bg-sky-500"}
+   {:key "blue-500" :twBg "bg-blue-500"}
+   {:key "indigo-500" :twBg "bg-indigo-500"}
+   {:key "violet-500" :twBg "bg-violet-500"}
+   {:key "purple-500" :twBg "bg-purple-500"}
+   {:key "fuchsia-500" :twBg "bg-fuchsia-500"}
+   {:key "pink-500" :twBg "bg-pink-500"}
+   {:key "rose-500" :twBg "bg-rose-500"}])
+
+(def HEX_BY_KEY
+  {"slate-500" "#64748b"
+   "zinc-500" "#71717a"
+   "neutral-500" "#737373"
+   "stone-500" "#78716c"
+   "red-500" "#ef4444"
+   "orange-500" "#f97316"
+   "amber-500" "#f59e0b"
+   "yellow-500" "#eab308"
+   "lime-500" "#84cc16"
+   "green-500" "#22c55e"
+   "emerald-500" "#10b981"
+   "teal-500" "#14b8a6"
+   "cyan-500" "#06b6d4"
+   "sky-500" "#0ea5e9"
+   "blue-500" "#3b82f6"
+   "indigo-500" "#6366f1"
+   "violet-500" "#8b5cf6"
+   "purple-500" "#a855f7"
+   "fuchsia-500" "#d946ef"
+   "pink-500" "#ec4899"
+   "rose-500" "#f43f5e"})
+
+(ann isWorkspaceTabIconColorKey (Fn [String] Bool))
+(defn isWorkspaceTabIconColorKey [value]
+  (some? (object-get HEX_BY_KEY value)))
+
+(ann workspaceTabIconColorKeyToHex (Fn [String] (Option String)))
+(defn workspaceTabIconColorKeyToHex [key]
+  (object-get HEX_BY_KEY key))

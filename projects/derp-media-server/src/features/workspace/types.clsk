@@ -1,0 +1,16 @@
+(import "../../../lib/types.clsk" [WorkspaceTaskbarPin])
+(import "./tab-groups-core.clsk" [ActiveTabMap
+                                  TabGroupSplits
+                                  WorkspaceTabWindow])
+
+(type WorkspaceState
+  {:windows (Vector WorkspaceTabWindow)
+   :activeWindowId String
+   :activeTabMap ActiveTabMap
+   :nextWindowId Number
+   :pinnedTaskbarItems (Vector WorkspaceTaskbarPin)
+   :tabGroupSplits TabGroupSplits
+   :browserTabTitle (Option String)
+   :browserTabIcon (Option String)
+   :browserTabIconColor (Option String)
+   :fileOpenTarget (Option String)})

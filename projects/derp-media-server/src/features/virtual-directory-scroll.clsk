@@ -1,0 +1,18 @@
+(def jsMap (js-global Map))
+
+(def scrollers (new jsMap))
+
+(ann registerVirtualFileScroller (Fn [String Js] Js))
+(defn registerVirtualFileScroller [scope scroller]
+  (do
+    (scrollers.set scope scroller)
+    (fn []
+      (if (identical? (scrollers.get scope) scroller)
+          (scrollers.delete scope)
+          nil))))
+
+(ann getVirtualFileScroller (Fn [Js] Js))
+(defn getVirtualFileScroller [scope]
+  (if (or (not (string? scope)) (= scope ""))
+      nil
+      (scrollers.get scope)))

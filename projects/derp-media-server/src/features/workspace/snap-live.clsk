@@ -1,0 +1,196 @@
+(import "./geometry.clsk" [snapZoneToBoundsWithOccupied])
+
+(type WorkspaceBounds
+  {:x Number
+   :y Number
+   :width Number
+   :height Number})
+
+(type WorkspaceCanvasSize
+  {:width Number
+   :height Number})
+
+(type SnapWindowLayout
+  {:bounds (Option WorkspaceBounds)
+   :snapZone (Option String)
+   :fullscreen (Option Bool)
+   :minimized (Option Bool)})
+
+(type SnapWindow
+  {:id String
+   :type String
+   :tabGroupId (Option String)
+   :layout SnapWindowLayout})
+
+(type OccupiedSnapBounds
+  {:bounds WorkspaceBounds
+   :snapZone String})
+
+(type LiveCell
+  {:col Number
+   :row Number})
+
+(def mergeTolerance 6)
+
+(ann mergeCloseSorted (Fn [(Vector Number)] (Vector Number)))
+(defn mergeCloseSorted [sorted]
+  (if (= (count sorted) 0)
+      []
+      (reduce (slice sorted 1 (count sorted))
+              [(nth sorted 0)]
+              (fn [out value]
+                (let [lastValue (last out)]
+                  (if (<= (- value lastValue) mergeTolerance)
+                      (conj (drop-last out 1) (round (/ (+ lastValue value) 2)))
+                      (conj out value)))))))
+
+(ann layoutObject (Fn [SnapWindow] SnapWindowLayout))
+(defn layoutObject [win]
+  (let [layout (get win :layout)]
+    (if (object? layout) layout {})))
+
+(ann layoutBounds (Fn [SnapWindowLayout] (Option WorkspaceBounds)))
+(defn layoutBounds [layout]
+  (let [bounds (get layout :bounds)]
+    (if (object? bounds) (unsafe-cast WorkspaceBounds bounds) nil)))
+
+(ann layoutSnapZone (Fn [SnapWindowLayout] (Option String)))
+(defn layoutSnapZone [layout]
+  (let [zone (get layout :snapZone)]
+    (if (string? zone) zone nil)))
+
+(ann layoutBoolTrue? (Fn [SnapWindowLayout String] Bool))
+(defn layoutBoolTrue? [layout field]
+  (= (object-get layout field) true))
+
+(ann clampNumber (Fn [Number Number Number] Number))
+(defn clampNumber [minValue maxValue value]
+  (max minValue (min maxValue value)))
+
+(ann collectEdgeCoordinates (Fn [(Vector SnapWindow) WorkspaceCanvasSize String Number] (Vector Number)))
+(defn collectEdgeCoordinates [windows canvas axis span]
+  (let [raw (reduce windows
+                    [0 span]
+                    (fn [coords win]
+                      (let [layout (layoutObject win)
+                            bounds (layoutBounds layout)
+                            zone (layoutSnapZone layout)]
+                        (match bounds
+                          nil coords
+                          (some b)
+                            (if (or (not (some? zone))
+                                    (layoutBoolTrue? layout "minimized")
+                                    (layoutBoolTrue? layout "fullscreen"))
+                                coords
+                                (if (= axis "x")
+                                    (conj (conj coords (clampNumber 0 span (round b.x)))
+                                          (clampNumber 0 span (round (+ b.x b.width))))
+                                    (conj (conj coords (clampNumber 0 span (round b.y)))
+                                          (clampNumber 0 span (round (+ b.y b.height))))))))))]
+    (mergeCloseSorted (sort-with raw (fn [a b] (- a b))))))
+
+(ann equalSplits (Fn [Number Number] (Vector Number)))
+(defn equalSplits [span segments]
+  (map (range 0 (+ segments 1))
+       (fn [index] (round (/ (* span index) segments)))))
+
+(ann pickAxisLines (Fn [(Vector Number) Number Number] (Vector Number)))
+(defn pickAxisLines [raw span segments]
+  (let [merged (mergeCloseSorted (sort-with (conj (conj raw 0) span)
+                                            (fn [a b] (- a b))))]
+    (if (>= (count merged) (+ segments 1))
+        (if (= (count merged) (+ segments 1))
+            merged
+            (equalSplits span segments))
+        (equalSplits span segments))))
+
+(ann shapeToLiveGridKey (Fn [Js] (Option String)))
+(defn shapeToLiveGridKey [shape]
+  (match shape
+    "3x2" "thirds3x2"
+    "3x3" "grid3x3"
+    "2x2" "quarters"
+    "2x3" "grid2x3"
+    _ nil))
+
+(ann gridDims (Fn [String] Js))
+(defn gridDims [key]
+  (match key
+    "thirds3x2" {:cols 3 :rows 2}
+    "quarters" {:cols 2 :rows 2}
+    "leftRight" {:cols 2 :rows 1}
+    "topBottom" {:cols 1 :rows 2}
+    "verticalThirds" {:cols 1 :rows 3}
+    "grid2x3" {:cols 2 :rows 3}
+    "grid3x3" {:cols 3 :rows 3}
+    _ {:cols 1 :rows 1}))
+
+(ann liveCellForZone (Fn [String String] (Option LiveCell)))
+(defn liveCellForZone [gridKey zone]
+  (match gridKey
+    "thirds3x2"
+      (match zone
+        "top-left-third" {:col 0 :row 0}
+        "top-center-third" {:col 1 :row 0}
+        "top-right-third" {:col 2 :row 0}
+        "bottom-left-third" {:col 0 :row 1}
+        "bottom-center-third" {:col 1 :row 1}
+        "bottom-right-third" {:col 2 :row 1}
+        _ nil)
+    "quarters"
+      (match zone
+        "top-left" {:col 0 :row 0}
+        "top-right" {:col 1 :row 0}
+        "bottom-left" {:col 0 :row 1}
+        "bottom-right" {:col 1 :row 1}
+        _ nil)
+    _ nil))
+
+(ann liveCellBounds (Fn [String WorkspaceCanvasSize (Vector SnapWindow) Js] (Option WorkspaceBounds)))
+(defn liveCellBounds [zone canvas windows assistGridShape]
+  (match (shapeToLiveGridKey assistGridShape)
+    nil nil
+    (some gridKey)
+      (match (liveCellForZone gridKey zone)
+        nil nil
+        (some cell)
+          (let [dims (gridDims gridKey)
+                xs (pickAxisLines (collectEdgeCoordinates windows canvas "x" canvas.width)
+                                  canvas.width
+                                  dims.cols)
+                ys (pickAxisLines (collectEdgeCoordinates windows canvas "y" canvas.height)
+                                  canvas.height
+                                  dims.rows)]
+            (if (or (>= (+ cell.col 1) (count xs))
+                    (>= (+ cell.row 1) (count ys)))
+                nil
+                (let [x (nth xs cell.col)
+                      y (nth ys cell.row)
+                      width (- (nth xs (+ cell.col 1)) x)
+                      height (- (nth ys (+ cell.row 1)) y)]
+                  (if (or (< width 50) (< height 50))
+                      nil
+                      {:x x :y y :width width :height height})))))))
+
+(ann intersectOccupiedAware (Fn [WorkspaceBounds String (Vector OccupiedSnapBounds) WorkspaceCanvasSize] WorkspaceBounds))
+(defn intersectOccupiedAware [live zone occupied canvas]
+  (let [template (snapZoneToBoundsWithOccupied zone occupied canvas)
+        x0 (max live.x template.x)
+        y0 (max live.y template.y)
+        x1 (min (+ live.x live.width) (+ template.x template.width))
+        y1 (min (+ live.y live.height) (+ template.y template.height))
+        width (max 100 (- x1 x0))
+        height (max 100 (- y1 y0))]
+    {:x (max 0 (min x0 (- canvas.width width)))
+     :y (max 0 (min y0 (- canvas.height height)))
+     :width (min width canvas.width)
+     :height (min height canvas.height)}))
+
+(ann snapZonePreviewBoundsForDrag (Fn [String WorkspaceCanvasSize (Vector SnapWindow) (Vector OccupiedSnapBounds) Js] WorkspaceBounds))
+(defn snapZonePreviewBoundsForDrag [zone canvas windows occupied preferredAssistGridShape]
+  (match (liveCellBounds zone canvas windows preferredAssistGridShape)
+    nil (snapZoneToBoundsWithOccupied zone occupied canvas)
+    (some live)
+      (if (= (count occupied) 0)
+          live
+          (intersectOccupiedAware live zone occupied canvas))))

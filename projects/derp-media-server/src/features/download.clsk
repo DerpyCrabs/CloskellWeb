@@ -1,0 +1,17 @@
+(import "./source-context.clsk" [normalizeSlashes stripSharePrefix])
+
+(type ShareDownloadContext {:token String :sharePath String})
+
+(ann fileDownloadHref (Fn [String (Option ShareDownloadContext)] String))
+(defn fileDownloadHref [path share]
+  (let [norm (normalizeSlashes path)]
+    (match share
+      (some currentShare)
+        (let [rel (stripSharePrefix norm currentShare.sharePath)]
+          (str "/api/share/"
+               currentShare.token
+               "/download?path="
+               (encode-uri-component rel)))
+      nil
+        (str "/api/files/download?path="
+             (encode-uri-component path)))))

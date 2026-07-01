@@ -1,0 +1,78 @@
+(import "fs" [createReadStream existsSync statSync])
+
+(ann fileStatsSync (Fn [String] Js))
+(defn fileStatsSync [fullPath]
+  (statSync fullPath))
+
+(ann fileExistsSync (Fn [String] Bool))
+(defn fileExistsSync [fullPath]
+  (existsSync fullPath))
+
+(ann replyAbortSignal (Fn [Js Js] Js))
+(defn replyAbortSignal [request reply]
+  (let [controller (new (js-global AbortController))
+        abort (fn []
+                (if (not reply.raw.writableEnded)
+                    (controller.abort)
+                    nil))]
+    (do
+      (request.raw.once "aborted" abort)
+      (reply.raw.once "close" abort)
+      (reply.raw.once "finish"
+                      (fn []
+                        (do
+                          (request.raw.off "aborted" abort)
+                          (reply.raw.off "close" abort))))
+      controller.signal)))
+
+(ann pipeRawResponse (Fn [Js Number Js Js] Js))
+(defn pipeRawResponse [reply status headers stream]
+  (do
+    (reply.raw.writeHead status headers)
+    (stream.pipe reply.raw)
+    reply))
+
+(ann streamFileResponse (Fn [Js String Number Js] Js))
+(defn streamFileResponse [reply fullPath status headers]
+  (pipeRawResponse reply status headers (createReadStream fullPath)))
+
+(ann streamFileRangeResponse (Fn [Js String Number Number Number Js] Js))
+(defn streamFileRangeResponse [reply fullPath start end status headers]
+  (pipeRawResponse reply status headers (createReadStream fullPath {:start start :end end})))
+
+(ann streamArchiveResponse (Fn [Js Number Js Js] Js))
+(defn streamArchiveResponse [reply status headers archive]
+  (do
+    (reply.raw.writeHead status headers)
+    (archive.on "error" (fn [err] (reply.raw.destroy err)))
+    (archive.pipe reply.raw)
+    reply))
+
+(ann sendRawResponse (Fn [Js Number Js Js] Js))
+(defn sendRawResponse [reply status headers body]
+  (do
+    (reply.raw.writeHead status headers)
+    (reply.raw.end body)
+    reply))
+
+(ann startEventStreamResponse (Fn [Js] Js))
+(defn startEventStreamResponse [reply]
+  (reply.raw.writeHead 200 {"Content-Type" "text/event-stream"
+                            "Cache-Control" "no-cache"
+                            "Connection" "keep-alive"}))
+
+(ann writeEventStreamChunk (Fn [Js String] Js))
+(defn writeEventStreamChunk [reply data]
+  (reply.raw.write data))
+
+(ann endRawResponse (Fn [Js] Js))
+(defn endRawResponse [reply]
+  (reply.raw.end))
+
+(ann replyHeadersSent? (Fn [Js] Bool))
+(defn replyHeadersSent? [reply]
+  (= reply.raw.headersSent true))
+
+(ann onRequestClose (Fn [Js (Fn [] Nil)] Js))
+(defn onRequestClose [request handler]
+  (request.raw.on "close" handler))

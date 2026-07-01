@@ -1,0 +1,61 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+/node_modules
+/.pnp
+
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# testing
+/coverage
+/test-media
+/test-media-*
+/test-data-*
+/.test-media-cache
+/test-results
+/playwright-report
+/blob-report
+tests/fixtures/.auth/
+tests/fixtures/test-config-*.jsonc
+
+# build output
+/.closkell/build/
+/dist/
+/.next/
+/.next-test/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# env files (can opt-in for committing if needed)
+.env*
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+
+# thumbnail cache
+.thumbnails
+settings.json
+stats.json
+shares.json
+kb-chats.json
+config.json*

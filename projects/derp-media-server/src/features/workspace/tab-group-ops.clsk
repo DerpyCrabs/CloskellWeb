@@ -1,0 +1,660 @@
+(import "../media-utils.clsk" [getMediaType])
+(import "../source-context.clsk" [normalizeSlashes])
+(import "../../../lib/types.clsk" [FileItem MediaType WorkspaceTaskbarPinSource])
+(import "./geometry.clsk" [WorkspaceBounds createDefaultBounds insertWindowAtGroupIndex maxWorkspaceWindowZ])
+(import "./state-core.clsk" [SPLIT_PANE_FRACTION_DEFAULT clampSplitPaneFraction])
+(import "./titles.clsk" [workspaceBrowserDirTitle])
+(import "./types.clsk" [WorkspaceState])
+(import "./tab-groups-core.clsk" [(clampTabInsertIndex as coreClampTabInsertIndex)
+                                  ActiveTabMap
+                                  TabGroupSplit
+                                  TabGroupSplits
+                                  TabGroupState
+                                  WorkspaceTabLayout
+                                  WorkspaceTabWindow
+                                  (groupIdForWindow as coreGroupIdForWindow)
+                                  (insertIndexAfterAllRightTabs as coreInsertIndexAfterAllRightTabs)
+                                  (isSplitLeftTab as coreIsSplitLeftTab)
+                                  (leadingPinnedTabCount as coreLeadingPinnedTabCount)
+                                  (mergeInsertIndexToRightStripSlot as coreMergeInsertIndexToRightStripSlot)
+                                  (orderedAllGroupIds as coreOrderedAllGroupIds)
+                                  (orderedVisibleGroupIds as coreOrderedVisibleGroupIds)
+                                  (pinnedCountInGroup as corePinnedCountInGroup)
+                                  (resolveGroupVisibleTabId as coreResolveGroupVisibleTabId)
+                                  (rightStripIndexToGroupInsertIndex as coreRightStripIndexToGroupInsertIndex)
+                                  (tabsInGroup as coreTabsInGroup)
+                                  (visibleTabIdAfterPlayerRemoved as coreVisibleTabIdAfterPlayerRemoved)
+                                  windowIndexById])
+
+(type TabGroupSplitsCast TabGroupSplits)
+
+(ann emptyTabGroupSplits TabGroupSplits)
+(def emptyTabGroupSplits (unsafe-cast TabGroupSplitsCast {}))
+
+(type NewTabPlacement
+  {:idx Number
+   :window WorkspaceTabWindow})
+
+(type ClosedTabHistoryEntry
+  {:window WorkspaceTabWindow
+   :groupId String
+   :insertIndex Number
+   :soloWindow Bool})
+
+(type TabGroupSplitEntry
+  {:key String
+   :value TabGroupSplit})
+
+(type ValidTabGroupSplitEntry
+  {:gid String
+   :split TabGroupSplit})
+
+(type SplitActiveAcc
+  {:activeTabMap ActiveTabMap
+   :activeWindowId String
+   :changed Bool})
+
+(ann groupIdForWindow (Fn [WorkspaceTabWindow] String))
+(defn groupIdForWindow [win]
+  (coreGroupIdForWindow win))
+
+(ann orderedVisibleGroupIds (Fn [(Vector WorkspaceTabWindow)] (Vector String)))
+(defn orderedVisibleGroupIds [windows]
+  (coreOrderedVisibleGroupIds windows))
+
+(ann orderedAllGroupIds (Fn [(Vector WorkspaceTabWindow)] (Vector String)))
+(defn orderedAllGroupIds [windows]
+  (coreOrderedAllGroupIds windows))
+
+(ann tabsInGroup (Fn [(Vector WorkspaceTabWindow) String] (Vector WorkspaceTabWindow)))
+(defn tabsInGroup [windows groupId]
+  (coreTabsInGroup windows groupId))
+
+(ann visibleTabIdAfterPlayerRemoved (Fn [(Vector WorkspaceTabWindow) String TabGroupSplits] (Option String)))
+(defn visibleTabIdAfterPlayerRemoved [windows groupId tabGroupSplits]
+  (coreVisibleTabIdAfterPlayerRemoved windows groupId tabGroupSplits))
+
+(ann resolveGroupVisibleTabId (Fn [TabGroupState String] String))
+(defn resolveGroupVisibleTabId [state groupId]
+  (coreResolveGroupVisibleTabId state groupId))
+
+(ann getTabGroupSplit (Fn [WorkspaceState String] (Option TabGroupSplit)))
+(defn getTabGroupSplit [state groupId]
+  (let [splits state.tabGroupSplits]
+    (if (object? splits) (object-get splits groupId) nil)))
+
+(ann splitLeftTab? (Fn [TabGroupSplits String String] Bool))
+(defn splitLeftTab? [splits groupId tabId]
+  (coreIsSplitLeftTab splits groupId tabId))
+
+(ann isSplitLeftTab (Fn [WorkspaceState String String] Bool))
+(defn isSplitLeftTab [state groupId tabId]
+  (coreIsSplitLeftTab state.tabGroupSplits groupId tabId))
+
+(ann withoutTabGroupSplitsForGroup (Fn [WorkspaceState String] WorkspaceState))
+(defn withoutTabGroupSplitsForGroup [state groupId]
+  (let [splits state.tabGroupSplits
+        split (if (object? splits) (object-get splits groupId) nil)]
+    (if (not (some? split))
+        state
+        (let [next (object-dissoc splits groupId)
+              keys (object-keys next)]
+          (merge state {:tabGroupSplits (if (> (count keys) 0) next nil)})))))
+
+(ann validSplitEntry (Fn [WorkspaceState TabGroupSplitEntry] (Option ValidTabGroupSplitEntry)))
+(defn validSplitEntry [state entry]
+  (let [gid entry.key
+        split entry.value
+        members (tabsInGroup state.windows gid)
+        left (find members (fn [win] (= win.id split.leftTabId)))
+        rightCount (count (filter members (fn [win] (not (= win.id split.leftTabId)))))]
+    (if (and (some? left) (>= rightCount 1))
+        {:gid gid
+         :split (merge split {:leftPaneFraction (clampSplitPaneFraction split.leftPaneFraction)})}
+        nil)))
+
+(ann addValidSplitEntry (Fn [TabGroupSplits (Option ValidTabGroupSplitEntry)] TabGroupSplits))
+(defn addValidSplitEntry [acc entry]
+  (match entry
+    nil acc
+    (some valid) (object-assoc acc valid.gid valid.split)))
+
+(ann ensureSplitActiveEntry (Fn [WorkspaceState SplitActiveAcc TabGroupSplitEntry] SplitActiveAcc))
+(defn ensureSplitActiveEntry [state acc entry]
+  (let [gid entry.key
+        split entry.value
+        members (tabsInGroup state.windows gid)
+        firstRight (find members (fn [win] (not (= win.id split.leftTabId))))
+        activeMap acc.activeTabMap
+        activeWindowId acc.activeWindowId
+        mapNeedsChange (and (some? firstRight) (= (object-get activeMap gid) split.leftTabId))
+        windowNeedsChange (and (some? firstRight) (= activeWindowId split.leftTabId))]
+    {:activeTabMap (if mapNeedsChange (object-assoc activeMap gid firstRight.id) activeMap)
+     :activeWindowId (if windowNeedsChange firstRight.id activeWindowId)
+     :changed (or acc.changed mapNeedsChange windowNeedsChange)}))
+
+(ann ensureSplitActiveNotLeft (Fn [WorkspaceState] WorkspaceState))
+(defn ensureSplitActiveNotLeft [state]
+  (let [splits state.tabGroupSplits]
+    (if (not (object? splits))
+        state
+        (let [result (reduce (object-entries splits)
+                             {:activeTabMap state.activeTabMap
+                              :activeWindowId state.activeWindowId
+                              :changed false}
+                             (fn [acc entry] (ensureSplitActiveEntry state acc entry)))]
+          (if result.changed
+              (merge state {:activeTabMap result.activeTabMap
+                             :activeWindowId result.activeWindowId})
+              state)))))
+
+(ann pruneTabGroupSplitsState (Fn [WorkspaceState] WorkspaceState))
+(defn pruneTabGroupSplitsState [state]
+  (let [splits state.tabGroupSplits]
+    (if (not (object? splits))
+        state
+        (let [validEntries (map (object-entries splits) (fn [entry] (validSplitEntry state entry)))
+              nextSplits (reduce validEntries emptyTabGroupSplits addValidSplitEntry)
+              withSplits (merge state {:tabGroupSplits (if (> (count (object-keys nextSplits)) 0)
+                                                            nextSplits
+                                                            nil)})]
+          (ensureSplitActiveNotLeft withSplits)))))
+
+(ann insertIndexAfterAllRightTabs (Fn [(Vector WorkspaceTabWindow) String] Number))
+(defn insertIndexAfterAllRightTabs [groupMembers leftTabId]
+  (coreInsertIndexAfterAllRightTabs groupMembers leftTabId))
+
+(ann rightStripIndexToGroupInsertIndex (Fn [(Vector WorkspaceTabWindow) String Number] Number))
+(defn rightStripIndexToGroupInsertIndex [groupMembers leftTabId rightStripIndex]
+  (coreRightStripIndexToGroupInsertIndex groupMembers leftTabId rightStripIndex))
+
+(ann mergeInsertIndexToRightStripSlot (Fn [(Vector WorkspaceTabWindow) String Number] Number))
+(defn mergeInsertIndexToRightStripSlot [groupMembers leftTabId fullGroupInsertIndex]
+  (coreMergeInsertIndexToRightStripSlot groupMembers leftTabId fullGroupInsertIndex))
+
+(ann enterSplitViewState (Fn [WorkspaceState String String (Option Number)] WorkspaceState))
+(defn enterSplitViewState [state groupId leftTabId leftPaneFraction]
+  (let [members (tabsInGroup state.windows groupId)
+        left (find members (fn [win] (= win.id leftTabId)))
+        rightCount (count (filter members (fn [win] (not (= win.id leftTabId)))))]
+    (if (or (not (some? left)) (< rightCount 1))
+        state
+        (let [existing (if (object? state.tabGroupSplits) state.tabGroupSplits emptyTabGroupSplits)
+              nextSplits (object-assoc existing
+                                       groupId
+                                       {:leftTabId leftTabId
+                                        :leftPaneFraction (clampSplitPaneFraction
+                                                           (if (some? leftPaneFraction)
+                                                               leftPaneFraction
+                                                               SPLIT_PANE_FRACTION_DEFAULT))})
+              next (merge state {:tabGroupSplits nextSplits})]
+          (ensureSplitActiveNotLeft next)))))
+
+(ann exitSplitViewState (Fn [WorkspaceState String] WorkspaceState))
+(defn exitSplitViewState [state groupId]
+  (withoutTabGroupSplitsForGroup state groupId))
+
+(ann setSplitFractionState (Fn [WorkspaceState String Number] WorkspaceState))
+(defn setSplitFractionState [state groupId fraction]
+  (let [split (getTabGroupSplit state groupId)]
+    (if (not (some? split))
+        state
+        (let [existing (if (object? state.tabGroupSplits) state.tabGroupSplits emptyTabGroupSplits)
+              nextSplit (match split
+                          nil {:leftTabId nil :leftPaneFraction (clampSplitPaneFraction fraction)}
+                          (some current) (merge current {:leftPaneFraction (clampSplitPaneFraction fraction)}))]
+          (merge state {:tabGroupSplits (object-assoc existing groupId nextSplit)})))))
+
+(ann setSplitLeftTabFromContextState (Fn [WorkspaceState String] WorkspaceState))
+(defn setSplitLeftTabFromContextState [state tabId]
+  (let [win (find state.windows (fn [current] (= current.id tabId)))]
+    (if (not (some? win))
+        state
+        (enterSplitViewState state (groupIdForWindow win) tabId SPLIT_PANE_FRACTION_DEFAULT))))
+
+(ann pinnedCountInGroup (Fn [(Vector WorkspaceTabWindow) String] Number))
+(defn pinnedCountInGroup [windows groupId]
+  (corePinnedCountInGroup windows groupId))
+
+(ann leadingPinnedTabCount (Fn [(Vector WorkspaceTabWindow)] Number))
+(defn leadingPinnedTabCount [tabs]
+  (coreLeadingPinnedTabCount tabs))
+
+(ann clampTabInsertIndex (Fn [(Vector WorkspaceTabWindow) String Number] Number))
+(defn clampTabInsertIndex [windows groupId insertIndex]
+  (coreClampTabInsertIndex windows groupId insertIndex))
+
+(ann replaceGroupMemberOrder (Fn [(Vector WorkspaceTabWindow) String (Vector WorkspaceTabWindow)] (Vector WorkspaceTabWindow)))
+(defn replaceGroupMemberOrder [fullWindows groupId orderedMembers]
+  (let [result (reduce fullWindows
+                       {:index 0 :windows []}
+                       (fn [acc win]
+                         (if (not (= (groupIdForWindow win) groupId))
+                             {:index acc.index :windows (conj acc.windows win)}
+                             (let [next (if (< acc.index (count orderedMembers))
+                                            (nth orderedMembers acc.index)
+                                            nil)]
+                               {:index (+ acc.index 1)
+                                :windows (conj acc.windows (if (some? next) next win))}))))]
+    result.windows))
+
+(ann setTabPinnedAndReorderState (Fn [WorkspaceState String Bool] WorkspaceState))
+(defn setTabPinnedAndReorderState [state tabId pinned]
+  (let [victim (find state.windows (fn [win] (= win.id tabId)))]
+    (if (not (some? victim))
+        state
+        (let [groupId (groupIdForWindow victim)
+              members (tabsInGroup state.windows groupId)
+              pinnedExisting (filter members (fn [win] (and (= win.tabPinned true) (not (= win.id tabId)))))
+              unpinned (filter members (fn [win] (and (not (= win.tabPinned true)) (not (= win.id tabId)))))
+              updatedVictim (merge victim {:tabPinned pinned})
+              nextMembers (reduce unpinned
+                                  (conj pinnedExisting updatedVictim)
+                                  (fn [items win] (conj items win)))]
+          (merge state {:windows (replaceGroupMemberOrder state.windows groupId nextMembers)})))))
+
+(ann layoutObject (Fn [WorkspaceTabWindow] WorkspaceTabLayout))
+(defn layoutObject [win]
+  (if (object? win.layout) win.layout {}))
+
+(ann migratedGroupWindow (Fn [String (Option WorkspaceBounds) Number WorkspaceTabWindow] WorkspaceTabWindow))
+(defn migratedGroupWindow [destGid sharedBounds sharedZ win]
+  (let [layout (layoutObject win)
+        bounds (match sharedBounds
+                 (some value) value
+                 nil (match layout.bounds
+                       (some value) value
+                       nil nil))]
+    (merge win {:tabGroupId destGid
+                 :layout (merge layout {:bounds bounds
+                                         :zIndex sharedZ
+                                         :minimized false})})))
+
+(ann promoteTargetGroupLeader (Fn [String String WorkspaceTabWindow] WorkspaceTabWindow))
+(defn promoteTargetGroupLeader [destGid targetWindowId win]
+  (if (and (= win.id targetWindowId) (not (some? win.tabGroupId)))
+      (merge win {:tabGroupId destGid})
+      win))
+
+(ann insertMigratedWindow (Fn [String Number (Vector WorkspaceTabWindow) WorkspaceTabWindow Number] (Vector WorkspaceTabWindow)))
+(defn insertMigratedWindow [destGid idx work win index]
+  (insertWindowAtGroupIndex work win destGid (+ idx index)))
+
+(ann mergeWindowIntoGroupState (Fn [WorkspaceState String String Number] WorkspaceState))
+(defn mergeWindowIntoGroupState [state windowId targetWindowId insertIndex]
+  (let [current state.windows
+        target (find current (fn [win] (= win.id targetWindowId)))
+        moved (find current (fn [win] (= win.id windowId)))]
+    (if (or (not (some? target)) (not (some? moved)))
+        state
+        (let [sourceGid (groupIdForWindow moved)
+              destGid (if (some? target.tabGroupId) target.tabGroupId targetWindowId)]
+          (if (= sourceGid destGid)
+              state
+              (let [sourceMembers (filter current (fn [win] (= (groupIdForWindow win) sourceGid)))
+                    targetLayout (layoutObject target)
+                    movedLayout (layoutObject moved)
+                    sharedBounds (if (some? targetLayout.bounds) targetLayout.bounds movedLayout.bounds)
+                    sharedZ (if (some? targetLayout.zIndex)
+                                targetLayout.zIndex
+                                (if (some? movedLayout.zIndex) movedLayout.zIndex 1))
+                    migrated (map sourceMembers (fn [win] (migratedGroupWindow destGid sharedBounds sharedZ win)))
+                    withoutSource (filter current (fn [win] (not (= (groupIdForWindow win) sourceGid))))
+                    work0 (map withoutSource (fn [win] (promoteTargetGroupLeader destGid targetWindowId win)))
+                    destCount (count (filter work0 (fn [win] (= (groupIdForWindow win) destGid))))
+                    idx (clampTabInsertIndex work0 destGid insertIndex)
+                    work (reduce-indexed migrated
+                                          work0
+                                          (fn [acc win index] (insertMigratedWindow destGid idx acc win index)))
+                    nextTabMap (object-dissoc (object-assoc state.activeTabMap destGid windowId) sourceGid)
+                    merged (merge state {:windows work
+                                          :activeWindowId windowId
+                                          :activeTabMap nextTabMap})]
+                (withoutTabGroupSplitsForGroup merged destGid)))))))
+
+(ann sharedLayoutFrom (Fn [WorkspaceTabLayout Number] WorkspaceTabLayout))
+(defn sharedLayoutFrom [layoutBase zIndex]
+  {:bounds layoutBase.bounds
+   :fullscreen layoutBase.fullscreen
+   :snapZone layoutBase.snapZone
+   :minimized false
+   :zIndex (if (some? layoutBase.zIndex) layoutBase.zIndex zIndex)
+   :restoreBounds layoutBase.restoreBounds})
+
+(ann nonEmptyPathSegments (Fn [String] (Vector String)))
+(defn nonEmptyPathSegments [path]
+  (filter (split (normalizeSlashes path) "/") (fn [segment] (not (= segment "")))))
+
+(ann fileDir (Fn [String String] String))
+(defn fileDir [path fallback]
+  (let [segments (nonEmptyPathSegments path)]
+    (if (<= (count segments) 1)
+        fallback
+        (join (slice segments 0 (- (count segments) 1)) "/"))))
+
+(ann fileBaseName (Fn [String String] String))
+(defn fileBaseName [path fallback]
+  (let [segments (nonEmptyPathSegments path)
+        value (if (> (count segments) 0) (nth segments (- (count segments) 1)) nil)]
+    (if (string? value) value fallback)))
+
+(ann extensionFromPath (Fn [String] String))
+(defn extensionFromPath [path]
+  (let [base (fileBaseName path "")
+        parts (split base ".")
+        extension (if (> (count parts) 1) (nth parts (- (count parts) 1)) "")]
+    extension))
+
+(ann browserTabWindow (Fn [String String WorkspaceTaskbarPinSource WorkspaceTabLayout FileItem] WorkspaceTabWindow))
+(defn browserTabWindow [id groupId source layout file]
+  (let [folderTitle (workspaceBrowserDirTitle file.path)]
+    {:id id
+     :type "browser"
+     :title folderTitle
+     :iconName nil
+     :iconPath file.path
+     :iconType MediaType.FOLDER
+     :iconIsVirtual false
+     :source source
+     :initialState {:dir file.path}
+     :tabGroupId groupId
+     :layout layout}))
+
+(ann viewerTabWindow (Fn [String String WorkspaceTaskbarPinSource WorkspaceTabLayout FileItem String] WorkspaceTabWindow))
+(defn viewerTabWindow [id groupId source layout file currentPath]
+  {:id id
+   :type "viewer"
+   :title (fileBaseName file.path "Viewer")
+   :iconName nil
+   :iconPath file.path
+   :iconType (getMediaType (extensionFromPath file.path))
+   :iconIsVirtual false
+   :source source
+   :initialState {:dir (fileDir file.path currentPath) :viewing file.path}
+   :tabGroupId groupId
+   :layout layout})
+
+(ann withSourceLeaderTabGroup (Fn [String String WorkspaceTabWindow] WorkspaceTabWindow))
+(defn withSourceLeaderTabGroup [sourceWindowId groupId win]
+  (if (and (= win.id sourceWindowId) (not (some? win.tabGroupId)))
+      (merge win {:tabGroupId groupId})
+      win))
+
+(ann openedFromAnchorIndex (Fn [(Vector WorkspaceTabWindow) String Number] Number))
+(defn openedFromAnchorIndex [groupMembers sourceWindowId sourceIdx]
+  (reduce-indexed groupMembers
+                  sourceIdx
+                  (fn [anchor win index]
+                    (if (= win.openedFromWindowId sourceWindowId)
+                        (max anchor index)
+                        anchor))))
+
+(ann resolveNewTabPlacement (Fn [(Vector WorkspaceTabWindow) String (Option TabGroupSplit) (Option Number) WorkspaceTabWindow] NewTabPlacement))
+(defn resolveNewTabPlacement [groupMembers sourceWindowId split insertIndex newWindow]
+  (let [leftId (match split
+                 nil nil
+                 (some value) value.leftTabId)]
+    (if (and (string? leftId) (= sourceWindowId leftId))
+      {:idx (insertIndexAfterAllRightTabs groupMembers leftId)
+       :window newWindow}
+      (match insertIndex
+        (some index) {:idx index :window newWindow}
+        nil
+          (let [sourceIdx (windowIndexById groupMembers sourceWindowId)]
+            (if (< sourceIdx 0)
+                {:idx (count groupMembers) :window newWindow}
+                (let [anchorIdx (openedFromAnchorIndex groupMembers sourceWindowId sourceIdx)]
+                  {:idx (+ anchorIdx 1)
+                   :window (merge newWindow {:openedFromWindowId sourceWindowId})})))))))
+
+(ann openInNewTabInGroupState (Fn [WorkspaceState String FileItem String (Option Number) WorkspaceTaskbarPinSource] WorkspaceState))
+(defn openInNewTabInGroupState [state sourceWindowId file currentPath insertIndex sourceOverride]
+  (if (= file.isVirtual true)
+      state
+      (let [sourceWindow (find state.windows (fn [win] (= win.id sourceWindowId)))]
+        (if (not (some? sourceWindow))
+            state
+            (let [groupId (if (some? sourceWindow.tabGroupId) sourceWindow.tabGroupId sourceWindowId)
+                  source sourceOverride
+                  n state.nextWindowId
+                  id (str "workspace-window-" n)
+                  layoutBase sourceWindow.layout
+                  zIndex (if (and (object? layoutBase) (some? layoutBase.zIndex)) layoutBase.zIndex 1)
+                  layout (sharedLayoutFrom layoutBase zIndex)
+                  newWindow (if (= file.isDirectory true)
+                                (browserTabWindow id groupId source layout file)
+                                (viewerTabWindow id groupId source layout file currentPath))
+                  withTabGroup (map state.windows (fn [win] (withSourceLeaderTabGroup sourceWindowId groupId win)))
+                  groupMembers (filter withTabGroup (fn [win] (= (groupIdForWindow win) groupId)))
+                  split (getTabGroupSplit state groupId)
+                  placement (resolveNewTabPlacement groupMembers sourceWindowId split insertIndex newWindow)
+                  idx (clampTabInsertIndex withTabGroup groupId placement.idx)
+                  nextWindows (insertWindowAtGroupIndex withTabGroup placement.window groupId idx)]
+              (merge state {:windows nextWindows
+                             :nextWindowId (+ n 1)
+                             :activeWindowId id
+                             :activeTabMap (object-assoc state.activeTabMap groupId id)}))))))
+
+(ann openInSplitViewFromBrowserState (Fn [WorkspaceState String FileItem String WorkspaceTaskbarPinSource] WorkspaceState))
+(defn openInSplitViewFromBrowserState [state browserWindowId file currentPath sourceOverride]
+  (let [browser (find state.windows (fn [win] (= win.id browserWindowId)))]
+    (if (or (not (some? browser)) (not (= browser.type "browser")))
+        state
+        (let [groupId (if (some? browser.tabGroupId) browser.tabGroupId browserWindowId)
+              withOpen (openInNewTabInGroupState state
+                                                 browserWindowId
+                                                 file
+                                                 currentPath
+                                                 nil
+                                                 sourceOverride)]
+          (if (identical? withOpen state)
+              state
+              (enterSplitViewState withOpen groupId browserWindowId SPLIT_PANE_FRACTION_DEFAULT))))))
+
+(ann makeClosedTabHistoryEntry (Fn [WorkspaceState String] (Option ClosedTabHistoryEntry)))
+(defn makeClosedTabHistoryEntry [state tabId]
+  (let [victim (find state.windows (fn [win] (= win.id tabId)))]
+    (if (or (not (some? victim)) (= victim.tabPinned true))
+        nil
+        (let [gid (groupIdForWindow victim)
+              split (getTabGroupSplit state gid)
+              members (filter state.windows (fn [win] (= (groupIdForWindow win) gid)))
+              idx (windowIndexById members tabId)
+              isLeader (and (not (some? victim.tabGroupId)) (= victim.id gid))
+              soloWindow (<= (count members) 1)
+              leftId (if (object? split) (object-get split "leftTabId") nil)]
+          (if (or (and (string? leftId) (= leftId tabId))
+                  (< idx 0)
+                  (and (> (count members) 1) isLeader))
+              nil
+              {:window victim
+               :groupId gid
+               :insertIndex idx
+               :soloWindow soloWindow})))))
+
+(ann reopenWindowForHistory (Fn [ClosedTabHistoryEntry String Bool String] WorkspaceTabWindow))
+(defn reopenWindowForHistory [entry newId solo groupId]
+  (merge entry.window
+         {:id newId
+          :tabPinned false
+          :openedFromWindowId nil
+          :tabGroupId (if solo
+                          nil
+                          (if (some? entry.window.tabGroupId)
+                              entry.window.tabGroupId
+                              groupId))}))
+
+(ann appendWindow (Fn [(Vector WorkspaceTabWindow) WorkspaceTabWindow] (Vector WorkspaceTabWindow)))
+(defn appendWindow [windows win]
+  (conj windows win))
+
+(ann reopenClosedTabEntry (Fn [WorkspaceState ClosedTabHistoryEntry] WorkspaceState))
+(defn reopenClosedTabEntry [state entry]
+  (let [n state.nextWindowId
+        newId (str "workspace-window-" n)]
+    (if (= entry.soloWindow true)
+        (pruneTabGroupSplitsState
+         (merge state {:windows (appendWindow state.windows (reopenWindowForHistory entry newId true entry.groupId))
+                        :nextWindowId (+ n 1)
+                        :activeWindowId newId}))
+        (let [groupStillThere (some? (find state.windows (fn [win] (= (groupIdForWindow win) entry.groupId))))]
+          (if (not groupStillThere)
+              (pruneTabGroupSplitsState
+               (merge state {:windows (appendWindow state.windows (reopenWindowForHistory entry newId true entry.groupId))
+                              :nextWindowId (+ n 1)
+                              :activeWindowId newId}))
+              (let [win (reopenWindowForHistory entry newId false entry.groupId)
+                    nextWindows (insertWindowAtGroupIndex state.windows win entry.groupId entry.insertIndex)]
+                (pruneTabGroupSplitsState
+                 (merge state {:windows nextWindows
+                                :nextWindowId (+ n 1)
+                                :activeWindowId newId
+                                :activeTabMap (object-assoc state.activeTabMap entry.groupId newId)}))))))))
+
+(ann duplicateTabInGroupState (Fn [WorkspaceState String] WorkspaceState))
+(defn duplicateTabInGroupState [state tabId]
+  (let [sourceWindow (find state.windows (fn [win] (= win.id tabId)))]
+    (if (not (some? sourceWindow))
+        state
+        (let [groupId (if (some? sourceWindow.tabGroupId) sourceWindow.tabGroupId tabId)
+              split (getTabGroupSplit state groupId)
+              leftId (if (object? split) (object-get split "leftTabId") nil)]
+          (if (and (string? leftId) (= leftId tabId))
+              state
+              (let [members (filter state.windows (fn [win] (= (groupIdForWindow win) groupId)))
+                    idx (windowIndexById members tabId)]
+                (if (< idx 0)
+                    state
+                    (let [n state.nextWindowId
+                          newId (str "workspace-window-" n)
+                          clone (merge sourceWindow
+                                        {:id newId
+                                         :tabPinned false
+                                         :openedFromWindowId tabId
+                                         :initialState sourceWindow.initialState
+                                         :layout sourceWindow.layout})
+                          withTabGroup (map state.windows (fn [win] (withSourceLeaderTabGroup tabId groupId win)))
+                          nextWindows (insertWindowAtGroupIndex withTabGroup clone groupId (+ idx 1))]
+                      (merge state {:windows nextWindows
+                                     :nextWindowId (+ n 1)
+                                     :activeWindowId newId
+                                     :activeTabMap (object-assoc state.activeTabMap groupId newId)})))))))))
+
+(ann addTabToGroupState (Fn [WorkspaceState String] WorkspaceState))
+(defn addTabToGroupState [state sourceWindowId]
+  (let [sourceWindow (find state.windows (fn [win] (= win.id sourceWindowId)))]
+    (if (not (some? sourceWindow))
+        state
+        (let [groupId (if (some? sourceWindow.tabGroupId) sourceWindow.tabGroupId sourceWindowId)
+              id (str "workspace-window-" state.nextWindowId)
+              layoutBase (layoutObject sourceWindow)
+              zIndex (if (some? layoutBase.zIndex) layoutBase.zIndex 1)
+              newWindow {:id id
+                         :type sourceWindow.type
+                         :title ""
+                         :iconName nil
+                         :iconPath ""
+                         :iconType (if (= sourceWindow.type "browser") MediaType.FOLDER MediaType.OTHER)
+                         :iconIsVirtual false
+                         :source sourceWindow.source
+                         :initialState (if (= sourceWindow.type "browser")
+                                           {:dir (if (some? sourceWindow.initialState.dir)
+                                                     sourceWindow.initialState.dir
+                                                     nil)}
+                                           {})
+                         :tabGroupId groupId
+                         :layout {:bounds layoutBase.bounds
+                                  :fullscreen layoutBase.fullscreen
+                                  :snapZone layoutBase.snapZone
+                                  :minimized false
+                                  :zIndex zIndex
+                                  :restoreBounds layoutBase.restoreBounds}}
+              updated (map state.windows (fn [win] (withSourceLeaderTabGroup sourceWindowId groupId win)))]
+          (merge state {:windows (appendWindow updated newWindow)
+                         :nextWindowId (+ state.nextWindowId 1)
+                         :activeWindowId id
+                         :activeTabMap (object-assoc state.activeTabMap groupId id)})))))
+
+(ann defaultSplitBounds (Fn [WorkspaceTabWindow (Option WorkspaceBounds)] WorkspaceBounds))
+(defn defaultSplitBounds [win offsetBounds]
+  (match offsetBounds
+    (some bounds) bounds
+    nil
+      (let [layout (layoutObject win)
+            base (match layout.bounds
+                   nil (createDefaultBounds 0 win.type)
+                   (some bounds) bounds)]
+        {:x (+ base.x 30)
+         :y (+ base.y 30)
+         :width base.width
+         :height base.height})))
+
+(ann splitDraggedWindow (Fn [String WorkspaceBounds Number WorkspaceTabWindow] WorkspaceTabWindow))
+(defn splitDraggedWindow [windowId defaultBounds nextZ win]
+  (if (= win.id windowId)
+      (let [layout (layoutObject win)]
+        (merge win {:tabGroupId nil
+                     :layout (merge layout
+                                     {:bounds defaultBounds
+                                      :snapZone nil
+                                      :fullscreen false
+                                      :restoreBounds (if (some? layout.bounds)
+                                                         layout.bounds
+                                                         (if (some? layout.restoreBounds)
+                                                             layout.restoreBounds
+                                                             nil))
+                                      :zIndex nextZ})}))
+      win))
+
+(ann ungroupLastGroupWindow (Fn [String WorkspaceTabLayout WorkspaceTabWindow] WorkspaceTabWindow))
+(defn ungroupLastGroupWindow [groupId groupLayout win]
+  (if (not (= win.tabGroupId groupId))
+      win
+      (let [fallbackBounds (createDefaultBounds 0 win.type)]
+        (merge win {:tabGroupId nil
+                     :layout (if (object? groupLayout)
+                                 (merge groupLayout
+                                         {:bounds (if (some? groupLayout.bounds)
+                                                      groupLayout.bounds
+                                                      (if (some? win.layout.bounds)
+                                                          win.layout.bounds
+                                                          fallbackBounds))
+                                          :snapZone (if (some? groupLayout.snapZone) groupLayout.snapZone nil)
+                                          :restoreBounds (if (some? groupLayout.restoreBounds)
+                                                             groupLayout.restoreBounds
+                                                             (if (some? groupLayout.bounds) groupLayout.bounds nil))})
+                                 win.layout)}))))
+
+(ann activeMapAfterSplit (Fn [WorkspaceState String String (Vector WorkspaceTabWindow)] ActiveTabMap))
+(defn activeMapAfterSplit [state groupId windowId nextWindows]
+  (let [hasGroupAfter (some? (find nextWindows (fn [win] (= win.tabGroupId groupId))))
+        activeMap state.activeTabMap]
+    (if (not hasGroupAfter)
+        (object-dissoc activeMap groupId)
+        (if (= (object-get activeMap groupId) windowId)
+            (let [still (filter nextWindows (fn [win] (= win.tabGroupId groupId)))]
+              (if (> (count still) 0)
+                  (object-assoc activeMap groupId (get (nth still 0) :id))
+                  activeMap))
+            activeMap))))
+
+(ann splitWindowFromGroupState (Fn [WorkspaceState String (Option WorkspaceBounds)] WorkspaceState))
+(defn splitWindowFromGroupState [state windowId offsetBounds]
+  (let [current state.windows
+        win (find current (fn [candidate] (= candidate.id windowId)))]
+    (if (or (not (some? win)) (not (some? win.tabGroupId)))
+        state
+        (let [groupId win.tabGroupId
+              groupWindows (filter current (fn [candidate] (= candidate.tabGroupId groupId)))
+              groupLayout win.layout
+              nextZ (+ (maxWorkspaceWindowZ current) 1)
+              bounds (defaultSplitBounds win offsetBounds)
+              splitWindows (map current (fn [item] (splitDraggedWindow windowId bounds nextZ item)))
+              nextWindows (if (= (count groupWindows) 2)
+                              (map splitWindows (fn [item] (ungroupLastGroupWindow groupId groupLayout item)))
+                              splitWindows)
+              nextActiveMap (activeMapAfterSplit state groupId windowId nextWindows)]
+          (pruneTabGroupSplitsState
+           (merge state {:windows nextWindows
+                          :activeWindowId windowId
+                          :activeTabMap nextActiveMap}))))))

@@ -1,0 +1,82 @@
+(import "../src/features/theme.clsk" [defaultThemeMode defaultThemePalette resolveThemeFromPreference])
+
+(def jsGlobalThis (js-global globalThis))
+
+(def COSMIC_NIGHT_FONTS_ID "theme-fonts-cosmic-night")
+(def COSMIC_NIGHT_FONTS_HREF
+  "https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap")
+
+(ann getSystemPrefersDark (Fn [] Bool))
+(defn getSystemPrefersDark []
+  (let [win jsGlobalThis.window]
+    (if (not (some? win))
+        true
+        (let [media (win.matchMedia "(prefers-color-scheme: dark)")]
+          media.matches))))
+
+(ann resolveTheme (Fn [String String] String))
+(defn resolveTheme [palette mode]
+  (resolveThemeFromPreference palette mode (getSystemPrefersDark)))
+
+(ann ensureCosmicNightFonts (Fn [] Nil))
+(defn ensureCosmicNightFonts []
+  (let [doc jsGlobalThis.document]
+    (if (not (some? doc))
+        nil
+        (let [existing (doc.getElementById COSMIC_NIGHT_FONTS_ID)]
+          (if (some? existing)
+              nil
+              (let [link (doc.createElement "link")]
+                (do
+                  (link.setAttribute "id" COSMIC_NIGHT_FONTS_ID)
+                  (link.setAttribute "rel" "stylesheet")
+                  (link.setAttribute "href" COSMIC_NIGHT_FONTS_HREF)
+                  (doc.head.appendChild link)
+                  nil)))))))
+
+(ann removeCosmicNightFonts (Fn [] Nil))
+(defn removeCosmicNightFonts []
+  (let [doc jsGlobalThis.document]
+    (if (not (some? doc))
+        nil
+        (let [link (doc.getElementById COSMIC_NIGHT_FONTS_ID)]
+          (if (some? link) (link.remove) nil)))))
+
+(ann applyTheme (Fn [String] Nil))
+(defn applyTheme [resolved]
+  (let [doc jsGlobalThis.document]
+    (if (not (some? doc))
+        nil
+        (do
+          (doc.documentElement.setAttribute "data-theme" resolved)
+          (if (starts-with? resolved "cosmic-night")
+              (ensureCosmicNightFonts)
+              (removeCosmicNightFonts))
+          nil))))
+
+(ann subscribeSystemPreference (Fn [Js] Js))
+(defn subscribeSystemPreference [cb]
+  (let [win jsGlobalThis.window]
+    (if (not (some? win))
+        (fn [] nil)
+        (let [media (win.matchMedia "(prefers-color-scheme: dark)")
+              handler (fn [] (cb))]
+          (do
+            (media.addEventListener "change" handler)
+            (fn []
+              (do
+                (media.removeEventListener "change" handler)
+                nil)))))))
+
+(ann readInitialPaletteMode (Fn [] Js))
+(defn readInitialPaletteMode []
+  {:palette defaultThemePalette
+   :mode defaultThemeMode})
+
+(ann initThemeFromStorage (Fn [] String))
+(defn initThemeFromStorage []
+  (let [stored (readInitialPaletteMode)
+        resolved (resolveTheme stored.palette stored.mode)]
+    (do
+      (applyTheme resolved)
+      resolved)))

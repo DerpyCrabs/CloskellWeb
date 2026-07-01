@@ -1,0 +1,38 @@
+(type McpServerConfig {:url String})
+(type McpConfig {:servers Js})
+
+(ann validMcpUrl? (Fn [String] Bool))
+(defn validMcpUrl? [url]
+  (and (regex-test? url "^[a-zA-Z][a-zA-Z0-9+.-]*:" "")
+       (some? (url-resolve url "http://derp.invalid/"))))
+
+(ann mcpServersObject (Fn [Js] Js))
+(defn mcpServersObject [srv]
+  (reduce (object-entries srv)
+          {}
+          (fn [servers entry]
+            (let [key (trim entry.key)
+                  value entry.value
+                  urlRaw (get value :url)
+                  url (if (string? urlRaw) (trim urlRaw) "")]
+              (if (and (not (= key ""))
+                       (object? value)
+                       (not (vector? value))
+                       (not (= url ""))
+                       (validMcpUrl? url))
+                  (object-assoc servers key {:url url})
+                  servers)))))
+
+(ann parseMcpConfig (Fn [Js] (Option McpConfig)))
+(defn parseMcpConfig [parsed]
+  (let [m (get parsed :mcp)
+        srv (get m :servers)]
+    (if (or (not (object? m))
+            (vector? m)
+            (not (object? srv))
+            (vector? srv))
+        nil
+        (let [servers (mcpServersObject srv)]
+          (if (> (count (object-keys servers)) 0)
+              {:servers servers}
+              nil)))))

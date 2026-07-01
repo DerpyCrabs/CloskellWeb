@@ -1,0 +1,21 @@
+(def jsPromise (js-global Promise))
+(def jsMap (js-global Map))
+
+(ann Mutex (Fn [] Js))
+(defn Mutex []
+  (let [state (new jsMap)]
+    (do
+      (state.set "tail" (jsPromise.resolve nil))
+      {:acquire
+       (fn []
+         (let [holder (new jsMap)
+               releasePromise (new jsPromise
+                                   (fn [resolve _reject]
+                                     (holder.set "resolve" resolve)))
+               previous (state.get "tail")]
+           (do
+             (state.set "tail" releasePromise)
+             (previous.then
+              (fn [_]
+                (fn []
+                  ((holder.get "resolve") nil)))))))})))

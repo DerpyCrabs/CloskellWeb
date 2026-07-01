@@ -1,0 +1,27 @@
+(def jsGlobalThis (js-global globalThis))
+
+(ann globalConstructor (Fn [String] Js))
+(defn globalConstructor [name]
+  (object-get jsGlobalThis name))
+
+(ann isInstanceOfConstructor (Fn [Js Js] Bool))
+(defn isInstanceOfConstructor [value ctor]
+  (and (some? value)
+       (some? ctor)
+       (some? ctor.prototype)
+       (ctor.prototype.isPrototypeOf value)))
+
+(ann shouldOfferPasteAsNewFile (Fn [Js] Bool))
+(defn shouldOfferPasteAsNewFile [event]
+  (let [target event.target
+        textAreaCtor (globalConstructor "HTMLTextAreaElement")
+        inputCtor (globalConstructor "HTMLInputElement")
+        htmlCtor (globalConstructor "HTMLElement")]
+    (if (isInstanceOfConstructor target textAreaCtor)
+        false
+        (if (isInstanceOfConstructor target inputCtor)
+            false
+            (if (and (isInstanceOfConstructor target htmlCtor)
+                     target.isContentEditable)
+                false
+                true)))))

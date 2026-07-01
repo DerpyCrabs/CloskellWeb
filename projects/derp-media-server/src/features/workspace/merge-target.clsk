@@ -1,0 +1,187 @@
+(import "./tab-groups-core.clsk" [groupIdForWindow (mergeTargetGroupSignature as coreMergeTargetGroupSignature)])
+(import "./tab-drop-hit.clsk" [insertIndexFromTabBodyPointer])
+
+(def jsGlobalThis (js-global globalThis))
+(def jsMap (js-global Map))
+(def jsParseInt (js-global parseInt))
+(def jsNumber (js-global Number))
+
+(type MergeTarget
+  {:groupId String
+   :insertIndex Number})
+
+(ann mergeTargetGroupSignature (Fn [Js] String))
+(defn mergeTargetGroupSignature [windows]
+  (coreMergeTargetGroupSignature windows))
+
+(ann pushGroupWindow (Fn [Js Js] Js))
+(defn pushGroupWindow [groups win]
+  (let [groupId (groupIdForWindow win)
+        existing (groups.get groupId)
+        items (unsafe-cast Js (if (some? existing) existing []))]
+    (do
+      (items.push win)
+      (groups.set groupId items)
+      groups)))
+
+(ann workspaceWindowsByGroupId (Fn [Js] Js))
+(defn workspaceWindowsByGroupId [windows]
+  (reduce windows (new jsMap) pushGroupWindow))
+
+(ann closestFromElement (Fn [Js String] Js))
+(defn closestFromElement [el selector]
+  (let [closest (object-get el "closest")]
+    (if (some? closest) (closest.call el selector) nil)))
+
+(ann hasAttribute? (Fn [Js String] Bool))
+(defn hasAttribute? [el name]
+  (let [hasAttribute (object-get el "hasAttribute")]
+    (if (some? hasAttribute)
+        (= (hasAttribute.call el name) true)
+        false)))
+
+(ann getAttributeValue (Fn [Js String] Js))
+(defn getAttributeValue [el name]
+  (let [getAttribute (object-get el "getAttribute")]
+    (if (some? getAttribute) (getAttribute.call el name) nil)))
+
+(ann isUnderWindowGroup (Fn [Js String] Bool))
+(defn isUnderWindowGroup [el groupId]
+  (let [groupEl (closestFromElement el "[data-window-group]")
+        attr (if (some? groupEl) (getAttributeValue groupEl "data-window-group") nil)]
+    (= attr groupId)))
+
+(ann splitSlotValue (Fn [String] Js))
+(defn splitSlotValue [slot]
+  (let [parts (split slot ":")
+        groupId (if (> (count parts) 0) (nth parts 0) "")
+        indexStr (if (> (count parts) 1) (nth parts 1) "")
+        insertIndex (jsParseInt indexStr 10)]
+    {:groupId groupId :insertIndex insertIndex}))
+
+(ann tabIndexById (Fn [Js String] Number))
+(defn tabIndexById [groupWindows tabId]
+  (reduce-indexed groupWindows
+                  -1
+                  (fn [found win index]
+                    (if (and (< found 0) (= win.id tabId)) index found))))
+
+(ann mergeTargetFromSlotElement (Fn [Js String] Js))
+(defn mergeTargetFromSlotElement [slotEl draggedGroupId]
+  (let [slot (getAttributeValue slotEl "data-tab-drop-slot")]
+    (if (not (string? slot))
+        nil
+        (let [parsed (splitSlotValue slot)
+              groupId parsed.groupId
+              insertIndex parsed.insertIndex]
+          (if (or (= groupId "")
+                  (= groupId draggedGroupId)
+                  (jsNumber.isNaN insertIndex))
+              nil
+              {:groupId groupId :insertIndex insertIndex})))))
+
+(ann mergeTargetFromTabCell (Fn [Js Js String Number] Js))
+(defn mergeTargetFromTabCell [tabCell byGroup draggedGroupId clientX]
+  (let [groupEl (closestFromElement tabCell "[data-window-group]")
+        groupId (if (some? groupEl) (getAttributeValue groupEl "data-window-group") nil)
+        tabId (getAttributeValue tabCell "data-workspace-tab-id")]
+    (if (or (not (string? groupId))
+            (= groupId "")
+            (not (string? tabId))
+            (= tabId "")
+            (= groupId draggedGroupId))
+        nil
+        (let [groupWindows (if (some? (byGroup.get groupId)) (byGroup.get groupId) [])
+              index (tabIndexById groupWindows tabId)]
+          (if (< index 0)
+              nil
+              (let [rect (tabCell.getBoundingClientRect)
+                    insertIndex (insertIndexFromTabBodyPointer clientX rect.left rect.width index)]
+                {:groupId groupId :insertIndex insertIndex}))))))
+
+(ann mergeTargetFromElement (Fn [Js Js String Number] Js))
+(defn mergeTargetFromElement [el byGroup draggedGroupId clientX]
+  (if (isUnderWindowGroup el draggedGroupId)
+      nil
+      (let [slotEl (let [closestSlot (closestFromElement el "[data-tab-drop-slot]")]
+                     (if (some? closestSlot)
+                         closestSlot
+                         (if (hasAttribute? el "data-tab-drop-slot") el nil)))]
+        (if (some? slotEl)
+            (mergeTargetFromSlotElement slotEl draggedGroupId)
+            (let [tabCell (closestFromElement el "[data-workspace-tab-id]")]
+              (if (some? tabCell)
+                  (mergeTargetFromTabCell tabCell byGroup draggedGroupId clientX)
+                  nil))))))
+
+(ann outsideCanvasRect? (Fn [Number Number Js] Bool))
+(defn outsideCanvasRect? [clientX clientY rect]
+  (and (some? rect)
+       (or (< clientX rect.left)
+           (> clientX rect.right)
+           (< clientY rect.top)
+           (> clientY rect.bottom))))
+
+(ann elementNode? (Fn [Js] Bool))
+(defn elementNode? [node]
+  (and (some? node)
+       (some? (object-get node "closest"))
+       (some? (object-get node "getAttribute"))))
+
+(ann firstDirectMergeHit (Fn [Js Js String Number] Js))
+(defn firstDirectMergeHit [elements byGroup draggedGroupId clientX]
+  (if (= (count elements) 0)
+      nil
+      (let [el (nth elements 0)
+            rest (slice elements 1 (count elements))]
+        (if (not (elementNode? el))
+            (firstDirectMergeHit rest byGroup draggedGroupId clientX)
+            (let [hit (mergeTargetFromElement el byGroup draggedGroupId clientX)]
+              (if (some? hit) hit (firstDirectMergeHit rest byGroup draggedGroupId clientX)))))))
+
+(ann firstGroupHeaderHit (Fn [Js Js String Number] Js))
+(defn firstGroupHeaderHit [elements byGroup draggedGroupId clientY]
+  (if (= (count elements) 0)
+      nil
+      (let [el (nth elements 0)
+            rest (slice elements 1 (count elements))]
+        (if (or (not (elementNode? el)) (isUnderWindowGroup el draggedGroupId))
+            (firstGroupHeaderHit rest byGroup draggedGroupId clientY)
+            (let [groupEl (closestFromElement el "[data-window-group]")]
+              (if (not (some? groupEl))
+                  (firstGroupHeaderHit rest byGroup draggedGroupId clientY)
+                  (let [group (unsafe-cast Js groupEl)
+                        groupId (getAttributeValue group "data-window-group")]
+                    (if (or (not (string? groupId)) (= groupId "") (= groupId draggedGroupId))
+                        (firstGroupHeaderHit rest byGroup draggedGroupId clientY)
+                        (let [rect (group.getBoundingClientRect)]
+                          (if (and (>= clientY rect.top) (<= clientY (+ rect.top 32)))
+                              (let [groupWindows (if (some? (byGroup.get groupId))
+                                                     (byGroup.get groupId)
+                                                     [])]
+                                {:groupId groupId :insertIndex (count groupWindows)})
+                              (firstGroupHeaderHit rest byGroup draggedGroupId clientY)))))))))))
+
+(ann mergeTargetHitTest (Fn [Js String Number Number Js] Js))
+(defn mergeTargetHitTest [byGroup draggedGroupId clientX clientY options]
+  (let [rect (if (object? options) options.canvasRect nil)]
+    (if (outsideCanvasRect? clientX clientY rect)
+        nil
+        (let [elements (jsGlobalThis.document.elementsFromPoint clientX clientY)
+              direct (firstDirectMergeHit elements byGroup draggedGroupId clientX)]
+          (if (some? direct)
+              direct
+              (firstGroupHeaderHit elements byGroup draggedGroupId clientY))))))
+
+(ann findWindowById (Fn [Js String] Js))
+(defn findWindowById [windows windowId]
+  (find windows (fn [win] (= win.id windowId))))
+
+(ann findMergeTarget (Fn [Js String Number Number Js] Js))
+(defn findMergeTarget [windows draggedWindowId clientX clientY options]
+  (let [draggedWindow (findWindowById windows draggedWindowId)
+        draggedGroupId (if (some? draggedWindow)
+                           (groupIdForWindow draggedWindow)
+                           draggedWindowId)
+        byGroup (workspaceWindowsByGroupId windows)]
+    (mergeTargetHitTest byGroup draggedGroupId clientX clientY options)))

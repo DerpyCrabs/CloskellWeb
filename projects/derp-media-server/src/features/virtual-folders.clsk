@@ -1,0 +1,16 @@
+(import "./source-context.clsk" [normalizeSlashes])
+
+(def virtualFolderMostPlayed "Most Played")
+(def virtualFolderFavorites "Favorites")
+(def virtualFolderShares "Shares")
+
+(ann virtualFolderValues (Vector String))
+(def virtualFolderValues [virtualFolderMostPlayed virtualFolderFavorites virtualFolderShares])
+
+(ann isVirtualFolderPath (Fn [String] Bool))
+(defn isVirtualFolderPath [relativePath]
+  (let [norm (normalizeSlashes relativePath)]
+    (any? virtualFolderValues
+          (fn [root]
+            (or (= norm root)
+                (starts-with? norm (str root "/")))))))

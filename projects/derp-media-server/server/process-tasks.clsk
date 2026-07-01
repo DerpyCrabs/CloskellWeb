@@ -1,0 +1,5 @@
+(import "child_process" [spawn])
+
+(ann spawnProcess (Fn [String Js Js] Js))
+(defn spawnProcess [command args options]
+  (spawn command args options))

@@ -1,0 +1,40 @@
+(import "./shares.clsk" [getShare isShareAccessAuthorized resolveShareSubPath])
+
+(def jsPromise (js-global Promise))
+(def jsObject (js-global Object))
+(def jsError (js-global Error))
+
+(ann HttpError (Fn [Number String] Js))
+(defn HttpError [statusCode message]
+  (let [error (new jsError message)]
+    (do
+      (jsObject.defineProperty error "statusCode" {:value statusCode :configurable true})
+      error)))
+
+(ann rejectHttpError (Fn [Number String] Js))
+(defn rejectHttpError [statusCode message]
+  (jsPromise.reject (HttpError statusCode message)))
+
+(ann cookieJar (Fn [Js] Js))
+(defn cookieJar [cookies]
+  {:get (fn [name]
+          (let [value (object-get cookies name)]
+            (if (string? value) {:value value} nil)))})
+
+(ann validateShareAccess (Fn [Js String] Js))
+(defn validateShareAccess [cookies token]
+  (let [sharePromise (getShare token)]
+    (sharePromise.then
+     (fn [share]
+       (if (not (some? share))
+           (rejectHttpError 404 "Share not found")
+           (if (isShareAccessAuthorized share (cookieJar cookies))
+               {:share share}
+               (rejectHttpError 401 "Passcode required")))))))
+
+(ann resolveSharePath (Fn [Js String] String))
+(defn resolveSharePath [share subPath]
+  (let [resolved (resolveShareSubPath share subPath)]
+    (if (string? resolved)
+        resolved
+        (fail "Path outside share boundary"))))

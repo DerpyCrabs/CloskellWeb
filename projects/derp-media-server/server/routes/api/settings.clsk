@@ -1,0 +1,305 @@
+(import "../../fs-tasks.clsk" [readFileUtf8 writeFileUtf8])
+(import "../../http-routes.clsk" [HttpRoute registerHttpRoutes])
+(import "../../../lib/config.clsk" [config getDataFilePath])
+(import "../../../lib/mutex.clsk" [Mutex])
+(import "../../../lib/knowledge-base.clsk" [getKnowledgeBases])
+(import "../../../lib/workspace-layout-presets-schema.clsk" [parseWorkspaceLayoutPresetsList
+                                                         sanitizeAdminWorkspaceLayoutPresets])
+(import "../../../src/features/workspace/taskbar-pins.clsk" [filterAdminWorkspaceTaskbarPins
+                                                                 parseWorkspaceTaskbarPins])
+
+(def SETTINGS_FILE (getDataFilePath "settings.json"))
+(def settingsMutex (new Mutex))
+
+(ann defaultSettings (Fn [] Js))
+(defn defaultSettings []
+  {:viewModes {}
+   :favorites []
+   :knowledgeBases []
+   :customIcons {}
+   :autoSave {}
+   :kbChatSystemPrompts {}
+   :workspaceTaskbarPins []
+   :workspaceLayoutPresets []})
+
+(ann readAllSettings (Fn [] Js))
+(defn readAllSettings []
+  (let [readPromise (readFileUtf8 SETTINGS_FILE)
+        parsedPromise (readPromise.then
+                       (fn [raw] (unwrap-or (json-parse-result raw) {})))]
+    (parsedPromise.catch (fn [_] {}))))
+
+(ann normalizeSlashes (Fn [String] String))
+(defn normalizeSlashes [value]
+  (join (split value "\\") "/"))
+
+(ann normalizeKbChatSystemPrompts (Fn [Js] Js))
+(defn normalizeKbChatSystemPrompts [value]
+  (if (not (object? value))
+      nil
+      (let [prompts (reduce (object-entries value)
+                            {}
+                            (fn [out entry]
+                              (if (string? entry.value)
+                                  (object-assoc out
+                                                (normalizeSlashes entry.key)
+                                                entry.value)
+                                  out)))]
+        (if (> (count (object-keys prompts)) 0) prompts {}))))
+
+(ann readSettings (Fn [] Js))
+(defn readSettings []
+  (let [settingsPromise (readAllSettings)]
+    (settingsPromise.then
+     (fn [allSettings]
+       (let [stored (object-get allSettings config.libraryKey)
+             raw (if (object? stored) stored (defaultSettings))
+             prompts (normalizeKbChatSystemPrompts raw.kbChatSystemPrompts)
+             taskbarPins (filterAdminWorkspaceTaskbarPins
+                          (parseWorkspaceTaskbarPins raw.workspaceTaskbarPins))
+             layoutPresets (sanitizeAdminWorkspaceLayoutPresets
+                            (parseWorkspaceLayoutPresetsList
+                             raw.workspaceLayoutPresets))]
+         (merge (defaultSettings)
+                raw
+                {:kbChatSystemPrompts (if (some? prompts) prompts {})
+                 :workspaceTaskbarPins taskbarPins
+                 :workspaceLayoutPresets layoutPresets}))))))
+
+(ann writeSettings (Fn [Js] Js))
+(defn writeSettings [settings]
+  (let [releasePromise (settingsMutex.acquire)]
+    (releasePromise.then
+     (fn [release]
+       (let [allSettingsPromise (readAllSettings)
+             writePromise (allSettingsPromise.then
+                           (fn [allSettings]
+                             (let [nextAllSettings (object-assoc allSettings
+                                                                  config.libraryKey
+                                                                  settings)]
+                               (writeFileUtf8 SETTINGS_FILE
+                                              (json-stringify nextAllSettings 2)))))]
+         (writePromise.finally release))))))
+
+(ann codeSend (Fn [Js Number Js] Js))
+(defn codeSend [reply code payload]
+  (let [codedReply (reply.code code)]
+    (codedReply.send payload)))
+
+(ann objectOrEmpty (Fn [Js] Js))
+(defn objectOrEmpty [value]
+  (if (object? value) value {}))
+
+(ann vectorOrEmpty (Fn [Js] Js))
+(defn vectorOrEmpty [value]
+  (if (vector? value) value []))
+
+(ann nonEmptyString? (Fn [Js] Bool))
+(defn nonEmptyString? [value]
+  (and (string? value) (not (= value ""))))
+
+(ann sendAfterWrite (Fn [Js Js Js] Js))
+(defn sendAfterWrite [settings reply payload]
+  (let [writePromise (writeSettings settings)]
+    (writePromise.then (fn [_] (reply.send payload)))))
+
+(ann handleGetSettings (Fn [Js Js] Js))
+(defn handleGetSettings [_request reply]
+  (let [settingsPromise (readSettings)
+        sent (settingsPromise.then (fn [settings] (reply.send settings)))]
+    (sent.catch (fn [_] (reply.send (defaultSettings))))))
+
+(ann handleViewMode (Fn [Js Js] Js))
+(defn handleViewMode [request reply]
+  (let [body request.body
+        settingsPromise (readSettings)]
+    (settingsPromise.then
+     (fn [settings]
+       (let [viewModes (objectOrEmpty settings.viewModes)
+             nextViewModes (object-assoc viewModes body.path body.viewMode)
+             nextSettings (merge settings {:viewModes nextViewModes})]
+         (sendAfterWrite nextSettings reply {:success true}))))))
+
+(ann toggleItem (Fn [Js Js] Js))
+(defn toggleItem [items value]
+  (if (includes? items value)
+      (filter items (fn [item] (not (= item value))))
+      (conj items value)))
+
+(ann handleFavorite (Fn [Js Js] Js))
+(defn handleFavorite [request reply]
+  (let [body request.body
+        filePath body.filePath]
+    (if (not (nonEmptyString? filePath))
+        (codeSend reply 400 {:error "File path is required"})
+        (let [settingsPromise (readSettings)]
+          (settingsPromise.then
+           (fn [settings]
+             (let [favorites (vectorOrEmpty settings.favorites)
+                   isFavorite (not (includes? favorites filePath))
+                   nextFavorites (toggleItem favorites filePath)
+                   nextSettings (merge settings {:favorites nextFavorites})]
+               (sendAfterWrite nextSettings
+                               reply
+                               {:success true
+                                :isFavorite isFavorite
+                                :favorites nextFavorites}))))))))
+
+(ann handleKnowledgeBase (Fn [Js Js] Js))
+(defn handleKnowledgeBase [request reply]
+  (let [body request.body
+        filePath body.filePath]
+    (if (not (nonEmptyString? filePath))
+        (codeSend reply 400 {:error "File path is required"})
+        (let [settingsPromise (readSettings)]
+          (settingsPromise.then
+           (fn [settings]
+             (let [knowledgeBases (vectorOrEmpty settings.knowledgeBases)
+                   isKnowledgeBase (not (includes? knowledgeBases filePath))
+                   nextKnowledgeBases (toggleItem knowledgeBases filePath)
+                   nextSettings (merge settings
+                                       {:knowledgeBases nextKnowledgeBases})]
+               (sendAfterWrite nextSettings
+                               reply
+                               {:success true
+                                :isKnowledgeBase isKnowledgeBase
+                                :knowledgeBases nextKnowledgeBases}))))))))
+
+(ann handleIcon (Fn [Js Js] Js))
+(defn handleIcon [request reply]
+  (let [body request.body]
+    (if (not (nonEmptyString? body.iconName))
+        (codeSend reply 400 {:error "Valid icon name is required"})
+        (let [settingsPromise (readSettings)]
+          (settingsPromise.then
+           (fn [settings]
+             (let [customIcons (objectOrEmpty settings.customIcons)
+                   nextCustomIcons (object-assoc customIcons
+                                                 body.path
+                                                 body.iconName)
+                   nextSettings (merge settings {:customIcons nextCustomIcons})]
+               (sendAfterWrite nextSettings
+                               reply
+                               {:success true
+                                :customIcons nextCustomIcons}))))))))
+
+(ann handleIconRemove (Fn [Js Js] Js))
+(defn handleIconRemove [request reply]
+  (let [body request.body
+        settingsPromise (readSettings)]
+    (settingsPromise.then
+     (fn [settings]
+       (let [customIcons (objectOrEmpty settings.customIcons)
+             nextCustomIcons (object-dissoc customIcons body.path)
+             nextSettings (merge settings {:customIcons nextCustomIcons})]
+         (sendAfterWrite nextSettings
+                         reply
+                         {:success true :customIcons nextCustomIcons}))))))
+
+(ann autoSaveEntry (Fn [Js] Js))
+(defn autoSaveEntry [body]
+  (let [base {:enabled body.enabled}]
+    (if (contains? body "readOnly")
+        (object-assoc base "readOnly" body.readOnly)
+        base)))
+
+(ann handleAutoSave (Fn [Js Js] Js))
+(defn handleAutoSave [request reply]
+  (let [body request.body
+        filePath body.filePath]
+    (if (not (nonEmptyString? filePath))
+        (codeSend reply 400 {:error "File path is required"})
+        (let [settingsPromise (readSettings)]
+          (settingsPromise.then
+           (fn [settings]
+             (let [autoSave (objectOrEmpty settings.autoSave)
+                   nextAutoSave (object-assoc autoSave
+                                              filePath
+                                              (autoSaveEntry body))
+                   nextSettings (merge settings {:autoSave nextAutoSave})]
+               (sendAfterWrite nextSettings
+                               reply
+                               {:success true :autoSave nextAutoSave}))))))))
+
+(ann handleWorkspaceTaskbarPins (Fn [Js Js] Js))
+(defn handleWorkspaceTaskbarPins [request reply]
+  (let [body request.body
+        parsed (filterAdminWorkspaceTaskbarPins
+                (parseWorkspaceTaskbarPins body.items))
+        settingsPromise (readSettings)]
+    (settingsPromise.then
+     (fn [settings]
+       (let [nextSettings (merge settings {:workspaceTaskbarPins parsed})]
+         (sendAfterWrite nextSettings
+                         reply
+                         {:success true :workspaceTaskbarPins parsed}))))))
+
+(ann handleWorkspaceLayoutPresets (Fn [Js Js] Js))
+(defn handleWorkspaceLayoutPresets [request reply]
+  (let [body request.body
+        parsed (sanitizeAdminWorkspaceLayoutPresets
+                (parseWorkspaceLayoutPresetsList body.presets))
+        settingsPromise (readSettings)]
+    (settingsPromise.then
+     (fn [settings]
+       (let [nextSettings (merge settings {:workspaceLayoutPresets parsed})]
+         (sendAfterWrite nextSettings
+                         reply
+                         {:success true :workspaceLayoutPresets parsed}))))))
+
+(ann normalizedKbRoot (Fn [Js] String))
+(defn normalizedKbRoot [value]
+  (if (string? value) (trim (normalizeSlashes value)) ""))
+
+(ann applyKbChatSystemPrompt (Fn [Js String Js] Js))
+(defn applyKbChatSystemPrompt [prompts kbRoot prompt]
+  (if (or (nil? prompt) (and (string? prompt) (= (trim prompt) "")))
+      (object-dissoc prompts kbRoot)
+      (if (string? prompt)
+          (object-assoc prompts kbRoot prompt)
+          nil)))
+
+(ann handleKbChatSystemPrompt (Fn [Js Js] Js))
+(defn handleKbChatSystemPrompt [request reply]
+  (let [body request.body
+        kbRoot (normalizedKbRoot body.kbRoot)]
+    (if (= kbRoot "")
+        (codeSend reply 400 {:error "kbRoot is required"})
+        (let [basesPromise (getKnowledgeBases)]
+          (basesPromise.then
+           (fn [bases]
+             (if (not (includes? bases kbRoot))
+                 (codeSend reply 400 {:error "Not a knowledge base"})
+                 (let [settingsPromise (readSettings)]
+                   (settingsPromise.then
+                    (fn [settings]
+                      (let [prompts (objectOrEmpty settings.kbChatSystemPrompts)
+                            nextPrompts (applyKbChatSystemPrompt prompts
+                                                                 kbRoot
+                                                                 body.prompt)]
+                        (if (nil? nextPrompts)
+                            (codeSend reply 400
+                                      {:error "prompt must be string or null"})
+                            (let [nextSettings (merge settings
+                                                      {:kbChatSystemPrompts nextPrompts})]
+                              (sendAfterWrite nextSettings
+                                              reply
+                                              {:success true
+                                               :kbChatSystemPrompts nextPrompts}))))))))))))))
+
+(ann settingsApiRouteDefinitions (Fn [] (Vector HttpRoute)))
+(defn settingsApiRouteDefinitions []
+  [{:method "GET" :path "/api/settings" :handler handleGetSettings}
+   {:method "POST" :path "/api/settings/viewMode" :handler handleViewMode}
+   {:method "POST" :path "/api/settings/favorite" :handler handleFavorite}
+   {:method "POST" :path "/api/settings/knowledgeBase" :handler handleKnowledgeBase}
+   {:method "POST" :path "/api/settings/icon" :handler handleIcon}
+   {:method "POST" :path "/api/settings/icon/remove" :handler handleIconRemove}
+   {:method "POST" :path "/api/settings/autoSave" :handler handleAutoSave}
+   {:method "POST" :path "/api/settings/workspaceTaskbarPins" :handler handleWorkspaceTaskbarPins}
+   {:method "POST" :path "/api/settings/workspaceLayoutPresets" :handler handleWorkspaceLayoutPresets}
+   {:method "POST" :path "/api/settings/kbChatSystemPrompt" :handler handleKbChatSystemPrompt}])
+
+(ann registerSettingsApiRoutes (Fn [Js] Js))
+(defn registerSettingsApiRoutes [app]
+  (registerHttpRoutes app (settingsApiRouteDefinitions)))

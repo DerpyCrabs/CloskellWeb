@@ -1,0 +1,114 @@
+(import "../../model.clsk" [AppState])
+(import "../../messages.clsk" [AppMsg UpdateResult])
+(import "./commands.clsk" [playMediaSelectorCommand
+                           restoreMediaCurrentTimeCommand
+                           syncWorkspaceTaskbarAudioCommand
+                           workspaceAudioStartCommands])
+(import "./state.clsk" [workspaceAudioKey
+                        workspaceAudioUrlForPath])
+
+(ann try-media-player-update (Fn [AppState AppMsg] (Option UpdateResult)))
+(defn try-media-player-update [state msg]
+  (match msg
+    {:kind :toggle-repeat}
+      [(merge state {:shareAudioRepeat (not state.shareAudioRepeat)})
+       Cmd.none]
+	    {:kind :media-play}
+	      [state (playMediaSelectorCommand "audio, video")]
+	    {:kind :media-audio-metadata-loaded :key key :value response}
+	      (if (and response.ok (= key state.mediaAudioMetadataKey))
+		          (let [duration (match response.body.duration
+		                           nil 0
+		                           (some value) (if (> value 0) value 0))]
+		            [(merge state {:mediaAudioDuration duration
+                                   :mediaAudioTitle response.body.title
+                                   :mediaAudioArtist response.body.artist
+                                   :mediaAudioCoverArt response.body.coverArt}) Cmd.none])
+	          [state Cmd.none])
+	    {:kind :media-audio-metadata-failed :error _error}
+	      [state Cmd.none]
+	    {:kind :video-compact :compact? compact?}
+	      [(merge state {:shareVideoCompact compact?}) Cmd.none]
+    {:kind :share-toggle-repeat}
+      [(merge state {:shareAudioRepeat (not state.shareAudioRepeat)})
+       Cmd.none]
+    {:kind :share-media-play}
+      [state (playMediaSelectorCommand "audio, video")]
+    {:kind :share-video-compact :compact? compact?}
+      [(merge state {:shareVideoCompact compact?}) Cmd.none]
+    {:kind :workspace-audio-open-toggle}
+      [(merge state {:workspaceAudioOpen (not state.workspaceAudioOpen)}) Cmd.none]
+    {:kind :workspace-audio-play :path path :name name :dir dir}
+      (let [next (merge state {:workspaceAudioPath path
+                               :workspaceAudioName name
+                               :workspaceAudioDir dir
+                               :workspaceAudioDuration 2})]
+        [next (workspaceAudioStartCommands next true)])
+    {:kind :workspace-audio-metadata-loaded :key key :value response}
+      (let [url (workspaceAudioUrlForPath state state.workspaceAudioPath)
+            currentKey (workspaceAudioKey state.workspaceAudioPath url)
+            duration (match response.body.duration
+                       nil 2
+                       (some value) (if (> value 0) value 2))]
+        (if (and response.ok (= key currentKey))
+            (let [next (merge state {:workspaceAudioDuration duration})]
+              [next (syncWorkspaceTaskbarAudioCommand key url duration false)])
+            [state Cmd.none]))
+    {:kind :workspace-audio-metadata-failed :error _error}
+      [state Cmd.none]
+    {:kind :workspace-audio-stop}
+      [(merge state {:workspaceAudioPath ""
+                     :workspaceAudioName ""
+                     :workspaceAudioDir ""
+                     :workspaceAudioOpen false
+                     :workspaceAudioDuration 2
+                     :workspaceAudioVideoWindowId ""
+                     :workspaceAudioVideoHidden false})
+       Cmd.none]
+    {:kind :workspace-audio-repeat-toggle}
+      (let [next (merge state {:workspaceAudioRepeat (not state.workspaceAudioRepeat)})
+            url (workspaceAudioUrlForPath next next.workspaceAudioPath)
+            key (workspaceAudioKey next.workspaceAudioPath url)]
+        [next (if (= next.workspaceAudioPath "")
+                  Cmd.none
+                  (syncWorkspaceTaskbarAudioCommand key url next.workspaceAudioDuration true))])
+    {:kind :workspace-audio-repeat-set :enabled enabled}
+      (let [next (merge state {:workspaceAudioRepeat enabled})
+            url (workspaceAudioUrlForPath next next.workspaceAudioPath)
+            key (workspaceAudioKey next.workspaceAudioPath url)]
+        [next (if (= next.workspaceAudioPath "")
+                  Cmd.none
+                  (syncWorkspaceTaskbarAudioCommand key url next.workspaceAudioDuration true))])
+    {:kind :workspace-audio-loop-resume}
+      (let [url (workspaceAudioUrlForPath state state.workspaceAudioPath)
+            key (workspaceAudioKey state.workspaceAudioPath url)]
+        [state (if (and state.workspaceAudioRepeat
+                        (not (= state.workspaceAudioPath "")))
+                   (Cmd.batch [(restoreMediaCurrentTimeCommand "[data-workspace-taskbar-media-audio]" 0)
+                               (syncWorkspaceTaskbarAudioCommand key url state.workspaceAudioDuration true)])
+                   Cmd.none)])
+    {:kind :workspace-audio-loop-check :currentTime currentTime :duration duration}
+      (let [url (workspaceAudioUrlForPath state state.workspaceAudioPath)
+            key (workspaceAudioKey state.workspaceAudioPath url)
+            nearEnd (and (> duration 0)
+                         (>= currentTime (max 0 (- duration 0.5))))]
+        [state (if (and state.workspaceAudioRepeat
+                        nearEnd
+                        (not (= state.workspaceAudioPath "")))
+                   (Cmd.batch [(restoreMediaCurrentTimeCommand "[data-workspace-taskbar-media-audio]" 0)
+                               (syncWorkspaceTaskbarAudioCommand key url state.workspaceAudioDuration true)])
+                   Cmd.none)])
+    {:kind :workspace-listen-only :windowId windowId :path path :name name :dir dir}
+      (let [next (merge state {:workspaceAudioPath path
+                               :workspaceAudioName name
+                               :workspaceAudioDir dir
+                               :workspaceAudioOpen false
+                               :workspaceAudioDuration 2
+                               :workspaceAudioVideoWindowId windowId
+                               :workspaceAudioVideoHidden true})]
+        [next (workspaceAudioStartCommands next true)])
+    {:kind :workspace-show-video}
+      [(merge state {:workspaceAudioVideoHidden false
+                     :workspaceAudioOpen false})
+       Cmd.none]
+    _ nil))

@@ -1,0 +1,192 @@
+(import "../virtual-folders.clsk" [isVirtualFolderPath])
+(import "./geometry.clsk" [createDefaultBounds createWindowLayout])
+(import "./page-persistence.clsk" [defaultPersistedStateWithBounds
+                                  normalizeWorkspaceStateValue])
+(import "../source-context.clsk" [normalizeSlashes])
+(import "./types.clsk" [WorkspaceState])
+
+(type WorkspaceSource
+  {:kind String
+   :rootPath (Option String)
+   :token (Option String)
+   :sharePath (Option String)})
+
+(type WorkspaceBounds
+  {:x Number
+   :y Number
+   :width Number
+   :height Number})
+
+(type WorkspaceBootstrapPreset
+  {:id String
+   :scope String
+   :snapshot (Option Js)})
+
+(type WorkspaceHydrationInput
+  {:dirParam (Option String)
+   :presetParam (Option String)
+   :loaded (Option WorkspaceState)
+   :presetsReadyNow Bool
+   :presetsList (Vector WorkspaceBootstrapPreset)
+   :layoutScope String
+   :source WorkspaceSource})
+
+(type DeferredPresetInput
+  {:presetParam (Option String)
+   :presetsReadyNow Bool
+   :hasPersistedDraft Bool
+   :presetsList (Vector WorkspaceBootstrapPreset)
+   :layoutScope String})
+
+(type WorkspaceHydrationOutcome
+  {:kind String
+   :workspace (Option WorkspaceState)
+   :baselinePresetId (Option String)
+   :baselineSnapshot (Option WorkspaceState)
+   :stripPresetFromUrl Bool})
+
+(ann truthyParam? (Fn [(Option String)] Bool))
+(defn truthyParam? [value]
+  (match value
+    nil false
+    (some current) (not (= current ""))))
+
+(ann workspaceDirParamTitle (Fn [String] String))
+(defn workspaceDirParamTitle [dirParam]
+  (let [parts (filter (split (normalizeSlashes dirParam) "/")
+                      (fn [segment] (not (= segment ""))))
+        lastPart (last parts)]
+    (if (some? lastPart) lastPart "Browser 1")))
+
+(ann buildWorkspaceFromDirParamWithBounds (Fn [String WorkspaceSource WorkspaceBounds] WorkspaceState))
+(defn buildWorkspaceFromDirParamWithBounds [dirParam source defaultBounds]
+  {:windows [{:id "workspace-window-1"
+              :type "browser"
+              :title (workspaceDirParamTitle dirParam)
+              :iconName nil
+              :iconPath dirParam
+              :iconType "folder"
+              :iconIsVirtual (isVirtualFolderPath dirParam)
+              :source source
+              :initialState {:dir dirParam}
+              :tabGroupId nil
+              :layout (createWindowLayout nil defaultBounds 1)}]
+   :activeWindowId "workspace-window-1"
+   :activeTabMap (hash-map)
+   :nextWindowId 2
+   :pinnedTaskbarItems []
+   :tabGroupSplits (hash-map)
+   :browserTabTitle nil
+   :browserTabIcon nil
+   :browserTabIconColor nil
+   :fileOpenTarget nil})
+
+(ann buildWorkspaceFromDirParam (Fn [String WorkspaceSource] WorkspaceState))
+(defn buildWorkspaceFromDirParam [dirParam source]
+  (buildWorkspaceFromDirParamWithBounds dirParam source (createDefaultBounds 0 "browser")))
+
+(ann snapshotHasWindows? (Fn [WorkspaceState] Bool))
+(defn snapshotHasWindows? [snapshot]
+  (> (count snapshot.windows) 0))
+
+(ann findPresetSnapshot (Fn [(Vector WorkspaceBootstrapPreset) String String] (Option WorkspaceState)))
+(defn findPresetSnapshot [presetsList presetParam layoutScope]
+  (let [found (find presetsList
+                    (fn [preset]
+                      (and (= preset.id presetParam)
+                           (= preset.scope layoutScope))))]
+    (if (some? found)
+        (match found.snapshot
+          nil nil
+          (some snapshot)
+            (let [normalized (normalizeWorkspaceStateValue snapshot nil)]
+              (if (and (some? normalized) (snapshotHasWindows? normalized)) normalized nil)))
+        nil)))
+
+(ann workspaceSetOutcome (Fn [WorkspaceState (Option String) (Option WorkspaceState) Bool] WorkspaceHydrationOutcome))
+(defn workspaceSetOutcome [workspace baselinePresetId baselineSnapshot stripPresetFromUrl]
+  {:kind "set-workspace"
+   :workspace workspace
+   :baselinePresetId baselinePresetId
+   :baselineSnapshot baselineSnapshot
+   :stripPresetFromUrl stripPresetFromUrl})
+
+(ann deferredPresetOutcome (Fn [] WorkspaceHydrationOutcome))
+(defn deferredPresetOutcome []
+  {:kind "defer-preset"
+   :workspace nil
+   :baselinePresetId nil
+   :baselineSnapshot nil
+   :stripPresetFromUrl false})
+
+(ann noopPresetOutcome (Fn [Bool] WorkspaceHydrationOutcome))
+(defn noopPresetOutcome [stripPresetFromUrl]
+  {:kind "noop"
+   :workspace nil
+   :baselinePresetId nil
+   :baselineSnapshot nil
+   :stripPresetFromUrl stripPresetFromUrl})
+
+(ann resolveWorkspaceInitialHydrationWithoutDir (Fn [WorkspaceHydrationInput WorkspaceBounds] WorkspaceHydrationOutcome))
+(defn resolveWorkspaceInitialHydrationWithoutDir [input defaultBounds]
+  (match input.loaded
+    (some loaded)
+      (workspaceSetOutcome loaded nil nil (truthyParam? input.presetParam))
+    nil
+      (if (and (truthyParam? input.presetParam) input.presetsReadyNow)
+          (match input.presetParam
+            nil (workspaceSetOutcome (defaultPersistedStateWithBounds input.source defaultBounds)
+                                     nil
+                                     nil
+                                     false)
+            (some presetParam)
+              (match (findPresetSnapshot input.presetsList presetParam input.layoutScope)
+                nil (workspaceSetOutcome (defaultPersistedStateWithBounds input.source defaultBounds)
+                                         nil
+                                         nil
+                                         true)
+                (some normalized)
+                  (workspaceSetOutcome normalized
+                                       presetParam
+                                       normalized
+                                       true)))
+          (if (and (truthyParam? input.presetParam) (not input.presetsReadyNow))
+              (deferredPresetOutcome)
+              (workspaceSetOutcome (defaultPersistedStateWithBounds input.source defaultBounds)
+                                   nil
+                                   nil
+                                   false)))))
+
+(ann resolveWorkspaceInitialHydrationWithBounds (Fn [WorkspaceHydrationInput WorkspaceBounds] WorkspaceHydrationOutcome))
+(defn resolveWorkspaceInitialHydrationWithBounds [input defaultBounds]
+  (match input.dirParam
+    nil (resolveWorkspaceInitialHydrationWithoutDir input defaultBounds)
+    (some dirParam)
+      (if (= dirParam "")
+          (resolveWorkspaceInitialHydrationWithoutDir input defaultBounds)
+          (workspaceSetOutcome (buildWorkspaceFromDirParamWithBounds dirParam input.source defaultBounds)
+                               nil
+                               nil
+                               (truthyParam? input.presetParam)))))
+
+(ann resolveWorkspaceInitialHydration (Fn [WorkspaceHydrationInput] WorkspaceHydrationOutcome))
+(defn resolveWorkspaceInitialHydration [input]
+  (resolveWorkspaceInitialHydrationWithBounds input (createDefaultBounds 0 "browser")))
+
+(ann resolveWorkspaceDeferredPresetApply (Fn [DeferredPresetInput] (Option WorkspaceHydrationOutcome)))
+(defn resolveWorkspaceDeferredPresetApply [input]
+  (if (or (not (truthyParam? input.presetParam))
+          (not input.presetsReadyNow)
+          input.hasPersistedDraft)
+      nil
+      (match input.presetParam
+        nil nil
+        (some presetParam)
+          (match (findPresetSnapshot input.presetsList presetParam input.layoutScope)
+            nil (noopPresetOutcome true)
+            (some normalized)
+              {:kind "apply"
+               :workspace normalized
+               :baselinePresetId presetParam
+               :baselineSnapshot normalized
+               :stripPresetFromUrl true}))))

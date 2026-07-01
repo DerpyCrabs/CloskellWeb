@@ -1,0 +1,83 @@
+(def jsMap (js-global Map))
+
+(type ThumbnailLoadTicket
+  {:cancel Js
+   :release Js})
+
+(def DEFAULT_CONCURRENCY 4)
+(def activeCountBox (unsafe-cast Js [0]))
+(def pending (unsafe-cast Js []))
+
+(ann boxGet (Fn [Js] Js))
+(defn boxGet [box]
+  (nth box 0))
+
+(ann boxSet (Fn [Js Js] Js))
+(defn boxSet [box value]
+  (box.splice 0 1 value))
+
+(ann itemGet (Fn [Js String] Js))
+(defn itemGet [item key]
+  (item.get key))
+
+(ann itemSet (Fn [Js String Js] Js))
+(defn itemSet [item key value]
+  (item.set key value))
+
+(ann startQueueItem (Fn [Js] Nil))
+(defn startQueueItem [item]
+  (do
+    (itemSet item "active" true)
+    (boxSet activeCountBox (+ (boxGet activeCountBox) 1))
+    ((itemGet item "start"))
+    nil))
+
+(ann drainThumbnailLoadQueue (Fn [] Nil))
+(defn drainThumbnailLoadQueue []
+  (if (>= (boxGet activeCountBox) DEFAULT_CONCURRENCY)
+      nil
+      (let [item (pending.shift)]
+        (if (not (some? item))
+            nil
+            (if (itemGet item "cancelled")
+                (drainThumbnailLoadQueue)
+                (do
+                  (startQueueItem item)
+                  (drainThumbnailLoadQueue)))))))
+
+(ann releaseItem (Fn [Js] Nil))
+(defn releaseItem [item]
+  (if (not (itemGet item "active"))
+      nil
+      (do
+        (itemSet item "active" false)
+        (boxSet activeCountBox (max 0 (- (boxGet activeCountBox) 1)))
+        (drainThumbnailLoadQueue)
+        nil)))
+
+(ann cancelItem (Fn [Js] Nil))
+(defn cancelItem [item]
+  (if (itemGet item "cancelled")
+      nil
+      (do
+        (itemSet item "cancelled" true)
+        (if (itemGet item "active")
+            (releaseItem item)
+            (let [index (pending.indexOf item)]
+              (if (not (= index -1)) (pending.splice index 1) nil)))
+        nil)))
+
+(ann enqueueThumbnailLoad (Fn [Js] ThumbnailLoadTicket))
+(defn enqueueThumbnailLoad [start]
+  (let [item (new jsMap)]
+    (do
+      (itemSet item "start" start)
+      (itemSet item "active" false)
+      (itemSet item "cancelled" false)
+      (pending.push item)
+      (drainThumbnailLoadQueue)
+      {:cancel (fn [] (cancelItem item))
+       :release (fn [] (releaseItem item))})))
+
+(def thumbnailLoadQueue
+  {:enqueue enqueueThumbnailLoad})

@@ -1,0 +1,121 @@
+(import "./knowledge-base.clsk" [getKnowledgeBaseRootForPath])
+(import "./source-context.clsk" [normalizeSlashes])
+
+(def jsDecodeURIComponent (js-global decodeURIComponent))
+
+(type MarkdownImageShareContext
+  {:token String
+   :sharePath String
+   :isDirectory Bool})
+
+(ann httpUrl? (Fn [String] Bool))
+(defn httpUrl? [src]
+  (or (starts-with? src "http://")
+      (starts-with? src "https://")))
+
+(ann pathSegments (Fn [String] (Vector String)))
+(defn pathSegments [path]
+  (let [safePath (if (string? path) path "")]
+    (filter (split safePath "/") (fn [segment] (not (= segment ""))))))
+
+(ann firstPathSegment (Fn [String] String))
+(defn firstPathSegment [path]
+  (let [segment (first (pathSegments path))]
+    (if (some? segment) segment "")))
+
+(ann stripLeadingSlashes (Fn [String] String))
+(defn stripLeadingSlashes [value]
+  (regex-capture value "^/*(.*)$" ""))
+
+(ann fileDirectory (Fn [String] String))
+(defn fileDirectory [path]
+  (let [segments (pathSegments path)
+        size (count segments)]
+    (if (<= size 1)
+        ""
+        (join (slice segments 0 (- size 1)) "/"))))
+
+(ann compactRelativePath (Fn [String] String))
+(defn compactRelativePath [path]
+  (join (pathSegments path) "/"))
+
+(ann encodePathSegments (Fn [String] String))
+(defn encodePathSegments [path]
+  (join (map (pathSegments path) (fn [segment] (encode-uri-component segment))) "/"))
+
+(ann maybeKbAttachmentPath (Fn [String (Vector String) String] String))
+(defn maybeKbAttachmentPath [viewingPath knowledgeBases src]
+  (if (and (not (starts-with? src "/"))
+           (not (includes? src "/")))
+      (let [kbRoot (getKnowledgeBaseRootForPath viewingPath knowledgeBases)]
+        (if (some? kbRoot)
+            (str kbRoot "/images/" src)
+            src))
+      src))
+
+(ann shareMarkdownImageUrl (Fn [String MarkdownImageShareContext (Vector String) String] (Option String)))
+(defn shareMarkdownImageUrl [viewingPath share knowledgeBases rawSrc]
+  (if (httpUrl? rawSrc)
+      rawSrc
+      (let [normView (normalizeSlashes viewingPath)
+            src (maybeKbAttachmentPath normView knowledgeBases rawSrc)
+            fileDir (fileDirectory normView)
+            shareRoot (normalizeSlashes share.sharePath)
+            srcFirst (firstPathSegment src)
+            viewFirst (firstPathSegment normView)
+            absolute? (or (starts-with? src "/")
+                          (and (not (= fileDir ""))
+                               (or (= src fileDir)
+                                   (starts-with? src (str fileDir "/"))))
+                          (and (not (= shareRoot ""))
+                               (or (= src shareRoot)
+                                   (starts-with? src (str shareRoot "/"))))
+                          (and (not (= srcFirst ""))
+                               (= srcFirst viewFirst)))
+            resolvedInitial (if absolute?
+                                (if (starts-with? src "/") (stripLeadingSlashes src) src)
+                                (compactRelativePath (str (if (= fileDir "") "" (str fileDir "/")) src)))
+            resolvedPath (if (and share.isDirectory
+                                  (not (= shareRoot ""))
+                                  (starts-with? resolvedInitial (str shareRoot "/")))
+                             (stripLeadingSlashes (string-slice resolvedInitial (count shareRoot)))
+                             resolvedInitial)]
+        (if (and share.isDirectory
+                 (not (= shareRoot ""))
+                 (= resolvedInitial shareRoot))
+            nil
+            (if (and (not share.isDirectory)
+                     (not (= resolvedInitial shareRoot)))
+                nil
+                (let [encoded (encodePathSegments resolvedPath)]
+                  (if (= encoded "")
+                      nil
+                      (str "/api/share/" share.token "/media/" encoded))))))))
+
+(ann adminMarkdownImageUrl (Fn [String (Vector String) String] String))
+(defn adminMarkdownImageUrl [viewingPath knowledgeBases rawSrc]
+  (let [src (if (and (not (httpUrl? rawSrc))
+                     (not (includes? rawSrc "/")))
+                (let [kbRoot (getKnowledgeBaseRootForPath (normalizeSlashes viewingPath) knowledgeBases)]
+                  (if (some? kbRoot)
+                      (str kbRoot "/images/" rawSrc)
+                      rawSrc))
+                rawSrc)]
+    (str "/api/media/" (encodePathSegments src))))
+
+(ann resolveMarkdownImageUrl (Fn [String (Option MarkdownImageShareContext) (Vector String) String] (Option String)))
+(defn resolveMarkdownImageUrl [viewingPath share knowledgeBases src]
+  (match share
+    nil (adminMarkdownImageUrl viewingPath knowledgeBases src)
+    (some currentShare) (shareMarkdownImageUrl viewingPath currentShare knowledgeBases src)))
+
+(ann decodeMarkdownImageSrc (Fn [String] String))
+(defn decodeMarkdownImageSrc [rawSrc]
+  (try
+   (jsDecodeURIComponent rawSrc)
+   (catch _error rawSrc)))
+
+(ann buildResolveMarkdownImageUrl (Fn [String (Option MarkdownImageShareContext) (Vector String)] (Fn [String] (Option String))))
+(defn buildResolveMarkdownImageUrl [viewingPath share knowledgeBases]
+  (fn [rawSrc]
+    (resolveMarkdownImageUrl viewingPath share knowledgeBases (decodeMarkdownImageSrc rawSrc))))

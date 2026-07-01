@@ -1,0 +1,13 @@
+(import "../src/features/virtual-folders.clsk" [(isVirtualFolderPath as closkellIsVirtualFolderPath)
+                                                virtualFolderFavorites
+                                                virtualFolderMostPlayed
+                                                virtualFolderShares])
+
+(def VIRTUAL_FOLDERS
+  {:MOST_PLAYED virtualFolderMostPlayed
+   :FAVORITES virtualFolderFavorites
+   :SHARES virtualFolderShares})
+
+(ann isVirtualFolderPath (Fn [String] Bool))
+(defn isVirtualFolderPath [relativePath]
+  (closkellIsVirtualFolderPath relativePath))

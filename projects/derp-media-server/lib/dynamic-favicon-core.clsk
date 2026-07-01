@@ -1,0 +1,81 @@
+(import "lucide-static/dist/cjs/lucide-static.js" [(default icons)])
+
+(def jsGlobalThis (js-global globalThis))
+(def jsPromise (js-global Promise))
+(def jsImage (js-global Image))
+(def jsBlob (js-global Blob))
+(def jsURL (js-global URL))
+(def jsRegExp (js-global RegExp))
+
+(def DEFAULT_FAVICON_DATA_URL
+  "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2'><path d='M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z'/></svg>")
+
+(def strokeCurrentColorPattern (new jsRegExp "stroke=\"currentColor\"" "g"))
+(def fillCurrentColorPattern (new jsRegExp "fill=\"currentColor\"" "g"))
+
+(ann getLucideIconSvg (Fn [String] (Option String)))
+(defn getLucideIconSvg [iconName]
+  (let [svg (get icons iconName)]
+    (if (string? svg) svg nil)))
+
+(ann coloredSvgString (Fn [String String] String))
+(defn coloredSvgString [svgString color]
+  (let [svgJs (unsafe-cast Js svgString)
+        withStroke (svgJs.replace strokeCurrentColorPattern (str "stroke=\"" color "\""))]
+    (withStroke.replace fillCurrentColorPattern (str "fill=\"" color "\""))))
+
+(ann generateFaviconFromSvg (Fn [String String] Js))
+(defn generateFaviconFromSvg [svgString color]
+  (let [doc jsGlobalThis.document]
+    (if (not (some? doc))
+        (jsPromise.resolve "")
+        (let [canvas (doc.createElement "canvas")
+              size 32
+              _width (canvas.setAttribute "width" (str size))
+              _height (canvas.setAttribute "height" (str size))
+              ctx (canvas.getContext "2d")]
+          (if (not (some? ctx))
+              (jsPromise.resolve "")
+              (let [img (new jsImage)
+                    coloredSvg (coloredSvgString svgString color)
+                    svgBlob (new jsBlob [coloredSvg] {:type "image/svg+xml;charset=utf-8"})
+                    url (jsURL.createObjectURL svgBlob)]
+                (new jsPromise
+                     (fn [resolve]
+                       (let [padding 4
+                             drawnSize (- size (* padding 2))
+                             onLoad (fn []
+                                      (do
+                                        (ctx.clearRect 0 0 size size)
+                                        (ctx.drawImage img padding padding drawnSize drawnSize)
+                                        (jsURL.revokeObjectURL url)
+                                        (resolve (canvas.toDataURL "image/png"))
+                                        nil))
+                             onError (fn []
+                                       (do
+                                         (jsURL.revokeObjectURL url)
+                                         (resolve "")
+                                         nil))]
+                         (do
+                           (img.addEventListener "load" onLoad)
+                           (img.addEventListener "error" onError)
+                           (img.setAttribute "src" url)
+                           nil))))))))))
+
+(ann setFaviconHref (Fn [String] Nil))
+(defn setFaviconHref [href]
+  (let [doc jsGlobalThis.document]
+    (if (not (some? doc))
+        nil
+        (let [existingLink (doc.querySelector "link[rel*='icon']")]
+          (if (some? existingLink)
+              (do
+                (existingLink.setAttribute "href" href)
+                nil)
+              (let [link (doc.createElement "link")]
+                (do
+                  (link.setAttribute "rel" "icon")
+                  (link.setAttribute "type" "image/png")
+                  (link.setAttribute "href" href)
+                  (doc.head.appendChild link)
+                  nil)))))))

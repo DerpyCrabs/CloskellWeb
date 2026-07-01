@@ -1,0 +1,146 @@
+(import "../../model.clsk" [AppState])
+(import "../../messages.clsk" [AppMsg UpdateResult])
+(import "../client-paths.clsk" [isPathEditable])
+(import "../pasted-kb-image.clsk" [spliceString])
+(import "./commands.clsk" [adminAutoSaveCommand
+                           saveAdminTextCommand
+                           shareEditCommand])
+(import "./pasted-image-commands.clsk" [readPastedKbImageCommand
+                                        restoreInputSelectionCommand
+                                        uploadPastedKbImageCommand])
+
+(ann textResponseErrorMessage (Fn [Number] String))
+(defn textResponseErrorMessage [status]
+  (str "Request failed (" status ")"))
+
+(ann textPathParts (Fn [String] (Vector String)))
+(defn textPathParts [path]
+  (filter (split (if (string? path) path "") "/") (fn [part] (not (= part "")))))
+
+(ann textParentDir (Fn [String] String))
+(defn textParentDir [path]
+  (let [parts (textPathParts path)]
+    (if (<= (count parts) 1)
+        ""
+        (join (slice parts 0 (- (count parts) 1)) "/"))))
+
+(ann try-text-editor-update (Fn [AppState AppMsg] (Option UpdateResult)))
+(defn try-text-editor-update [state msg]
+  (match msg
+    {:kind :admin-text-loaded :value response}
+      (if response.ok
+          (let [body (if (string? response.body) response.body "")]
+            [(merge state {:adminTextPath (match state.viewingPath nil state.adminTextPath (some path) path)
+                           :adminTextContent body
+                           :adminTextDraft body
+                           :adminTextPending false
+                           :adminTextError nil
+                           :adminTextReadOnly false})
+             Cmd.none])
+          [(merge state {:adminTextPending false
+                         :adminTextError (textResponseErrorMessage response.status)})
+           Cmd.none])
+    {:kind :admin-text-failed :error error}
+      [(merge state {:adminTextPending false :adminTextError error}) Cmd.none]
+    {:kind :admin-text-input :value value}
+      [(merge state {:adminTextDraft value}) Cmd.none]
+    {:kind :admin-text-save}
+      (if (= state.adminTextPath "")
+          [state Cmd.none]
+          [(merge state {:adminTextSaving true :adminTextError nil})
+           (saveAdminTextCommand state.adminTextPath state.adminTextDraft)])
+    {:kind :admin-text-save-if-needed}
+      (if (and state.adminTextAutoSave
+               (not (= state.adminTextPath ""))
+               (not (= state.adminTextDraft state.adminTextContent)))
+          [(merge state {:adminTextSaving true :adminTextError nil})
+           (saveAdminTextCommand state.adminTextPath state.adminTextDraft)]
+          [state Cmd.none])
+    {:kind :admin-text-saved :value response}
+      (if response.ok
+          [(merge state {:adminTextSaving false
+                         :adminTextContent state.adminTextDraft
+                         :adminTextPending false
+                         :adminTextError nil
+                         :filesPending true})
+           {:kind :http/request
+            :request {:url (str "/api/files?dir=" (encode-uri-component state.currentDir))
+                      :method "GET"}
+            :response :json
+            :onSuccess :files-loaded
+            :onError :files-failed}]
+          [(merge state {:adminTextSaving false
+                         :adminTextError (textResponseErrorMessage response.status)})
+           Cmd.none])
+    {:kind :admin-text-save-failed :error error}
+      [(merge state {:adminTextSaving false :adminTextError error}) Cmd.none]
+    {:kind :admin-text-read-only :readOnly readOnly}
+      [(merge state {:adminTextReadOnly readOnly}) Cmd.none]
+    {:kind :admin-text-auto-save-toggle}
+      (let [enabled (not state.adminTextAutoSave)]
+        [(merge state {:adminTextAutoSave enabled})
+         (adminAutoSaveCommand state.adminTextPath enabled state.adminTextReadOnly)])
+    {:kind :admin-text-auto-save-loaded :value _response}
+      [state Cmd.none]
+    {:kind :pasted-kb-image-start :filePath filePath :blob blob :target target :content content :selectionStart start :selectionEnd end :imagePath imagePath :fileName fileName :mimeType mimeType}
+      (let [allowed (match state.shareToken
+                      nil (isPathEditable (textParentDir imagePath) state.editableFolders state.mediaRoots)
+                      (some _token) (and state.shareAllowEdit state.shareAllowUpload))]
+        (if allowed
+            [state (readPastedKbImageCommand blob filePath target content start end imagePath fileName mimeType)]
+            [state Cmd.none]))
+    {:kind :pasted-kb-image-read :filePath filePath :target target :content content :selectionStart start :selectionEnd end :imagePath imagePath :fileName fileName :mimeType mimeType :base64Content base64Content}
+      [state (uploadPastedKbImageCommand state filePath target content start end imagePath fileName mimeType base64Content)]
+    {:kind :pasted-kb-image-uploaded :value response :filePath _filePath :target target :content content :selectionStart start :selectionEnd end :fileName fileName}
+      (if response.ok
+          (let [insert (str "[[" fileName "]]")
+                nextContent (spliceString content start end insert)
+                cursor (+ start (count insert))
+                next (match state.shareToken
+                       nil (merge state {:adminTextDraft nextContent :adminTextError nil})
+                       (some _token) (merge state {:shareTextContent nextContent :shareTextError nil}))]
+            [next (restoreInputSelectionCommand target cursor cursor)])
+          [(match state.shareToken
+             nil (merge state {:adminTextError (textResponseErrorMessage response.status)})
+             (some _token) (merge state {:shareTextError (textResponseErrorMessage response.status)}))
+           Cmd.none])
+    {:kind :pasted-kb-image-failed :error error}
+      [(match state.shareToken
+         nil (merge state {:adminTextError error})
+         (some _token) (merge state {:shareTextError error}))
+       Cmd.none]
+    {:kind :share-text-loaded :value response}
+      (if response.ok
+          [(merge state {:shareTextPending false
+                         :shareTextError nil
+                         :shareTextContent (if (string? response.body) response.body "")})
+           Cmd.none]
+          [(merge state {:shareTextPending false
+                         :shareTextError (textResponseErrorMessage response.status)})
+           Cmd.none])
+    {:kind :share-text-failed :error error}
+      [(merge state {:shareTextPending false :shareTextError error})
+       Cmd.none]
+	    {:kind :share-text-input :value value}
+	      [(merge state {:shareTextContent value :shareTextError nil})
+	       Cmd.none]
+	    {:kind :share-text-copy}
+	      [state {:kind :browser/clipboard-write :text state.shareTextContent}]
+	    {:kind :share-text-save}
+	      (if (and state.shareAllowEdit (not (= state.shareTextPath "")))
+	          (match state.shareToken
+            nil [state Cmd.none]
+            (some token)
+              [(merge state {:shareTextSaving true :shareTextError nil})
+               (shareEditCommand token state.shareTextPath state.shareTextContent)])
+          [state Cmd.none])
+    {:kind :share-text-saved :value response}
+      (if response.ok
+          [(merge state {:shareTextSaving false :shareTextError nil}) Cmd.none]
+          [(merge state {:shareTextSaving false
+                         :shareTextError (textResponseErrorMessage response.status)})
+           Cmd.none])
+    {:kind :share-text-save-failed :error error}
+      [(merge state {:shareTextSaving false :shareTextError error})
+       Cmd.none]
+    _ nil))

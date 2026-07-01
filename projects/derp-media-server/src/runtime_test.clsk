@@ -1,0 +1,1267 @@
+(import "closkell/test" [describe test expect=])
+(import "./features/clamp-fixed-menu.clsk" [clampFixedMenuPositionInViewport fixedMenuViewportEdge])
+(import "./features/source-context.clsk" [normalizeSlashes stripSharePrefix])
+(import "./features/download.clsk" [fileDownloadHref])
+(import "./features/file-drag-data.clsk" [fileDragMime fileDragPayloadText parseFileDragData getFileDragData hasFileDragData isCompatibleSource])
+(import "./features/kb-chat-fs-paths.clsk" [(canonicalKbRelativePath as canonicalKbChatRelativePath) (kbRelativeToMediaPath as kbChatRelativeToMediaPath) (mediaPathToKbRelative as mediaPathToKbChatRelative)])
+(import "./features/kb-chat-message-core.clsk" [(formatAnswerSeconds as formatKbChatAnswerSeconds) isMediaPathUnderKb resolveMediaPathForKbChat])
+(import "./features/knowledge-base.clsk" [getKnowledgeBaseRootForPath isKnowledgeBaseImagePath])
+(import "./features/media-roots.clsk" [getLibraryKey normalizeMediaRoots])
+(import "./features/media-urls.clsk" [buildAdminMediaUrl buildAudioExtractUrl buildAudioMetadataUrl buildMediaUrl buildShareMediaUrl buildThumbnailUrl])
+(import "./features/media-utils.clsk" [formatFileSize getMediaType getMimeType])
+(import "./features/mcp-ai-tool-key.clsk" [mcpAiToolKey])
+(import "./features/mcp-config.clsk" [parseMcpConfig validMcpUrl?])
+(import "./features/paste-data.clsk" [isTextFileType pastedFileExtension textFileExtensions])
+(import "./features/pasted-kb-image.clsk" [formatObsidianPastedImageFileNameWithStamp pastedImageExtensionForMimeType spliceString])
+(import "./features/resolve-markdown-image-url.clsk" [resolveMarkdownImageUrl])
+(import "./features/text-viewer-markdown.clsk" [preprocessObsidianImages stripAngleSrc])
+(import "./features/share-path.clsk" [resolveShareSubPath])
+(import "./features/share-restrictions.clsk" [checkUploadQuota defaultMaxUploadBytes getEffectiveRestrictions positiveInfinity])
+(import "./features/client-paths.clsk" [(getKnowledgeBaseRoot as getClientKnowledgeBaseRoot) isPathEditable])
+(import "./features/theme.clsk" [isThemeMode isThemePalette normalizeLegacyThemeMode normalizeLegacyThemePalette resolveThemeFromPreference])
+(import "./features/virtual-folders.clsk" [isVirtualFolderPath virtualFolderFavorites virtualFolderMostPlayed virtualFolderShares])
+(import "./features/video-player-position.clsk" [defaultVideoPlayerPosition defaultVideoPlayerPositionForViewport validateVideoPlayerPositionInViewport])
+(import "./features/workspace/assist-grid.clsk" [assistShapeMatchingSpan assistShapeToDims assistGridSpanToBounds assistGridSpansEqual assistSpanToGridLines detectEdgeAssistGridSpan isAssistGridShape segmentIndex snapEdgeThresholdPx topSnapAssistCenterHalfWidthPx])
+(import "./features/workspace/bootstrap.clsk" [buildWorkspaceFromDirParamWithBounds resolveWorkspaceDeferredPresetApply resolveWorkspaceInitialHydrationWithBounds workspaceDirParamTitle])
+(import "./features/workspace/browser-pane-paths.clsk" [workspaceBrowserPaneParentDir])
+(import "./features/workspace/file-open-target-picker.clsk" [(layoutBoundsForWindowHighlight as pickerLayoutBoundsForWindowHighlight) (pickWorkspaceWindowAtClientPoint as pickerPickWorkspaceWindowAtClientPoint)])
+(import "./features/workspace/geometry.clsk" [createDefaultBoundsForViewport createFullscreenBoundsForCanvas createWindowLayout getPlaybackTitle getPlayerBoundsForAspectRatioInViewport insertWindowAtGroupIndex isVideoPath maxWorkspaceWindowZ reconcileLayoutBoundsFromSnapZonesForCanvas scaleSnappedWindowsBoundsForCanvasResize snapZoneToBoundsWithOccupied workspaceTitleBarPx workspaceWindowMinVisiblePx])
+(import "./features/workspace/snap-resize-handles.clsk" [getWorkspaceSnapResizeHandleMap snapResizeEdgeTolerance snapResizeHandlesFromBounds])
+(import "./features/workspace/layout-preview.clsk" [computeLayoutPreviewDetailForCanvas computeLayoutPreviewNormForCanvas tabLabelMax truncateTabTitle])
+(import "./features/workspace/snap-live.clsk" [(snapZonePreviewBoundsForDrag as snapLivePreviewBoundsForDrag)])
+(import "./features/workspace/tab-drop-hit.clsk" [tabDropBeforeFraction insertIndexFromTabBodyPointer])
+(import "./features/workspace/tab-groups-core.clsk" [clampTabInsertIndex groupIdForWindow insertIndexAfterAllRightTabs leadingPinnedTabCount mergeInsertIndexToRightStripSlot mergeTargetGroupSignature orderedAllGroupIds orderedVisibleGroupIds pinnedCountInGroup resolveGroupVisibleTabId rightStripIndexToGroupInsertIndex tabGroupSignatureSeparator tabsInGroup visibleTabIdAfterPlayerRemoved])
+(import "./features/workspace/tab-icon-colors.clsk" [workspaceTabIconSwatches isWorkspaceTabIconColorKey workspaceTabIconColorKeyToHex])
+(import "./features/workspace/taskbar-pins.clsk" [parseWorkspaceTaskbarPins filterAdminWorkspaceTaskbarPins filterShareWorkspaceTaskbarPins])
+(import "./features/workspace/page-persistence.clsk" [defaultInitialBrowserTitle defaultPersistedStateWithBounds isWorkspaceRoute])
+(import "./features/workspace/session-resize.clsk" [(computeSnappedResizeWindows as computeSessionSnappedResizeWindows)])
+(import "./features/workspace/layout-presets.clsk" [parseWorkspaceLayoutPresetsListWithNow sanitizeAdminWorkspaceLayoutPresets sanitizeShareWorkspaceLayoutPresets workspaceLayoutScopeFromShareToken])
+(import "./features/workspace/snap-pick.clsk" [assistGutterSlopPx assistPickMatchesGridSpan narrowPickToAssistShape normalizeAssistGridSpan pointInRect rectArea slopInflatedRect spanGutterKind])
+(import "./features/workspace/titles.clsk" [workspaceBrowserDirTitle workspaceKbRootDisplayName workspaceKbChatWindowTitle])
+(import "./features/workspace/video-intrinsics.clsk" [mediaUrlForVideoIntrinsicsPreload validVideoIntrinsics viewerBoundsForVideoOpenInViewport workspaceVideoIntrinsicsCacheKey])
+(import "./features/workspace/state-core.clsk" [clampSplitPaneFraction workspaceStorageBaseKey workspaceStorageSessionKey parseWorkspaceFileOpenTargetField workspaceSourceToMediaContext resolveNewTabAnchorWindowId getWorkspaceWindowTitle])
+
+(type TestActiveTabMap (Map String String))
+
+(type TestTabGroupSplit
+  {:leftTabId (Option String)
+   :leftPaneFraction (Option Number)})
+
+(type TestTabGroupSplits (Map String TestTabGroupSplit))
+
+(describe "source context"
+  (test "normalizes separators and strips share prefixes"
+    (expect= (normalizeSlashes "share\\root\\file.png") "share/root/file.png")
+    (expect= (stripSharePrefix "/share/root/sub/file.png" "") "/share/root/sub/file.png")
+    (expect= (stripSharePrefix "/share/root/sub/file.png" "/share/root") "sub/file.png")
+    (expect= (stripSharePrefix "/share/root" "/share/root") "")
+    (expect= (stripSharePrefix "/other/file.png" "/share/root") "/other/file.png")))
+
+(describe "download urls"
+  (test "builds admin and share download hrefs"
+    (expect= (fileDownloadHref "/a/b c" nil)
+             (str "/api/files/download?path=" (encode-uri-component "/a/b c")))
+    (expect= (fileDownloadHref "/share/root/sub/file.png"
+                               {:token "tok" :sharePath "/share/root"})
+             (str "/api/share/tok/download?path="
+                  (encode-uri-component "sub/file.png")))))
+
+(describe "media urls"
+  (test "builds admin and share media urls with original encoding rules"
+    (expect= (buildAdminMediaUrl "Folder/a b.mp4") "/api/media/Folder/a%20b.mp4")
+    (expect= (buildMediaUrl "Folder/a b.mp4" nil) "/api/media/Folder/a%20b.mp4")
+    (expect= (buildShareMediaUrl "tok" "Shared\\Root" "Shared/Root/sub/a b.mp4")
+             "/api/share/tok/media/sub/a%20b.mp4")
+    (expect= (buildShareMediaUrl "tok" "Shared/Root" "Shared/Root")
+             "/api/share/tok/media/.")
+    (expect= (buildAudioExtractUrl "Folder/a b.mp3" nil)
+             "/api/audio/extract/Folder/a b.mp3")
+    (expect= (buildAudioMetadataUrl "Shared/Root/sub/a b.mp3"
+                                    {:token "tok" :sharePath "Shared/Root"})
+             "/api/share/tok/audio/metadata/sub/a%20b.mp3")
+    (expect= (buildThumbnailUrl "Folder/a b.jpg" nil)
+             "/api/thumbnail/Folder/a%20b.jpg")))
+
+(describe "media utils"
+  (test "maps extensions to media types"
+    (expect= (getMediaType "MP4") "video")
+    (expect= (getMediaType "mp3") "audio")
+    (expect= (getMediaType "png") "image")
+    (expect= (getMediaType "pdf") "pdf")
+    (expect= (getMediaType "tsx") "text")
+    (expect= (getMediaType "bin") "other"))
+
+  (test "maps extensions to mime types"
+    (expect= (getMimeType "JPG") "image/jpeg")
+    (expect= (getMimeType "ogg") "video/ogg")
+    (expect= (getMimeType "unknown") "application/octet-stream"))
+
+  (test "formats file sizes with original units and rounding"
+    (expect= (formatFileSize 0) "0 Bytes")
+    (expect= (formatFileSize 1023) "1023 Bytes")
+    (expect= (formatFileSize 1024) "1 KB")
+    (expect= (formatFileSize 1536) "1.5 KB")
+    (expect= (formatFileSize 1048576) "1 MB")
+    (expect= (formatFileSize 123456789) "117.74 MB")))
+
+(describe "fixed menu placement"
+  (test "keeps fixed menus inside the viewport"
+    (expect= fixedMenuViewportEdge 8)
+    (expect= (clampFixedMenuPositionInViewport {:w 320 :h 240}
+                                                {:preferredLeft 40
+                                                 :width 100
+                                                 :height 80
+                                                 :flip {:anchorTop 30
+                                                        :anchorBottom 60
+                                                        :gap 6}})
+             {:left 40 :top 66})
+    (expect= (clampFixedMenuPositionInViewport {:w 320 :h 240}
+                                                {:preferredLeft 280
+                                                 :width 100
+                                                 :height 80
+                                                 :flip {:anchorTop 180
+                                                        :anchorBottom 220
+                                                        :gap 6}})
+             {:left 212 :top 94})
+    (expect= (clampFixedMenuPositionInViewport {:w 120 :h 80}
+                                                {:preferredLeft -20
+                                                 :width 200
+                                                 :height 200
+                                                 :flip {:anchorTop 4
+                                                        :anchorBottom 8
+                                                        :gap 6}})
+             {:left 8 :top 8})))
+
+(describe "workspace assist grid"
+  (test "maps assist shapes and segments"
+    (expect= snapEdgeThresholdPx 36)
+    (expect= topSnapAssistCenterHalfWidthPx 150)
+    (expect= (isAssistGridShape "3x2") true)
+    (expect= (isAssistGridShape "4x4") false)
+    (expect= (assistShapeToDims "2x3") {:cols 2 :rows 3})
+    (expect= (assistShapeMatchingSpan {:gridCols 3
+                                       :gridRows 3
+                                       :gc0 1
+                                       :gc1 1
+                                       :gr0 0
+                                       :gr1 0})
+             "3x3")
+    (expect= (assistShapeMatchingSpan {:gridCols 4
+                                       :gridRows 4
+                                       :gc0 0
+                                       :gc1 0
+                                       :gr0 0
+                                       :gr1 0})
+             nil)
+    (expect= (segmentIndex 10 300 3) 0)
+    (expect= (segmentIndex 150 300 3) 1)
+    (expect= (segmentIndex 301 300 3) 2)
+    (expect= (segmentIndex 10 0 3) 0))
+
+  (test "detects edge spans and converts grid geometry"
+    (expect= (detectEdgeAssistGridSpan 320 10 900 600 "3x2" {:suppressTopEdgeSpans false})
+             {:gridCols 3 :gridRows 2 :gc0 0 :gc1 1 :gr0 0 :gr1 0})
+    (expect= (detectEdgeAssistGridSpan 450 10 900 600 "3x2" {:suppressTopEdgeSpans true})
+             nil)
+    (let [span {:gridCols 3 :gridRows 2 :gc0 1 :gc1 2 :gr0 0 :gr1 0}]
+      (expect= (assistGridSpanToBounds {:width 900 :height 600} span)
+               {:x 300 :y 0 :width 600 :height 300})
+      (expect= (assistSpanToGridLines span)
+               {:colStart 3 :colEnd 6 :rowStart 1 :rowEnd 2})
+      (expect= (assistGridSpansEqual span span) true)
+      (expect= (assistGridSpansEqual span {:gridCols 3 :gridRows 2 :gc0 1 :gc1 1 :gr0 0 :gr1 0})
+               false))
+    (expect= (assistGridSpanToBounds {:width 80 :height 70}
+                                      {:gridCols 2 :gridRows 2 :gc0 0 :gc1 0 :gr0 0 :gr1 0})
+             {:x 0 :y 0 :width 80 :height 70})))
+
+  (test "matches snap assist picks and gutter slop geometry"
+    (let [cell {:gridCols 3 :gridRows 2 :gc0 1 :gc1 1 :gr0 0 :gr1 0}
+          col-span {:gridCols 3 :gridRows 2 :gc0 0 :gc1 1 :gr0 0 :gr1 0}
+          row-span {:gridCols 3 :gridRows 2 :gc0 1 :gc1 1 :gr0 0 :gr1 1}
+          junction {:gridCols 3 :gridRows 2 :gc0 0 :gc1 1 :gr0 0 :gr1 1}
+          pick {:kind "grid-span" :span cell}
+          rect {:left 10 :top 20 :right 16 :bottom 60 :width 6 :height 40}]
+      (expect= assistGutterSlopPx 3)
+      (expect= (narrowPickToAssistShape pick "3x2") pick)
+      (expect= (narrowPickToAssistShape pick "2x2") nil)
+      (expect= (narrowPickToAssistShape nil "3x2") nil)
+      (expect= (spanGutterKind cell) nil)
+      (expect= (spanGutterKind col-span) "v")
+      (expect= (spanGutterKind row-span) "h")
+      (expect= (spanGutterKind junction) "j")
+      (expect= (rectArea rect) 240)
+      (expect= (rectArea {:left 0 :top 0 :right 0 :bottom 0 :width -1 :height 5}) 0)
+      (expect= (pointInRect 10 20 rect) true)
+      (expect= (pointInRect 9 20 rect) false)
+      (expect= (pointInRect 10 20 {:left 10 :top 20 :right 16 :bottom 60 :width 0 :height 40})
+               false)
+      (expect= (slopInflatedRect rect "v")
+               {:left 7 :top 20 :right 19 :bottom 60 :width 12 :height 40})
+      (expect= (slopInflatedRect rect "h")
+               {:left 10 :top 17 :right 16 :bottom 63 :width 6 :height 46})
+      (expect= (slopInflatedRect rect "j")
+               {:left 7 :top 17 :right 19 :bottom 63 :width 12 :height 46})
+      (expect= (normalizeAssistGridSpan 0 1 0 0 3 2)
+               {:gridCols 3 :gridRows 2 :gc0 0 :gc1 1 :gr0 0 :gr1 0})
+      (expect= (normalizeAssistGridSpan 2 1 0 0 3 2) nil)
+      (expect= (normalizeAssistGridSpan 0 3 0 0 3 2) nil)
+      (expect= (normalizeAssistGridSpan "0" 1 0 0 3 2) nil)
+      (expect= (assistPickMatchesGridSpan pick cell) true)
+      (expect= (assistPickMatchesGridSpan pick col-span) false)
+      (expect= (assistPickMatchesGridSpan nil cell) false)))
+
+(describe "file drag data"
+  (test "serializes and parses drag payloads"
+    (let [local {:path "Documents/readme.txt"
+                 :isDirectory false
+                 :sourceKind "local"}
+          share {:path "SharedContent/subfolder"
+                 :isDirectory true
+                 :sourceKind "share"
+                 :sourceToken "abc123"}]
+      (expect= (parseFileDragData (fileDragPayloadText local)) local)
+      (expect= (parseFileDragData (fileDragPayloadText share)) share)))
+
+  (test "rejects empty malformed and incomplete drag payloads"
+    (expect= (parseFileDragData "") nil)
+    (expect= (parseFileDragData "not json") nil)
+    (expect= (parseFileDragData (json-stringify {:isDirectory true})) nil)
+    (expect= (parseFileDragData (json-stringify {:path "test" :sourceKind "local"})) nil))
+
+  (test "reads data-transfer shaped objects"
+    (let [data {:path "Videos/sample.mp4"
+                :isDirectory false
+                :sourceKind "local"}
+          dt {:types [fileDragMime]
+              :getData (fn [mime] (if (= mime fileDragMime) (fileDragPayloadText data) ""))}]
+      (expect= (hasFileDragData dt) true)
+      (expect= (getFileDragData dt) data)))
+
+  (test "checks drag source compatibility"
+    (expect= (isCompatibleSource {:sourceKind "local"} {:path "a" :isDirectory false :sourceKind "local"}) true)
+    (expect= (isCompatibleSource {:sourceKind "share" :sourceToken "tok1"}
+                                  {:path "a" :isDirectory false :sourceKind "share" :sourceToken "tok1"})
+             true)
+    (expect= (isCompatibleSource {:sourceKind "share" :sourceToken "tok1"}
+                                  {:path "a" :isDirectory false :sourceKind "share" :sourceToken "tok2"})
+             false)
+    (expect= (isCompatibleSource {:sourceKind "local"}
+                                  {:path "a" :isDirectory false :sourceKind "share" :sourceToken "tok1"})
+             false)
+    (expect= (isCompatibleSource {:sourceKind "share" :sourceToken "tok1"}
+                                  {:path "a" :isDirectory false :sourceKind "local"})
+             false)))
+
+(describe "mcp helpers"
+  (test "namespaces and sanitizes ai tool keys"
+    (expect= (mcpAiToolKey "vkusvill" "search") "vkusvill__search")
+    (expect= (mcpAiToolKey "my-server" "tool.name") "my_server__tool_name")
+    (expect= (= (mcpAiToolKey "a" "b") (mcpAiToolKey "a_" "b")) false))
+
+  (test "validates mcp urls"
+    (expect= (validMcpUrl? "https://mcp001.vkusvill.ru/mcp") true)
+    (expect= (validMcpUrl? "http://127.0.0.1:3000/mcp") true)
+    (expect= (validMcpUrl? "not a url") false)
+    (expect= (validMcpUrl? "/relative") false))
+
+  (test "parses cursor-style mcp config"
+    (let [parsed (parseMcpConfig {:mcp {:servers {:vkusvill {:url "https://mcp001.vkusvill.ru/mcp"}
+                                                   :other {:url "http://127.0.0.1:3000/mcp"}}}})
+          cfg (match parsed
+                (some current) current
+                nil {:servers {}})]
+      (expect= cfg.servers.vkusvill.url "https://mcp001.vkusvill.ru/mcp")
+      (expect= cfg.servers.other.url "http://127.0.0.1:3000/mcp")))
+
+  (test "drops invalid mcp server entries and empty configs"
+    (let [parsed (parseMcpConfig {:mcp {:servers {"" {:url "http://x.test/mcp"}
+                                                   :bad {:url "not a url"}
+                                                   :good {:url "https://example.com/mcp"}}}})
+          cfg (match parsed
+                (some current) current
+                nil {:servers {}})]
+      (expect= (object-keys cfg.servers) ["good"])
+      (expect= cfg.servers.good.url "https://example.com/mcp")
+      (expect= (parseMcpConfig {}) nil)
+      (expect= (parseMcpConfig {:mcp {}}) nil)
+      (expect= (parseMcpConfig {:mcp {:servers {}}}) nil))))
+
+(describe "knowledge-base paths"
+  (test "finds knowledge-base roots"
+    (expect= (getKnowledgeBaseRootForPath "Notes/file.md" []) nil)
+    (expect= (getKnowledgeBaseRootForPath "Notes" ["Notes"]) "Notes")
+    (expect= (getKnowledgeBaseRootForPath "Notes/subfolder/file.md" ["Notes"]) "Notes")
+    (expect= (getKnowledgeBaseRootForPath "Documents/file.md" ["Notes"]) nil)
+    (expect= (getKnowledgeBaseRootForPath "Notes\\subfolder" ["Notes"]) "Notes")
+    (expect= (getKnowledgeBaseRootForPath "NotesExtra/file.md" ["Notes"]) nil))
+
+  (test "detects allowed knowledge-base image paths"
+    (let [kbs ["Notes"]]
+      (expect= (isKnowledgeBaseImagePath "Notes/images/diagram.png" "Notes" kbs) true)
+      (expect= (isKnowledgeBaseImagePath "Notes/images/../../../etc/passwd" "Notes" kbs) false)
+      (expect= (isKnowledgeBaseImagePath "../Notes/images/diagram.png" "Notes" kbs) false)
+      (expect= (isKnowledgeBaseImagePath "Notes/images/" "Notes" kbs) false)
+      (expect= (isKnowledgeBaseImagePath "Notes/images/sub/diagram.png" "Notes" kbs) false)
+      (expect= (isKnowledgeBaseImagePath "Notes/welcome.md" "Notes" kbs) false)
+      (expect= (isKnowledgeBaseImagePath "Documents/images/pic.png" "Documents" kbs) false)
+      (expect= (isKnowledgeBaseImagePath "Notes\\images\\..\\secret.txt" "Notes" kbs) false))))
+
+(describe "knowledge-base chat filesystem paths"
+  (test "maps kb-relative and media paths"
+    (expect= (kbChatRelativeToMediaPath "Notes" "") "Notes")
+    (expect= (kbChatRelativeToMediaPath "Notes" "foo/bar.md") "Notes/foo/bar.md")
+    (expect= (kbChatRelativeToMediaPath "Notes" "Notes/Logs") "Notes/Logs")
+    (expect= (kbChatRelativeToMediaPath "Vault" "Vault/a/Vault/b") "Vault/a/Vault/b")
+    (expect= (mediaPathToKbChatRelative "Notes" "Notes") "")
+    (expect= (mediaPathToKbChatRelative "Notes" "Notes/foo.md") "foo.md"))
+
+  (test "canonicalizes repeated kb root segments"
+    (expect= (canonicalKbChatRelativePath "Notes" "Notes/Notes/Logs/x.md") "Logs/x.md")
+    (expect= (canonicalKbChatRelativePath "Notes" "Logs/x.md") "Logs/x.md")))
+
+(describe "knowledge-base chat message helpers"
+  (test "resolves media links under the knowledge-base root"
+    (expect= (isMediaPathUnderKb "Notes/images/a.png" "Notes") true)
+    (expect= (isMediaPathUnderKb "\\Notes\\images\\a.png\\" "/Notes/") true)
+    (expect= (isMediaPathUnderKb "NotesExtra/a.png" "Notes") false)
+    (expect= (isMediaPathUnderKb "Notes/a.png" "") false)
+    (expect= (resolveMediaPathForKbChat "images/a.png" "Notes") "Notes/images/a.png")
+    (expect= (resolveMediaPathForKbChat "Notes/images/a.png" "Notes") "Notes/images/a.png")
+    (expect= (resolveMediaPathForKbChat "" "Notes") "Notes")
+    (expect= (resolveMediaPathForKbChat "/images/a.png/" nil) "images/a.png")
+    (expect= (formatKbChatAnswerSeconds 1.234) "1.23s")
+    (expect= (formatKbChatAnswerSeconds 1.235) "1.24s")
+    (expect= (formatKbChatAnswerSeconds -1) "")
+    (expect= (formatKbChatAnswerSeconds "bad") "")))
+
+(def dir-share
+  {:token "test-token"
+   :path "SharedContent"
+   :isDirectory true
+   :editable false
+   :createdAt 0})
+
+(def file-share
+  {:token "test-token"
+   :path "Documents/readme.txt"
+   :isDirectory false
+   :editable false
+   :createdAt 0})
+
+(def restricted-share
+  {:token "restricted"
+   :path "SharedContent"
+   :isDirectory true
+   :editable true
+   :passcode nil
+   :createdAt 0
+   :restrictions {:allowDelete false
+                  :allowUpload nil
+                  :allowEdit true
+                  :maxUploadBytes 100}
+   :usedBytes 40})
+
+(describe "share path resolution"
+  (test "resolves directory share subpaths"
+    (expect= (resolveShareSubPath dir-share "") "SharedContent")
+    (expect= (resolveShareSubPath dir-share ".") "SharedContent")
+    (expect= (resolveShareSubPath dir-share "subfolder") "SharedContent/subfolder")
+    (expect= (resolveShareSubPath dir-share "sub/deep/file.txt") "SharedContent/sub/deep/file.txt")
+    (expect= (resolveShareSubPath dir-share "..") nil)
+    (expect= (resolveShareSubPath dir-share "subfolder/../../etc") nil)
+    (expect= (resolveShareSubPath dir-share "../outside") nil)
+    (expect= (resolveShareSubPath dir-share "..\\outside") nil)
+    (expect= (resolveShareSubPath dir-share "a/../../../etc/passwd") nil))
+
+  (test "restricts file share subpaths"
+    (expect= (resolveShareSubPath file-share "") "Documents/readme.txt")
+    (expect= (resolveShareSubPath file-share ".") "Documents/readme.txt")
+    (expect= (resolveShareSubPath file-share "other.txt") nil)
+    (expect= (resolveShareSubPath file-share "..") nil)))
+
+(describe "share restrictions"
+  (test "applies defaults and upload quotas"
+    (expect= defaultMaxUploadBytes 2147483648)
+    (expect= positiveInfinity (/ 1 0))
+    (expect= (getEffectiveRestrictions dir-share)
+             {:allowDelete true
+              :allowUpload true
+              :allowEdit true
+              :maxUploadBytes 2147483648})
+    (expect= (getEffectiveRestrictions restricted-share)
+             {:allowDelete false
+              :allowUpload true
+              :allowEdit true
+              :maxUploadBytes 100})
+    (expect= (checkUploadQuota restricted-share 60) {:allowed true :remaining 60})
+    (expect= (checkUploadQuota restricted-share 61) {:allowed false :remaining 60})
+    (expect= (checkUploadQuota (assoc restricted-share
+                                      :restrictions {:allowDelete nil
+                                                     :allowUpload nil
+                                                     :allowEdit nil
+                                                     :maxUploadBytes 0})
+                               999999)
+             {:allowed true :remaining (/ 1 0)})))
+
+(describe "media roots"
+  (test "normalizes legacy and multi-root media config"
+    (expect= (normalizeMediaRoots "test-media" ["Notes"] nil)
+             [{:name "test-media" :path "test-media" :editableFolders ["Notes"]}])
+    (expect= (map (normalizeMediaRoots "ignored"
+                                        []
+                                        [{:path "/srv/media/movies"
+                                          :editableFolders ["Incoming"]}
+                                         {:path "/srv/media/shows"
+                                          :editableFolders ["Downloads"]}])
+                  (fn [root] root.name))
+             ["movies" "shows"])
+    (expect= (map (normalizeMediaRoots "ignored"
+                                        []
+                                        [{:path "/srv/a/media" :name "Movies"}
+                                         {:path "/srv/b/media" :name "Shows"}])
+                  (fn [root] root.name))
+             ["Movies" "Shows"]))
+
+  (test "builds media library keys"
+    (let [roots (normalizeMediaRoots "ignored"
+                                      []
+                                      [{:path "/srv/a/media" :name "Movies"}
+                                       {:path "/srv/b/media" :name "Shows"}])]
+      (expect= (getLibraryKey "test-media" [{:name "test-media"
+                                             :path "test-media"
+                                             :editableFolders ["Notes"]}])
+               "test-media")
+      (expect= (getLibraryKey "ignored" roots)
+               "Movies:/srv/a/media|Shows:/srv/b/media"))))
+
+(describe "virtual folders and client paths"
+  (test "recognizes virtual folder roots and descendants"
+    (expect= virtualFolderMostPlayed "Most Played")
+    (expect= virtualFolderFavorites "Favorites")
+    (expect= virtualFolderShares "Shares")
+    (expect= (isVirtualFolderPath "Favorites") true)
+    (expect= (isVirtualFolderPath "Favorites/song.mp3") true)
+    (expect= (isVirtualFolderPath "Favorites\\song.mp3") true)
+    (expect= (isVirtualFolderPath "Favorites2/song.mp3") false))
+
+  (test "checks client editability for single and multiple roots"
+    (expect= (isPathEditable "Notes/page.md" ["Notes"] nil) true)
+    (expect= (isPathEditable "NotesExtra/page.md" ["Notes"] nil) false)
+    (expect= (isPathEditable "Movies/Incoming/new.txt"
+                             ["Movies/Incoming"]
+                             [{:name "Movies" :editableFolders ["Incoming"]}
+                              {:name "Shows" :editableFolders ["Downloads"]}])
+             true)
+    (expect= (isPathEditable "Shows/Incoming/new.txt"
+                             ["Movies/Incoming"]
+                             [{:name "Movies" :editableFolders ["Incoming"]}
+                              {:name "Shows" :editableFolders ["Downloads"]}])
+             false))
+
+  (test "finds client knowledge-base roots"
+    (expect= (getClientKnowledgeBaseRoot "Notes/page.md" ["Notes"]) "Notes")
+    (expect= (getClientKnowledgeBaseRoot "Notes\\page.md" ["Notes"]) "Notes")
+    (expect= (getClientKnowledgeBaseRoot "NotesExtra/page.md" ["Notes"]) nil)))
+
+(describe "theme and player position helpers"
+  (test "resolves theme names and validates stored values"
+    (expect= (isThemePalette "default") true)
+    (expect= (isThemePalette "bad") false)
+    (expect= (isThemeMode "system") true)
+    (expect= (isThemeMode "auto") false)
+    (expect= (normalizeLegacyThemePalette "cosmic-night") "cosmic-night")
+    (expect= (normalizeLegacyThemePalette "other") "default")
+    (expect= (normalizeLegacyThemeMode "light") "light")
+    (expect= (normalizeLegacyThemeMode "other") "dark")
+    (expect= (resolveThemeFromPreference "default" "system" true) "default-dark")
+    (expect= (resolveThemeFromPreference "caffeine" "system" false) "caffeine-light")
+    (expect= (resolveThemeFromPreference "cosmic-night" "dark" false) "cosmic-night-dark"))
+
+  (test "computes video player default and constrained positions"
+    (expect= defaultVideoPlayerPosition {:x 0 :y 0})
+    (expect= (defaultVideoPlayerPositionForViewport {:width 1000 :height 800})
+             {:x 664 :y 420})
+    (expect= (defaultVideoPlayerPositionForViewport {:width 200 :height 200})
+             {:x 0 :y 0})
+    (expect= (validateVideoPlayerPositionInViewport {:x -10 :y 900}
+                                                   {:width 1000 :height 800})
+             {:x 0 :y 700})))
+
+(describe "paste data helpers"
+  (test "recognizes text file paste payloads"
+    (expect= (includes? textFileExtensions "tsx") true)
+    (expect= (pastedFileExtension "README.MD") "md")
+    (expect= (pastedFileExtension "README") nil)
+    (expect= (isTextFileType "text/plain" "binary.bin") true)
+    (expect= (isTextFileType "" "config.yaml") true)
+    (expect= (isTextFileType "application/octet-stream" "image.png") false)))
+
+(describe "pasted knowledge-base image helpers"
+  (test "maps pasted image mime types"
+    (expect= (pastedImageExtensionForMimeType "") "png")
+    (expect= (pastedImageExtensionForMimeType "image/png") "png")
+    (expect= (pastedImageExtensionForMimeType "image/jpeg") "jpg")
+    (expect= (pastedImageExtensionForMimeType "image/jpg") "jpg")
+    (expect= (pastedImageExtensionForMimeType "image/gif") "gif")
+    (expect= (pastedImageExtensionForMimeType "image/webp") "webp"))
+
+  (test "formats pasted image file names and splices strings"
+    (expect= (formatObsidianPastedImageFileNameWithStamp "20260102030405" "image/webp")
+             "Pasted image 20260102030405.webp")
+    (expect= (spliceString "hello world" 5 6 ",") "hello,world")
+    (expect= (spliceString "abcdef" 1 4 "X") "aXef")))
+
+(describe "markdown image url resolution"
+  (test "resolves bare kb images for admin and share media urls"
+    (expect= (resolveMarkdownImageUrl "Notes/page.md" nil ["Notes"] "photo.png")
+             "/api/media/Notes/images/photo.png")
+    (expect= (resolveMarkdownImageUrl "Notes/sub/page.md"
+                                      {:token "tok" :sharePath "Notes" :isDirectory true}
+                                      ["Notes"]
+                                      "diagram.png")
+             "/api/share/tok/media/images/diagram.png"))
+
+  (test "preprocesses Obsidian image embeds for markdown rendering"
+    (expect= (preprocessObsidianImages "before ![[photo.png]] after")
+             "before ![photo.png](<photo.png>) after")
+    (expect= (preprocessObsidianImages "![[folder/photo.JPG|Alt | more]]")
+             "![Alt | more](<folder/photo.JPG>)")
+    (expect= (preprocessObsidianImages "![[note.md]] and ![[diagram.svg]]")
+             "![[note.md]] and ![diagram.svg](<diagram.svg>)")
+    (expect= (preprocessObsidianImages "broken ![[photo.png")
+             "broken ![[photo.png")
+    (expect= (stripAngleSrc "< folder/photo.png >") "folder/photo.png")
+    (expect= (stripAngleSrc " folder/photo.png ") "folder/photo.png")))
+
+(def local-pin
+  {:id "local-docs"
+   :path "Docs/readme.md"
+   :isDirectory false
+   :title "Readme"
+   :customIconName nil
+   :source {:kind "local" :rootPath nil :token nil :sharePath nil}})
+
+(def unsafe-local-pin
+  {:id "bad"
+   :path "../secret.txt"
+   :isDirectory false
+   :title "Bad"
+   :customIconName nil
+   :source {:kind "local" :rootPath nil :token nil :sharePath nil}})
+
+(def share-root-pin
+  {:id "share-root"
+   :path "SharedContent"
+   :isDirectory true
+   :title "SharedContent"
+   :customIconName nil
+   :source {:kind "share" :rootPath nil :token "tok" :sharePath "SharedContent"}})
+
+(def share-child-pin
+  {:id "share-child"
+   :path "SharedContent\\Nested"
+   :isDirectory true
+   :title "Nested"
+   :customIconName nil
+   :source {:kind "share" :rootPath nil :token "tok" :sharePath "SharedContent"}})
+
+(def admin-layout-snapshot
+  {:windows [{:id "admin-browser"
+              :type "browser"
+              :source {:kind "local" :rootPath nil :token nil :sharePath nil}
+              :iconPath "Docs"
+              :initialState {:dir "Docs" :viewing "Docs/readme.md"}
+              :layout {:bounds {:x 0 :y 0 :width 400 :height 300}}}]
+   :pinnedTaskbarItems [local-pin]})
+
+(def admin-layout-bad-path-snapshot
+  {:windows [{:id "bad-admin-browser"
+              :type "browser"
+              :source {:kind "local" :rootPath nil :token nil :sharePath nil}
+              :initialState {:dir "Docs/../Secrets"}
+              :layout {}}]
+   :pinnedTaskbarItems []})
+
+(def admin-layout-bad-pin-snapshot
+  {:windows [{:id "bad-admin-pin-browser"
+              :type "browser"
+              :source {:kind "local" :rootPath nil :token nil :sharePath nil}
+              :initialState {:dir "Docs"}
+              :layout {}}]
+   :pinnedTaskbarItems [unsafe-local-pin]})
+
+(def share-layout-snapshot
+  {:windows [{:id "share-browser"
+              :type "browser"
+              :source {:kind "share" :rootPath nil :token "tok" :sharePath "SharedContent"}
+              :iconPath "SharedContent/Nested"
+              :initialState {:dir "SharedContent" :viewing "SharedContent/Nested/file.txt"}
+              :layout {:bounds {:x 0 :y 0 :width 400 :height 300}}}]
+   :pinnedTaskbarItems [share-root-pin share-child-pin]})
+
+(def share-layout-outside-snapshot
+  {:windows [{:id "bad-share-browser"
+              :type "browser"
+              :source {:kind "share" :rootPath nil :token "tok" :sharePath "SharedContent"}
+              :initialState {:dir "OtherRoot"}
+              :layout {}}]
+   :pinnedTaskbarItems []})
+
+(def share-layout-wrong-token-snapshot
+  {:windows [{:id "bad-share-token-browser"
+              :type "browser"
+              :source {:kind "share" :rootPath nil :token "other" :sharePath "SharedContent"}
+              :initialState {:dir "SharedContent"}
+              :layout {}}]
+   :pinnedTaskbarItems []})
+
+(describe "workspace helpers"
+  (test "computes tab drop insert indexes"
+    (expect= tabDropBeforeFraction 0.4)
+    (expect= (insertIndexFromTabBodyPointer 130 100 100 2) 2)
+    (expect= (insertIndexFromTabBodyPointer 170 100 100 2) 3)
+    (expect= (insertIndexFromTabBodyPointer 170 100 0 2) 3))
+
+  (test "derives browser parent paths"
+    (expect= (workspaceBrowserPaneParentDir "") "")
+    (expect= (workspaceBrowserPaneParentDir "Root") "")
+    (expect= (workspaceBrowserPaneParentDir "Root/Nested/File.txt") "Root/Nested")
+    (expect= (workspaceBrowserPaneParentDir "Root\\Nested\\File.txt") "Root/Nested"))
+
+  (test "computes snapped resize handles"
+    (expect= snapResizeEdgeTolerance 6)
+    (expect= (getWorkspaceSnapResizeHandleMap false "left" nil nil) "all")
+    (expect= (getWorkspaceSnapResizeHandleMap true nil nil nil) "all")
+    (expect= (getWorkspaceSnapResizeHandleMap true "top-left" nil nil)
+             {:top false
+              :bottom true
+              :left false
+              :right true
+              :topLeft false
+              :topRight false
+              :bottomLeft false
+              :bottomRight true})
+    (expect= (getWorkspaceSnapResizeHandleMap true
+                                              "assist-custom"
+                                              {:x 100 :y 10 :width 300 :height 200}
+                                              {:width 800 :height 600})
+             {:top true
+              :bottom true
+              :left true
+              :right true
+              :topLeft true
+              :topRight true
+              :bottomLeft true
+              :bottomRight true})
+    (expect= (snapResizeHandlesFromBounds {:x 0 :y 0 :width 800 :height 600}
+                                          {:width 800 :height 600})
+             {:top false
+              :bottom false
+              :left false
+              :right false
+              :topLeft false
+              :topRight false
+              :bottomLeft false
+              :bottomRight false}))
+
+  (test "computes workspace geometry and snap reconciliation"
+    (let [canvas {:width 1280 :height 720}
+          fallback {:x 10 :y 20 :width 300 :height 200}
+          snapped [{:id "a"
+                    :type "browser"
+                    :tabGroupId nil
+                    :layout {:snapZone "left"
+                             :bounds {:x 0 :y 0 :width 640 :height 720}
+                             :fullscreen false
+                             :minimized false
+                             :zIndex 2}}
+                   {:id "b"
+                    :type "browser"
+                    :tabGroupId nil
+                    :layout {:snapZone "top-right"
+                             :bounds {:x 900 :y 0 :width 50 :height 360}
+                             :fullscreen false
+                             :minimized false
+                             :zIndex 4}}
+                   {:id "c"
+                    :type "browser"
+                    :tabGroupId nil
+                    :layout {:snapZone "bottom-right"
+                             :bounds {:x 900 :y 500 :width 50 :height 100}
+                             :fullscreen false
+                             :minimized false
+                             :zIndex 3}}]
+          reconciled (reconcileLayoutBoundsFromSnapZonesForCanvas snapped canvas)
+          scaled (scaleSnappedWindowsBoundsForCanvasResize [(nth snapped 0)]
+                                                           {:width 640 :height 720}
+                                                           canvas)
+          inserted (insertWindowAtGroupIndex [{:id "left"
+                                               :type "browser"
+                                               :tabGroupId "g"
+                                               :layout {}}
+                                              {:id "right"
+                                               :type "viewer"
+                                               :tabGroupId "g"
+                                               :layout {}}
+                                              {:id "solo"
+                                               :type "browser"
+                                               :tabGroupId nil
+                                               :layout {}}]
+                                             {:id "new"
+                                              :type "viewer"
+                                              :tabGroupId "g"
+                                              :layout {}}
+                                             "g"
+                                             1)]
+      (expect= workspaceTitleBarPx 32)
+      (expect= workspaceWindowMinVisiblePx 100)
+      (expect= (createDefaultBoundsForViewport 0 "browser" canvas)
+               {:x 24 :y 24 :width 435 :height 418})
+      (expect= (createFullscreenBoundsForCanvas {:width 100 :height 100})
+               {:x 0 :y 0 :width 360 :height 240})
+      (expect= (createWindowLayout nil fallback 7)
+               {:bounds fallback
+                :fullscreen false
+                :snapZone nil
+                :minimized false
+                :zIndex 7
+                :restoreBounds nil})
+      (expect= (getPlayerBoundsForAspectRatioInViewport (/ 16 9) nil canvas)
+               {:x 71 :y 24 :width 1138 :height 672})
+      (expect= (snapZoneToBoundsWithOccupied "top-right"
+                                             [{:bounds {:x 0 :y 0 :width 640 :height 720}
+                                               :snapZone "left"}]
+                                             canvas)
+               {:x 640 :y 0 :width 640 :height 360})
+      (expect= (maxWorkspaceWindowZ snapped) 4)
+      (expect= (get (get (get (nth scaled 0) :layout) :bounds) :width) 1280)
+      (expect= (get (get (get (nth reconciled 1) :layout) :bounds) :x) 640)
+      (expect= (get (get (get (nth reconciled 2) :layout) :bounds) :y) 360)
+      (expect= (map inserted (fn [win] win.id)) ["left" "new" "right" "solo"])
+      (expect= (getPlaybackTitle nil) "Video Player")
+      (expect= (getPlaybackTitle "Movies\\sample.mp4") "sample.mp4")
+      (expect= (isVideoPath "clip.MP4") true)
+      (expect= (isVideoPath "notes.txt") false)))
+
+  (test "computes workspace video intrinsic preload helpers"
+    (let [local-source {:kind "local" :rootPath nil :token nil :sharePath nil}
+          share-source {:kind "share" :rootPath nil :token "tok" :sharePath "Shared/Root"}
+          viewport {:width 1280 :height 720}]
+      (expect= (workspaceVideoIntrinsicsCacheKey local-source "Movies/a.mp4")
+               "local::Movies/a.mp4")
+      (expect= (workspaceVideoIntrinsicsCacheKey share-source "Shared/Root/a.mp4")
+               "share:tok:Shared/Root/a.mp4")
+      (expect= (validVideoIntrinsics 1920 1080) true)
+      (expect= (validVideoIntrinsics 0 1080) false)
+      (expect= (mediaUrlForVideoIntrinsicsPreload local-source "Folder/a b.mp4" "")
+               "/api/media/Folder/a%20b.mp4")
+      (expect= (mediaUrlForVideoIntrinsicsPreload share-source
+                                                  "Shared/Root/sub/a b.mp4"
+                                                  "Shared\\Root")
+               "/api/share/tok/media/sub/a%20b.mp4")
+      (expect= (viewerBoundsForVideoOpenInViewport "Movies/a.mp4" local-source nil 1 viewport)
+               {:x 52 :y 52 :width 435 :height 418})
+      (expect= (viewerBoundsForVideoOpenInViewport "Movies/a.mp4"
+                                                   local-source
+                                                   {:width 1920 :height 1080}
+                                                   1
+                                                   viewport)
+               {:x 71 :y 24 :width 1138 :height 672})
+      (expect= (viewerBoundsForVideoOpenInViewport "Movies/a.mp4"
+                                                   local-source
+                                                   {:width 0 :height 1080}
+                                                   1
+                                                   viewport)
+               {:x 52 :y 52 :width 435 :height 418})))
+
+  (test "computes workspace layout preview groups"
+    (let [canvas {:width 1000 :height 500}
+          state {:windows [{:id "left"
+                            :title " Browser "
+                            :type "browser"
+                            :tabGroupId "g"
+                            :tabPinned true
+                            :layout {:bounds {:x 100 :y 50 :width 500 :height 300}
+                                     :zIndex 3
+                                     :minimized false
+                                     :fullscreen false}}
+                           {:id "right"
+                            :title "1234567890123456789012345"
+                            :type "viewer"
+                            :tabGroupId "g"
+                            :tabPinned false
+                            :layout {:bounds {:x 100 :y 50 :width 500 :height 300}
+                                     :zIndex 4
+                                     :minimized false
+                                     :fullscreen false}}]
+                 :tabGroupSplits {"g" {:leftTabId "left" :leftPaneFraction 0.1}}}
+          detail (computeLayoutPreviewDetailForCanvas state canvas)
+          norm (computeLayoutPreviewNormForCanvas state canvas)]
+      (expect= tabLabelMax 22)
+      (expect= (truncateTabTitle "   ") "Untitled")
+      (expect= (truncateTabTitle "1234567890123456789012345") "123456789012345678901…")
+      (expect= (get detail :aspectRatio) 2)
+      (expect= (get (nth (get detail :groups) 0) :mode) "split")
+      (expect= (get (nth (get detail :groups) 0) :leftPaneFraction) 0.3)
+      (expect= (get (nth (get (nth (get detail :groups) 0) :leftTabs) 0) :pinned) true)
+      (expect= (get (nth (get (nth (get detail :groups) 0) :rightTabs) 0) :label)
+               "123456789012345678901…")
+      (expect= (get (nth (get norm :panes) 0) :leftPct) 10)
+      (expect= (get (nth (get norm :panes) 0) :widthPct) 50)))
+
+  (test "picks workspace file-open target windows"
+    (let [windows [{:id "back"
+                    :type "browser"
+                    :tabGroupId nil
+                    :layout {:bounds {:x 0 :y 0 :width 300 :height 200}
+                             :zIndex 1
+                             :minimized false}}
+                   {:id "front"
+                    :type "viewer"
+                    :tabGroupId nil
+                    :layout {:bounds {:x 40 :y 40 :width 300 :height 200}
+                             :zIndex 5
+                             :minimized false}}
+                   {:id "hidden"
+                    :type "browser"
+                    :tabGroupId nil
+                    :layout {:bounds {:x 0 :y 0 :width 500 :height 500}
+                             :zIndex 10
+                             :minimized true}}
+                   {:id "group-left"
+                    :type "browser"
+                    :tabGroupId "grp"
+                    :layout {:bounds {:x 10 :y 10 :width 100 :height 100}
+                             :zIndex 1
+                             :minimized true}}
+                   {:id "group-right"
+                    :type "viewer"
+                    :tabGroupId "grp"
+                    :layout {:bounds {:x 200 :y 10 :width 100 :height 100}
+                             :zIndex 2
+                             :minimized false}}]
+          rect {:left 10 :top 20}]
+      (expect= (pickerPickWorkspaceWindowAtClientPoint windows rect 70 80) "front")
+      (expect= (pickerPickWorkspaceWindowAtClientPoint windows rect 900 900) nil)
+      (expect= (pickerLayoutBoundsForWindowHighlight windows "hidden") nil)
+      (expect= (pickerLayoutBoundsForWindowHighlight windows "group-right")
+               {:x 200 :y 10 :width 100 :height 100})))
+
+  (test "computes snapped session resize siblings"
+    (let [windows [{:id "left"
+                    :type "browser"
+                    :tabGroupId nil
+                    :layout {:bounds {:x 0 :y 0 :width 600 :height 400}
+                             :snapZone "left"}}
+                   {:id "right-a"
+                    :type "browser"
+                    :tabGroupId "right-group"
+                    :layout {:bounds {:x 600 :y 0 :width 600 :height 200}
+                             :snapZone "top-right"}}
+                   {:id "right-b"
+                    :type "viewer"
+                    :tabGroupId "right-group"
+                    :layout {:bounds {:x 600 :y 200 :width 600 :height 200}
+                             :snapZone "bottom-right"}}]
+          resized (computeSessionSnappedResizeWindows windows
+                                                      "left"
+                                                      {:x 0 :y 0 :width 700 :height 400}
+                                                      "right")]
+      (expect= (get (get (get (nth resized 1) :layout) :bounds) :x) 700)
+      (expect= (get (get (get (nth resized 1) :layout) :bounds) :width) 500)
+      (expect= (get (get (get (nth resized 2) :layout) :bounds) :x) 700)
+      (expect= (get (get (get (nth resized 2) :layout) :bounds) :width) 500)))
+
+  (test "computes live snap preview bounds"
+    (let [canvas {:width 1200 :height 800}
+          windows [{:id "left"
+                    :type "browser"
+                    :tabGroupId nil
+                    :layout {:bounds {:x 0 :y 0 :width 500 :height 400}
+                             :snapZone "top-left-third"
+                             :minimized false
+                             :fullscreen false}}
+                   {:id "center"
+                    :type "browser"
+                    :tabGroupId nil
+                    :layout {:bounds {:x 500 :y 0 :width 300 :height 400}
+                             :snapZone "top-center-third"
+                             :minimized false
+                             :fullscreen false}}]]
+      (expect= (snapLivePreviewBoundsForDrag "top-center-third" canvas windows [] "3x2")
+               {:x 500 :y 0 :width 300 :height 400})
+      (expect= (snapLivePreviewBoundsForDrag "top-right-third"
+                                             canvas
+                                             windows
+                                             [{:bounds {:x 0 :y 0 :width 500 :height 800}
+                                               :snapZone "left"}]
+                                             "3x2")
+               {:x 800 :y 0 :width 400 :height 400})
+      (expect= (snapLivePreviewBoundsForDrag "top-left" canvas [] [] "2x3")
+               {:x 0 :y 0 :width 600 :height 400})))
+
+  (test "resolves workspace bootstrap hydration decisions"
+    (let [source {:kind "local" :rootPath nil :token nil :sharePath nil}
+          bounds {:x 24 :y 24 :width 420 :height 360}
+          preset-snapshot {:windows [{:id "preset-win"
+                                      :type "browser"
+                                      :source source
+                                      :initialState {:dir "/preset"}
+                                      :layout {:bounds bounds}}]
+                           :activeWindowId "preset-win"
+                           :activeTabMap (hash-map)
+                           :nextWindowId 2
+                           :pinnedTaskbarItems []
+                           :tabGroupSplits (hash-map)
+                           :browserTabTitle nil
+                           :browserTabIcon nil
+                           :browserTabIconColor nil
+                           :fileOpenTarget nil}
+          presets [{:id "p1" :scope "admin" :snapshot preset-snapshot}]
+          dir-out (resolveWorkspaceInitialHydrationWithBounds
+                    {:dirParam "Favorites/Sub"
+                     :presetParam "p1"
+                     :loaded nil
+                     :presetsReadyNow true
+                     :presetsList presets
+                     :layoutScope "admin"
+                     :source source}
+                    bounds)
+          loaded-out (resolveWorkspaceInitialHydrationWithBounds
+                       {:dirParam nil
+                        :presetParam "p1"
+                        :loaded preset-snapshot
+                        :presetsReadyNow true
+                        :presetsList presets
+                        :layoutScope "admin"
+                        :source source}
+                       bounds)
+          preset-out (resolveWorkspaceInitialHydrationWithBounds
+                       {:dirParam nil
+                        :presetParam "p1"
+                        :loaded nil
+                        :presetsReadyNow true
+                        :presetsList presets
+                        :layoutScope "admin"
+                        :source source}
+                       bounds)
+          missing-out (resolveWorkspaceInitialHydrationWithBounds
+                        {:dirParam nil
+                         :presetParam "missing"
+                         :loaded nil
+                         :presetsReadyNow true
+                         :presetsList presets
+                         :layoutScope "admin"
+                         :source source}
+                        bounds)
+          deferred-out (resolveWorkspaceInitialHydrationWithBounds
+                         {:dirParam nil
+                          :presetParam "p1"
+                          :loaded nil
+                          :presetsReadyNow false
+                          :presetsList []
+                          :layoutScope "admin"
+                          :source source}
+                         bounds)
+          deferred-apply (resolveWorkspaceDeferredPresetApply
+                           {:presetParam "p1"
+                            :presetsReadyNow true
+                            :hasPersistedDraft false
+                            :presetsList presets
+                            :layoutScope "admin"})
+          default-state (defaultPersistedStateWithBounds source bounds)]
+      (expect= (workspaceDirParamTitle "Favorites/Sub") "Sub")
+      (expect= (workspaceDirParamTitle "///") "Browser 1")
+      (expect= (buildWorkspaceFromDirParamWithBounds "Favorites" source bounds)
+               {:windows [{:id "workspace-window-1"
+                           :type "browser"
+                           :title "Favorites"
+                           :iconName nil
+                           :iconPath "Favorites"
+                           :iconType "folder"
+                           :iconIsVirtual true
+                           :source source
+                           :initialState {:dir "Favorites"}
+                           :tabGroupId nil
+                           :layout {:bounds bounds
+                                    :fullscreen false
+                                    :snapZone nil
+                                    :minimized false
+                                    :zIndex 1
+                                    :restoreBounds nil}}]
+                :activeWindowId "workspace-window-1"
+                :activeTabMap (hash-map)
+                :nextWindowId 2
+                :pinnedTaskbarItems []
+                :tabGroupSplits (hash-map)
+                :browserTabTitle nil
+                :browserTabIcon nil
+                :browserTabIconColor nil
+                :fileOpenTarget nil})
+      (expect= (get dir-out :kind) "set-workspace")
+      (expect= (get dir-out :stripPresetFromUrl) true)
+      (expect= (get (nth (get (get dir-out :workspace) :windows) 0) :iconIsVirtual) true)
+      (expect= (get (nth (get (get loaded-out :workspace) :windows) 0) :id) "preset-win")
+      (expect= (get loaded-out :baselinePresetId) nil)
+      (expect= (get (nth (get (get preset-out :workspace) :windows) 0) :id) "preset-win")
+      (expect= (get preset-out :baselinePresetId) "p1")
+      (expect= (get (nth (get (get preset-out :baselineSnapshot) :windows) 0) :id) "preset-win")
+      (expect= (get (nth (get (get missing-out :workspace) :windows) 0) :id) "workspace-window-1")
+      (expect= (get missing-out :stripPresetFromUrl) true)
+      (expect= deferred-out {:kind "defer-preset"})
+      (expect= (get deferred-apply :kind) "apply")
+      (expect= (get deferred-apply :baselinePresetId) "p1")
+      (expect= (resolveWorkspaceDeferredPresetApply
+                 {:presetParam "bad"
+                  :presetsReadyNow true
+                  :hasPersistedDraft false
+                  :presetsList presets
+                  :layoutScope "admin"})
+               {:kind "noop" :stripPresetFromUrl true})
+      (expect= (get (nth (get default-state :windows) 0) :title) "Browser 1")
+      (expect= (get (get (nth (get default-state :windows) 0) :layout) :bounds) bounds)))
+
+  (test "handles tab group ordering split visibility and pinned insert bounds"
+    (let [tabs [{:id "left"
+                 :type "browser"
+                 :tabGroupId "g1"
+                 :layout {:minimized false}
+                 :tabPinned true}
+                {:id "viewer"
+                 :type "viewer"
+                 :tabGroupId "g1"
+                 :layout {:minimized false}
+                 :tabPinned true}
+                {:id "chat"
+                 :type "chat"
+                 :tabGroupId "g1"
+                 :layout {:minimized false}
+                 :tabPinned false}
+                {:id "hidden"
+                 :type "browser"
+                 :tabGroupId "g2"
+                 :layout {:minimized true}
+                 :tabPinned nil}
+                {:id "solo"
+                 :type "viewer"
+                 :tabGroupId nil
+                 :layout {:minimized false}
+                 :tabPinned nil}]
+          splits (unsafe-cast TestTabGroupSplits {"g1" {:leftTabId "left" :leftPaneFraction 0.5}})
+          activeMap (unsafe-cast TestActiveTabMap {"g1" "left"})]
+      (expect= (groupIdForWindow (nth tabs 4)) "solo")
+      (expect= (orderedVisibleGroupIds tabs) ["g1" "solo"])
+      (expect= (orderedAllGroupIds tabs) ["g1" "g2" "solo"])
+      (expect= (map (tabsInGroup tabs "g1") (fn [tab] tab.id)) ["left" "viewer" "chat"])
+      (expect= (visibleTabIdAfterPlayerRemoved tabs "g1" splits) "viewer")
+      (expect= (resolveGroupVisibleTabId {:windows tabs
+                                          :activeTabMap activeMap
+                                          :tabGroupSplits splits}
+                                        "g1")
+               "viewer")
+      (expect= (insertIndexAfterAllRightTabs (tabsInGroup tabs "g1") "left") 3)
+      (expect= (rightStripIndexToGroupInsertIndex (tabsInGroup tabs "g1") "left" 1) 2)
+      (expect= (mergeInsertIndexToRightStripSlot (tabsInGroup tabs "g1") "left" 3) 2)
+      (expect= (pinnedCountInGroup tabs "g1") 2)
+      (expect= (leadingPinnedTabCount (tabsInGroup tabs "g1")) 2)
+      (expect= (clampTabInsertIndex tabs "g1" 0) 2)
+      (expect= (mergeTargetGroupSignature [(nth tabs 0) (nth tabs 4)])
+               (str "left"
+                    tabGroupSignatureSeparator
+                    "g1"
+                    tabGroupSignatureSeparator
+                    "solo"
+                    tabGroupSignatureSeparator
+                    "solo"
+                    tabGroupSignatureSeparator))))
+
+  (test "maps workspace tab icon color keys"
+    (expect= (count workspaceTabIconSwatches) 21)
+    (expect= (isWorkspaceTabIconColorKey "blue-500") true)
+    (expect= (isWorkspaceTabIconColorKey "not-a-color") false)
+    (expect= (workspaceTabIconColorKeyToHex "rose-500") "#f43f5e")
+    (expect= (workspaceTabIconColorKeyToHex "not-a-color") nil))
+
+  (test "parses and filters taskbar pins for admin and share scopes"
+    (let [pins (parseWorkspaceTaskbarPins [local-pin
+                                           unsafe-local-pin
+                                           share-root-pin
+                                           share-child-pin
+                                           {:id "missing-fields"}
+                                           {:id "bad-share"
+                                            :path "SharedContent/Other"
+                                            :isDirectory true
+                                            :title "Other"
+                                            :source {:kind "share"}}])
+          admin (filterAdminWorkspaceTaskbarPins pins)
+          share (filterShareWorkspaceTaskbarPins "SharedContent" "tok" pins)]
+      (expect= (count pins) 4)
+      (expect= (map admin (fn [pin] pin.id)) ["local-docs"])
+      (expect= (map share (fn [pin] pin.id)) ["share-root" "share-child"])))
+
+  (test "formats workspace browser and knowledge-base titles"
+    (expect= (workspaceBrowserDirTitle "") "Home")
+    (expect= (workspaceBrowserDirTitle "Root\\Nested") "Nested")
+    (expect= (workspaceBrowserDirTitle "Root/  ") "  ")
+    (expect= (workspaceKbRootDisplayName "") "Knowledge base")
+    (expect= (workspaceKbRootDisplayName "Root/  ") "Knowledge base")
+    (expect= (workspaceKbChatWindowTitle "Notes/Project") "Project Chat"))
+
+  (test "recognizes workspace routes and default browser titles"
+    (expect= (isWorkspaceRoute "/workspace") true)
+    (expect= (isWorkspaceRoute "/share/tok/workspace") true)
+    (expect= (isWorkspaceRoute "/share/tok/workspace/") true)
+    (expect= (isWorkspaceRoute "/share/tok") false)
+    (expect= (defaultInitialBrowserTitle {:kind "local"
+                                          :rootPath nil
+                                          :token nil
+                                          :sharePath nil})
+             "Browser 1")
+    (expect= (defaultInitialBrowserTitle {:kind "share"
+                                          :rootPath nil
+                                          :token "t"
+                                          :sharePath "D:\\media\\Work"})
+             "Work")
+    (expect= (defaultInitialBrowserTitle {:kind "share"
+                                          :rootPath nil
+                                          :token "t"
+                                          :sharePath "/var/media/Work"})
+             "Work"))
+
+  (test "builds workspace layout scopes"
+    (expect= (workspaceLayoutScopeFromShareToken nil) "admin")
+    (expect= (workspaceLayoutScopeFromShareToken "") "admin")
+    (expect= (workspaceLayoutScopeFromShareToken "tok") "share:tok"))
+
+  (test "parses and sanitizes workspace layout presets"
+    (let [parsed (parseWorkspaceLayoutPresetsListWithNow [{:id "admin-a"
+                                                           :name "  First layout  "
+                                                           :scope "admin"
+                                                           :snapshot admin-layout-snapshot}
+                                                          {:id "missing-snapshot"
+                                                           :name "Missing"
+                                                           :scope "admin"}
+                                                          {:id "null-snapshot"
+                                                           :name "Null snapshot"
+                                                           :scope "admin"
+                                                           :snapshot nil
+                                                           :createdAt "older"
+                                                           :updatedAt "newer"}
+                                                          {:id "bad-scope"
+                                                           :name "Bad"
+                                                           :scope "classic"
+                                                           :snapshot admin-layout-snapshot}]
+                                                         "now-iso")]
+      (expect= (count parsed) 2)
+      (expect= (get (nth parsed 0) :name) "First layout")
+      (expect= (get (nth parsed 0) :createdAt) "now-iso")
+      (expect= (get (nth parsed 0) :updatedAt) nil)
+      (expect= (get (nth parsed 1) :snapshot) nil)
+      (expect= (get (nth parsed 1) :updatedAt) "newer"))
+    (let [admin-presets [{:id "admin-ok"
+                          :name "Admin"
+                          :scope "admin"
+                          :snapshot admin-layout-snapshot
+                          :createdAt "a"
+                          :updatedAt nil}
+                         {:id "admin-bad-path"
+                          :name "Bad path"
+                          :scope "admin"
+                          :snapshot admin-layout-bad-path-snapshot
+                          :createdAt "a"
+                          :updatedAt nil}
+                         {:id "admin-bad-pin"
+                          :name "Bad pin"
+                          :scope "admin"
+                          :snapshot admin-layout-bad-pin-snapshot
+                          :createdAt "a"
+                          :updatedAt nil}
+                         {:id "admin-empty"
+                          :name ""
+                          :scope "admin"
+                          :snapshot admin-layout-snapshot
+                          :createdAt "a"
+                          :updatedAt nil}
+                         {:id "share-in-admin"
+                          :name "Share"
+                          :scope "share:tok"
+                          :snapshot share-layout-snapshot
+                          :createdAt "a"
+                          :updatedAt nil}]
+          share-presets [{:id "share-ok"
+                          :name "Share"
+                          :scope "share:tok"
+                          :snapshot share-layout-snapshot
+                          :createdAt "s"
+                          :updatedAt nil}
+                         {:id "share-outside"
+                          :name "Outside"
+                          :scope "share:tok"
+                          :snapshot share-layout-outside-snapshot
+                          :createdAt "s"
+                          :updatedAt nil}
+                         {:id "share-wrong-token"
+                          :name "Wrong token"
+                          :scope "share:tok"
+                          :snapshot share-layout-wrong-token-snapshot
+                          :createdAt "s"
+                          :updatedAt nil}
+                         {:id "admin-in-share"
+                          :name "Admin"
+                          :scope "admin"
+                          :snapshot admin-layout-snapshot
+                          :createdAt "s"
+                          :updatedAt nil}]
+          capped (sanitizeAdminWorkspaceLayoutPresets
+                   (map (range 0 40)
+                        (fn [index]
+                          {:id (str "preset-" index)
+                           :name (str "Preset " index)
+                           :scope "admin"
+                           :snapshot admin-layout-snapshot
+                           :createdAt "a"
+                           :updatedAt nil})))]
+      (expect= (map (sanitizeAdminWorkspaceLayoutPresets admin-presets) (fn [preset] preset.id))
+               ["admin-ok"])
+      (expect= (map (sanitizeShareWorkspaceLayoutPresets "SharedContent" "tok" share-presets)
+                    (fn [preset] preset.id))
+               ["share-ok"])
+      (expect= (count capped) 32)
+      (expect= (get (last capped) :id) "preset-31")))
+
+  (test "normalizes workspace state core decisions"
+    (expect= (clampSplitPaneFraction 0.2) 0.3)
+    (expect= (clampSplitPaneFraction 0.8) 0.7)
+    (expect= (clampSplitPaneFraction "bad") 0.5)
+    (expect= (workspaceStorageBaseKey nil) "workspace-state")
+    (expect= (workspaceStorageBaseKey "tok") "workspace-state-share-tok")
+    (expect= (workspaceStorageSessionKey "workspace-state" "abc") "workspace-state-ws-abc")
+    (expect= (parseWorkspaceFileOpenTargetField "new-tab") "new-tab")
+    (expect= (parseWorkspaceFileOpenTargetField "bad") nil)
+    (expect= (workspaceSourceToMediaContext {:kind "local" :rootPath nil :token nil :sharePath nil}) nil)
+    (expect= (workspaceSourceToMediaContext {:kind "share" :rootPath nil :token "tok" :sharePath "Shared"})
+             {:shareToken "tok" :sharePath "Shared"})
+    (expect= (resolveNewTabAnchorWindowId {:windows [{:id "browser"
+                                                       :type "browser"
+                                                       :fileOpenTargetWindowId "viewer"}
+                                                      {:id "viewer"
+                                                       :type "viewer"
+                                                       :fileOpenTargetWindowId nil}]}
+                                            "browser")
+             "viewer")
+    (expect= (resolveNewTabAnchorWindowId {:windows [{:id "browser"
+                                                       :type "browser"
+                                                       :fileOpenTargetWindowId "missing"}]}
+                                            "browser")
+             "browser")
+    (expect= (getWorkspaceWindowTitle {:title "KB Chat"
+                                       :type "chat"
+                                       :source {:kind "local" :rootPath nil :token nil :sharePath nil}
+                                       :initialState {"kbRoot" "Notes/Project"}})
+             "Project Chat")
+    (expect= (getWorkspaceWindowTitle {:title ""
+                                       :type "viewer"
+                                       :source {:kind "share" :rootPath nil :token "tok" :sharePath "Shared"}
+                                       :initialState {}})
+             "Share Viewer")))

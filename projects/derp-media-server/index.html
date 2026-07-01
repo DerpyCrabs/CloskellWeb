@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Media Server</title>
+    <meta name="description" content="Browse and play your media files" />
+    <link
+      rel="icon"
+      type="image/svg+xml"
+      href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2'><path d='M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z'/></svg>"
+    />
+    <script>
+      ;(function () {
+        var p = localStorage.getItem('theme-palette') || 'default'
+        var m = localStorage.getItem('theme-mode') || 'dark'
+        var dark =
+          m === 'dark' ||
+          (m === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches)
+        document.documentElement.setAttribute('data-theme', p + '-' + (dark ? 'dark' : 'light'))
+      })()
+    </script>
+  </head>
+  <body class="antialiased">
+    <div id="root" data-testid="upload-drop-zone"></div>
+    <!--PRELOADED-->
+	    <script>
+	      ;(function () {
+	        window.__derpMediaKbSearchRequested = window.__derpMediaKbSearchRequested || [false]
+	        var kbSearchRetry = null
+	        function isTextInput(target) {
+	          var tag = target && target.tagName ? target.tagName.toLowerCase() : ''
+	          return tag === 'input' || tag === 'textarea'
+	        }
+	        function openKbSearchWhenReady() {
+	          var button = document.querySelector('button[aria-label="Open search"]')
+	          if (!button) return false
+	          window.__derpMediaKbSearchRequested[0] = false
+	          button.click()
+	          return true
+	        }
+	        function requestKbSearch() {
+	          if (openKbSearchWhenReady()) return
+	          window.__derpMediaKbSearchRequested[0] = true
+	          if (kbSearchRetry) return
+	          var attempts = 0
+	          kbSearchRetry = window.setInterval(function () {
+	            attempts += 1
+	            if (openKbSearchWhenReady() || attempts > 80) {
+	              window.clearInterval(kbSearchRetry)
+	              kbSearchRetry = null
+	            }
+	          }, 25)
+	        }
+	        document.addEventListener('keydown', function (event) {
+	          var key = event.key || ''
+	          var lower = key.toLowerCase()
+	          var shouldOpen = key === '/' || ((event.ctrlKey || event.metaKey) && lower === 'k')
+	          if (!shouldOpen || isTextInput(event.target)) return
+	          event.preventDefault()
+	          requestKbSearch()
+	        })
+	        document.addEventListener('dragenter', function (event) {
+	          var types =
+	            event.dataTransfer && event.dataTransfer.types
+              ? Array.prototype.slice.call(event.dataTransfer.types)
+              : []
+          if (types.indexOf('Files') === -1) return
+          var zone =
+            event.target &&
+            event.target.closest &&
+            event.target.closest('[data-testid="upload-drop-zone"]')
+          if (!zone || document.getElementById('pre-hydration-upload-overlay')) return
+          var overlay = document.createElement('div')
+          overlay.id = 'pre-hydration-upload-overlay'
+          overlay.textContent = 'Drop files to upload'
+          overlay.style.position = 'fixed'
+          overlay.style.inset = '0'
+          overlay.style.zIndex = '30'
+          overlay.style.display = 'flex'
+          overlay.style.alignItems = 'center'
+          overlay.style.justifyContent = 'center'
+          overlay.style.pointerEvents = 'none'
+          overlay.style.background = 'rgba(255, 255, 255, 0.85)'
+          overlay.style.font = '500 14px system-ui, sans-serif'
+          document.body.appendChild(overlay)
+        })
+      })()
+    </script>
+    <script type="module">
+      window.addEventListener('DOMContentLoaded', function () {
+        import('/src/app.clsk')
+      })
+    </script>
+  </body>
+</html>

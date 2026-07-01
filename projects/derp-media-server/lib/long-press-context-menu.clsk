@@ -1,0 +1,87 @@
+(def jsGlobalThis (js-global globalThis))
+(def jsMouseEvent (js-global MouseEvent))
+
+(ann boxGet (Fn [Js] Js))
+(defn boxGet [box]
+  (nth box 0))
+
+(ann boxSet (Fn [Js Js] Js))
+(defn boxSet [box value]
+  (box.splice 0 1 value))
+
+(ann callEventMethod (Fn [Js String] Nil))
+(defn callEventMethod [event name]
+  (let [fnValue (object-get event name)]
+    (if (some? fnValue)
+        (do
+          (fnValue.call event)
+          nil)
+        nil)))
+
+(ann clearLongPressTimeout (Fn [Js] Nil))
+(defn clearLongPressTimeout [timeoutBox]
+  (let [timeout (boxGet timeoutBox)]
+    (if (some? timeout)
+        (do
+          (jsGlobalThis.clearTimeout timeout)
+          (boxSet timeoutBox nil)
+          nil)
+        nil)))
+
+(ann touchPointOrNil (Fn [Js] Js))
+(defn touchPointOrNil [event]
+  (let [touches event.touches]
+    (if (and (some? touches) (> touches.length 0)) (nth touches 0) nil)))
+
+(ann longPressClientX (Fn [Js Js] Number))
+(defn longPressClientX [event touch]
+  (if (some? touch)
+      (let [point (unsafe-cast Js touch)]
+        point.clientX)
+      event.clientX))
+
+(ann longPressClientY (Fn [Js Js] Number))
+(defn longPressClientY [event touch]
+  (if (some? touch)
+      (let [point (unsafe-cast Js touch)]
+        point.clientY)
+      event.clientY))
+
+(ann dispatchLongPressContextMenu (Fn [Js] Nil))
+(defn dispatchLongPressContextMenu [event]
+  (let [target event.target
+        touch (touchPointOrNil event)
+        clientX (longPressClientX event touch)
+        clientY (longPressClientY event touch)
+        menuEvent (new jsMouseEvent "contextmenu"
+                       {:bubbles true
+                        :cancelable true
+                        :view jsGlobalThis.window
+                        :clientX clientX
+                        :clientY clientY})]
+    (do
+      (callEventMethod event "preventDefault")
+      (target.dispatchEvent menuEvent)
+      nil)))
+
+(ann createLongPressContextMenuHandlers (Fn [Js] Js))
+(defn createLongPressContextMenuHandlers [delayMs]
+  (let [delay (if (number? delayMs) delayMs 500)
+        timeoutBox (unsafe-cast Js [nil])
+        clear (fn [] (clearLongPressTimeout timeoutBox))]
+    {:onPointerDown (fn [event]
+                      (if (and (= event.pointerType "mouse") (not (= event.button 0)))
+                          nil
+                          (do
+                            (clear)
+                            (let [timeout (jsGlobalThis.setTimeout
+                                           (fn []
+                                             (do
+                                               (boxSet timeoutBox nil)
+                                               (dispatchLongPressContextMenu event)))
+                                           delay)]
+                              (boxSet timeoutBox timeout))
+                            nil)))
+     :onPointerUp clear
+     :onPointerLeave clear
+     :onPointerCancel clear}))

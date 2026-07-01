@@ -1,0 +1,44 @@
+(import "../../model.clsk" [AppState])
+(import "./geometry.clsk" [getViewportSize])
+(import "./interaction.clsk" [startWorkspaceResize])
+(import "./snap-resize-handles.clsk" [getWorkspaceSnapResizeHandleMap])
+(import "./state.clsk" [boundsForWindow layoutForWindow])
+(import "./tab-groups-core.clsk" [WorkspaceTabWindow])
+
+(ann workspaceResizeHandleMapForWindow (Fn [WorkspaceTabWindow] Js))
+(defn workspaceResizeHandleMapForWindow [win]
+  (let [layout (layoutForWindow win)
+        zone (if (string? layout.snapZone) layout.snapZone nil)
+        snapped? (and (some? zone) (not (= layout.fullscreen true)))]
+    (getWorkspaceSnapResizeHandleMap snapped? zone (boundsForWindow win) (getViewportSize))))
+
+(ann workspaceResizeHandleEnabled? (Fn [Js String] Bool))
+(defn workspaceResizeHandleEnabled? [resizeMap key]
+  (if (= resizeMap "all")
+      true
+      (= (object-get resizeMap key) true)))
+
+(ann WorkspaceResizeHandleView (Fn [AppState String WorkspaceTabWindow Js String String String String] Html))
+(defn WorkspaceResizeHandleView [state windowId win resizeMap key direction className cursor]
+  (if (workspaceResizeHandleEnabled? resizeMap key)
+      #html <div data-workspace-resize-handle
+                 class={(str className)}
+                 style={(str "cursor:" cursor)}
+                 on:mousedown={(startWorkspaceResize state windowId direction win event)}></div>
+      #html <span class="hidden"></span>))
+
+(ann WorkspaceResizeHandlesView (Fn [AppState String WorkspaceTabWindow Bool Bool] Html))
+(defn WorkspaceResizeHandlesView [state windowId win minimized fullscreen]
+  (if (or minimized fullscreen)
+      #html <span class="hidden"></span>
+      (let [resizeMap (workspaceResizeHandleMapForWindow win)]
+        #html <div class="contents">
+                {(WorkspaceResizeHandleView state windowId win resizeMap "top" "top" "pointer-events-auto absolute top-0 right-2 left-2 z-[100] h-2" "row-resize")}
+                {(WorkspaceResizeHandleView state windowId win resizeMap "bottom" "bottom" "pointer-events-auto absolute right-2 bottom-0 left-2 z-[100] h-2" "row-resize")}
+                {(WorkspaceResizeHandleView state windowId win resizeMap "left" "left" "pointer-events-auto absolute top-2 bottom-2 left-0 z-[100] w-2" "col-resize")}
+                {(WorkspaceResizeHandleView state windowId win resizeMap "right" "right" "pointer-events-auto absolute top-2 right-0 bottom-2 z-[100] w-2" "col-resize")}
+                {(WorkspaceResizeHandleView state windowId win resizeMap "topLeft" "top-left" "pointer-events-auto absolute top-0 left-0 z-[110] h-4 w-4" "nwse-resize")}
+                {(WorkspaceResizeHandleView state windowId win resizeMap "topRight" "top-right" "pointer-events-auto absolute top-0 right-0 z-[110] h-4 w-4" "nesw-resize")}
+                {(WorkspaceResizeHandleView state windowId win resizeMap "bottomLeft" "bottom-left" "pointer-events-auto absolute bottom-0 left-0 z-[110] h-4 w-4" "nesw-resize")}
+                {(WorkspaceResizeHandleView state windowId win resizeMap "bottomRight" "bottom-right" "pointer-events-auto absolute right-0 bottom-0 z-[110] h-4 w-4" "nwse-resize")}
+              </div>)))

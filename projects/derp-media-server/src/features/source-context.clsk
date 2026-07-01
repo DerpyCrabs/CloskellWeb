@@ -1,0 +1,36 @@
+(ann normalizeSlashes (Fn [String] String))
+(defn normalizeSlashes [value]
+  (let [safeValue (if (string? value) value "")]
+    (join (split safeValue "\\") "/")))
+
+(type SourceContext
+  {:shareToken (Option String)
+   :sharePath (Option String)})
+
+(def jsUndefined (js-global undefined))
+
+(ann resolveSourceContext (Fn [Js (Option String)] SourceContext))
+(defn resolveSourceContext [sourceOrToken sharePath]
+  (if (or (string? sourceOrToken)
+          (nil? sourceOrToken)
+          (not (identical? sharePath jsUndefined)))
+      {:shareToken (if (string? sourceOrToken) sourceOrToken nil)
+       :sharePath sharePath}
+      (if (object? sourceOrToken)
+          sourceOrToken
+          {})))
+
+(ann stripSharePrefix (Fn [String (Option String)] String))
+(defn stripSharePrefix [filePath sharePath]
+  (match sharePath
+    nil filePath
+    (some value)
+      (if (= value "")
+          filePath
+          (let [norm (normalizeSlashes filePath)
+                base (normalizeSlashes value)]
+            (if (= norm base)
+                ""
+                (if (starts-with? norm (str base "/"))
+                    (string-slice norm (+ (count base) 1))
+                    norm))))))

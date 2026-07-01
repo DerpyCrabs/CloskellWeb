@@ -1,0 +1,30 @@
+(ann hideSnapPreview (Fn [Js] Nil))
+(defn hideSnapPreview [el]
+  (do
+    (el.style.setProperty "display" "none")
+    nil))
+
+(ann showSnapPreviewBounds (Fn [Js Js] Nil))
+(defn showSnapPreviewBounds [el bounds]
+  (do
+    (el.style.setProperty "display" "block")
+    (el.style.setProperty "left" (str bounds.x "px"))
+    (el.style.setProperty "top" (str bounds.y "px"))
+    (el.style.setProperty "width" (str bounds.width "px"))
+    (el.style.setProperty "height" (str bounds.height "px"))
+    nil))
+
+(ann applySnapPreviewLayout (Fn [Js Js Js Js] Nil))
+(defn applySnapPreviewLayout [el zone _container getZoneBounds]
+  (if (not (some? el))
+      nil
+      (if (not (some? zone))
+          (hideSnapPreview el)
+          (if (= zone "snap-assist")
+              (hideSnapPreview el)
+              (if (= zone "edge-grid")
+                  (let [bounds (getZoneBounds "left")]
+                    (if (<= bounds.width 0)
+                        (hideSnapPreview el)
+                        (showSnapPreviewBounds el bounds)))
+                  (showSnapPreviewBounds el (getZoneBounds zone)))))))

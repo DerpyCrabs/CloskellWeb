@@ -1,0 +1,16 @@
+(import "fastify" [(default Fastify)])
+
+(ann healthHandler (Fn [Js Js] Js))
+(defn healthHandler [request reply]
+  (reply.send {:ok true}))
+
+(ann registerHealth (Fn [Js] Js))
+(defn registerHealth [app]
+  (app.get "/health" healthHandler))
+
+(ann main (Fn [ServerBoot] Js))
+(defn main [boot]
+  (let [app (Fastify {:logger false})]
+    (do
+      (registerHealth app)
+      (app.listen {:port 0 :host "127.0.0.1"}))))

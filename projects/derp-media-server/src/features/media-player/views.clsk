@@ -1,0 +1,696 @@
+(import "../../model.clsk" [AppState])
+(import "../../../lib/types.clsk" [FileItem MediaType])
+(import "../download.clsk" [fileDownloadHref])
+(import "../media-urls.clsk" [buildMediaUrl buildThumbnailUrl])
+(import "../media-utils.clsk" [formatFileSize])
+(import "../text-editor/views.clsk" [AdminTextViewer])
+(import "./state.clsk" [selectedSharePlayingFile
+                        selectedFile
+                        selectedFileOrEmpty
+                        selectedPlayingFile
+                        unsupportedSelected?
+                        showAdminAudioChrome?
+                        adminImageFilesForUpdate
+                        adminImageIndexForUpdate
+                        imageZoomLabel
+                        imageZoomScale
+	                        shareFileMediaUrl
+	                        shareFileMatchesPath?
+	                        shareFileThumbnailUrl])
+
+(def jsDocument (js-global document))
+
+(ann mediaCurrentTime (Fn [String] Number))
+(defn mediaCurrentTime [selector]
+  (let [el (jsDocument.querySelector selector)
+        value (if (some? el) el.currentTime 0)]
+    (if (number? value) value 0)))
+
+(ann IconZoomOut (Fn [String] Html))
+(defn IconZoomOut [className]
+  #html <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class={(str "lucide lucide-zoom-out " className)} aria-hidden="true">
+          <circle cx="11" cy="11" r="8"></circle>
+          <line x1="21" x2="16.65" y1="21" y2="16.65"></line>
+          <line x1="8" x2="14" y1="11" y2="11"></line>
+        </svg>)
+
+(ann IconZoomIn (Fn [String] Html))
+(defn IconZoomIn [className]
+  #html <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class={(str "lucide lucide-zoom-in " className)} aria-hidden="true">
+          <circle cx="11" cy="11" r="8"></circle>
+          <line x1="21" x2="16.65" y1="21" y2="16.65"></line>
+          <line x1="11" x2="11" y1="8" y2="14"></line>
+          <line x1="8" x2="14" y1="11" y2="11"></line>
+        </svg>)
+
+(ann IconMaximize2 (Fn [String] Html))
+(defn IconMaximize2 [className]
+  #html <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class={(str "lucide lucide-maximize-2 " className)} aria-hidden="true">
+          <path d="M15 3h6v6"></path>
+          <path d="m21 3-7 7"></path>
+          <path d="M9 21H3v-6"></path>
+          <path d="m3 21 7-7"></path>
+        </svg>)
+
+(ann IconMinimize2 (Fn [String] Html))
+(defn IconMinimize2 [className]
+  #html <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class={(str "lucide lucide-minimize-2 " className)} aria-hidden="true">
+          <path d="M4 14h6v6"></path>
+          <path d="m10 14-7 7"></path>
+          <path d="M20 10h-6V4"></path>
+          <path d="m14 10 7-7"></path>
+        </svg>)
+
+(ann IconRotateCw (Fn [String] Html))
+(defn IconRotateCw [className]
+  #html <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class={(str "lucide lucide-rotate-cw " className)} aria-hidden="true">
+          <path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"></path>
+          <path d="M21 3v5h-5"></path>
+        </svg>)
+
+(ann IconDownload (Fn [String] Html))
+(defn IconDownload [className]
+  #html <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class={(str className)} aria-hidden="true">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+          <path d="M7 10l5 5 5-5"></path>
+          <path d="M12 15V3"></path>
+        </svg>)
+
+(ann IconExternalLink (Fn [String] Html))
+(defn IconExternalLink [className]
+  #html <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class={(str className)} aria-hidden="true">
+          <path d="M15 3h6v6"></path>
+          <path d="M10 14 21 3"></path>
+          <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path>
+        </svg>)
+
+(ann IconX (Fn [String] Html))
+(defn IconX [className]
+  #html <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class={(str "lucide lucide-x " className)} aria-hidden="true">
+          <path d="M18 6 6 18"></path>
+          <path d="m6 6 12 12"></path>
+        </svg>)
+
+(ann IconHeadphones (Fn [String] Html))
+(defn IconHeadphones [className]
+  #html <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class={(str className)} aria-hidden="true">
+          <path d="M3 14h3a2 2 0 0 1 2 2v3a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-7a9 9 0 0 1 18 0v7a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3"></path>
+        </svg>)
+
+(ann IconMonitor (Fn [String] Html))
+(defn IconMonitor [className]
+  #html <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class={(str className)} aria-hidden="true">
+          <rect width="20" height="14" x="2" y="3" rx="2"></rect>
+          <line x1="8" x2="16" y1="21" y2="21"></line>
+          <line x1="12" x2="12" y1="17" y2="21"></line>
+        </svg>)
+
+(ann IconPlay (Fn [String] Html))
+(defn IconPlay [className]
+  #html <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class={(str "lucide lucide-play " className)} aria-hidden="true">
+          <path d="M5 5a2 2 0 0 1 3.008-1.728l11.997 6.998a2 2 0 0 1 .003 3.458l-12 7A2 2 0 0 1 5 19z"></path>
+        </svg>)
+
+(ann IconRepeat (Fn [String] Html))
+(defn IconRepeat [className]
+  #html <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class={(str "lucide lucide-repeat " className)} aria-hidden="true">
+          <path d="m17 2 4 4-4 4"></path>
+          <path d="M3 11v-1a4 4 0 0 1 4-4h14"></path>
+          <path d="m7 22-4-4 4-4"></path>
+          <path d="M21 13v1a4 4 0 0 1-4 4H3"></path>
+        </svg>)
+
+(ann IconStepBack (Fn [String] Html))
+(defn IconStepBack [className]
+  #html <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class={(str "lucide lucide-step-back " className)} aria-hidden="true">
+          <path d="M13.971 4.285A2 2 0 0 1 17 6v12a2 2 0 0 1-3.029 1.715l-9.997-5.998a2 2 0 0 1-.003-3.432z"></path>
+          <path d="M21 20V4"></path>
+        </svg>)
+
+(ann IconStepForward (Fn [String] Html))
+(defn IconStepForward [className]
+  #html <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class={(str "lucide lucide-step-forward " className)} aria-hidden="true">
+          <path d="M10.029 4.285A2 2 0 0 0 7 6v12a2 2 0 0 0 3.029 1.715l9.997-5.998a2 2 0 0 0 .003-3.432z"></path>
+          <path d="M3 4v16"></path>
+        </svg>)
+
+(ann IconVolume2 (Fn [String] Html))
+(defn IconVolume2 [className]
+  #html <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class={(str "lucide lucide-volume-2 " className)} aria-hidden="true">
+          <path d="M11 4.702a.705.705 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.705.705 0 0 0 11 19.298z"></path>
+          <path d="M16 9a5 5 0 0 1 0 6"></path>
+          <path d="M19.364 18.364a9 9 0 0 0 0-12.728"></path>
+        </svg>)
+
+(ann IconFileQuestion (Fn [String] Html))
+(defn IconFileQuestion [className]
+  #html <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class={(str className)} aria-hidden="true">
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+          <path d="M14 2v6h6"></path>
+          <path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 2-3 4"></path>
+          <path d="M12 17h.01"></path>
+        </svg>)
+
+(ann IconFileText (Fn [String] Html))
+(defn IconFileText [className]
+  #html <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class={(str className)} aria-hidden="true">
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+          <path d="M14 2v6h6"></path>
+          <path d="M16 13H8"></path>
+          <path d="M16 17H8"></path>
+          <path d="M10 9H8"></path>
+        </svg>)
+
+(ann UnsupportedFileDialogContent (Fn [FileItem] Html))
+(defn UnsupportedFileDialogContent [file]
+  #html <div role="dialog"
+             aria-modal="true"
+             aria-labelledby="unsupported-file-title"
+             class="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+          <div class="max-h-[90vh] w-full max-w-md overflow-auto rounded-xl border border-border bg-card text-card-foreground shadow-lg">
+            <div class="flex items-start justify-between gap-2 border-b border-border p-4">
+              <div class="flex min-w-0 flex-1 items-start gap-3">
+                {(IconFileQuestion "h-8 w-8 shrink-0 text-yellow-500")}
+                <div class="min-w-0">
+                  <h2 id="unsupported-file-title" class="truncate text-lg font-semibold">{file.name}</h2>
+                  <p class="text-xs text-muted-foreground">{(str (if (= file.extension "")
+                                                                     "Unknown"
+                                                                     (str "." (if (= file.extension "xyz") "XYZ" file.extension)))
+                                                                   " file • " (formatFileSize file.size))}</p>
+                </div>
+              </div>
+              <button type="button"
+                      title="Close"
+                      aria-label="Close"
+                      class="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md hover:bg-muted"
+                      on:click={{:kind :close-viewer}}>
+                {(IconX "h-4 w-4")}
+              </button>
+            </div>
+            <div class="flex flex-col items-center space-y-4 rounded-b-xl bg-muted/50 p-8 text-center">
+              {(IconFileText "h-16 w-16 text-muted-foreground opacity-50")}
+              <div>
+                <h3 class="mb-2 text-lg font-medium">Unsupported File Type</h3>
+                <p class="text-sm text-muted-foreground">This file type is not supported for preview. The media server currently supports video, audio, and image files.</p>
+              </div>
+              <a href={(fileDownloadHref file.path nil)}
+                 download={file.name}
+                 class="inline-flex h-9 items-center justify-center rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground shadow-sm hover:bg-primary/90">Download File</a>
+            </div>
+          </div>
+        </div>)
+
+(ann UnsupportedFileDialog (Fn [AppState] Html))
+(defn UnsupportedFileDialog [state]
+  #html <div>
+          {(if (unsupportedSelected? state)
+               (UnsupportedFileDialogContent (selectedFileOrEmpty state))
+               #html <span class="hidden"></span>)}
+        </div>)
+
+(ann coverImageFile? (Fn [FileItem] Bool))
+(defn coverImageFile? [file]
+  (and (= file.type MediaType.IMAGE)
+       (starts-with? (lower-case file.name) "cover.")))
+
+(ann adminCoverArtUrl (Fn [AppState FileItem] (Option String)))
+(defn adminCoverArtUrl [state file]
+  (if (= file.type MediaType.VIDEO)
+      (buildThumbnailUrl file.path nil)
+      (match state.mediaAudioCoverArt
+        nil (let [cover (find state.files coverImageFile?)]
+              (if (some? cover) (buildMediaUrl cover.path nil) nil))
+        (some value) value)))
+
+(ann shareCoverArtUrl (Fn [AppState FileItem] (Option String)))
+(defn shareCoverArtUrl [state file]
+  (if (= file.type MediaType.VIDEO)
+      (shareFileThumbnailUrl state file)
+      (match state.mediaAudioCoverArt
+        nil (let [cover (find state.shareFiles coverImageFile?)]
+              (if (some? cover) (shareFileMediaUrl state cover) nil))
+        (some value) value)))
+
+(ann mediaAudioTitle (Fn [AppState FileItem] String))
+(defn mediaAudioTitle [state file]
+  (match state.mediaAudioTitle
+    nil file.name
+    (some value) value))
+
+(ann mediaAudioArtist (Fn [AppState] String))
+(defn mediaAudioArtist [state]
+  (match state.mediaAudioArtist
+    nil "Unknown Artist"
+    (some value) value))
+
+(def audioSliderClass
+  "flex-1 h-2 bg-secondary rounded-lg appearance-none cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-primary")
+
+(ann audioNavFile? (Fn [FileItem] Bool))
+(defn audioNavFile? [file]
+  (or (= file.type MediaType.AUDIO)
+      (= file.type MediaType.VIDEO)))
+
+(ann audioFile? (Fn [FileItem] Bool))
+(defn audioFile? [file]
+  (= file.type MediaType.AUDIO))
+
+(ann mediaNavFiles (Fn [(Vector FileItem)] (Vector FileItem)))
+(defn mediaNavFiles [files]
+  (filter files audioNavFile?))
+
+(ann mediaNavCurrentIndex (Fn [AppState (Vector FileItem) String Bool] Number))
+(defn mediaNavCurrentIndex [state files path share?]
+  (let [navFiles (mediaNavFiles files)
+        hit (find (map (range 0 (count navFiles))
+                       (fn [index] {:index index :file (nth navFiles index)}))
+                  (fn [entry]
+                    (if share?
+                        (shareFileMatchesPath? state entry.file path)
+                        (= entry.file.path path))))]
+    (if (some? hit) hit.index -1)))
+
+(ann hasAudioFileInRange? (Fn [(Vector FileItem) Number Number] Bool))
+(defn hasAudioFileInRange? [files start end]
+  (some? (find (range start end)
+               (fn [index] (audioFile? (nth files index))))))
+
+(ann hasPreviousAudioFile? (Fn [AppState (Vector FileItem) String Bool] Bool))
+(defn hasPreviousAudioFile? [state files path share?]
+  (let [navFiles (mediaNavFiles files)
+        index (mediaNavCurrentIndex state files path share?)]
+    (if (< index 0)
+        false
+        (hasAudioFileInRange? navFiles 0 index))))
+
+(ann hasNextAudioFile? (Fn [AppState (Vector FileItem) String Bool] Bool))
+(defn hasNextAudioFile? [state files path share?]
+  (let [navFiles (mediaNavFiles files)
+        index (mediaNavCurrentIndex state files path share?)]
+    (if (< index 0)
+        false
+        (hasAudioFileInRange? navFiles (+ index 1) (count navFiles)))))
+
+(ann AlbumArtImage (Fn [(Option String)] Html))
+(defn AlbumArtImage [source]
+  (if (some? source)
+      #html <img src={source}
+                 alt="Album art"
+                 class="size-full object-cover"></img>
+      #html <span class="hidden"></span>))
+
+(ann AdminAudioElement (Fn [AppState] Html))
+(defn AdminAudioElement [state]
+  (match (selectedPlayingFile state)
+    nil #html <audio class="hidden"></audio>
+    (some file)
+      (if (showAdminAudioChrome? state)
+          #html <audio src={(buildMediaUrl file.path nil)}
+                       preload="auto"
+                       autoplay
+                       loop={state.shareAudioRepeat}
+                       class="hidden"></audio>
+          #html <audio class="hidden"></audio>)))
+
+(ann adminImageCounter (Fn [AppState FileItem] String))
+(defn adminImageCounter [state file]
+  (let [images (adminImageFilesForUpdate state)
+        total (count images)
+        index (adminImageIndexForUpdate images file.path)]
+    (if (= total 0)
+        "1 of 1"
+        (str (+ (if (< index 0) 0 index) 1) " of " total))))
+
+(ann AdminImageViewer (Fn [AppState FileItem] Html))
+(defn AdminImageViewer [state file]
+  #html <div role="dialog"
+             aria-modal="true"
+             aria-labelledby="image-viewer-title"
+             class="fixed inset-0 z-50 flex flex-col bg-black/95">
+          <span class="sr-only"><h2 id="image-viewer-title">{file.name}</h2></span>
+          <div class="flex items-center justify-between bg-black/50 p-4 backdrop-blur-sm">
+            <div class="flex-1">
+              <h2 class="max-w-md truncate text-lg font-medium text-white">{file.name}</h2>
+            </div>
+            <div class="shrink-0 px-4">
+              <span class="text-sm font-medium text-white">{(adminImageCounter state file)}</span>
+            </div>
+            <div class="flex flex-1 items-center justify-end gap-2">
+              <button type="button"
+                      title="Zoom out"
+                      class="inline-flex h-9 w-9 items-center justify-center rounded-md text-white hover:bg-white/10"
+                      on:click={{:kind :admin-image-zoom-out}}>
+                {(IconZoomOut "h-5 w-5")}
+              </button>
+              <span class="min-w-16 text-center text-sm text-white">{(imageZoomLabel state.adminImageZoom)}</span>
+              <button type="button"
+                      title="Zoom in"
+                      class="inline-flex h-9 w-9 items-center justify-center rounded-md text-white hover:bg-white/10"
+                      on:click={{:kind :admin-image-zoom-in}}>
+                {(IconZoomIn "h-5 w-5")}
+              </button>
+              <button type="button"
+                      title="Fit to screen"
+                      class="inline-flex h-9 w-9 items-center justify-center rounded-md text-white hover:bg-white/10"
+                      on:click={{:kind :admin-image-fit}}>
+                {(IconMaximize2 "h-5 w-5")}
+              </button>
+              <button type="button"
+                      title="Rotate"
+                      class="inline-flex h-9 w-9 items-center justify-center rounded-md text-white hover:bg-white/10"
+                      on:click={{:kind :admin-image-rotate}}>
+                {(IconRotateCw "h-5 w-5")}
+              </button>
+              <div class="mx-2 h-6 w-px bg-white/20"></div>
+              <button type="button"
+                      title="Download"
+                      class="inline-flex h-9 w-9 items-center justify-center rounded-md text-white hover:bg-white/10"
+                      on:click={{:kind :download-url
+                                 :url (fileDownloadHref file.path nil)
+                                 :filename file.name}}>
+                {(IconDownload "h-5 w-5")}
+              </button>
+              <button type="button"
+                      title="Close"
+                      class="inline-flex h-9 w-9 items-center justify-center rounded-md text-white hover:bg-white/10"
+                      on:click={{:kind :close-viewer}}>
+                {(IconX "h-5 w-5")}
+              </button>
+            </div>
+          </div>
+          <div class="relative flex flex-1 items-center justify-center overflow-auto p-4">
+            <div role="presentation"
+                 class="absolute bottom-0 left-0 top-0 z-10 w-[30%] cursor-pointer"
+                 on:click={{:kind :admin-image-previous}}></div>
+            <div role="presentation"
+                 class="absolute bottom-0 right-0 top-0 z-10 w-[30%] cursor-pointer"
+                 on:click={{:kind :admin-image-next}}></div>
+            <img src={(buildMediaUrl file.path nil)}
+                 alt={file.name}
+                 style={{:transform (str "rotate(" state.adminImageRotation "deg) scale(" (imageZoomScale state.adminImageZoom) ")")}}
+                 class={(if (= state.adminImageZoom 0)
+                            "pointer-events-none h-full w-full object-contain transition-transform duration-200"
+                            "pointer-events-none max-h-full max-w-full object-none transition-transform duration-200")}></img>
+          </div>
+        </div>)
+
+(ann AdminPdfViewer (Fn [FileItem] Html))
+(defn AdminPdfViewer [file]
+  #html <div role="dialog"
+             aria-modal="true"
+             aria-label={file.name}
+             class="fixed inset-0 z-50 flex flex-col bg-black/95">
+          <div class="flex items-center justify-between bg-black/50 p-4 backdrop-blur-sm">
+            <div class="flex-1">
+              <h2 class="max-w-md truncate text-lg font-medium text-white">{file.name}</h2>
+            </div>
+            <div class="flex flex-1 items-center justify-end gap-2">
+              <button type="button"
+                      title="Open in new tab"
+                      class="inline-flex h-9 w-9 items-center justify-center rounded-md text-white hover:bg-white/10"
+                      on:click={{:kind :open-url-new-tab :url (buildMediaUrl file.path nil)}}>
+                {(IconExternalLink "h-5 w-5")}
+              </button>
+              <button type="button"
+                      title="Download"
+                      class="inline-flex h-9 w-9 items-center justify-center rounded-md text-white hover:bg-white/10"
+                      on:click={{:kind :download-url
+                                 :url (fileDownloadHref file.path nil)
+                                 :filename file.name}}>
+                {(IconDownload "h-5 w-5")}
+              </button>
+              <div class="mx-2 h-6 w-px bg-white/20"></div>
+              <button type="button"
+                      title="Close"
+                      class="inline-flex h-9 w-9 items-center justify-center rounded-md text-white hover:bg-white/10"
+                      on:click={{:kind :close-viewer}}>
+                {(IconX "h-5 w-5")}
+              </button>
+            </div>
+          </div>
+          <div class="flex flex-1 items-center justify-center overflow-hidden bg-neutral-800">
+            <embed src={(str (buildMediaUrl file.path nil) "#toolbar=1")}
+                   type="application/pdf"
+                   class="h-full w-full"
+                   title={file.name}></embed>
+          </div>
+        </div>)
+
+(ann AdminViewerLayer (Fn [AppState] Html))
+(defn AdminViewerLayer [state]
+  (match (selectedFile state)
+    nil #html <div><span class="hidden"></span></div>
+    (some file)
+      (if (= file.type MediaType.IMAGE)
+          #html <div class="contents">{(AdminImageViewer state file)}</div>
+          (if (= file.type MediaType.PDF)
+              #html <div class="contents">{(AdminPdfViewer file)}</div>
+              (if (= file.type MediaType.TEXT)
+                  #html <div class="contents">{(AdminTextViewer state file)}</div>
+	                  #html <span class="hidden"></span>)))))
+
+(ann formatMediaTime (Fn [Number] String))
+(defn formatMediaTime [value]
+  (let [safe (if (> value 0) value 0)
+        total (floor safe)
+        minutes (floor (/ total 60))
+        seconds (- total (* minutes 60))]
+    (str minutes ":" (if (< seconds 10) "0" "") seconds)))
+
+(ann AdminMediaPlayerLayer (Fn [AppState] Html))
+(defn AdminMediaPlayerLayer [state]
+  (match (selectedPlayingFile state)
+    nil #html <div>{(AdminAudioElement state)}</div>
+    (some current)
+      #html <div>
+              {(AdminAudioElement state)}
+              {(if (and (= current.type MediaType.VIDEO) (not state.audioOnly))
+		                   #html <div class={(if state.shareVideoCompact "fixed bottom-4 right-4 z-40 w-80" "w-full bg-background")}
+                                data-video-player-inline={(if state.shareVideoCompact nil "true")}>
+                           <div class={(if state.shareVideoCompact "overflow-hidden rounded-lg border border-border shadow-lg" "")}>
+                             <div class="bg-black">
+                           <div class="z-10 flex items-center justify-between border-b border-border bg-background/90 p-2 backdrop-blur-sm">
+                             <span class="flex-1 truncate px-2 text-sm font-medium">{current.name}</span>
+                             <div class="flex items-center gap-1">
+                               <button type="button"
+                                       aria-label="Audio only mode"
+                                       class="inline-flex h-8 w-8 items-center justify-center rounded-md hover:bg-muted"
+                                       on:click={{:kind :audio-only :enabled true :currentTime 0}}>
+                                 {(IconHeadphones "h-4 w-4")}
+                               </button>
+                               {(if state.shareVideoCompact
+                                    #html <button type="button"
+                                                  aria-label="Maximize player"
+                                                  class="inline-flex h-8 w-8 items-center justify-center rounded-md hover:bg-muted"
+                                                  on:click={{:kind :video-compact :compact? false}}>
+                                            {(IconMaximize2 "h-4 w-4")}
+                                          </button>
+                                    #html <button type="button"
+                                                  aria-label="Minimize player"
+                                                  class="inline-flex h-8 w-8 items-center justify-center rounded-md hover:bg-muted"
+                                                  on:click={{:kind :video-compact :compact? true}}>
+                                            {(IconMinimize2 "h-4 w-4")}
+                                          </button>)}
+                               <button type="button"
+                                       aria-label="Close player"
+                                       title="Close"
+                                       class="inline-flex h-8 w-8 items-center justify-center rounded-md hover:bg-muted"
+                                       on:click={{:kind :close-player}}>
+                                 {(IconX "h-4 w-4")}
+                               </button>
+                             </div>
+                           </div>
+	                           <video src={(buildMediaUrl current.path nil)}
+	                                  controls
+	                                  class="w-full bg-black"
+	                                  style={(if state.shareVideoCompact "max-height:180px;min-height:180px;height:180px;" "max-height:70vh;aspect-ratio:16 / 9;")}>Your browser does not support the video tag.</video>
+                             </div>
+                           </div>
+                         </div>
+	                   #html <div data-testid="audio-player-chrome"
+	                              class="fixed bottom-0 left-0 right-0 z-50 border-t border-border bg-background pb-[env(safe-area-inset-bottom,0px)]">
+                           <div class="container mx-auto px-2 py-1.5 min-[650px]:px-4 min-[650px]:py-3">
+                             <div class="flex min-w-0 items-center gap-2 min-[650px]:gap-4">
+	                               <div class="flex shrink-0 items-center gap-0.5 min-[650px]:gap-2">
+	                                 <button type="button"
+	                                         disabled={(not (hasPreviousAudioFile? state state.files current.path false))}
+	                                         class="inline-flex size-8 shrink-0 items-center justify-center rounded-md hover:bg-accent disabled:opacity-50 min-[650px]:size-10">
+	                                   {(IconStepBack "size-3.5 min-[650px]:size-4")}
+	                                 </button>
+                                 <button type="button"
+                                         class="inline-flex size-8 shrink-0 items-center justify-center rounded-md bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50 min-[650px]:size-10"
+                                         on:click={{:kind :media-play}}>
+                                   {(IconPlay "size-3.5 min-[650px]:size-4")}
+	                                 </button>
+	                                 <button type="button"
+	                                         disabled={(not (hasNextAudioFile? state state.files current.path false))}
+	                                         class="inline-flex size-8 shrink-0 items-center justify-center rounded-md hover:bg-accent disabled:opacity-50 min-[650px]:size-10">
+	                                   {(IconStepForward "size-3.5 min-[650px]:size-4")}
+	                                 </button>
+                                 <button type="button"
+                                         class={(str "inline-flex size-8 shrink-0 items-center justify-center rounded-md disabled:opacity-50 min-[650px]:size-10 "
+                                                     (if state.shareAudioRepeat "bg-primary text-primary-foreground" "hover:bg-accent"))}
+                                         on:click={{:kind :toggle-repeat}}>
+                                   {(IconRepeat "size-3.5 min-[650px]:size-4")}
+                                 </button>
+                                 {(if (= current.type MediaType.VIDEO)
+                                      #html <button type="button"
+                                                    aria-label="Show video"
+                                                    class="inline-flex size-8 shrink-0 items-center justify-center rounded-md hover:bg-accent disabled:opacity-50 min-[650px]:size-10"
+                                                    on:click={{:kind :audio-only
+                                                               :enabled false
+                                                               :currentTime (mediaCurrentTime "audio")}}>
+                                              {(IconMonitor "size-3.5 min-[650px]:size-4")}
+                                            </button>
+                                      #html <span class="hidden"></span>)}
+                               </div>
+                               <div class="hidden min-[650px]:block w-px h-8 bg-border shrink-0"></div>
+		                               <div class="hidden min-[650px]:flex flex-1 items-center gap-3">
+		                                 <span class="text-sm tabular-nums">0:00</span>
+		                                 <input type="range" min="0" max={state.mediaAudioDuration} value="0"
+		                                        class={audioSliderClass}></input>
+		                                 <span class="text-sm tabular-nums">{(formatMediaTime state.mediaAudioDuration)}</span>
+		                               </div>
+                               <div class="hidden min-[650px]:block w-px h-8 bg-border shrink-0"></div>
+	                               <div class="hidden lg:flex items-center gap-2 min-w-[140px]">
+	                                 <button type="button"
+	                                         class="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-md hover:bg-accent">
+	                                   {(IconVolume2 "h-4 w-4")}
+		                                 </button>
+	                                 <input type="range" min="0" max="1" step="0.01" value="1"
+	                                        class={audioSliderClass}></input>
+	                               </div>
+                               <div class="hidden md:block w-px h-8 bg-border shrink-0"></div>
+	                               <div class="flex min-w-0 flex-1 items-center gap-2 min-[650px]:w-[200px] min-[650px]:flex-none min-[650px]:gap-3 lg:w-[280px]">
+	                                 <div class="size-9 shrink-0 overflow-hidden rounded bg-secondary min-[650px]:size-12">
+	                                   {(AlbumArtImage (adminCoverArtUrl state current))}
+	                                 </div>
+	                                 <div class="min-w-0 flex-1">
+	                                   <div class="truncate text-xs font-medium min-[650px]:text-sm">{(mediaAudioTitle state current)}</div>
+	                                   <div class="truncate text-[11px] text-muted-foreground min-[650px]:text-xs">{(mediaAudioArtist state)}</div>
+	                                 </div>
+	                               </div>
+                             </div>
+                           </div>
+                         </div>)}
+            </div>))
+
+(ann ShareMediaPlayerLayer (Fn [AppState] Html))
+(defn ShareMediaPlayerLayer [state]
+  (match (selectedSharePlayingFile state)
+    nil #html <div><span class="hidden"></span></div>
+    (some current)
+      #html <div>
+              {(if (and (= current.type MediaType.VIDEO) (not state.audioOnly))
+	                   #html <div class={(if state.shareVideoCompact "fixed bottom-4 right-4 z-40 w-80" "w-full bg-background")}
+                                data-video-player-inline={(if state.shareVideoCompact nil "true")}>
+                           <div class={(if state.shareVideoCompact "overflow-hidden rounded-lg border border-border shadow-lg" "")}>
+                             <div class="bg-black">
+                           <div class="z-10 flex items-center justify-between border-b border-border bg-background/90 p-2 backdrop-blur-sm">
+                             <span class="flex-1 truncate px-2 text-sm font-medium">{current.name}</span>
+                             <div class="flex items-center gap-1">
+                               <button type="button"
+                                       aria-label="Audio only mode"
+                                       class="inline-flex h-8 w-8 items-center justify-center rounded-md hover:bg-muted"
+                                       on:click={{:kind :share-audio-only :enabled true :currentTime 0}}>
+                                 {(IconHeadphones "h-4 w-4")}
+                               </button>
+                               {(if state.shareVideoCompact
+                                    #html <button type="button"
+                                                  aria-label="Maximize player"
+                                                  class="inline-flex h-8 w-8 items-center justify-center rounded-md hover:bg-muted"
+                                                  on:click={{:kind :share-video-compact :compact? false}}>
+                                            {(IconMaximize2 "h-4 w-4")}
+                                          </button>
+                                    #html <button type="button"
+                                                  aria-label="Minimize player"
+                                                  class="inline-flex h-8 w-8 items-center justify-center rounded-md hover:bg-muted"
+                                                  on:click={{:kind :share-video-compact :compact? true}}>
+                                            {(IconMinimize2 "h-4 w-4")}
+                                          </button>)}
+                               <button type="button"
+                                       aria-label="Close player"
+                                       class="inline-flex h-8 w-8 items-center justify-center rounded-md hover:bg-muted"
+                                       on:click={{:kind :share-close-player}}>
+                                 {(IconX "h-4 w-4")}
+                               </button>
+                             </div>
+                           </div>
+	                           <video src={(shareFileMediaUrl state current)}
+	                                  controls
+	                                  class="w-full bg-black"
+	                                  style={(if state.shareVideoCompact "max-height:180px;min-height:180px;height:180px;" "max-height:70vh;aspect-ratio:16 / 9;")}>Your browser does not support the video tag.</video>
+                             </div>
+                           </div>
+                         </div>
+	                   #html <div data-testid="audio-player-chrome"
+	                              class="fixed bottom-0 left-0 right-0 z-50 border-t border-border bg-background pb-[env(safe-area-inset-bottom,0px)]">
+                           <audio src={(shareFileMediaUrl state current)}
+                                  autoplay
+                                  loop={state.shareAudioRepeat}
+                                  class="hidden"></audio>
+                           <div class="container mx-auto px-2 py-1.5 min-[650px]:px-4 min-[650px]:py-3">
+                             <div class="flex min-w-0 items-center gap-2 min-[650px]:gap-4">
+	                               <div class="flex shrink-0 items-center gap-0.5 min-[650px]:gap-2">
+	                                 <button type="button"
+	                                         disabled={(not (hasPreviousAudioFile? state state.shareFiles current.path true))}
+	                                         class="inline-flex size-8 shrink-0 items-center justify-center rounded-md hover:bg-accent disabled:opacity-50 min-[650px]:size-10">
+	                                   {(IconStepBack "size-3.5 min-[650px]:size-4")}
+	                                 </button>
+                                 <button type="button"
+                                         class="inline-flex size-8 shrink-0 items-center justify-center rounded-md bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50 min-[650px]:size-10"
+                                         on:click={{:kind :share-media-play}}>
+                                   {(IconPlay "size-3.5 min-[650px]:size-4")}
+	                                 </button>
+	                                 <button type="button"
+	                                         disabled={(not (hasNextAudioFile? state state.shareFiles current.path true))}
+	                                         class="inline-flex size-8 shrink-0 items-center justify-center rounded-md hover:bg-accent disabled:opacity-50 min-[650px]:size-10">
+	                                   {(IconStepForward "size-3.5 min-[650px]:size-4")}
+	                                 </button>
+                                 <button type="button"
+                                         class={(str "inline-flex size-8 shrink-0 items-center justify-center rounded-md disabled:opacity-50 min-[650px]:size-10 "
+                                                     (if state.shareAudioRepeat "bg-primary text-primary-foreground" "hover:bg-accent"))}
+                                         on:click={{:kind :share-toggle-repeat}}>
+                                   {(IconRepeat "size-3.5 min-[650px]:size-4")}
+                                 </button>
+                                 {(if (= current.type MediaType.VIDEO)
+                                      #html <button type="button"
+                                                    aria-label="Show video"
+                                                    class="inline-flex size-8 shrink-0 items-center justify-center rounded-md hover:bg-accent disabled:opacity-50 min-[650px]:size-10"
+                                                    on:click={{:kind :share-audio-only
+                                                               :enabled false
+                                                               :currentTime (mediaCurrentTime "audio")}}>
+                                              {(IconMonitor "size-3.5 min-[650px]:size-4")}
+                                            </button>
+                                      #html <span class="hidden"></span>)}
+                               </div>
+                               <div class="hidden min-[650px]:block w-px h-8 bg-border shrink-0"></div>
+		                               <div class="hidden min-[650px]:flex flex-1 items-center gap-3">
+		                                 <span class="text-sm tabular-nums">0:00</span>
+		                                 <input type="range" min="0" max={state.mediaAudioDuration} value="0"
+		                                        class={audioSliderClass}></input>
+		                                 <span class="text-sm tabular-nums">{(formatMediaTime state.mediaAudioDuration)}</span>
+		                               </div>
+                               <div class="hidden min-[650px]:block w-px h-8 bg-border shrink-0"></div>
+                               <div class="hidden lg:flex items-center gap-2 min-w-[140px]">
+                                 <button type="button"
+                                         class="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-md hover:bg-accent">
+                                   {(IconVolume2 "h-4 w-4")}
+	                                 </button>
+	                                 <input type="range" min="0" max="1" step="0.01" value="1"
+	                                        class={audioSliderClass}></input>
+	                               </div>
+                               <div class="hidden md:block w-px h-8 bg-border shrink-0"></div>
+	                               <div class="flex min-w-0 flex-1 items-center gap-2 min-[650px]:w-[200px] min-[650px]:flex-none min-[650px]:gap-3 lg:w-[280px]">
+	                                 <div class="size-9 shrink-0 overflow-hidden rounded bg-secondary min-[650px]:size-12">
+	                                   {(AlbumArtImage (shareCoverArtUrl state current))}
+	                                 </div>
+	                                 <div class="min-w-0 flex-1">
+	                                   <div class="truncate text-xs font-medium min-[650px]:text-sm">{(mediaAudioTitle state current)}</div>
+	                                   <div class="truncate text-[11px] text-muted-foreground min-[650px]:text-xs">{(mediaAudioArtist state)}</div>
+	                                 </div>
+	                               </div>
+                             </div>
+                           </div>
+                         </div>)}
+            </div>))

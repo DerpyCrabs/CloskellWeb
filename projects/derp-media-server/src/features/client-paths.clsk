@@ -1,0 +1,52 @@
+(import "./source-context.clsk" [normalizeSlashes])
+
+(type ClientMediaRoot
+  {:name String
+   :editableFolders (Vector String)})
+
+(ann nonEmptyPathSegments (Fn [String] (Vector String)))
+(defn nonEmptyPathSegments [path]
+  (let [safePath (if (string? path) path "")]
+    (filter (split safePath "/") (fn [segment] (not (= segment ""))))))
+
+(ann pathWithinFolder? (Fn [String String] Bool))
+(defn pathWithinFolder? [normalizedPath folder]
+  (let [normalizedFolder (normalizeSlashes folder)]
+    (or (= normalizedPath normalizedFolder)
+        (starts-with? normalizedPath (str normalizedFolder "/")))))
+
+(ann pathWithinAnyFolder? (Fn [String (Vector String)] Bool))
+(defn pathWithinAnyFolder? [normalizedPath editableFolders]
+  (any? editableFolders (fn [folder] (pathWithinFolder? normalizedPath folder))))
+
+(ann findMediaRootByName (Fn [String (Vector ClientMediaRoot)] (Option ClientMediaRoot)))
+(defn findMediaRootByName [rootName mediaRoots]
+  (find mediaRoots
+        (fn [entry]
+          (= (lower-case entry.name) (lower-case rootName)))))
+
+(ann isPathEditable (Fn [String (Vector String) Js] Bool))
+(defn isPathEditable [relativePath editableFolders mediaRoots]
+  (if (= (count editableFolders) 0)
+      false
+      (let [normalizedPath (normalizeSlashes relativePath)]
+        (if (and (vector? mediaRoots) (> (count mediaRoots) 1))
+            (let [segments (nonEmptyPathSegments normalizedPath)
+                  rootName (if (> (count segments) 0) (nth segments 0) "")
+                  root (findMediaRootByName rootName mediaRoots)]
+              (match root
+                nil false
+                (some current)
+                  (let [rootRelativePath (join (slice segments 1 (count segments)) "/")]
+                    (pathWithinAnyFolder? rootRelativePath current.editableFolders))))
+            (pathWithinAnyFolder? normalizedPath editableFolders)))))
+
+(ann getKnowledgeBaseRoot (Fn [String (Vector String)] (Option String)))
+(defn getKnowledgeBaseRoot [filePath knowledgeBases]
+  (if (= (count knowledgeBases) 0)
+      nil
+      (let [normalizedPath (normalizeSlashes filePath)
+            found (find knowledgeBases
+                        (fn [kb]
+                          (pathWithinFolder? normalizedPath kb)))]
+        (if (some? found) (normalizeSlashes found) nil))))

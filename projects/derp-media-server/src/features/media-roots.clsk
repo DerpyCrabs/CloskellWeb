@@ -1,0 +1,77 @@
+(import "node:path" [(basename as pathBasename) (resolve as pathResolve)])
+
+(foreign pure pathBasename (Fn [String] String))
+(foreign pure pathResolve (Fn [String] String))
+
+(type MediaDirConfig
+  {:path String
+   :name (Option String)
+   :editableFolders Js})
+
+(type MediaRoot
+  {:name String
+   :path String
+   :editableFolders (Vector String)})
+
+(def reservedMediaRootNames ["favorites" "most played" "shares"])
+
+(ann normalizeEditableFolders (Fn [Js] (Vector String)))
+(defn normalizeEditableFolders [raw]
+  (if (vector? raw)
+      (filter (map raw (fn [folder] (trim (str folder))))
+              (fn [folder] (not (= folder ""))))
+      []))
+
+(ann deriveMediaRootName (Fn [String] String))
+(defn deriveMediaRootName [mediaPath]
+  (trim (pathBasename (pathResolve mediaPath))))
+
+(ann normalizeMediaRootName (Fn [String Js] String))
+(defn normalizeMediaRootName [mediaPath explicitName]
+  (let [explicit (if (string? explicitName) (trim explicitName) "")
+        name (if (not (= explicit "")) explicit (deriveMediaRootName mediaPath))]
+    (if (= name "")
+        (fail (str "mediaDirs entry for \"" mediaPath "\" requires a name"))
+        (if (or (includes? name "/") (includes? name "\\"))
+            (fail (str "mediaDirs name \"" name "\" must not contain path separators"))
+            (if (includes? reservedMediaRootNames (lower-case name))
+                (fail (str "mediaDirs name \"" name "\" conflicts with a virtual folder"))
+                name)))))
+
+(ann rootFromMediaDirConfig (Fn [MediaDirConfig] MediaRoot))
+(defn rootFromMediaDirConfig [entry]
+  {:name (normalizeMediaRootName entry.path entry.name)
+   :path entry.path
+   :editableFolders (normalizeEditableFolders entry.editableFolders)})
+
+(ann legacyMediaRoot (Fn [String (Vector String)] MediaRoot))
+(defn legacyMediaRoot [mediaDir editableFolders]
+  (let [derived (deriveMediaRootName mediaDir)]
+    {:name (if (= derived "") "Media" derived)
+     :path mediaDir
+     :editableFolders editableFolders}))
+
+(ann collectRootName (Fn [(Vector String) MediaRoot] (Vector String)))
+(defn collectRootName [seen root]
+  (let [key (lower-case root.name)]
+    (if (includes? seen key)
+        (fail (str "Duplicate mediaDirs name \"" root.name "\". Add explicit unique names."))
+        (conj seen key))))
+
+(ann validateUniqueMediaRootNames (Fn [(Vector MediaRoot)] (Vector MediaRoot)))
+(defn validateUniqueMediaRootNames [roots]
+  (let [_ (reduce roots [] collectRootName)]
+    roots))
+
+(ann normalizeMediaRoots (Fn [String (Vector String) Js] (Vector MediaRoot)))
+(defn normalizeMediaRoots [mediaDir editableFolders mediaDirs]
+  (let [roots (if (and (vector? mediaDirs) (> (count mediaDirs) 0))
+                  (map mediaDirs rootFromMediaDirConfig)
+                  [(legacyMediaRoot mediaDir editableFolders)])]
+    (validateUniqueMediaRootNames roots)))
+
+(ann getLibraryKey (Fn [String (Vector MediaRoot)] String))
+(defn getLibraryKey [mediaDir roots]
+  (if (<= (count roots) 1)
+      mediaDir
+      (join (map roots (fn [root] (str root.name ":" (pathResolve root.path)))) "|")))

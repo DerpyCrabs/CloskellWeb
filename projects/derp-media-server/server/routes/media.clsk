@@ -1,0 +1,187 @@
+(import "path" [(default path)])
+(import "node:console" [(error as consoleError)])
+(import "../../lib/file-system.clsk" [getFilePath isPathEditable])
+(import "../../src/features/media-utils.clsk" [getMimeType])
+(import "../http-capabilities.clsk" [fileStatsSync
+                                     streamFileRangeResponse
+                                     streamFileResponse])
+(import "../http-routes.clsk" [HttpRoute registerHttpRoutes])
+(import "../lib/audio-helpers.clsk" [extractAudioMetadata extractAudioTrack])
+
+(def TEXT_EXTENSIONS ["txt"
+                      "md"
+                      "json"
+                      "xml"
+                      "csv"
+                      "log"
+                      "yaml"
+                      "yml"
+                      "ini"
+                      "conf"
+                      "sh"
+                      "bat"
+                      "ps1"
+                      "js"
+                      "ts"
+                      "jsx"
+                      "tsx"
+                      "css"
+                      "scss"
+                      "html"
+                      "py"
+                      "java"
+                      "c"
+                      "cpp"
+                      "h"
+                      "cs"
+                      "go"
+                      "rs"
+                      "php"
+                      "rb"
+                      "swift"
+                      "kt"
+                      "sql"])
+
+(ann codeSend (Fn [Js Number Js] Js))
+(defn codeSend [reply code payload]
+  (let [codedReply (reply.status code)]
+    (codedReply.send payload)))
+
+(ann errorMessageIncludes? (Fn [Js String] Bool))
+(defn errorMessageIncludes? [error text]
+  (and (object? error)
+       (string? error.message)
+       (includes? error.message text)))
+
+(ann extensionOfPath (Fn [String] String))
+(defn extensionOfPath [fullPath]
+  (let [ext (path.extname fullPath)]
+    (lower-case (string-slice ext 1 (count ext)))))
+
+(ann mediaCacheControl (Fn [String String] String))
+(defn mediaCacheControl [extension filePath]
+  (let [isTextFile (includes? TEXT_EXTENSIONS (lower-case extension))
+        editable (isPathEditable filePath)]
+    (if (or isTextFile editable)
+        "no-cache, no-store, must-revalidate"
+        "public, max-age=31536000")))
+
+(ann noRangeHeaders (Fn [String Number String] Js))
+(defn noRangeHeaders [mimeType size cacheControl]
+  {"Content-Type" mimeType
+   "Content-Length" size
+   "Accept-Ranges" "bytes"
+   "Cache-Control" cacheControl})
+
+(ann rangeHeaders (Fn [Number Number Number String String] Js))
+(defn rangeHeaders [start end total mimeType cacheControl]
+  {"Content-Range" (str "bytes " start "-" end "/" total)
+   "Accept-Ranges" "bytes"
+   "Content-Length" (+ (- end start) 1)
+   "Content-Type" mimeType
+   "Cache-Control" cacheControl})
+
+(ann rangeBody (Fn [String] String))
+(defn rangeBody [range]
+  (if (starts-with? range "bytes=")
+      (string-slice range 6 (count range))
+      range))
+
+(ann rangeEnd (Fn [Js Number] Number))
+(defn rangeEnd [parts fallback]
+  (let [raw (second parts)]
+    (if (and (string? raw) (not (= raw "")))
+        (to-number raw)
+        fallback)))
+
+(ann streamRange (Fn [Js String Js String String String] Js))
+(defn streamRange [reply fullPath stats mimeType cacheControl range]
+  (let [parts (split (rangeBody range) "-")
+        start (to-number (first parts))
+        end (rangeEnd parts (- stats.size 1))]
+    (streamFileRangeResponse reply
+                             fullPath
+                             start
+                             end
+                             206
+                             (rangeHeaders start end stats.size mimeType cacheControl))))
+
+(ann streamWholeFile (Fn [Js String Js String String] Js))
+(defn streamWholeFile [reply fullPath stats mimeType cacheControl]
+  (streamFileResponse reply
+                      fullPath
+                      200
+                      (noRangeHeaders mimeType stats.size cacheControl)))
+
+(ann streamMediaFile (Fn [Js Js String] Js))
+(defn streamMediaFile [request reply filePath]
+  (let [fullPath (getFilePath filePath)
+        stats (fileStatsSync fullPath)]
+    (if (not (stats.isFile))
+        (codeSend reply 400 {:error "Not a file"})
+        (let [extension (extensionOfPath fullPath)
+              mimeType (getMimeType extension)
+              cacheControl (mediaCacheControl extension filePath)
+              range request.headers.range]
+          (if (string? range)
+              (streamRange reply fullPath stats mimeType cacheControl range)
+              (streamWholeFile reply fullPath stats mimeType cacheControl))))))
+
+(ann handleMediaError (Fn [Js Js] Js))
+(defn handleMediaError [reply error]
+  (if (errorMessageIncludes? error "Invalid path")
+      (codeSend reply 403 {:error "Invalid path"})
+      (codeSend reply 404 {:error "File not found"})))
+
+(ann handleMedia (Fn [Js Js] Js))
+(defn handleMedia [request reply]
+  (try
+   (let [filePath (object-get request.params "*")]
+     (streamMediaFile request reply filePath))
+   (catch error (handleMediaError reply error))))
+
+(ann handleAudioMetadata (Fn [Js Js] Js))
+(defn handleAudioMetadata [request reply]
+  (try
+   (let [filePath (object-get request.params "*")]
+     (if (not (and (string? filePath) (not (= filePath ""))))
+         (codeSend reply 400 {:error "Path is required"})
+         (let [fullPath (getFilePath filePath)
+               metadataPromise (extractAudioMetadata fullPath)
+               sent (metadataPromise.then (fn [metadata] (reply.send metadata)))]
+           (sent.catch
+            (fn [error]
+              (do
+                (consoleError "Error reading audio metadata:" error)
+                (codeSend reply 500 {:error "Failed to read audio metadata"})))))))
+   (catch error
+     (do
+       (consoleError "Error reading audio metadata:" error)
+       (codeSend reply 500 {:error "Failed to read audio metadata"})))))
+
+(ann handleAudioExtractError (Fn [Js Js] Js))
+(defn handleAudioExtractError [reply error]
+  (if (errorMessageIncludes? error "ENOENT")
+      (codeSend reply 501 {:error "FFmpeg not found. Please install ffmpeg on the server."})
+      (if (errorMessageIncludes? error "Invalid path")
+          (codeSend reply 403 {:error "Invalid path"})
+          (codeSend reply 500 {:error "Audio extraction failed"}))))
+
+(ann handleAudioExtract (Fn [Js Js] Js))
+(defn handleAudioExtract [request reply]
+  (try
+   (let [filePath (object-get request.params "*")
+         fullPath (getFilePath filePath)
+         extracted (extractAudioTrack fullPath request reply)]
+     (extracted.catch (fn [error] (handleAudioExtractError reply error))))
+   (catch error (handleAudioExtractError reply error))))
+
+(ann mediaRouteDefinitions (Fn [] (Vector HttpRoute)))
+(defn mediaRouteDefinitions []
+  [{:method "GET" :path "/api/media/*" :handler handleMedia}
+   {:method "GET" :path "/api/audio/metadata/*" :handler handleAudioMetadata}
+   {:method "GET" :path "/api/audio/extract/*" :handler handleAudioExtract}])
+
+(ann registerMediaRoutes (Fn [Js] Js))
+(defn registerMediaRoutes [app]
+  (registerHttpRoutes app (mediaRouteDefinitions)))

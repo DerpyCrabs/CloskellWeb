@@ -1,0 +1,87 @@
+(def INITIAL_DELAY_MS 5000)
+(def MAX_DELAY_MS 60000)
+(def BACKOFF_MULTIPLIER 2)
+(def jsGlobalThis (js-global globalThis))
+(def jsMath (js-global Math))
+
+(ann boxGet (Fn [Js] Js))
+(defn boxGet [box]
+  (nth box 0))
+
+(ann boxSet (Fn [Js Js] Js))
+(defn boxSet [box value]
+  (box.splice 0 1 value))
+
+(ann getDelayMs (Fn [Number] Number))
+(defn getDelayMs [retryCount]
+  (min (* INITIAL_DELAY_MS (jsMath.pow BACKOFF_MULTIPLIER retryCount))
+       MAX_DELAY_MS))
+
+(ann currentDocument (Fn [] Js))
+(defn currentDocument []
+  jsGlobalThis.document)
+
+(ann isTabVisible (Fn [] Bool))
+(defn isTabVisible []
+  (let [doc (currentDocument)]
+    (and (some? doc) (not doc.hidden))))
+
+(ann cancelReconnect (Fn [Js] Nil))
+(defn cancelReconnect [timeoutIdBox]
+  (let [timeoutId (boxGet timeoutIdBox)]
+    (if (some? timeoutId)
+        (do
+          (jsGlobalThis.clearTimeout timeoutId)
+          (boxSet timeoutIdBox nil)
+          nil)
+        nil)))
+
+(ann createReconnectScheduler (Fn [Js] Js))
+(defn createReconnectScheduler [connect]
+  (let [retryCountBox (unsafe-cast Js [0])
+        timeoutIdBox (unsafe-cast Js [nil])
+        cancel (fn [] (cancelReconnect timeoutIdBox))
+        reset (fn []
+                (do
+                  (cancel)
+                  (boxSet retryCountBox 0)
+                  nil))
+        schedule (fn []
+                   (let [timeoutId (boxGet timeoutIdBox)]
+                     (if (some? timeoutId)
+                         nil
+                         (if (not (isTabVisible))
+                             nil
+                             (let [retryCount (boxGet retryCountBox)
+                                   delay (getDelayMs retryCount)
+                                   nextTimeout (jsGlobalThis.setTimeout
+                                                (fn []
+                                                  (do
+                                                    (boxSet timeoutIdBox nil)
+                                                    (if (isTabVisible) (connect) nil)))
+                                                delay)]
+                               (do
+                                 (boxSet retryCountBox (+ retryCount 1))
+                                 (boxSet timeoutIdBox nextTimeout)
+                                 nil))))))
+        handleVisibilityChange (fn []
+                                 (if (isTabVisible)
+                                     (do
+                                       (reset)
+                                       (connect)
+                                       nil)
+                                     (cancel)))
+        doc (currentDocument)]
+    (do
+      (if (some? doc)
+          (doc.addEventListener "visibilitychange" handleVisibilityChange)
+          nil)
+      {:schedule schedule
+       :cleanup (fn []
+                  (do
+                    (cancel)
+                    (let [cleanupDoc (currentDocument)]
+                      (if (some? cleanupDoc)
+                          (cleanupDoc.removeEventListener "visibilitychange" handleVisibilityChange)
+                          nil))
+                    nil))})))

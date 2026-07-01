@@ -1,0 +1,15 @@
+(ann aiToolKeyChar? (Fn [String] Bool))
+(defn aiToolKeyChar? [ch]
+  (regex-test? ch "^[a-zA-Z0-9_]$" ""))
+
+(ann sanitizeAiToolKeyPart (Fn [String] String))
+(defn sanitizeAiToolKeyPart [value]
+  (join (map (split value "")
+             (fn [ch] (if (aiToolKeyChar? ch) ch "_")))
+        ""))
+
+(ann mcpAiToolKey (Fn [String String] String))
+(defn mcpAiToolKey [serverName toolName]
+  (str (sanitizeAiToolKeyPart serverName)
+       "__"
+       (sanitizeAiToolKeyPart toolName)))

@@ -1,0 +1,27 @@
+(import "fs" [readFileSync])
+
+(def jsProcess (js-global process))
+
+(ann hostCwd (Fn [] String))
+(defn hostCwd []
+  (jsProcess.cwd))
+
+(ann hostEnv (Fn [] Js))
+(defn hostEnv []
+  jsProcess.env)
+
+(ann hostPid (Fn [] Js))
+(defn hostPid []
+  jsProcess.pid)
+
+(ann hostArgv (Fn [] Js))
+(defn hostArgv []
+  jsProcess.argv)
+
+(ann hostExit (Fn [Number] Js))
+(defn hostExit [code]
+  (jsProcess.exit code))
+
+(ann readTextFileSync (Fn [String] String))
+(defn readTextFileSync [fullPath]
+  (readFileSync fullPath "utf-8"))

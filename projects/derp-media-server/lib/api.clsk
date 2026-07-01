@@ -1,0 +1,89 @@
+(def jsGlobalThis (js-global globalThis))
+(def jsObject (js-global Object))
+(def jsArray (js-global Array))
+(def jsHeaders (js-global Headers))
+(def jsError (js-global Error))
+(def jsPromise (js-global Promise))
+(def jsUndefined (js-global undefined))
+
+(ann ApiError (Fn [Number String] Js))
+(defn ApiError [status message]
+  (let [error (new jsError message)]
+    (do
+      (jsObject.defineProperty error "name" {:value "ApiError" :configurable true})
+      (jsObject.defineProperty error "status" {:value status :configurable true})
+      error)))
+
+(ann isApiError (Fn [Js] Bool))
+(defn isApiError [error]
+  (and (object? error)
+       (= (object-get error "name") "ApiError")
+       (number? (object-get error "status"))))
+
+(ann globalConstructor (Fn [String] Js))
+(defn globalConstructor [name]
+  (object-get jsGlobalThis name))
+
+(ann isInstanceOfConstructor (Fn [Js Js] Bool))
+(defn isInstanceOfConstructor [value ctor]
+  (and (some? value)
+       (some? ctor)
+       (some? ctor.prototype)
+       (ctor.prototype.isPrototypeOf value)))
+
+(ann setHeaderEntry (Fn [Js Js] Js))
+(defn setHeaderEntry [out pair]
+  (do
+    (out.set (nth pair 0) (nth pair 1))
+    out))
+
+(ann setObjectHeaderEntry (Fn [Js Js] Js))
+(defn setObjectHeaderEntry [out entry]
+  (do
+    (if (not (= entry.value jsUndefined))
+        (out.set entry.key (str entry.value))
+        nil)
+    out))
+
+(ann mergeFetchHeaders (Fn [Js Js] Js))
+(defn mergeFetchHeaders [base extra]
+  (let [out (new jsHeaders base)
+        headersCtor (globalConstructor "Headers")]
+    (if (not (some? extra))
+        out
+        (if (isInstanceOfConstructor extra headersCtor)
+            (do
+              (extra.forEach (fn [value key] (out.set key value)))
+              out)
+            (if (jsArray.isArray extra)
+                (reduce extra out setHeaderEntry)
+                (reduce (object-entries extra) out setObjectHeaderEntry))))))
+
+(ann apiErrorFromResponse (Fn [Js] Js))
+(defn apiErrorFromResponse [res]
+  (let [bodyPromise (res.json)
+        parsed (bodyPromise.catch (fn [_error] {}))]
+    (parsed.then
+     (fn [body]
+       (let [message (if (and (object? body) (string? body.error))
+                         body.error
+                         res.statusText)]
+         (jsPromise.reject (ApiError res.status message)))))))
+
+(ann api (Fn [String Js] Js))
+(defn api [url options]
+  (let [opts (if (object? options) options {})
+        optsHeaders (get opts :headers)
+        rest (object-dissoc opts "headers")
+        headers (mergeFetchHeaders {"Content-Type" "application/json"} optsHeaders)
+        requestOptions (object-assoc rest "headers" headers)
+        fetched (jsGlobalThis.fetch url requestOptions)]
+    (fetched.then
+     (fn [res]
+       (if res.ok
+           (res.json)
+           (apiErrorFromResponse res))))))
+
+(ann post (Fn [String Js] Js))
+(defn post [url body]
+  (api url {:method "POST" :body (json-stringify body)}))

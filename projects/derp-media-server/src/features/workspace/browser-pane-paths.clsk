@@ -1,0 +1,9 @@
+(import "../source-context.clsk" [normalizeSlashes])
+
+(ann workspaceBrowserPaneParentDir (Fn [String] String))
+(defn workspaceBrowserPaneParentDir [fullPath]
+  (let [parts (filter (split (normalizeSlashes fullPath) "/")
+                      (fn [part] (not (= part ""))))]
+    (if (<= (count parts) 1)
+        ""
+        (join (slice parts 0 (- (count parts) 1)) "/"))))

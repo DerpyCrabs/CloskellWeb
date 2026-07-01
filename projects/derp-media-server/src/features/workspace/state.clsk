@@ -1,0 +1,631 @@
+(import "../../model.clsk" [AppState])
+(import "../../../lib/types.clsk" [FileItem
+                                 MediaType
+                                 WorkspaceTaskbarPin
+                                 WorkspaceTaskbarPinSource])
+(import "../media-urls.clsk" [MediaShareContext buildMediaUrl])
+(import "../media-utils.clsk" [getMediaType])
+(import "../virtual-folders.clsk" [isVirtualFolderPath])
+(import "./assist-grid.clsk" [AssistGridSpan assistGridSpanToBounds])
+(import "./geometry.clsk" [WorkspaceBounds
+                          createDefaultBounds
+                          createFullscreenBounds
+                          createWindowLayout
+                          getPlayerBoundsForAspectRatio
+                          getViewportSize
+                          maxWorkspaceWindowZ
+                          snapZoneToBounds])
+(import "./session-resize.clsk" [computeSnappedResizeWindows])
+(import "./state-core.clsk" [getWorkspaceWindowTitle])
+(import "./tab-group-ops.clsk" [groupIdForWindow
+                                openInNewTabInGroupState
+                                openInSplitViewFromBrowserState
+                                orderedAllGroupIds
+                                pruneTabGroupSplitsState
+                                resolveGroupVisibleTabId
+                                tabsInGroup])
+(import "./tab-groups-core.clsk" [WorkspaceTabLayout WorkspaceTabWindow])
+(import "./titles.clsk" [workspaceBrowserDirTitle])
+(import "./types.clsk" [WorkspaceState])
+(import "./video-intrinsics.clsk" [viewerBoundsForVideoOpen])
+
+(def jsCrypto (js-global crypto))
+(def jsDate (js-global Date))
+
+(ann shareWorkspacePath? (Fn [String] Bool))
+(defn shareWorkspacePath? [pathname]
+  (regex-test? pathname "^/share/[^/]+/workspace/?$" ""))
+
+(ann workspaceSourceForState (Fn [AppState] WorkspaceTaskbarPinSource))
+(defn workspaceSourceForState [state]
+  (match state.shareToken
+    nil {:kind "local" :rootPath nil :token nil :sharePath nil}
+    (some token) {:kind "share" :rootPath nil :token token :sharePath state.sharePath}))
+
+(ann workspaceWindows (Fn [AppState] (Vector WorkspaceTabWindow)))
+(defn workspaceWindows [state]
+  state.workspace.windows)
+
+(ann workspaceTaskbarPins (Fn [AppState] (Vector WorkspaceTaskbarPin)))
+(defn workspaceTaskbarPins [state]
+  (if (and (object? state.workspace) (vector? state.workspace.pinnedTaskbarItems))
+      state.workspace.pinnedTaskbarItems
+      []))
+
+(ann workspacePinKey (Fn [WorkspaceTaskbarPin] String))
+(defn workspacePinKey [pin]
+  (let [source pin.source
+        token (if (string? source.token) source.token "")]
+    (str pin.path ":" source.kind ":" token)))
+
+(ann workspaceFilePinKey (Fn [FileItem WorkspaceTaskbarPinSource] String))
+(defn workspaceFilePinKey [file source]
+  (let [token (if (string? source.token) source.token "")]
+    (str file.path ":" source.kind ":" token)))
+
+(ann workspacePinFromFile (Fn [AppState FileItem] WorkspaceTaskbarPin))
+(defn workspacePinFromFile [state file]
+  (let [source (workspaceSourceForState state)]
+    {:id (if (some? jsCrypto.randomUUID) (jsCrypto.randomUUID) (str "pin-" (jsDate.now)))
+     :path file.path
+     :isDirectory file.isDirectory
+     :title file.name
+     :customIconName nil
+     :source source}))
+
+(ann addWorkspaceTaskbarPinState (Fn [AppState FileItem] WorkspaceState))
+(defn addWorkspaceTaskbarPinState [state file]
+  (let [pins (workspaceTaskbarPins state)
+        source (workspaceSourceForState state)
+        key (workspaceFilePinKey file source)]
+    (if (some? (find pins (fn [pin] (= (workspacePinKey pin) key))))
+        state.workspace
+        (object-assoc state.workspace
+                      "pinnedTaskbarItems"
+                      (conj pins (workspacePinFromFile state file))))))
+
+(ann removeWorkspaceTaskbarPinState (Fn [AppState String] WorkspaceState))
+(defn removeWorkspaceTaskbarPinState [state id]
+  (object-assoc state.workspace
+                "pinnedTaskbarItems"
+                (filter (workspaceTaskbarPins state)
+                        (fn [pin] (not (= pin.id id))))))
+
+(ann workspaceWithTaskbarPins (Fn [WorkspaceState (Vector WorkspaceTaskbarPin)] WorkspaceState))
+(defn workspaceWithTaskbarPins [workspace pins]
+  (merge workspace {:pinnedTaskbarItems pins}))
+
+(ann workspaceWithSource (Fn [AppState WorkspaceState] WorkspaceState))
+(defn workspaceWithSource [state workspace]
+  (let [source (workspaceSourceForState state)]
+    (merge workspace
+           {:windows (map workspace.windows
+                          (fn [win]
+                            (if (some? win.source)
+                                win
+                                (merge win {:source source}))))})))
+
+(ann setWorkspaceState (Fn [AppState WorkspaceState] AppState))
+(defn setWorkspaceState [state workspace]
+  (let [nextWorkspace (workspaceWithSource state workspace)
+        revision (if (number? state.workspaceRevision) state.workspaceRevision 0)
+        target (if (string? nextWorkspace.fileOpenTarget)
+                   nextWorkspace.fileOpenTarget
+                   state.workspaceFileOpenTarget)]
+    (merge state {:workspace nextWorkspace
+                  :workspaceRevision (+ revision 1)
+                  :workspaceFileOpenTarget (if (= target "new-tab") "new-tab" "new-window")})))
+
+(ann updateWorkspaceState (Fn [AppState (Fn [WorkspaceState] WorkspaceState)] AppState))
+(defn updateWorkspaceState [state updater]
+  (setWorkspaceState state (updater state.workspace)))
+
+(ann findWorkspaceWindow (Fn [WorkspaceState String] (Option WorkspaceTabWindow)))
+(defn findWorkspaceWindow [workspace id]
+  (find workspace.windows (fn [win] (= win.id id))))
+
+(ann emptyWorkspaceTabLayout WorkspaceTabLayout)
+(def emptyWorkspaceTabLayout
+  {:minimized nil
+   :bounds nil
+   :zIndex nil
+   :snapZone nil
+   :fullscreen nil
+   :restoreBounds nil})
+
+(ann layoutForWindow (Fn [(Option WorkspaceTabWindow)] WorkspaceTabLayout))
+(defn layoutForWindow [win]
+  (match win
+    nil emptyWorkspaceTabLayout
+    (some current) current.layout))
+
+(ann boundsForWindow (Fn [(Option WorkspaceTabWindow)] WorkspaceBounds))
+(defn boundsForWindow [win]
+  (let [layout (layoutForWindow win)]
+    (match layout.bounds
+      nil (createDefaultBounds 0 (match win
+                                    nil "browser"
+                                    (some current) current.type))
+      (some currentBounds) currentBounds)))
+
+(ann workspaceWindowTitle (Fn [WorkspaceTabWindow] String))
+(defn workspaceWindowTitle [win]
+  (getWorkspaceWindowTitle {:title (match win.title
+                                     nil ""
+                                     (some title) title)
+                            :type win.type
+                            :source win.source
+                            :initialState {:dir win.initialState.dir
+                                           :viewing win.initialState.viewing
+                                           :playing win.initialState.playing
+                                           :kbRoot win.initialState.kbRoot}}))
+
+(ann focusWorkspaceWindowState (Fn [WorkspaceState String] WorkspaceState))
+(defn focusWorkspaceWindowState [workspace windowId]
+  (let [target (findWorkspaceWindow workspace windowId)]
+    (if (not (some? target))
+        workspace
+        (let [gid (groupIdForWindow target)
+              maxZ (maxWorkspaceWindowZ workspace.windows)
+              newZ (+ maxZ 1)
+              nextWindows (map workspace.windows
+                               (fn [win]
+                                 (if (= (groupIdForWindow win) gid)
+                                     (merge win
+                                            {:layout (merge (layoutForWindow win)
+                                                            {:zIndex newZ
+                                                             :minimized false})})
+                                     win)))]
+          (merge workspace {:windows nextWindows
+                            :activeWindowId windowId
+                            :activeTabMap (object-assoc workspace.activeTabMap gid windowId)})))))
+
+(ann closeWorkspaceTabState (Fn [WorkspaceState String] WorkspaceState))
+(defn closeWorkspaceTabState [workspace tabId]
+  (let [victim (findWorkspaceWindow workspace tabId)]
+    (if (not (some? victim))
+        workspace
+        (let [gid (groupIdForWindow victim)
+              members (filter workspace.windows (fn [win] (= (groupIdForWindow win) gid)))]
+          (if (<= (count members) 1)
+              (let [nextWindows (filter workspace.windows (fn [win] (not (= win.id tabId))))
+                    nextActive (if (= workspace.activeWindowId tabId)
+                                   (let [lastWin (last nextWindows)]
+                                     (if (some? lastWin) lastWin.id nil))
+                                   workspace.activeWindowId)]
+                (pruneTabGroupSplitsState
+                 (merge workspace {:windows nextWindows
+                                   :activeWindowId nextActive
+                                   :activeTabMap (object-dissoc workspace.activeTabMap gid)})))
+              (let [nextWindows0 (filter workspace.windows (fn [win] (not (= win.id tabId))))
+                    still (filter nextWindows0 (fn [win] (= (groupIdForWindow win) gid)))
+                    activeMap0 workspace.activeTabMap
+                    nextActiveMap (if (= (object-get activeMap0 gid) tabId)
+                                      (object-assoc activeMap0 gid (get (nth still 0) :id))
+                                      activeMap0)
+                    nextWindows (if (= (count still) 1)
+                                    (map nextWindows0
+                                         (fn [win]
+                                           (if (= win.id (get (nth still 0) :id))
+                                               (merge win {:tabGroupId nil})
+                                               win)))
+                                    nextWindows0)
+                    finalMap (if (= (count still) 1) (object-dissoc nextActiveMap gid) nextActiveMap)
+                    nextActive (if (= workspace.activeWindowId tabId)
+                                   (if (= (count still) 1)
+                                       (get (nth still 0) :id)
+                                       (object-get finalMap gid))
+                                   workspace.activeWindowId)]
+                (pruneTabGroupSplitsState
+                 (merge workspace {:windows nextWindows
+                                   :activeWindowId nextActive
+                                   :activeTabMap finalMap}))))))))
+
+(ann closeWorkspaceWindowState (Fn [WorkspaceState String] WorkspaceState))
+(defn closeWorkspaceWindowState [workspace windowId]
+  (let [target (findWorkspaceWindow workspace windowId)
+        gid (if (some? target) (groupIdForWindow target) windowId)
+        nextWindows (filter workspace.windows (fn [win] (not (= (groupIdForWindow win) gid))))
+        activeRemoved? (not (some? (find nextWindows (fn [win] (= win.id workspace.activeWindowId)))))
+        nextActive (if activeRemoved?
+                       (let [lastWin (last nextWindows)]
+                         (if (some? lastWin) lastWin.id nil))
+                       workspace.activeWindowId)]
+    (pruneTabGroupSplitsState
+     (merge workspace {:windows nextWindows
+                       :activeWindowId nextActive
+                       :activeTabMap (object-dissoc workspace.activeTabMap gid)}))))
+
+(ann updateWorkspaceGroupLayout (Fn [WorkspaceState String WorkspaceTabLayout] WorkspaceState))
+(defn updateWorkspaceGroupLayout [workspace windowId layoutPatch]
+  (let [target (findWorkspaceWindow workspace windowId)
+        gid (if (some? target) (groupIdForWindow target) windowId)
+        nextWindows (map workspace.windows
+                         (fn [win]
+                           (if (= (groupIdForWindow win) gid)
+                               (merge win {:layout (merge (layoutForWindow win) layoutPatch)})
+                               win)))]
+    (merge workspace {:windows nextWindows})))
+
+(ann updateWorkspaceWindowBoundsState (Fn [WorkspaceState String WorkspaceBounds] WorkspaceState))
+(defn updateWorkspaceWindowBoundsState [workspace windowId bounds]
+  (updateWorkspaceGroupLayout workspace windowId {:bounds bounds
+                                                  :fullscreen false
+                                                  :snapZone nil
+                                                  :restoreBounds nil
+                                                  :minimized false}))
+
+(ann resizeWorkspaceWindowBoundsState (Fn [WorkspaceState String WorkspaceBounds String] WorkspaceState))
+(defn resizeWorkspaceWindowBoundsState [workspace windowId bounds direction]
+  (merge workspace
+         {:windows (computeSnappedResizeWindows workspace.windows windowId bounds direction)}))
+
+(ann minimizeWorkspaceWindowState (Fn [WorkspaceState String Bool] WorkspaceState))
+(defn minimizeWorkspaceWindowState [workspace windowId minimized]
+  (updateWorkspaceGroupLayout workspace windowId {:minimized minimized}))
+
+(ann toggleFullscreenWorkspaceWindowState (Fn [WorkspaceState String] WorkspaceState))
+(defn toggleFullscreenWorkspaceWindowState [workspace windowId]
+  (let [target (findWorkspaceWindow workspace windowId)
+        current (layoutForWindow target)
+        full? (= current.fullscreen true)
+        bounds (if full?
+                   (if (object? current.restoreBounds) current.restoreBounds (boundsForWindow target))
+                   (createFullscreenBounds nil))]
+    (updateWorkspaceGroupLayout workspace
+                                windowId
+                                {:fullscreen (not full?)
+                                 :snapZone nil
+                                 :bounds bounds
+                                 :restoreBounds (if full? nil (boundsForWindow target))
+                                 :minimized false})))
+
+(ann snapWorkspaceWindowState (Fn [WorkspaceState String String] WorkspaceState))
+(defn snapWorkspaceWindowState [workspace windowId zone]
+  (let [bounds (snapZoneToBounds zone (getViewportSize))
+        target (findWorkspaceWindow workspace windowId)
+        currentBounds (boundsForWindow target)]
+    (updateWorkspaceGroupLayout workspace
+                                windowId
+                                {:bounds bounds
+                                 :snapZone zone
+                                 :fullscreen false
+                                 :restoreBounds currentBounds
+                                 :minimized false})))
+
+(ann tilingPickWorkspaceState (Fn [WorkspaceState String AssistGridSpan] WorkspaceState))
+(defn tilingPickWorkspaceState [workspace windowId span]
+  (let [bounds (assistGridSpanToBounds (getViewportSize) span)
+        target (findWorkspaceWindow workspace windowId)]
+    (updateWorkspaceGroupLayout workspace
+                                windowId
+                                {:bounds bounds
+                                 :snapZone "assist-custom"
+                                 :fullscreen false
+                                 :restoreBounds (boundsForWindow target)
+                                 :minimized false})))
+
+(ann newWorkspaceBrowserWindow (Fn [AppState WorkspaceState Number String] WorkspaceTabWindow))
+(defn newWorkspaceBrowserWindow [state workspace index dir]
+  (let [n workspace.nextWindowId
+        id (str "workspace-window-" n)
+        source (workspaceSourceForState state)
+        title (if (= dir "")
+                  (if (= source.kind "share") state.shareName (workspaceBrowserDirTitle ""))
+                  (workspaceBrowserDirTitle dir))
+        layout (createWindowLayout nil
+                                   (createDefaultBounds index "browser")
+                                   (+ (maxWorkspaceWindowZ workspace.windows) 1))]
+    {:id id
+     :type "browser"
+     :title title
+     :iconName nil
+     :iconPath dir
+     :iconType MediaType.FOLDER
+     :iconIsVirtual (isVirtualFolderPath dir)
+     :source source
+     :initialState (if (= dir "") {} {:dir dir})
+     :tabGroupId nil
+     :layout layout}))
+
+(ann openWorkspaceBrowserState (Fn [AppState WorkspaceState String] WorkspaceState))
+(defn openWorkspaceBrowserState [state workspace dir]
+  (let [win (newWorkspaceBrowserWindow state workspace (count workspace.windows) dir)]
+    (merge workspace {:windows (conj workspace.windows win)
+                      :nextWindowId (+ workspace.nextWindowId 1)
+                      :activeWindowId win.id})))
+
+(ann workspaceWindowDir (Fn [WorkspaceTabWindow] String))
+(defn workspaceWindowDir [win]
+  (let [dir win.initialState.dir]
+    (if (string? dir) dir "")))
+
+(ann workspaceWindowViewingPath (Fn [WorkspaceTabWindow] (Option String)))
+	(defn workspaceWindowViewingPath [win]
+	  (let [direct win.viewingPath
+	        viewing win.initialState.viewing
+	        playing win.initialState.playing
+	        iconPath win.iconPath
+        title win.title]
+    (if (string? direct)
+        direct
+        (if (string? viewing)
+            viewing
+            (if (string? playing)
+                playing
+                (if (and (= win.type "viewer") (string? iconPath))
+                    iconPath
+                    (match title
+                      nil nil
+                      (some titleValue)
+	                      (if (includes? titleValue ".")
+	                          titleValue
+	                          nil))))))))
+
+(ann sameWorkspaceBounds? (Fn [WorkspaceBounds WorkspaceBounds] Bool))
+(defn sameWorkspaceBounds? [a b]
+  (and (= a.x b.x)
+       (= a.y b.y)
+       (= a.width b.width)
+       (= a.height b.height)))
+
+(ann workspaceWindowViewingPathMatches? (Fn [WorkspaceTabWindow String] Bool))
+(defn workspaceWindowViewingPathMatches? [win path]
+  (match (workspaceWindowViewingPath win)
+    nil false
+    (some viewing) (= viewing path)))
+
+(ann resizeWorkspaceVideoViewerForMetadataState (Fn [WorkspaceState String String Number Number] WorkspaceState))
+(defn resizeWorkspaceVideoViewerForMetadataState [workspace windowId path width height]
+  (let [target (findWorkspaceWindow workspace windowId)]
+    (match target
+      nil workspace
+      (some win)
+        (if (or (not (= win.type "viewer"))
+                (<= width 0)
+                (<= height 0)
+                (not (workspaceWindowViewingPathMatches? win path)))
+            workspace
+            (let [current (boundsForWindow target)
+                  nextBounds (getPlayerBoundsForAspectRatio (/ width height) current)]
+              (if (sameWorkspaceBounds? current nextBounds)
+                  workspace
+                  (updateWorkspaceGroupLayout workspace windowId {:bounds nextBounds})))))))
+
+(ann workspaceWindowId (Fn [WorkspaceTabWindow] String))
+(defn workspaceWindowId [win]
+  win.id)
+
+(ann workspaceGroupIds (Fn [AppState] (Vector String)))
+(defn workspaceGroupIds [state]
+  (orderedAllGroupIds (workspaceWindows state)))
+
+(ann workspacePathParts (Fn [String] (Vector String)))
+(defn workspacePathParts [path]
+  (filter (split path "/") (fn [part] (not (= part "")))))
+
+(ann workspacePathNameFromPath (Fn [String] String))
+(defn workspacePathNameFromPath [path]
+  (let [parts (workspacePathParts path)
+        name (last parts)]
+    (if (some? name) name path)))
+
+(ann workspaceNameWithoutExtension (Fn [String] String))
+(defn workspaceNameWithoutExtension [name]
+  (let [parts (split name ".")]
+    (if (<= (count parts) 1)
+        name
+        (join (slice parts 0 (- (count parts) 1)) "."))))
+
+(ann workspaceParentDir (Fn [String] String))
+(defn workspaceParentDir [path]
+  (let [parts (workspacePathParts path)]
+    (if (<= (count parts) 1)
+        ""
+        (join (slice parts 0 (- (count parts) 1)) "/"))))
+
+(ann workspaceExtensionFromPath (Fn [String] String))
+(defn workspaceExtensionFromPath [path]
+  (let [name (workspacePathNameFromPath path)
+        parts (split name ".")
+        ext (last parts)]
+    (if (and (some? ext) (> (count parts) 1)) (lower-case ext) "")))
+
+(ann workspaceEmptyFileItem (Fn [] FileItem))
+(defn workspaceEmptyFileItem []
+  {:name ""
+   :path ""
+   :type MediaType.OTHER
+   :size 0
+   :extension ""
+   :isDirectory false
+   :isVirtual nil
+   :viewCount nil
+   :shareToken nil
+   :thumbnailGenerated nil})
+
+(ann workspaceFileItemFromPath (Fn [String] FileItem))
+(defn workspaceFileItemFromPath [path]
+  (let [ext (workspaceExtensionFromPath path)]
+    {:name (workspacePathNameFromPath path)
+     :path path
+     :type (getMediaType ext)
+     :size 0
+     :extension ext
+     :isDirectory false
+     :isVirtual nil
+     :viewCount nil
+     :shareToken nil
+     :thumbnailGenerated true}))
+
+(ann workspaceFileItemFromDrag (Fn [String Bool] FileItem))
+(defn workspaceFileItemFromDrag [path isDirectory]
+  (let [ext (if isDirectory "" (workspaceExtensionFromPath path))]
+    {:name (workspacePathNameFromPath path)
+     :path path
+     :type (if isDirectory MediaType.FOLDER (getMediaType ext))
+     :size 0
+     :extension ext
+     :isDirectory isDirectory
+     :isVirtual nil
+     :viewCount nil
+     :shareToken nil
+     :thumbnailGenerated (not isDirectory)}))
+
+(ann workspaceWindowFileItem (Fn [WorkspaceTabWindow] FileItem))
+(defn workspaceWindowFileItem [win]
+  (match (workspaceWindowViewingPath win)
+    nil (workspaceEmptyFileItem)
+    (some path) (workspaceFileItemFromPath path)))
+
+(ann workspaceWindowSourceMediaContext (Fn [WorkspaceTabWindow] (Option MediaShareContext)))
+(defn workspaceWindowSourceMediaContext [win]
+  (let [source win.source]
+    (if (= source.kind "share")
+        (let [token source.token
+              sharePath source.sharePath]
+          (if (string? token)
+              {:token token :sharePath (if (string? sharePath) sharePath "")}
+              nil))
+        nil)))
+
+(ann workspaceWindowMediaUrl (Fn [AppState WorkspaceTabWindow FileItem] String))
+(defn workspaceWindowMediaUrl [state win file]
+  (let [url (if (shareWorkspacePath? state.pathname)
+                (match state.shareToken
+                  nil (buildMediaUrl file.path (workspaceWindowSourceMediaContext win))
+                  (some token) (buildMediaUrl file.path {:token token :sharePath state.sharePath}))
+                (buildMediaUrl file.path (workspaceWindowSourceMediaContext win)))]
+    (if (= file.type MediaType.PDF) (str url "#toolbar=1") url)))
+
+(ann workspaceWindowTitleFromFile (Fn [FileItem] String))
+(defn workspaceWindowTitleFromFile [file]
+  (if (= file.name "") (workspacePathNameFromPath file.path) file.name))
+
+(ann workspaceWindowFileDir (Fn [FileItem String] String))
+(defn workspaceWindowFileDir [file fallback]
+  (let [dir (workspaceParentDir file.path)]
+    (if (= dir "") fallback dir)))
+
+(ann workspaceCurrentFilesForSnapshot (Fn [AppState] (Vector FileItem)))
+(defn workspaceCurrentFilesForSnapshot [state]
+  (if (shareWorkspacePath? state.pathname) state.shareFiles state.files))
+
+(ann workspaceImageFilesSnapshot (Fn [AppState FileItem] (Vector FileItem)))
+(defn workspaceImageFilesSnapshot [state file]
+  (if (= file.type MediaType.IMAGE)
+      (filter (workspaceCurrentFilesForSnapshot state)
+              (fn [item] (= item.type MediaType.IMAGE)))
+      []))
+
+(ann workspaceShareRootLabel (Fn [AppState WorkspaceTabWindow] String))
+(defn workspaceShareRootLabel [state win]
+  (if (not (= state.shareName ""))
+      state.shareName
+      (let [source win.source
+            sharePath source.sharePath]
+        (if (and (string? sharePath) (not (= sharePath "")))
+            (workspacePathNameFromPath sharePath)
+            "Share"))))
+
+	(ann newWorkspaceViewerWindow (Fn [AppState WorkspaceState Number FileItem] WorkspaceTabWindow))
+	(defn newWorkspaceViewerWindow [state workspace index file]
+	  (let [n workspace.nextWindowId
+	        id (str "workspace-window-" n)
+	        source (workspaceSourceForState state)
+	        layout (createWindowLayout nil
+	                                   (if (= file.type MediaType.VIDEO)
+	                                       (viewerBoundsForVideoOpen file.path source index)
+	                                       (createDefaultBounds index "viewer"))
+	                                   (+ (maxWorkspaceWindowZ workspace.windows) 1))]
+    {:id id
+     :type "viewer"
+     :title (workspaceWindowTitleFromFile file)
+     :iconName nil
+     :iconPath file.path
+     :iconType file.type
+     :iconIsVirtual false
+     :source source
+     :viewingPath file.path
+     :initialState {:dir (workspaceWindowFileDir file state.currentDir)
+                    :viewing file.path
+                    :imageFiles (workspaceImageFilesSnapshot state file)}
+     :tabGroupId nil
+     :layout layout}))
+
+(ann openWorkspaceFileInNewWindowState (Fn [AppState WorkspaceState FileItem] WorkspaceState))
+(defn openWorkspaceFileInNewWindowState [state workspace file]
+  (if file.isDirectory
+      (openWorkspaceBrowserState state workspace file.path)
+      (let [win (newWorkspaceViewerWindow state workspace (count workspace.windows) file)]
+        (merge workspace {:windows (conj workspace.windows win)
+                          :nextWindowId (+ workspace.nextWindowId 1)
+                          :activeWindowId win.id}))))
+
+(ann updateWorkspaceBrowserWindowState (Fn [WorkspaceState String String] WorkspaceState))
+(defn updateWorkspaceBrowserWindowState [workspace windowId dir]
+  (merge workspace
+         {:windows (map workspace.windows
+                        (fn [win]
+                          (if (= win.id windowId)
+                              (merge win
+                                     {:type "browser"
+                                      :title (workspaceBrowserDirTitle dir)
+                                      :iconPath dir
+                                      :iconType MediaType.FOLDER
+                                      :iconIsVirtual (isVirtualFolderPath dir)
+                                      :viewingPath nil
+                                      :initialState (if (= dir "") {} {:dir dir})})
+                              win)))}))
+
+(ann updateWorkspaceViewerWindowState (Fn [AppState WorkspaceState String FileItem] WorkspaceState))
+(defn updateWorkspaceViewerWindowState [state workspace windowId file]
+  (merge workspace
+         {:windows (map workspace.windows
+                        (fn [win]
+                          (if (= win.id windowId)
+                              (merge win
+                                     {:type "viewer"
+                                      :title (workspaceWindowTitleFromFile file)
+                                      :iconPath file.path
+                                      :iconType file.type
+                                      :iconIsVirtual false
+                                      :viewingPath file.path
+                                      :initialState {:dir (workspaceWindowFileDir file state.currentDir)
+                                                     :viewing file.path
+                                                     :imageFiles (workspaceImageFilesSnapshot state file)}})
+                              win)))}))
+
+(ann openWorkspaceFileForWindowState (Fn [AppState WorkspaceState String FileItem String] WorkspaceState))
+(defn openWorkspaceFileForWindowState [state workspace windowId file mode]
+  (if file.isDirectory
+      (updateWorkspaceBrowserWindowState workspace windowId file.path)
+      (if (and (= file.type MediaType.OTHER) (= mode "new-window"))
+          (updateWorkspaceViewerWindowState state workspace windowId file)
+      (if (and (= mode "new-window")
+               (some? (find (object-entries workspace.tabGroupSplits)
+                            (fn [entry] (= (object-get entry.value "leftTabId") windowId)))))
+          (openInNewTabInGroupState workspace windowId file state.currentDir nil (workspaceSourceForState state))
+          (if (= mode "new-tab")
+          (openInNewTabInGroupState workspace windowId file state.currentDir nil (workspaceSourceForState state))
+          (if (= mode "split-view")
+              (openInSplitViewFromBrowserState workspace windowId file state.currentDir (workspaceSourceForState state))
+              (openWorkspaceFileInNewWindowState state workspace file)))))))
+
+(ann workspaceGroupIdAtIndex (Fn [AppState Number] (Option String)))
+(defn workspaceGroupIdAtIndex [state index]
+  (let [groups (orderedAllGroupIds (workspaceWindows state))]
+    (if (and (>= index 0) (< index (count groups)))
+        (nth groups index)
+        nil)))
+
+(ann workspaceVisibleWindowIdForGroup (Fn [AppState String] (Option String)))
+(defn workspaceVisibleWindowIdForGroup [state groupId]
+  (let [id (resolveGroupVisibleTabId state.workspace groupId)]
+    (if (= id "") nil id)))
+
+(ann workspaceWindowIdAtIndex (Fn [AppState Number] (Option String)))
+(defn workspaceWindowIdAtIndex [state index]
+  (match (workspaceGroupIdAtIndex state index)
+    nil nil
+    (some groupId) (workspaceVisibleWindowIdForGroup state groupId)))

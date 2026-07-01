@@ -1,0 +1,86 @@
+(ann filesKey (Fn [Js] Js))
+(defn filesKey [path]
+  (if (some? path)
+      (unsafe-cast Js ["files" path])
+      (unsafe-cast Js ["files"])))
+
+(ann shareFilesKey (Fn [Js Js] Js))
+(defn shareFilesKey [token dir]
+  (if (not (some? token))
+      (unsafe-cast Js ["share-files"])
+      (if (some? dir)
+          (unsafe-cast Js ["share-files" token dir])
+          (unsafe-cast Js ["share-files" token]))))
+
+(ann settingsKey (Fn [] Js))
+(defn settingsKey [] ["settings"])
+
+(ann authConfigKey (Fn [] Js))
+(defn authConfigKey [] ["auth-config"])
+
+(ann sharesKey (Fn [] Js))
+(defn sharesKey [] ["shares"])
+
+(ann statsKey (Fn [] Js))
+(defn statsKey [] ["stats"])
+
+(ann kbKey (Fn [] Js))
+(defn kbKey [] ["kb"])
+
+(ann kbRecentKey (Fn [String] Js))
+(defn kbRecentKey [scopePath] ["kb-recent" scopePath])
+
+(ann shareKbRecentKey (Fn [Js Js] Js))
+(defn shareKbRecentKey [token dir]
+  (if (not (some? token))
+      (unsafe-cast Js ["share-kb-recent"])
+      (if (some? dir)
+          (unsafe-cast Js ["share-kb-recent" token dir])
+          (unsafe-cast Js ["share-kb-recent" token]))))
+
+(ann kbSearchKey (Fn [String String] Js))
+(defn kbSearchKey [root query] ["kb-search" root query])
+
+(ann shareKbSearchKey (Fn [String String String] Js))
+(defn shareKbSearchKey [token query dir] ["share-kb-search" token query dir])
+
+(ann shareInfoKey (Fn [String] Js))
+(defn shareInfoKey [token] ["share-info" token])
+
+(ann textContentKey (Fn [String] Js))
+(defn textContentKey [filePath] ["text-content" filePath])
+
+(ann shareTextKey (Fn [String String] Js))
+(defn shareTextKey [token filePath] ["share-text" token filePath])
+
+(ann audioMetadataKey (Fn [String] Js))
+(defn audioMetadataKey [filePath] ["audio-metadata" "v2" filePath])
+
+(ann kbChatStatusKey (Fn [] Js))
+(defn kbChatStatusKey [] ["kb-chat-status"])
+
+(ann kbChatHistoryKey (Fn [String] Js))
+(defn kbChatHistoryKey [kbRoot] ["kb-chat-history" kbRoot])
+
+(ann kbChatDetailKey (Fn [String] Js))
+(defn kbChatDetailKey [chatId] ["kb-chat-detail" chatId])
+
+(def queryKeys
+  {:files filesKey
+   :shareFiles shareFilesKey
+   :settings settingsKey
+   :authConfig authConfigKey
+   :shares sharesKey
+   :stats statsKey
+   :kb kbKey
+   :kbRecent kbRecentKey
+   :shareKbRecent shareKbRecentKey
+   :kbSearch kbSearchKey
+   :shareKbSearch shareKbSearchKey
+   :shareInfo shareInfoKey
+   :textContent textContentKey
+   :shareText shareTextKey
+   :audioMetadata audioMetadataKey
+   :kbChatStatus kbChatStatusKey
+   :kbChatHistory kbChatHistoryKey
+   :kbChatDetail kbChatDetailKey})

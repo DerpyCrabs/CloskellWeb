@@ -1,0 +1,692 @@
+(import "archiver" [ZipArchive])
+(import "path" [(default path)])
+(import "node:buffer" [Buffer])
+(import "node:console" [(error as consoleError)])
+(import "../fs-tasks.clsk" [mkdirRecursive writeFileBytes])
+(import "../http-capabilities.clsk" [fileExistsSync
+                                     fileStatsSync
+                                     replyAbortSignal
+                                     streamArchiveResponse
+                                     streamFileRangeResponse
+                                     streamFileResponse])
+(import "../http-routes.clsk" [HttpRoute registerHttpRoutes])
+(import "../lib/audio-helpers.clsk" [extractAudioMetadata extractAudioTrack])
+(import "../lib/thumbnails.clsk" [isThumbnailAbortError
+                                   readThumbnail
+                                   sendPlaceholder
+                                   sendThumbnailData])
+(import "../../lib/file-system.clsk" [getFilePath
+                                   validatePath
+                                   isPathEditable
+                                   writeBinaryFile
+                                   fileExists])
+(import "../../src/features/media-utils.clsk" [formatFileSize getMimeType])
+(import "../../lib/shares.clsk" [getShare
+                               isShareAccessAuthorized
+                               resolveShareSubPath
+                               getEffectiveRestrictions
+                               checkUploadQuota
+                               addShareUsedBytes])
+(import "../../lib/knowledge-base.clsk" [getKnowledgeBases
+                                      isKnowledgeBaseImagePath
+                                      getKnowledgeBaseRootForPath])
+(import "../../lib/file-change-emitter.clsk" [broadcastFileChange])
+
+(def jsPromise (js-global Promise))
+(def asyncIteratorSymbol (js-global Symbol.asyncIterator))
+(def jsMath (js-global Math))
+(def jsDate (js-global Date))
+
+(ann codeSend (Fn [Js Number Js] Js))
+(defn codeSend [reply code payload]
+  (let [codedReply (reply.status code)]
+    (codedReply.send payload)))
+
+(ann normalizeSlashes (Fn [String] String))
+(defn normalizeSlashes [value]
+  (join (split value "\\") "/"))
+
+(ann normalizeParent (Fn [String] String))
+(defn normalizeParent [dir]
+  (let [normalized (normalizeSlashes dir)]
+    (if (= normalized ".") "" normalized)))
+
+(ann maybeErrorMessage (Fn [Js String] String))
+(defn maybeErrorMessage [error fallback]
+  (if (and (object? error) (string? error.message)) error.message fallback))
+
+(ann requestToken (Fn [Js] String))
+(defn requestToken [request]
+  (let [token request.params.token]
+    (if (string? token) token "")))
+
+(ann requestStarPath (Fn [Js] String))
+(defn requestStarPath [request]
+  (let [value (object-get request.params "*")]
+    (if (string? value) value "")))
+
+(ann requestCookies (Fn [Js] Js))
+(defn requestCookies [request]
+  (if (object? request.cookies) request.cookies {}))
+
+(ann cookieJar (Fn [Js] Js))
+(defn cookieJar [cookies]
+  {:get (fn [name]
+          (let [value (object-get cookies name)]
+            (if (string? value) {:value value} nil)))})
+
+(ann validateShareAccessHTTP (Fn [Js Js Js] Bool))
+(defn validateShareAccessHTTP [request share reply]
+  (if (isShareAccessAuthorized share (cookieJar (requestCookies request)))
+      true
+      (do
+        (codeSend reply 401 {:error "Passcode required"})
+        false)))
+
+(ann resolveSharePathHTTP (Fn [Js String] Js))
+(defn resolveSharePathHTTP [share subPath]
+  (resolveShareSubPath share subPath))
+
+(ann rangeBody (Fn [String] String))
+(defn rangeBody [range]
+  (if (starts-with? range "bytes=")
+      (string-slice range 6 (count range))
+      range))
+
+(ann rangeEnd (Fn [Js Number] Number))
+(defn rangeEnd [parts fallback]
+  (let [raw (second parts)]
+    (if (and (string? raw) (not (= raw "")))
+        (to-number raw)
+        fallback)))
+
+(ann streamRangeHeaders (Fn [Number Number Number String] Js))
+(defn streamRangeHeaders [start end total mimeType]
+  {"Content-Range" (str "bytes " start "-" end "/" total)
+   "Accept-Ranges" "bytes"
+   "Content-Length" (+ (- end start) 1)
+   "Content-Type" mimeType
+   "Cache-Control" "no-cache"})
+
+(ann streamWholeHeaders (Fn [String Number] Js))
+(defn streamWholeHeaders [mimeType size]
+  {"Content-Type" mimeType
+   "Content-Length" size
+   "Accept-Ranges" "bytes"
+   "Cache-Control" "no-cache"})
+
+(ann streamSharedFile (Fn [Js Js String] Js))
+(defn streamSharedFile [request reply resolvedPath]
+  (let [fullPath (getFilePath resolvedPath)
+        stats (fileStatsSync fullPath)]
+    (if (not (stats.isFile))
+        (codeSend reply 400 {:error "Not a file"})
+        (let [ext (path.extname fullPath)
+              extension (string-slice ext 1 (count ext))
+              mimeType (getMimeType extension)
+              range request.headers.range]
+          (if (string? range)
+              (let [parts (split (rangeBody range) "-")
+                    start (to-number (first parts))
+                    end (rangeEnd parts (- stats.size 1))]
+                (streamFileRangeResponse
+                 reply
+                 fullPath
+                 start
+                 end
+                 206
+                 (streamRangeHeaders start end stats.size mimeType)))
+              (streamFileResponse
+               reply
+               fullPath
+               200
+               (streamWholeHeaders mimeType stats.size)))))))
+
+(ann resolveMediaPathForShare (Fn [Js String] Js))
+(defn resolveMediaPathForShare [share filePath]
+  (if share.isDirectory
+      (resolveSharePathHTTP share filePath)
+      (if (or (= filePath share.path) (= filePath "."))
+          share.path
+          nil)))
+
+(ann handleShareMediaWithShare (Fn [Js Js Js String] Js))
+(defn handleShareMediaWithShare [request reply share filePath]
+  (if (not (validateShareAccessHTTP request share reply))
+      reply
+      (let [resolved (resolveMediaPathForShare share filePath)]
+        (if (some? resolved)
+            (streamSharedFile request reply resolved)
+            (let [knowledgeBasesPromise (getKnowledgeBases)]
+              (knowledgeBasesPromise.then
+               (fn [knowledgeBases]
+                 (if (isKnowledgeBaseImagePath filePath share.path knowledgeBases)
+                     (streamSharedFile request reply filePath)
+                     (codeSend reply 403 {:error "Invalid path"})))))))))
+
+(ann handleShareMedia (Fn [Js Js] Js))
+(defn handleShareMedia [request reply]
+  (try
+   (let [token (requestToken request)
+         filePath (requestStarPath request)
+         sharePromise (getShare token)]
+     (sharePromise.then
+      (fn [share]
+        (if (not (some? share))
+            (codeSend reply 404 {:error "Share not found"})
+            (handleShareMediaWithShare request reply share filePath)))))
+   (catch error
+     (do
+       (consoleError "Error streaming shared media:" error)
+       (codeSend reply 404 {:error "File not found"})))))
+
+(ann sendLongPlaceholder (Fn [Js] Js))
+(defn sendLongPlaceholder [reply]
+  (do
+    (sendPlaceholder reply "public, max-age=31536000")
+    reply))
+
+(ann sendShortPlaceholder (Fn [Js] Js))
+(defn sendShortPlaceholder [reply]
+  (do
+    (sendPlaceholder reply "public, max-age=3600")
+    reply))
+
+(ann sendShareThumbnailFile (Fn [Js Js String] Js))
+(defn sendShareThumbnailFile [request reply resolved]
+  (let [fullPath (getFilePath resolved)]
+    (if (not (fileExistsSync fullPath))
+        (sendLongPlaceholder reply)
+        (let [stats (fileStatsSync fullPath)]
+          (if (not (stats.isFile))
+              (sendLongPlaceholder reply)
+              (let [dataPromise (readThumbnail
+                                 fullPath
+                                 stats.mtime
+                                 (replyAbortSignal request reply))
+                    sent (dataPromise.then
+                          (fn [data]
+                            (do
+                              (sendThumbnailData reply data)
+                              reply)))]
+                (sent.catch
+                 (fn [error]
+                   (if (isThumbnailAbortError error)
+                       reply
+                       (sendShortPlaceholder reply))))))))))
+
+(ann handleShareThumbnailWithShare (Fn [Js Js Js String] Js))
+(defn handleShareThumbnailWithShare [request reply share filePath]
+  (if (not (validateShareAccessHTTP request share reply))
+      reply
+      (let [resolved (resolveSharePathHTTP share filePath)]
+        (if (some? resolved)
+            (sendShareThumbnailFile request reply resolved)
+            (sendLongPlaceholder reply)))))
+
+(ann handleShareThumbnail (Fn [Js Js] Js))
+(defn handleShareThumbnail [request reply]
+  (try
+   (let [token (requestToken request)
+         filePath (requestStarPath request)
+         sharePromise (getShare token)]
+     (sharePromise.then
+      (fn [share]
+        (if (not (some? share))
+            (codeSend reply 404 {:error "Share not found"})
+            (handleShareThumbnailWithShare request reply share filePath)))))
+   (catch error
+     (do
+       (consoleError "Error in share thumbnail endpoint:" error)
+       (sendShortPlaceholder reply)))))
+
+(ann downloadFileHeaders (Fn [String Number] Js))
+(defn downloadFileHeaders [fileName size]
+  {"Content-Type" "application/octet-stream"
+   "Content-Disposition" (str "attachment; filename*=UTF-8''"
+                              (encode-uri-component fileName))
+   "Content-Length" size})
+
+(ann downloadZipHeaders (Fn [String] Js))
+(defn downloadZipHeaders [folderName]
+  {"Content-Type" "application/zip"
+   "Content-Disposition" (str "attachment; filename*=UTF-8''"
+                              (encode-uri-component (str folderName ".zip")))})
+
+(ann sendShareDownloadFile (Fn [Js String] Js))
+(defn sendShareDownloadFile [reply fullPath]
+  (let [fileName (path.basename fullPath)
+        stats (fileStatsSync fullPath)]
+    (streamFileResponse reply fullPath 200 (downloadFileHeaders fileName stats.size))))
+
+(ann sendShareDownloadFolder (Fn [Js String] Js))
+(defn sendShareDownloadFolder [reply fullPath]
+  (let [folderName (path.basename fullPath)
+        archive (new ZipArchive {:zlib {:level 1}})]
+    (do
+      (streamArchiveResponse reply 200 (downloadZipHeaders folderName) archive)
+      (archive.directory fullPath false)
+      (let [finalized (archive.finalize)]
+        (finalized.then (fn [_] reply))))))
+
+(ann handleShareDownloadWithShare (Fn [Js Js Js] Js))
+(defn handleShareDownloadWithShare [request reply share]
+  (if (not (validateShareAccessHTTP request share reply))
+      reply
+      (let [pathRaw (object-get request.query "path")
+            subPath (if (string? pathRaw) pathRaw "")
+            resolved (resolveSharePathHTTP share subPath)]
+        (if (not (some? resolved))
+            (codeSend reply 403 {:error "Path outside share boundary"})
+            (let [fullPath (getFilePath resolved)
+                  stats (fileStatsSync fullPath)]
+              (if (stats.isDirectory)
+                  (sendShareDownloadFolder reply fullPath)
+                  (sendShareDownloadFile reply fullPath)))))))
+
+(ann handleShareDownload (Fn [Js Js] Js))
+(defn handleShareDownload [request reply]
+  (try
+   (let [token (requestToken request)
+         sharePromise (getShare token)]
+     (sharePromise.then
+      (fn [share]
+        (if (not (some? share))
+            (codeSend reply 404 {:error "Share not found"})
+            (handleShareDownloadWithShare request reply share)))))
+   (catch error
+     (do
+       (consoleError "Share download error:" error)
+       (codeSend reply 500 {:error (maybeErrorMessage error "Failed to download")})))))
+
+(ann asyncIterator (Fn [Js] Js))
+(defn asyncIterator [iterable]
+  (let [method (object-get iterable asyncIteratorSymbol)]
+    (method.call iterable)))
+
+(ann readIteratorChunks (Fn [Js Js] Js))
+(defn readIteratorChunks [iterator chunks]
+  (let [nextPromise (iterator.next)]
+    (nextPromise.then
+     (fn [result]
+       (if result.done
+           (Buffer.concat chunks)
+           (do
+             (chunks.push result.value)
+             (readIteratorChunks iterator chunks)))))))
+
+(ann readFilePartBuffer (Fn [Js] Js))
+(defn readFilePartBuffer [fileStream]
+  (readIteratorChunks (asyncIterator fileStream) (unsafe-cast Js [])))
+
+(ann initialUploadState (Fn [] Js))
+(defn initialUploadState []
+  (let [state (new (js-global Map))]
+    (do
+      (state.set "targetSubDir" "")
+      (state.set "files" (unsafe-cast Js []))
+      state)))
+
+(ann stateFiles (Fn [Js] Js))
+(defn stateFiles [state]
+  (state.get "files"))
+
+(ann collectUploadParts (Fn [Js Js] Js))
+(defn collectUploadParts [iterator state]
+  (let [nextPromise (iterator.next)]
+    (nextPromise.then
+     (fn [partResult]
+       (if partResult.done
+           state
+           (let [part partResult.value]
+             (if (and (= part.type "field") (= part.fieldname "targetDir"))
+                 (do
+                   (state.set "targetSubDir" part.value)
+                   (collectUploadParts iterator state))
+                 (if (= part.type "file")
+                     (let [bufferPromise (readFilePartBuffer part.file)]
+                       (bufferPromise.then
+                        (fn [data]
+                          (let [files (stateFiles state)]
+                            (do
+                              (files.push {:name part.filename :data data})
+                              (collectUploadParts iterator state))))))
+                     (collectUploadParts iterator state)))))))))
+
+(ann totalUploadBytes (Fn [Js] Number))
+(defn totalUploadBytes [files]
+  (reduce files 0 (fn [total file] (+ total file.data.length))))
+
+(ann shareUploadPath (Fn [String Js] String))
+(defn shareUploadPath [targetSubDir file]
+  (if (= targetSubDir "") file.name (str targetSubDir "/" file.name)))
+
+(ann writeShareUploadFile (Fn [Js String Js] Js))
+(defn writeShareUploadFile [share targetSubDir file]
+  (let [subPath (shareUploadPath targetSubDir file)
+        resolved (resolveSharePathHTTP share subPath)]
+    (if (not (some? resolved))
+        (jsPromise.resolve nil)
+        (let [fullPath (validatePath resolved)
+              mkdirPromise (mkdirRecursive (path.dirname fullPath))]
+          (mkdirPromise.then
+           (fn [_]
+             (let [written (writeFileBytes fullPath file.data)]
+               (written.then
+                (fn [_]
+                  (let [parentDir (normalizeParent (path.dirname resolved))]
+                    {:normalizedParent parentDir :resolved resolved}))))))))))
+
+(ann applyShareUploadResult (Fn [Js Js] Js))
+(defn applyShareUploadResult [state entry]
+  (if (object? entry)
+      (do
+        (state.events.set entry.normalizedParent entry.resolved)
+        {:events state.events :count (+ state.count 1)})
+      state))
+
+(ann broadcastEvents (Fn [Js] Nil))
+(defn broadcastEvents [events]
+  (do
+    (events.forEach (fn [changedPath dir] (broadcastFileChange dir changedPath)))
+    nil))
+
+(ann finishShareUpload (Fn [String Js Js Number Js] Js))
+(defn finishShareUpload [token reply uploaded totalBytes share]
+  (let [state (reduce uploaded
+                      {:events (new (js-global Map)) :count 0}
+                      applyShareUploadResult)
+        added (if (> totalBytes 0)
+                  (addShareUsedBytes token totalBytes)
+                  (jsPromise.resolve nil))]
+    (added.then
+     (fn [_]
+       (do
+         (broadcastEvents state.events)
+         (reply.send {:success true :uploaded state.count}))))))
+
+(ann processShareUpload (Fn [String Js Js Js] Js))
+(defn processShareUpload [token share reply state]
+  (let [files (stateFiles state)]
+    (if (= files.length 0)
+        (codeSend reply 400 {:error "No files provided"})
+        (let [totalBytes (totalUploadBytes files)
+              quota (checkUploadQuota share totalBytes)]
+          (if (not quota.allowed)
+              (codeSend reply
+                        413
+                        {:error (str "Upload exceeds quota ("
+                                     (formatFileSize quota.remaining)
+                                     " remaining, "
+                                     (formatFileSize totalBytes)
+                                     " requested)")
+                         :remaining quota.remaining
+                         :requested totalBytes})
+              (let [targetSubDir (state.get "targetSubDir")
+                    uploadedPromise (jsPromise.all
+                                     (map files
+                                          (fn [file]
+                                            (writeShareUploadFile
+                                             share
+                                             (if (string? targetSubDir)
+                                                 targetSubDir
+                                                 "")
+                                             file))))]
+                (uploadedPromise.then
+                 (fn [uploaded]
+                   (finishShareUpload token reply uploaded totalBytes share)))))))))
+
+(ann handleShareUploadWithShare (Fn [Js Js String Js] Js))
+(defn handleShareUploadWithShare [request reply token share]
+  (if (not (validateShareAccessHTTP request share reply))
+      reply
+      (if (not share.editable)
+          (codeSend reply 403 {:error "Share is not editable"})
+          (let [restrictions (getEffectiveRestrictions share)]
+            (if (not restrictions.allowUpload)
+                (codeSend reply 403 {:error "Uploads are not allowed for this share"})
+                (let [parts (request.parts)
+                      state (initialUploadState)
+                      collected (collectUploadParts (asyncIterator parts) state)]
+                  (collected.then
+                   (fn [nextState]
+                     (processShareUpload token share reply nextState)))))))))
+
+(ann handleShareUpload (Fn [Js Js] Js))
+(defn handleShareUpload [request reply]
+  (try
+   (let [token (requestToken request)
+         sharePromise (getShare token)]
+     (sharePromise.then
+      (fn [share]
+        (if (not (some? share))
+            (codeSend reply 404 {:error "Share not found"})
+            (handleShareUploadWithShare request reply token share)))))
+   (catch error
+     (do
+       (consoleError "Error uploading to share:" error)
+       (codeSend reply 500 {:error (maybeErrorMessage error "Upload failed")})))))
+
+(ann resolveSharedAudioPath (Fn [Js String] Js))
+(defn resolveSharedAudioPath [share filePath]
+  (if share.isDirectory
+      (resolveSharePathHTTP share filePath)
+      (if (= filePath ".") share.path nil)))
+
+(ann handleShareAudioMetadataWithShare (Fn [Js Js Js String] Js))
+(defn handleShareAudioMetadataWithShare [request reply share filePath]
+  (if (not (validateShareAccessHTTP request share reply))
+      reply
+      (let [resolved (resolveSharedAudioPath share filePath)]
+        (if (not (some? resolved))
+            (codeSend reply 403 {:error "Invalid path"})
+            (let [metadataPromise (extractAudioMetadata (getFilePath resolved))]
+              (metadataPromise.then (fn [metadata] (reply.send metadata))))))))
+
+(ann handleShareAudioMetadata (Fn [Js Js] Js))
+(defn handleShareAudioMetadata [request reply]
+  (try
+   (let [token (requestToken request)
+         filePath (requestStarPath request)
+         sharePromise (getShare token)]
+     (sharePromise.then
+      (fn [share]
+        (if (not (some? share))
+            (codeSend reply 404 {:error "Share not found"})
+            (handleShareAudioMetadataWithShare request reply share filePath)))))
+   (catch error
+     (do
+       (consoleError "Error reading shared audio metadata:" error)
+       (codeSend reply 500 {:error "Failed to read audio metadata"})))))
+
+(ann handleShareAudioExtractWithShare (Fn [Js Js Js String] Js))
+(defn handleShareAudioExtractWithShare [request reply share filePath]
+  (if (not (validateShareAccessHTTP request share reply))
+      reply
+      (let [resolved (resolveSharedAudioPath share filePath)]
+        (if (not (some? resolved))
+            (codeSend reply 403 {:error "Invalid path"})
+            (extractAudioTrack (getFilePath resolved) request reply)))))
+
+(ann handleShareAudioExtractError (Fn [Js Js] Js))
+(defn handleShareAudioExtractError [reply error]
+  (if (and (object? error)
+           (string? error.message)
+           (includes? error.message "ENOENT"))
+      (codeSend reply
+                501
+                {:error "FFmpeg not found. Please install ffmpeg on the server."})
+      (codeSend reply 500 {:error "Audio extraction failed"})))
+
+(ann handleShareAudioExtract (Fn [Js Js] Js))
+(defn handleShareAudioExtract [request reply]
+  (try
+   (let [token (requestToken request)
+         filePath (requestStarPath request)
+         sharePromise (getShare token)]
+     (sharePromise.then
+      (fn [share]
+        (if (not (some? share))
+            (codeSend reply 404 {:error "Share not found"})
+            (let [extracted (handleShareAudioExtractWithShare request reply share filePath)]
+              (if (and (object? extracted) (object? extracted.catch))
+                  (extracted.catch (fn [error] (handleShareAudioExtractError reply error)))
+                  extracted))))))
+   (catch error (handleShareAudioExtractError reply error))))
+
+(ann sanitizeKbPastedImageFileName (Fn [Js] Js))
+(defn sanitizeKbPastedImageFileName [name]
+  (if (not (string? name))
+      nil
+      (let [trimmed (trim name)]
+        (if (or (= trimmed "") (> (count trimmed) 180))
+            nil
+            (let [normalized (normalizeSlashes trimmed)
+                  base (path.basename normalized)
+                  stem (unsafe-cast Js (first (split base ".")))]
+              (if (or (not (= base normalized))
+                      (includes? base "..")
+                      (not (regex-test? base "\\.(png|jpe?g|gif|webp)$" "i"))
+                      (not (regex-test? (base.replace (new (js-global RegExp) "\\.[^.]+$" "") "")
+                                        "^[\\w\\s().-]+$"
+                                        "i")))
+                  nil
+                  base))))))
+
+(ann randomImageName (Fn [String] String))
+(defn randomImageName [safeExt]
+  (let [ext (if (= safeExt "jpeg") "jpg" safeExt)
+        randomPart (to-radix (jsMath.random) 36)]
+    (str "image-"
+         (jsDate.now)
+         "-"
+         (string-slice randomPart 2 8)
+         "."
+         ext)))
+
+(ann safeImageExt (Fn [Js] String))
+(defn safeImageExt [mimeType]
+  (let [rawMime (if (string? mimeType) mimeType "image/png")
+        parts (split rawMime "/")
+        ext (if (some? (second parts)) (second parts) "png")]
+    (if (includes? ["png" "jpg" "jpeg" "gif" "webp"] ext) ext "png")))
+
+(ann baseImageFileName (Fn [Js String] String))
+(defn baseImageFileName [requestedName safeExt]
+  (let [sanitized (sanitizeKbPastedImageFileName requestedName)]
+    (if (string? sanitized) sanitized (randomImageName safeExt))))
+
+(ann nextImageName (Fn [String Number String] String))
+(defn nextImageName [baseFileName n safeExt]
+  (let [match (regex-capture-all baseFileName "^(.*?)(\\.[^.]+)?$" "")]
+    (if (> (count match) 0)
+        (let [groups (nth match 0)
+              stem (if (string? (nth groups 0)) (nth groups 0) baseFileName)
+              dotExt (if (string? (nth groups 1))
+                         (nth groups 1)
+                         (str "." (if (= safeExt "jpeg") "jpg" safeExt)))]
+          (str stem "_" n dotExt))
+        (str baseFileName "_" n))))
+
+(ann uniqueImagePath (Fn [String String String Number] Js))
+(defn uniqueImagePath [imagesDir baseFileName safeExt n]
+  (let [candidateName (if (= n 0)
+                          baseFileName
+                          (nextImageName baseFileName n safeExt))
+        imagePath (str imagesDir "/" candidateName)
+        existsPromise (fileExists imagePath)]
+    (existsPromise.then
+     (fn [exists]
+       (if exists
+           (uniqueImagePath imagesDir baseFileName safeExt (+ n 1))
+           {:imagePath imagePath :fileName candidateName})))))
+
+(ann imagesDirForShare (Fn [Js Js] String))
+(defn imagesDirForShare [share knowledgeBases]
+  (let [sharePath (normalizeSlashes share.path)
+        kbRoot (getKnowledgeBaseRootForPath sharePath knowledgeBases)]
+    (if (string? kbRoot)
+        (str kbRoot "/images")
+        (if share.isDirectory
+            (str sharePath "/images")
+            (str (normalizeParent (path.dirname sharePath)) "/images")))))
+
+(ann handleUploadImageWrite (Fn [String Js Js String String Number] Js))
+(defn handleUploadImageWrite [token reply body imagesDir safeExt contentSize]
+  (if (not (isPathEditable imagesDir))
+      (codeSend reply 403 {:error "Images folder is not in an editable directory"})
+      (let [baseFileName (baseImageFileName body.fileName safeExt)
+            uniquePromise (uniqueImagePath imagesDir baseFileName safeExt 0)]
+        (uniquePromise.then
+         (fn [unique]
+           (let [written (writeBinaryFile unique.imagePath body.base64Content)]
+             (written.then
+              (fn [_]
+                (let [added (addShareUsedBytes token contentSize)]
+                  (added.then
+                   (fn [_]
+                     (let [parentDir (normalizeParent (path.dirname unique.imagePath))]
+                       (do
+                         (broadcastFileChange parentDir unique.imagePath)
+                         (reply.send {:success true
+                                      :path unique.imagePath
+                                      :fileName unique.fileName}))))))))))))))
+
+(ann handleUploadImageWithShare (Fn [Js Js String Js] Js))
+(defn handleUploadImageWithShare [request reply token share]
+  (if (not (validateShareAccessHTTP request share reply))
+      reply
+      (if (not share.editable)
+          (codeSend reply 403 {:error "Share is not editable"})
+          (let [restrictions (getEffectiveRestrictions share)]
+            (if (not restrictions.allowUpload)
+                (codeSend reply 403 {:error "Uploads are not allowed for this share"})
+                (let [body request.body
+                      base64Content body.base64Content]
+                  (if (not (string? base64Content))
+                      (codeSend reply 400 {:error "base64Content is required"})
+                      (let [contentSize (ceil (/ (* (count base64Content) 3) 4))
+                            quota (checkUploadQuota share contentSize)]
+                        (if (not quota.allowed)
+                            (codeSend reply
+                                      413
+                                      {:error "Upload quota exceeded for this share"})
+                            (let [knowledgeBasesPromise (getKnowledgeBases)]
+                              (knowledgeBasesPromise.then
+                               (fn [knowledgeBases]
+                                 (handleUploadImageWrite
+                                  token
+                                  reply
+                                  body
+                                  (imagesDirForShare share knowledgeBases)
+                                  (safeImageExt body.mimeType)
+                                  contentSize)))))))))))))
+
+(ann handleShareUploadImage (Fn [Js Js] Js))
+(defn handleShareUploadImage [request reply]
+  (try
+   (let [token (requestToken request)
+         sharePromise (getShare token)]
+     (sharePromise.then
+      (fn [share]
+        (if (not (some? share))
+            (codeSend reply 404 {:error "Share not found"})
+            (handleUploadImageWithShare request reply token share)))))
+   (catch error
+     (do
+       (consoleError "Error uploading image:" error)
+       (codeSend reply 500 {:error (maybeErrorMessage error "Failed to upload image")})))))
+
+(ann shareMediaRouteDefinitions (Fn [] (Vector HttpRoute)))
+(defn shareMediaRouteDefinitions []
+  [{:method "GET" :path "/api/share/:token/media/*" :handler handleShareMedia}
+   {:method "GET" :path "/api/share/:token/thumbnail/*" :handler handleShareThumbnail}
+   {:method "GET" :path "/api/share/:token/download" :handler handleShareDownload}
+   {:method "POST" :path "/api/share/:token/upload" :handler handleShareUpload}
+   {:method "GET" :path "/api/share/:token/audio/metadata/*" :handler handleShareAudioMetadata}
+   {:method "GET" :path "/api/share/:token/audio/extract/*" :handler handleShareAudioExtract}
+   {:method "POST" :path "/api/share/:token/upload-image" :handler handleShareUploadImage}])
+
+(ann registerShareMediaRoutes (Fn [Js] Js))
+(defn registerShareMediaRoutes [app]
+  (registerHttpRoutes app (shareMediaRouteDefinitions)))

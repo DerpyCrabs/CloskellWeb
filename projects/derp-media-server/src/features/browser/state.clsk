@@ -1,0 +1,124 @@
+(import "../../model.clsk" [AppState])
+(import "../../../lib/types.clsk" [FileItem MediaType ShareLink])
+(import "../client-paths.clsk" [isPathEditable])
+(import "../media-utils.clsk" [formatFileSize])
+(import "../source-context.clsk" [normalizeSlashes])
+(import "../virtual-folders.clsk" [isVirtualFolderPath
+                                  virtualFolderFavorites
+                                  virtualFolderMostPlayed
+                                  virtualFolderShares])
+
+(def jsWindow (js-global window))
+
+(ann isVirtualFolder (Fn [AppState] Bool))
+(defn isVirtualFolder [state]
+  (or (= state.currentDir virtualFolderMostPlayed)
+      (= state.currentDir virtualFolderFavorites)
+      (= state.currentDir virtualFolderShares)
+      (isVirtualFolderPath state.currentDir)))
+
+(ann currentPathEditable? (Fn [AppState] Bool))
+(defn currentPathEditable? [state]
+  (and (not (isVirtualFolder state))
+       (isPathEditable state.currentDir state.editableFolders state.mediaRoots)))
+
+(ann visibleBrowserFiles (Fn [AppState] (Vector FileItem)))
+(defn visibleBrowserFiles [state]
+  (let [total (count state.files)]
+    (if (> total 120)
+        (if (> state.scrollY 40)
+            (slice state.files (max 0 (- total 60)) total)
+            (slice state.files 0 60))
+        state.files)))
+
+(ann pathShared? (Fn [AppState String] Bool))
+(defn pathShared? [state filePath]
+  (any? state.shares (fn [share] (= share.path filePath))))
+
+(ann adminSharesForPath (Fn [AppState String] (Vector ShareLink)))
+(defn adminSharesForPath [state filePath]
+  (filter state.shares (fn [share] (= share.path filePath))))
+
+(ann adminShareUrl (Fn [AppState ShareLink] String))
+(defn adminShareUrl [state share]
+  (let [origin (match state.shareLinkDomain
+                 nil jsWindow.location.origin
+                 (some domain) domain)
+        passcode (match share.passcode
+                   nil ""
+                   (some code) (str "?p=" (encode-uri-component code)))]
+    (str origin "/share/" share.token passcode)))
+
+(ann favorite? (Fn [AppState String] Bool))
+(defn favorite? [state filePath]
+  (includes? state.favorites filePath))
+
+(ann fileEditable? (Fn [AppState FileItem] Bool))
+(defn fileEditable? [state file]
+  (and (not (isVirtualFolderPath file.path))
+       (isPathEditable file.path state.editableFolders state.mediaRoots)))
+
+(ann knowledgeBase? (Fn [AppState String] Bool))
+(defn knowledgeBase? [state filePath]
+  (let [normalized (normalizeSlashes filePath)]
+    (some? (find state.knowledgeBases
+                 (fn [kb] (= normalized (normalizeSlashes kb)))))))
+
+(ann fileIconLabel (Fn [FileItem] String))
+(defn fileIconLabel [file]
+  (if file.isDirectory
+      "DIR"
+      (if (= file.type MediaType.IMAGE)
+          "IMG"
+          (if (= file.type MediaType.VIDEO)
+              "VID"
+              (if (= file.type MediaType.AUDIO)
+                  "AUD"
+                  (if (= file.type MediaType.PDF)
+                      "PDF"
+                      (if (= file.type MediaType.TEXT) "TXT" "FILE")))))))
+
+(ann fileSubtitle (Fn [FileItem] String))
+(defn fileSubtitle [file]
+  (if file.isDirectory
+      "Folder"
+      (str (if (= file.extension "") file.type file.extension)
+           " - "
+           (formatFileSize file.size))))
+
+(ann viewCountText (Fn [FileItem] String))
+(defn viewCountText [file]
+  (let [count file.viewCount]
+    (if (number? count) (str count) "0")))
+
+(ann showThumbnail? (Fn [FileItem] Bool))
+(defn showThumbnail? [file]
+  (and (not file.isDirectory)
+       (or (= file.type MediaType.IMAGE) (= file.type MediaType.VIDEO))))
+
+(ann fileThumbnailTestId (Fn [FileItem] String))
+(defn fileThumbnailTestId [file]
+  (if (= file.type MediaType.VIDEO)
+      "file-browser-video-thumbnail"
+      (if (= file.type MediaType.IMAGE)
+          "file-browser-image-thumbnail"
+          "file-browser-thumbnail")))
+
+(ann rowClass (Fn [AppState FileItem] String))
+(defn rowClass [state file]
+  (str "group cursor-pointer select-none border-b border-border transition-colors hover:bg-muted/50 "
+       (if (= state.viewingPath file.path) "bg-primary/10 " "")
+       (if (= state.playingPath file.path) "bg-primary/10 " "")))
+
+(ann cardClass (Fn [AppState FileItem] String))
+(defn cardClass [state file]
+  (str "ring-foreground/10 bg-card text-card-foreground cursor-pointer py-0 transition-colors select-none hover:bg-muted/50 rounded-xl text-left shadow-xs ring-1 overflow-hidden flex flex-col "
+       (if (= state.viewingPath file.path) "bg-primary/10 " "")
+       (if (= state.playingPath file.path) "bg-primary/10 " "")))
+
+(ann viewModeButtonClass (Fn [Bool] String))
+(defn viewModeButtonClass [active]
+  (str "inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-transparent p-0 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring "
+       (if active
+           "bg-primary text-primary-foreground shadow-sm hover:bg-primary/90"
+           "text-foreground hover:bg-muted hover:text-foreground dark:hover:bg-muted/50")))

@@ -1,0 +1,689 @@
+(import "@ai-sdk/provider" [APICallError])
+(import "ai" [stepCountIs streamText])
+(import "@ai-sdk/openai" [createOpenAI])
+(import "@openrouter/ai-sdk-provider" [createOpenRouter])
+(import "../../http-capabilities.clsk" [endRawResponse
+                                       replyHeadersSent?
+                                       startEventStreamResponse
+                                       writeEventStreamChunk])
+(import "../../http-routes.clsk" [HttpRoute registerHttpRoutes])
+(import "../../../lib/config.clsk" [getAiConfig getMcpConfig])
+(import "../../../lib/knowledge-base.clsk" [getKnowledgeBases])
+(import "../../../lib/kb-chats.clsk" [createChat
+                                    updateChatMessages
+                                    getChat
+                                    getChatHistory
+                                    deleteChat
+                                    setChatPinned])
+(import "../../kb-context.clsk" [gatherKbContext])
+(import "./settings.clsk" [readSettings])
+(import "../../mcp-kb-chat-tools.clsk" [buildMcpToolsetForKbChat])
+(import "../../kb-chat-fs-tools.clsk" [buildKbFsTools describeKbApplyOperations])
+
+(def jsPromise (js-global Promise))
+(def jsObject (js-global Object))
+(def jsArray (js-global Array))
+(def jsDate (js-global Date))
+(def jsFetch (js-global fetch))
+(def jsAbortSignal (js-global AbortSignal))
+(def jsUndefined (js-global undefined))
+(def asyncIteratorSymbol (js-global Symbol.asyncIterator))
+
+(ann normalizeSlashes (Fn [String] String))
+(defn normalizeSlashes [value]
+  (join (split value "\\") "/"))
+
+(ann objectKeysCount (Fn [Js] Number))
+(defn objectKeysCount [value]
+  (count (jsObject.keys value)))
+
+(ann errorMessage (Fn [Js String] String))
+(defn errorMessage [err fallback]
+  (let [message (object-get err "message")]
+    (if (string? message) message fallback)))
+
+(ann parsedProviderErrorMessage (Fn [String] Js))
+(defn parsedProviderErrorMessage [raw]
+  (try
+   (let [parsed (json-parse raw)
+         nested (object-get parsed "error")
+         nestedMessage (object-get nested "message")
+         directMessage (object-get parsed "message")]
+     (if (and (string? nestedMessage) (not (= (trim nestedMessage) "")))
+         (trim nestedMessage)
+         (if (and (string? directMessage) (not (= (trim directMessage) "")))
+             (trim directMessage)
+             nil)))
+   (catch _error nil)))
+
+(ann providerApiMessage (Fn [Js String] String))
+(defn providerApiMessage [err fallback]
+  (if (APICallError.isInstance err)
+      (let [message (errorMessage err fallback)
+            responseBody (object-get err "responseBody")
+            raw (if (string? responseBody) (trim responseBody) "")
+            parsed (if (= raw "") nil (parsedProviderErrorMessage raw))]
+        (if (string? parsed) parsed message))
+      fallback))
+
+(ann providerErrorMessage (Fn [Js String] String))
+(defn providerErrorMessage [err provider]
+  (let [base (providerApiMessage err (errorMessage err "Stream error"))]
+    (if (and (= provider "lmstudio") (regex-test? base "no models loaded" "i"))
+        (str base
+             " In LM Studio: open the Developer / Local Server pane, start the server, and load a model (the Chat tab alone does not load models for the API).")
+        base)))
+
+(ann namedError (Fn [String String] Js))
+(defn namedError [name message]
+  (let [error (new (js-global Error) message)]
+    (do
+      (jsObject.defineProperty error "name" {:value name :configurable true})
+      error)))
+
+(ann ChatProviderNotReadyError (Fn [String] Js))
+(defn ChatProviderNotReadyError [message]
+  (namedError "ChatProviderNotReadyError" message))
+
+(ann chatProviderNotReadyError? (Fn [Js] Bool))
+(defn chatProviderNotReadyError? [err]
+  (= (object-get err "name") "ChatProviderNotReadyError"))
+
+(ann promiseReject (Fn [Js] Js))
+(defn promiseReject [err]
+  (jsPromise.reject err))
+
+(ann promiseResolve (Fn [Js] Js))
+(defn promiseResolve [value]
+  (jsPromise.resolve value))
+
+(ann trimTrailingSlash (Fn [String] String))
+(defn trimTrailingSlash [value]
+  (if (ends-with? value "/")
+      (string-slice value 0 (- (count value) 1))
+      value))
+
+(ann modelIdMatches? (Fn [String String] Bool))
+(defn modelIdMatches? [modelId id]
+  (or (= id modelId) (includes? id modelId) (includes? modelId id)))
+
+(ann lmStudioModelsBody (Fn [Js] Js))
+(defn lmStudioModelsBody [res]
+  (let [bodyPromise (res.json)]
+    (bodyPromise.catch (fn [_error] nil))))
+
+(ann validateLmStudioModels (Fn [String Js] Js))
+(defn validateLmStudioModels [configuredModel body]
+  (let [models (if (vector? body.data) body.data [])]
+    (if (= (count models) 0)
+        (promiseReject
+         (ChatProviderNotReadyError
+          "LM Studio is not exposing any models at /v1/models. Start the local API server and load a model into memory in LM Studio (Developer tab), then retry."))
+        (let [modelId (trim configuredModel)]
+          (if (= modelId "")
+              jsUndefined
+              (let [ids (map models (fn [model] model.id))
+                    matches (any? ids (fn [id] (modelIdMatches? modelId id)))]
+                (if matches
+                    jsUndefined
+                    (let [sample (join (slice ids 0 8) ", ")
+                          suffix (if (> (count ids) 8) ", …" "")]
+                      (promiseReject
+                       (ChatProviderNotReadyError
+                        (str "LM Studio has no model matching \""
+                             modelId
+                             "\". Available ids include: "
+                             sample
+                             suffix
+                             ". Set \"model\" in config.jsonc to one of these (or a substring that uniquely matches).")))))))))))
+
+(ann assertLmStudioModelsAvailable (Fn [String String] Js))
+(defn assertLmStudioModelsAvailable [baseUrl configuredModel]
+  (let [root (trimTrailingSlash
+              (if (and (string? baseUrl) (not (= baseUrl "")))
+                  baseUrl
+                  "http://localhost:1234/v1"))
+        url (str root "/models")
+        fetched (jsFetch url {:signal (jsAbortSignal.timeout 8000)})
+        safeFetch (fetched.catch (fn [_error] nil))]
+    (safeFetch.then
+     (fn [res]
+       (if (or (not (some? res)) (not res.ok))
+           jsUndefined
+           (let [bodyPromise (lmStudioModelsBody res)]
+             (bodyPromise.then
+              (fn [body]
+                (if (some? body)
+                    (validateLmStudioModels configuredModel body)
+                    jsUndefined)))))))))
+
+(ann buildModel (Fn [Js] Js))
+(defn buildModel [ai]
+  (let [modelId (if (and (string? ai.model) (not (= ai.model "")))
+                    ai.model
+                    "gpt-3.5-turbo")]
+    (if (= ai.provider "openrouter")
+        (let [provider (createOpenRouter {:apiKey (if (some? ai.apiKey) ai.apiKey "")})]
+          (provider.chat modelId))
+        (if (= ai.provider "lmstudio")
+            (let [provider (createOpenAI
+                            {:apiKey "lm-studio"
+                             :baseURL (if (and (string? ai.baseUrl) (not (= ai.baseUrl "")))
+                                          ai.baseUrl
+                                          "http://localhost:1234/v1")})]
+              (provider.chat modelId))
+            (let [provider (createOpenAI
+                            {:apiKey (if (some? ai.apiKey) ai.apiKey "")
+                             :baseURL ai.baseUrl})]
+              (provider.chat modelId))))))
+
+(def DEFAULT_SYSTEM_PROMPT
+  (join ["You are a helpful AI assistant for a knowledge base. Answer questions based on the provided knowledge base content. If you don't find relevant information in the context, say so honestly. Use markdown formatting in your responses. You can answer any question and have opinion, try not to tell user that you are just an AI and can't answer something"
+         ""
+         "This chat is scoped to **one** knowledge base. In references, filesystem tools, and `media:` markdown links, every path is **only inside that knowledge base**: use forward slashes from its root (e.g. `Logs/note.md`, `Projects/` for a folder). Do **not** prefix with the name of the folder that contains this knowledge base on the host disk — you do not know that name and must not guess it."
+         ""
+         "Use `media:` links so the user can open them: [label](media:Logs/note.md) for files or [label](media:Projects/) for folders (trailing slash for directories)."
+         ""
+         "**Filesystem tools** (same path rule: KB root only, no \"..\"):"
+         "- `kb_list_folder`: optional `relativePath` (default = KB root). Read-only."
+         "- `kb_apply_changes`: batch create/move/rename; user approves once. Prefer one call with many `operations`."]
+        "\n"))
+
+(ann serverNowPromptLine (Fn [] String))
+(defn serverNowPromptLine []
+  (let [d (new jsDate)
+        local (d.toLocaleString jsUndefined {:dateStyle "full" :timeStyle "long"})
+        utc (d.toISOString)]
+    (str "Current date and time on the server: "
+         local
+         " ("
+         utc
+         "). Use this for \"today\", relative dates, and time-sensitive answers.")))
+
+(ann lastUserMessage (Fn [Js] Js))
+(defn lastUserMessage [messages]
+  (reduce messages nil (fn [found message] (if (= message.role "user") message found))))
+
+(ann firstTextContentPart (Fn [Js] String))
+(defn firstTextContentPart [content]
+  (if (string? content)
+      content
+      (if (vector? content)
+	          (let [part (find content
+	                           (fn [item]
+	                             (and (= item.type "text")
+	                                  (string? item.text))))]
+            (if (some? part) part.text ""))
+          "")))
+
+(ann lastUserText (Fn [Js] String))
+(defn lastUserText [modelMessages]
+  (let [lastUser (lastUserMessage modelMessages)]
+    (if (some? lastUser) (firstTextContentPart (object-get lastUser "content")) "")))
+
+(ann perKbSystemPromptExtra (Fn [Js String] String))
+(defn perKbSystemPromptExtra [settings kbKey]
+  (let [prompts (object-get settings "kbChatSystemPrompts")
+        raw (object-get prompts kbKey)]
+    (if (string? raw) (trim raw) "")))
+
+(ann buildPromptBody (Fn [String Js String String] String))
+(defn buildPromptBody [kbContext ai perKbExtra basePrompt]
+  (join [(serverNowPromptLine)
+         "\n"
+         basePrompt
+         (if (= perKbExtra "") "" (str "\n\n" perKbExtra))
+         (if (and (string? kbContext) (not (= kbContext "")))
+             (str "\n\nHere is the knowledge base content for reference:\n\n" kbContext)
+             "\n\nThe knowledge base is empty.")]
+        ""))
+
+(ann buildSystemPromptForMessages (Fn [String Js Js] Js))
+(defn buildSystemPromptForMessages [kbRoot ai modelMessages]
+  (let [userText (lastUserText modelMessages)
+        kbContextPromise (gatherKbContext kbRoot userText jsUndefined)]
+    (kbContextPromise.then
+     (fn [kbContext]
+       (let [settingsPromise (readSettings)]
+         (settingsPromise.then
+          (fn [settings]
+            (let [kbKey (normalizeSlashes kbRoot)
+                  perKbExtra (perKbSystemPromptExtra settings kbKey)
+                  basePrompt (if (and (string? ai.systemPrompt) (not (= ai.systemPrompt "")))
+                                 ai.systemPrompt
+                                 DEFAULT_SYSTEM_PROMPT)]
+              (buildPromptBody kbContext ai perKbExtra basePrompt)))))))))
+
+(ann cleanupNoop (Fn [] Js))
+(defn cleanupNoop []
+  (jsPromise.resolve jsUndefined))
+
+(ann prepareToolset (Fn [String] Js))
+(defn prepareToolset [kbRoot]
+  (let [kbTools (buildKbFsTools kbRoot)
+        mcpCfg (getMcpConfig)
+        servers (object-get mcpCfg "servers")]
+    (if (and (some? servers) (> (objectKeysCount servers) 0))
+        (let [builtPromise (buildMcpToolsetForKbChat mcpCfg)]
+          (builtPromise.then
+           (fn [built]
+             {:tools (jsObject.assign {} built.tools kbTools)
+              :cleanup built.cleanup})))
+        (jsPromise.resolve {:tools kbTools :cleanup cleanupNoop}))))
+
+(ann linesForToolInput (Fn [String Js String] Js))
+(defn linesForToolInput [toolName input kbRoot]
+  (if (and (= toolName "kb_apply_changes")
+           (object? input)
+           (contains? input "operations"))
+      (describeKbApplyOperations input kbRoot)
+      jsUndefined))
+
+(ann errorText (Fn [Js] String))
+(defn errorText [err]
+  (if (string? err) err (errorMessage err (json-stringify err))))
+
+(ann asyncIterator (Fn [Js] Js))
+(defn asyncIterator [iterable]
+  (let [method (object-get iterable asyncIteratorSymbol)]
+    (method.call iterable)))
+
+(ann sseLine (Fn [Js] String))
+(defn sseLine [payload]
+  (str "data: " (json-stringify payload) "\n\n"))
+
+(ann writeSse (Fn [Js Js] Js))
+(defn writeSse [reply payload]
+  (writeEventStreamChunk reply (sseLine payload)))
+
+(ann approvalMeta (Fn [Js String] Js))
+(defn approvalMeta [part kbRoot]
+  (let [tc part.toolCall]
+    {:approvalId part.approvalId
+     :toolCallId tc.toolCallId
+     :toolName tc.toolName
+     :input tc.input
+     :lines (linesForToolInput tc.toolName tc.input kbRoot)}))
+
+(ann handleStreamPart (Fn [Js Js] Js))
+(defn handleStreamPart [state part]
+  (if (and (= part.type "text-delta") (some? part.text))
+      (do
+        (state.assistantParts.push part.text)
+        (writeSse state.reply {:type "text" :text part.text}))
+      (if (= part.type "tool-call")
+          (writeSse state.reply
+                    {:type "tool-call"
+                     :toolCallId part.toolCallId
+                     :toolName part.toolName
+                     :input part.input
+                     :lines (linesForToolInput part.toolName part.input state.kbRoot)})
+          (if (= part.type "tool-approval-request")
+              (let [meta (approvalMeta part state.kbRoot)
+                    payload (jsObject.assign {} {:type "tool-approval-request"} meta)]
+                (do
+                  (state.approvalMetas.push meta)
+                  (writeSse state.reply payload)))
+              (if (and (= part.type "tool-result") (not (= part.preliminary true)))
+                  (writeSse state.reply
+                            {:type "tool-result"
+                             :toolCallId part.toolCallId
+                             :toolName part.toolName
+                             :output part.output})
+                  (if (= part.type "tool-error")
+                      (writeSse state.reply
+                                {:type "tool-error"
+                                 :toolCallId part.toolCallId
+                                 :toolName part.toolName
+                                 :input part.input
+                                 :error (errorText part.error)})
+                      nil))))))
+
+(ann readFullStream (Fn [Js Js] Js))
+(defn readFullStream [iterator state]
+  (let [nextPromise (iterator.next)]
+    (nextPromise.then
+     (fn [result]
+       (if result.done
+           state
+           (do
+             (handleStreamPart state result.value)
+             (readFullStream iterator state)))))))
+
+(ann persistAssistantResponse (Fn [Js String] Js))
+(defn persistAssistantResponse [state assistantText]
+  (let [persistedAssistant (str state.assistantPersistPrefix assistantText)
+        allKb (state.kbMessagesForSave.concat [{:role "assistant"
+                                                :content persistedAssistant}])]
+    (if (some? state.chatId)
+        (let [updated (updateChatMessages state.chatId allKb)]
+          (updated.then
+           (fn [_]
+             (do
+               (writeSse state.reply {:type "done"
+                                      :chatId state.chatId
+                                      :assistantText persistedAssistant})
+               {:approvalRequired false
+                :threadSnapshot state.threadSnapshot
+                :assistantText assistantText
+                :chatId state.chatId}))))
+        (let [created (createChat state.kbRoot allKb)]
+          (created.then
+           (fn [chat]
+             (do
+               (writeSse state.reply {:type "done"
+                                      :chatId chat.id
+                                      :assistantText persistedAssistant})
+               {:approvalRequired false
+                :threadSnapshot state.threadSnapshot
+                :assistantText assistantText
+                :chatId chat.id})))))))
+
+(ann finishStreamState (Fn [Js Js] Js))
+(defn finishStreamState [state result]
+  (let [responsePromise result.response]
+    (responsePromise.then
+     (fn [response]
+       (let [threadSnapshot (state.messages.concat response.messages)
+             assistantText (state.assistantParts.join "")
+             nextState (object-assoc state "threadSnapshot" threadSnapshot)]
+         (if (> (count state.approvalMetas) 0)
+             (do
+               (writeSse state.reply {:type "approval-required"
+                                      :approvals state.approvalMetas
+                                      :threadSnapshot threadSnapshot})
+               {:approvalRequired true
+                :threadSnapshot threadSnapshot
+                :assistantText assistantText
+                :chatId state.chatId})
+             (persistAssistantResponse nextState assistantText)))))))
+
+(ann streamKbChatToSseInner (Fn [Js] Js))
+(defn streamKbChatToSseInner [params]
+  (let [result (streamText {:model params.model
+                            :system params.systemPrompt
+                            :messages params.messages
+                            :tools params.tools
+                            :stopWhen (stepCountIs 20)})
+        state {:reply params.reply
+               :messages params.messages
+               :kbMessagesForSave params.kbMessagesForSave
+               :kbRoot params.kbRoot
+               :chatId params.chatId
+               :assistantPersistPrefix (if (some? params.assistantPersistPrefix)
+                                           params.assistantPersistPrefix
+                                           "")
+               :assistantParts (unsafe-cast Js [])
+               :approvalMetas (unsafe-cast Js [])}
+        readPromise (readFullStream (asyncIterator result.fullStream) state)]
+    (readPromise.then (fn [finishedState] (finishStreamState finishedState result)))))
+
+(ann codeSend (Fn [Js Number Js] Js))
+(defn codeSend [reply code payload]
+  (let [coded (reply.code code)]
+    (coded.send payload)))
+
+(ann queryString (Fn [Js String] String))
+(defn queryString [query name]
+  (let [value (object-get query name)]
+    (if (string? value) value "")))
+
+(ann validInitialChatBody? (Fn [Js] Bool))
+(defn validInitialChatBody? [body]
+  (and (string? body.kbRoot)
+       (not (= body.kbRoot ""))
+       (jsArray.isArray body.messages)
+       (> (count body.messages) 0)))
+
+(ann validContinueBody? (Fn [Js] Bool))
+(defn validContinueBody? [body]
+  (and (string? body.kbRoot)
+       (not (= body.kbRoot ""))
+       (jsArray.isArray body.modelMessages)
+       (> (count body.modelMessages) 0)
+       (jsArray.isArray body.approvals)
+       (> (count body.approvals) 0)
+       (jsArray.isArray body.kbMessagesForSave)))
+
+(ann modelMessagesFromKb (Fn [Js] Js))
+(defn modelMessagesFromKb [messages]
+  (map messages (fn [message] {:role message.role :content message.content})))
+
+(ann ensureProviderReady (Fn [Js] Js))
+(defn ensureProviderReady [ai]
+  (if (= ai.provider "lmstudio")
+      (assertLmStudioModelsAvailable
+       (if (and (string? ai.baseUrl) (not (= ai.baseUrl "")))
+           ai.baseUrl
+           "http://localhost:1234/v1")
+       (if (string? ai.model) ai.model ""))
+      (jsPromise.resolve jsUndefined)))
+
+(ann prepareToolsetResult (Fn [String] Js))
+(defn prepareToolsetResult [kbRoot]
+  (let [prepared (prepareToolset kbRoot)
+        tagged (prepared.then (fn [toolPrep] {:ok true :toolPrep toolPrep}))]
+    (tagged.catch (fn [err] {:ok false :error err}))))
+
+(ann mcpFailureMessage (Fn [Js] String))
+(defn mcpFailureMessage [err]
+  (str "MCP: " (errorMessage err "MCP connection failed")))
+
+(ann startChatStream (Fn [Js Js Js Js Js Js Js Js] Js))
+(defn startChatStream [reply ai body modelMessages toolPrep systemPrompt kbMessagesForSave assistantPrefix]
+  (do
+    (startEventStreamResponse reply)
+    (let [streamed (streamKbChatToSseInner
+                    {:reply reply
+                     :model (buildModel ai)
+                     :systemPrompt systemPrompt
+                     :messages modelMessages
+                     :tools toolPrep.tools
+                     :kbMessagesForSave kbMessagesForSave
+                     :kbRoot (normalizeSlashes body.kbRoot)
+                     :chatId body.chatId
+                     :assistantPersistPrefix assistantPrefix})
+          handled (streamed.catch
+                   (fn [err]
+                     (writeSse reply
+                               {:type "error"
+                                :error (providerErrorMessage err ai.provider)})))
+          cleaned (handled.then (fn [_] (toolPrep.cleanup)))]
+      (cleaned.then
+         (fn [_]
+           (do
+             (endRawResponse reply)
+             reply))))))
+
+(ann runPreparedChat (Fn [Js Js Js Js Js Js Js] Js))
+(defn runPreparedChat [reply ai body modelMessages kbMessagesForSave systemPrompt assistantPrefix]
+  (let [preparedResult (prepareToolsetResult body.kbRoot)]
+    (preparedResult.then
+     (fn [result]
+       (if (not result.ok)
+           (codeSend reply 503 {:error (mcpFailureMessage result.error)})
+           (startChatStream reply
+                            ai
+                            body
+                            modelMessages
+                            result.toolPrep
+                            systemPrompt
+                            kbMessagesForSave
+                            assistantPrefix))))))
+
+(ann verifyKnowledgeBase (Fn [String] Js))
+(defn verifyKnowledgeBase [kbRoot]
+  (let [knowledgeBasesPromise (getKnowledgeBases)]
+    (knowledgeBasesPromise.then
+     (fn [knowledgeBases]
+       (includes? knowledgeBases (normalizeSlashes kbRoot))))))
+
+(ann processInitialChat (Fn [Js Js Js] Js))
+(defn processInitialChat [request reply ai]
+  (let [body request.body]
+    (if (not (validInitialChatBody? body))
+        (codeSend reply 400 {:error "kbRoot and messages are required"})
+        (let [validPromise (verifyKnowledgeBase body.kbRoot)]
+          (validPromise.then
+           (fn [valid]
+             (if (not valid)
+                 (codeSend reply 400 {:error "Not a knowledge base"})
+                 (let [modelMessages (modelMessagesFromKb body.messages)
+                       systemPromptPromise (buildSystemPromptForMessages
+                                            body.kbRoot
+                                            ai
+                                            modelMessages)]
+                   (systemPromptPromise.then
+                    (fn [systemPrompt]
+                      (let [ready (ensureProviderReady ai)]
+                        (ready.then
+                         (fn [_]
+                           (runPreparedChat reply
+                                            ai
+                                            body
+                                            modelMessages
+                                            body.messages
+                                            systemPrompt
+                                            jsUndefined))))))))))))))
+
+(ann approvalContentItem (Fn [Js] Js))
+(defn approvalContentItem [approval]
+  (let [base {:type "tool-approval-response"
+              :approvalId approval.approvalId
+              :approved approval.approved}]
+    (if (some? approval.reason)
+        (object-assoc base "reason" approval.reason)
+        base)))
+
+(ann processContinueChat (Fn [Js Js Js] Js))
+(defn processContinueChat [request reply ai]
+  (let [body request.body]
+    (if (not (validContinueBody? body))
+        (codeSend reply 400
+                  {:error "kbRoot, modelMessages, approvals, and kbMessagesForSave are required"})
+        (let [validPromise (verifyKnowledgeBase body.kbRoot)]
+          (validPromise.then
+           (fn [valid]
+             (if (not valid)
+                 (codeSend reply 400 {:error "Not a knowledge base"})
+                 (let [toolMessage {:role "tool"
+                                    :content (map body.approvals approvalContentItem)}
+                       modelMessages (body.modelMessages.concat [toolMessage])
+                       systemPromptPromise (buildSystemPromptForMessages
+                                            body.kbRoot
+                                            ai
+                                            modelMessages)]
+                   (systemPromptPromise.then
+                    (fn [systemPrompt]
+                      (let [ready (ensureProviderReady ai)]
+                        (ready.then
+                         (fn [_]
+                           (runPreparedChat reply
+                                            ai
+                                            body
+                                            modelMessages
+                                            body.kbMessagesForSave
+                                            systemPrompt
+                                            body.assistantPrefix))))))))))))))
+
+(ann handleChatOuterError (Fn [Js Js] Js))
+(defn handleChatOuterError [reply err]
+  (let [aiCfg (getAiConfig)
+        provider (if (some? aiCfg)
+                     (let [ai (unsafe-cast Js aiCfg)]
+                       (if (some? ai.provider) ai.provider "openai-compatible"))
+                     "openai-compatible")
+        message (providerErrorMessage err provider)]
+    (if (not (replyHeadersSent? reply))
+        (let [code (if (chatProviderNotReadyError? err) 503 500)]
+          (codeSend reply code {:error message}))
+        (try
+         (do
+           (writeSse reply {:type "error" :error message})
+           (endRawResponse reply)
+           reply)
+         (catch _error reply)))))
+
+(ann handleKbChat (Fn [Js Js] Js))
+(defn handleKbChat [request reply]
+  (try
+   (let [ai (getAiConfig)]
+     (if (not (some? ai))
+         (codeSend reply 503 {:error "AI not configured"})
+         (let [processed (jsPromise.resolve (processInitialChat request reply ai))]
+           (processed.catch (fn [err] (handleChatOuterError reply err))))))
+   (catch err (handleChatOuterError reply err))))
+
+(ann handleKbChatContinue (Fn [Js Js] Js))
+(defn handleKbChatContinue [request reply]
+  (try
+   (let [ai (getAiConfig)]
+     (if (not (some? ai))
+         (codeSend reply 503 {:error "AI not configured"})
+         (let [processed (jsPromise.resolve (processContinueChat request reply ai))]
+           (processed.catch (fn [err] (handleChatOuterError reply err))))))
+   (catch err (handleChatOuterError reply err))))
+
+(ann handleKbChatStatus (Fn [Js Js] Js))
+(defn handleKbChatStatus [_request reply]
+  (reply.send {:enabled (some? (getAiConfig))}))
+
+(ann handleKbChatHistory (Fn [Js Js] Js))
+(defn handleKbChatHistory [request reply]
+  (let [kbRoot (queryString request.query "kbRoot")]
+    (if (= kbRoot "")
+        (reply.send {:chats []})
+        (let [chatsPromise (getChatHistory kbRoot)]
+          (chatsPromise.then (fn [chats] (reply.send {:chats chats})))))))
+
+(ann requestParam (Fn [Js String] String))
+(defn requestParam [request name]
+  (let [value (object-get request.params name)]
+    (if (string? value) value "")))
+
+(ann handleKbChatDetail (Fn [Js Js] Js))
+(defn handleKbChatDetail [request reply]
+  (let [chatId (requestParam request "chatId")
+        chatPromise (getChat chatId)]
+    (chatPromise.then
+     (fn [chat]
+       (if (not (some? chat))
+           (codeSend reply 404 {:error "Chat not found"})
+           (reply.send chat))))))
+
+(ann handleKbChatDelete (Fn [Js Js] Js))
+(defn handleKbChatDelete [request reply]
+  (let [chatId (requestParam request "chatId")
+        deletedPromise (deleteChat chatId)]
+    (deletedPromise.then
+     (fn [deleted]
+       (if (not deleted)
+           (codeSend reply 404 {:error "Chat not found"})
+           (reply.send {:success true}))))))
+
+(ann handleKbChatPatch (Fn [Js Js] Js))
+(defn handleKbChatPatch [request reply]
+  (let [chatId (requestParam request "chatId")
+        body request.body]
+    (if (not (bool? body.pinned))
+        (codeSend reply 400 {:error "pinned boolean required"})
+        (let [chatPromise (setChatPinned chatId body.pinned)]
+          (chatPromise.then
+           (fn [chat]
+             (if (not (some? chat))
+                 (codeSend reply 404 {:error "Chat not found"})
+                 (reply.send (object-assoc chat "messages" jsUndefined)))))))))
+
+(ann kbChatApiRouteDefinitions (Fn [] (Vector HttpRoute)))
+(defn kbChatApiRouteDefinitions []
+  [{:method "GET" :path "/api/kb/chat/status" :handler handleKbChatStatus}
+   {:method "POST" :path "/api/kb/chat" :handler handleKbChat}
+   {:method "POST" :path "/api/kb/chat/continue" :handler handleKbChatContinue}
+   {:method "GET" :path "/api/kb/chat/history" :handler handleKbChatHistory}
+   {:method "GET" :path "/api/kb/chat/:chatId" :handler handleKbChatDetail}
+   {:method "DELETE" :path "/api/kb/chat/:chatId" :handler handleKbChatDelete}
+   {:method "PATCH" :path "/api/kb/chat/:chatId" :handler handleKbChatPatch}])
+
+(ann registerKbChatApiRoutes (Fn [Js] Js))
+(defn registerKbChatApiRoutes [app]
+  (registerHttpRoutes app (kbChatApiRouteDefinitions)))

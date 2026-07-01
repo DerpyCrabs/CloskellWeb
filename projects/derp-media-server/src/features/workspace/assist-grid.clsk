@@ -1,0 +1,158 @@
+(def snapEdgeThresholdPx 36)
+(def topSnapAssistKeepalivePx 320)
+(def topSnapAssistCenterBandPx 300)
+(def topSnapAssistCenterHalfWidthPx (/ topSnapAssistCenterBandPx 2))
+(def SNAP_EDGE_THRESHOLD_PX snapEdgeThresholdPx)
+(def TOP_SNAP_ASSIST_KEEPALIVE_PX topSnapAssistKeepalivePx)
+(def TOP_SNAP_ASSIST_CENTER_BAND_PX topSnapAssistCenterBandPx)
+(def TOP_SNAP_ASSIST_CENTER_HALF_WIDTH_PX topSnapAssistCenterHalfWidthPx)
+(def numberEpsilon 0.0000000000000002220446049250313)
+
+(ann assistGridShapes (Vector String))
+(def assistGridShapes ["3x2" "3x3" "2x2" "2x3"])
+
+(type AssistGridDims
+  {:cols Number
+   :rows Number})
+
+(type AssistGridSpan
+  {:gridCols Number
+   :gridRows Number
+   :gc0 Number
+   :gc1 Number
+   :gr0 Number
+   :gr1 Number})
+
+(type WorkspaceCanvasSize
+  {:width Number
+   :height Number})
+
+(type WorkspaceBounds
+  {:x Number
+   :y Number
+   :width Number
+   :height Number})
+
+(type EdgeAssistDetectOptions
+  {:suppressTopEdgeSpans Bool})
+
+(type AssistGridLines
+  {:colStart Number
+   :colEnd Number
+   :rowStart Number
+   :rowEnd Number})
+
+(ann isAssistGridShape (Fn [String] Bool))
+(defn isAssistGridShape [shape]
+  (includes? assistGridShapes shape))
+
+(ann assistShapeToDims (Fn [String] AssistGridDims))
+(defn assistShapeToDims [shape]
+  (if (= shape "3x2")
+      {:cols 3 :rows 2}
+      (if (= shape "3x3")
+          {:cols 3 :rows 3}
+          (if (= shape "2x2")
+              {:cols 2 :rows 2}
+              {:cols 2 :rows 3}))))
+
+(ann assistShapeMatchingSpan (Fn [AssistGridSpan] (Option String)))
+(defn assistShapeMatchingSpan [span]
+  (if (and (= span.gridCols 3) (= span.gridRows 2))
+      "3x2"
+      (if (and (= span.gridCols 3) (= span.gridRows 3))
+          "3x3"
+          (if (and (= span.gridCols 2) (= span.gridRows 2))
+              "2x2"
+              (if (and (= span.gridCols 2) (= span.gridRows 3))
+                  "2x3"
+                  nil)))))
+
+(ann segmentIndex (Fn [Number Number Number] Number))
+(defn segmentIndex [localX span segments]
+  (if (or (<= span 0) (<= segments 0))
+      0
+      (let [t (min (max (/ localX span) 0) (- 1 numberEpsilon))]
+        (min (- segments 1) (floor (* t segments))))))
+
+(ann topBottomEdgeSlot (Fn [Number Number Number] {:gc0 Number :gc1 Number}))
+(defn topBottomEdgeSlot [cursorX cw cols]
+  (let [slots (- (* cols 2) 1)
+        t (min (max (* (/ cursorX cw) slots) 0) (- slots numberEpsilon))
+        slot (min (- slots 1) (floor t))]
+    (if (= (mod slot 2) 0)
+        (let [c (/ slot 2)]
+          {:gc0 c :gc1 c})
+        (let [i (/ (- slot 1) 2)]
+          {:gc0 i :gc1 (+ i 1)}))))
+
+(ann leftRightEdgeSlot (Fn [Number Number Number] {:gr0 Number :gr1 Number}))
+(defn leftRightEdgeSlot [cursorY ch rows]
+  (let [slots (- (* rows 2) 1)
+        t (min (max (* (/ cursorY ch) slots) 0) (- slots numberEpsilon))
+        slot (min (- slots 1) (floor t))]
+    (if (= (mod slot 2) 0)
+        (let [r (/ slot 2)]
+          {:gr0 r :gr1 r})
+        (let [i (/ (- slot 1) 2)]
+          {:gr0 i :gr1 (+ i 1)}))))
+
+(ann detectEdgeAssistGridSpan (Fn [Number Number Number Number String EdgeAssistDetectOptions] (Option AssistGridSpan)))
+(defn detectEdgeAssistGridSpan [lx ly cw ch shape opts]
+  (let [dims (assistShapeToDims shape)
+        cols dims.cols
+        rows dims.rows
+        nearL (<= lx snapEdgeThresholdPx)
+        nearR (>= lx (- cw snapEdgeThresholdPx))
+        nearT (<= ly snapEdgeThresholdPx)
+        nearB (>= ly (- ch snapEdgeThresholdPx))]
+    (if (and nearL nearT)
+        {:gridCols cols :gridRows rows :gc0 0 :gc1 0 :gr0 0 :gr1 0}
+        (if (and nearR nearT)
+            {:gridCols cols :gridRows rows :gc0 (- cols 1) :gc1 (- cols 1) :gr0 0 :gr1 0}
+            (if (and nearL nearB)
+                {:gridCols cols :gridRows rows :gc0 0 :gc1 0 :gr0 (- rows 1) :gr1 (- rows 1)}
+                (if (and nearR nearB)
+                    {:gridCols cols :gridRows rows :gc0 (- cols 1) :gc1 (- cols 1) :gr0 (- rows 1) :gr1 (- rows 1)}
+                    (if (and nearT (not opts.suppressTopEdgeSpans))
+                        (let [slot (topBottomEdgeSlot lx cw cols)]
+                          {:gridCols cols :gridRows rows :gc0 slot.gc0 :gc1 slot.gc1 :gr0 0 :gr1 0})
+                        (if nearB
+                            (let [slot (topBottomEdgeSlot lx cw cols)]
+                              {:gridCols cols :gridRows rows :gc0 slot.gc0 :gc1 slot.gc1 :gr0 (- rows 1) :gr1 (- rows 1)})
+                            (if nearL
+                                (let [slot (leftRightEdgeSlot ly ch rows)]
+                                  {:gridCols cols :gridRows rows :gc0 0 :gc1 0 :gr0 slot.gr0 :gr1 slot.gr1})
+                                (if nearR
+                                    (let [slot (leftRightEdgeSlot ly ch rows)]
+                                      {:gridCols cols :gridRows rows :gc0 (- cols 1) :gc1 (- cols 1) :gr0 slot.gr0 :gr1 slot.gr1})
+                                    nil))))))))))
+
+(ann assistGridSpanToBounds (Fn [WorkspaceCanvasSize AssistGridSpan] WorkspaceBounds))
+(defn assistGridSpanToBounds [canvas span]
+  (let [xu (/ canvas.width span.gridCols)
+        yu (/ canvas.height span.gridRows)
+        x (round (* span.gc0 xu))
+        y (round (* span.gr0 yu))
+        width (round (* (+ (- span.gc1 span.gc0) 1) xu))
+        height (round (* (+ (- span.gr1 span.gr0) 1) yu))]
+    {:x (max 0 (min x (- canvas.width 100)))
+     :y (max 0 (min y (- canvas.height 100)))
+     :width (min (max width 100) canvas.width)
+     :height (min (max height 100) canvas.height)}))
+
+(ann assistGridSpansEqual (Fn [AssistGridSpan AssistGridSpan] Bool))
+(defn assistGridSpansEqual [a b]
+  (and (= a.gridCols b.gridCols)
+       (= a.gridRows b.gridRows)
+       (= a.gc0 b.gc0)
+       (= a.gc1 b.gc1)
+       (= a.gr0 b.gr0)
+       (= a.gr1 b.gr1)))
+
+(ann assistSpanToGridLines (Fn [AssistGridSpan] AssistGridLines))
+(defn assistSpanToGridLines [span]
+  {:colStart (+ (* span.gc0 2) 1)
+   :colEnd (+ (* span.gc1 2) 2)
+   :rowStart (+ (* span.gr0 2) 1)
+   :rowEnd (+ (* span.gr1 2) 2)})

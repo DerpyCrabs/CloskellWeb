@@ -1,0 +1,262 @@
+(import "turndown" [(default TurndownService)])
+(import "../src/features/paste-data.clsk" [isTextFileType])
+
+(def jsGlobalThis (js-global globalThis))
+(def jsPromise (js-global Promise))
+(def jsFileReader (js-global FileReader))
+(def jsBlob (js-global Blob))
+(def jsDate (js-global Date))
+(def jsRegExp (js-global RegExp))
+
+(def CLIPBOARD_STRUCTURED_SELECTORS
+  ["h1" "h2" "h3" "h4" "h5" "h6" "ol" "ul" "blockquote" "pre" "table"])
+
+(def nbspPattern (new jsRegExp "\\u00a0" "g"))
+(def crlfPattern (new jsRegExp "\\r\\n" "g"))
+(def scriptPattern (new jsRegExp "<script\\b[\\s\\S]*?<\\/script>" "gi"))
+(def stylePattern (new jsRegExp "<style\\b[\\s\\S]*?<\\/style>" "gi"))
+(def tagPattern (new jsRegExp "<[^>]+>" "g"))
+(def whitespacePattern (new jsRegExp "\\s+" "g"))
+
+(ann stringReplaceAll (Fn [String Js String] String))
+(defn stringReplaceAll [value pattern replacement]
+  (let [jsValue (unsafe-cast Js value)]
+    (jsValue.replace pattern replacement)))
+
+(ann readFileAs (Fn [Js String] Js))
+(defn readFileAs [file mode]
+  (new jsPromise
+       (fn [resolve reject]
+         (let [reader (new jsFileReader)
+               onLoad (fn []
+                        (let [result reader.result]
+                          (do
+                            (resolve (if (string? result) result ""))
+                            nil)))
+               onError (fn []
+                         (do
+                           (reject reader.error)
+                           nil))]
+           (do
+             (reader.addEventListener "load" onLoad)
+             (reader.addEventListener "error" onError)
+             (if (= mode "text")
+                 (reader.readAsText file)
+                 (reader.readAsDataURL file))
+             nil)))))
+
+(ann readFileAsDataURL (Fn [Js] Js))
+(defn readFileAsDataURL [file]
+  (readFileAs file "data-url"))
+
+(ann readFileAsText (Fn [Js] Js))
+(defn readFileAsText [file]
+  (readFileAs file "text"))
+
+(ann base64Payload (Fn [String] String))
+(defn base64Payload [dataUrl]
+  (let [parts (split dataUrl ",")]
+    (if (> (count parts) 1) (nth parts 1) "")))
+
+(ann pasteDataFromFile (Fn [Js] Js))
+(defn pasteDataFromFile [file]
+  (let [fileName file.name
+        fileSize file.size
+        isTextFile (isTextFileType file.type fileName)]
+    (if (starts-with? file.type "image/")
+        (let [readPromise (readFileAsDataURL file)]
+          (readPromise.then
+           (fn [result]
+             {:type "image"
+              :content (base64Payload result)
+              :suggestedName fileName
+              :fileType file.type
+              :fileSize fileSize
+              :showPreview true
+              :isTextContent false})))
+        (if isTextFile
+            (let [readPromise (readFileAsText file)]
+              (readPromise.then
+               (fn [text]
+                 {:type "file"
+                  :content text
+                  :suggestedName fileName
+                  :fileType file.type
+                  :fileSize fileSize
+                  :showPreview true
+                  :isTextContent true})))
+            (let [readPromise (readFileAsDataURL file)]
+              (readPromise.then
+               (fn [result]
+                 {:type "file"
+                  :content (base64Payload result)
+                  :suggestedName fileName
+                  :fileType file.type
+                  :fileSize fileSize
+                  :showPreview true
+                  :isTextContent false})))))))
+
+(ann globalConstructor (Fn [String] Js))
+(defn globalConstructor [name]
+  (object-get jsGlobalThis name))
+
+(ann hasDomParser (Fn [] Bool))
+(defn hasDomParser []
+  (some? (globalConstructor "DOMParser")))
+
+(ann parseClipboardHtml (Fn [String] Js))
+(defn parseClipboardHtml [html]
+  (let [DOMParser (globalConstructor "DOMParser")
+        parser (new DOMParser)]
+    (parser.parseFromString html "text/html")))
+
+(ann clipboardHtmlBodyLooksStructured (Fn [Js] Bool))
+(defn clipboardHtmlBodyLooksStructured [body]
+  (if (not (some? body))
+      false
+      (any? CLIPBOARD_STRUCTURED_SELECTORS
+            (fn [tag]
+              (let [matches (body.getElementsByTagName tag)]
+                (> matches.length 0))))))
+
+(ann newClipboardTurndown (Fn [Js] Js))
+(defn newClipboardTurndown [doc]
+  (new TurndownService {:headingStyle "atx"
+                        :bulletListMarker "-"
+                        :document doc}))
+
+(ann documentBodyToMarkdown (Fn [Js] String))
+(defn documentBodyToMarkdown [doc]
+  (let [service (unsafe-cast Js (newClipboardTurndown doc))]
+    (trim (service.turndown doc.body))))
+
+(ann clipboardHtmlToPlainText (Fn [String] String))
+(defn clipboardHtmlToPlainText [html]
+  (let [raw (if (hasDomParser)
+                (let [doc (parseClipboardHtml html)
+                      body doc.body
+                      text (if (some? body) body.textContent "")]
+                  (if (string? text) text ""))
+                "")
+        normalized (stringReplaceAll (stringReplaceAll raw nbspPattern " ") crlfPattern "\n")
+        trimmed (trim normalized)]
+    (if (not (= trimmed ""))
+        trimmed
+        (trim
+         (stringReplaceAll
+          (stringReplaceAll
+           (stringReplaceAll
+            (stringReplaceAll
+             (stringReplaceAll html scriptPattern "")
+             stylePattern "")
+            tagPattern " ")
+           nbspPattern " ")
+          whitespacePattern " ")))))
+
+(ann clipboardHtmlToMarkdown (Fn [String] String))
+(defn clipboardHtmlToMarkdown [html]
+  (if (not (hasDomParser))
+      (clipboardHtmlToPlainText html)
+      (let [doc (parseClipboardHtml html)
+            md (documentBodyToMarkdown doc)]
+        (if (not (= md "")) md (clipboardHtmlToPlainText html)))))
+
+(ann textPasteSuggestedName (Fn [String] String))
+(defn textPasteSuggestedName [ext]
+  (str "pasted-" (jsDate.now) "." ext))
+
+(ann textSuggestedExtension (Fn [Js] String))
+(defn textSuggestedExtension [opts]
+  (let [raw (if (object? opts) (object-get opts "textSuggestedExtension") nil)]
+    (if (= raw "md") "md" "txt")))
+
+(ann textSize (Fn [String] Number))
+(defn textSize [value]
+  (let [blob (new jsBlob [value])]
+    blob.size))
+
+(ann textPasteData (Fn [String String] Js))
+(defn textPasteData [text ext]
+  {:type "text"
+   :content text
+   :suggestedName (textPasteSuggestedName ext)
+   :fileSize (textSize text)
+   :showPreview true
+   :isTextContent true})
+
+(ann imageItemFromClipboardItems (Fn [Js] Js))
+(defn imageItemFromClipboardItems [items]
+  (if (or (not (some? items)) (= items.length 0))
+      nil
+      (unsafe-cast Js
+        (find (map (range 0 items.length) (fn [index] (nth items index)))
+              (fn [item] (starts-with? item.type "image/"))))))
+
+(ann fileFromClipboardItem (Fn [Js] Js))
+(defn fileFromClipboardItem [item]
+  (let [fnValue (object-get item "getAsFile")]
+    (if (some? fnValue) (fnValue.call item) nil)))
+
+(ann imageExtensionFromMimeType (Fn [String] String))
+(defn imageExtensionFromMimeType [mimeType]
+  (let [parts (split mimeType "/")
+        ext (if (> (count parts) 1) (nth parts 1) "")]
+    (if (= ext "") "png" ext)))
+
+(ann pasteDataFromClipboardImageItem (Fn [Js] Js))
+(defn pasteDataFromClipboardImageItem [item]
+  (let [blob (fileFromClipboardItem item)]
+    (if (some? blob)
+        (let [file (unsafe-cast Js blob)
+              readPromise (readFileAsDataURL file)]
+          (readPromise.then
+           (fn [result]
+             {:type "image"
+              :content (base64Payload result)
+              :suggestedName (str "image-" (jsDate.now) "." (imageExtensionFromMimeType item.type))
+              :fileType item.type
+              :fileSize file.size
+              :showPreview true
+              :isTextContent false})))
+        (jsPromise.resolve nil))))
+
+(ann structuredMarkdownPaste (Fn [String String] Js))
+(defn structuredMarkdownPaste [html ext]
+  (if (and (= ext "md") (not (= html "")) (hasDomParser))
+      (let [doc (parseClipboardHtml html)]
+        (if (clipboardHtmlBodyLooksStructured doc.body)
+            (let [md (documentBodyToMarkdown doc)]
+              (if (not (= md ""))
+                  (textPasteData md ext)
+                  nil))
+            nil))
+      nil))
+
+(ann extractTextPasteData (Fn [String String String] Js))
+(defn extractTextPasteData [rawPlain html ext]
+  (let [structured (structuredMarkdownPaste html ext)]
+    (if (some? structured)
+        structured
+        (if (not (= (trim rawPlain) ""))
+            (textPasteData rawPlain ext)
+            (if (not (= html ""))
+                (let [fromHtml (if (= ext "md")
+                                   (clipboardHtmlToMarkdown html)
+                                   (clipboardHtmlToPlainText html))]
+                  (if (not (= fromHtml "")) (textPasteData fromHtml ext) nil))
+                nil)))))
+
+(ann extractPasteDataFromClipboardData (Fn [Js Js] Js))
+(defn extractPasteDataFromClipboardData [clipboardData opts]
+  (if (not (some? clipboardData))
+      (jsPromise.resolve nil)
+      (let [ext (textSuggestedExtension opts)
+            files clipboardData.files]
+        (if (and (some? files) (> files.length 0))
+            (pasteDataFromFile (nth files 0))
+            (let [imageItem (imageItemFromClipboardItems clipboardData.items)]
+              (if (some? imageItem)
+                  (pasteDataFromClipboardImageItem imageItem)
+                  (let [rawPlain (clipboardData.getData "text/plain")
+                        html (clipboardData.getData "text/html")]
+                    (jsPromise.resolve (extractTextPasteData rawPlain html ext)))))))))

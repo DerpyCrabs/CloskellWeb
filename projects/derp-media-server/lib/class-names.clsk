@@ -1,0 +1,6 @@
+(import "clsx" [clsx])
+(import "tailwind-merge" [twMerge])
+
+(ann cn (Fn [Js] String))
+(defn cn [inputs]
+  (twMerge (clsx inputs)))

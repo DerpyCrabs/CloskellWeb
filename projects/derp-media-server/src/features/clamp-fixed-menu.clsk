@@ -1,0 +1,54 @@
+(def fixedMenuViewportEdge 8)
+(def jsDocument (js-global document))
+(def jsWindow (js-global window))
+
+(type LayoutViewportSize
+  {:w Number
+   :h Number})
+
+(type ClampFixedMenuFlip
+  {:anchorTop Number
+   :anchorBottom Number
+   :gap Number})
+
+(type ClampFixedMenuArgs
+  {:preferredLeft Number
+   :width Number
+   :height Number
+   :flip ClampFixedMenuFlip})
+
+(type FixedMenuPosition
+  {:left Number
+   :top Number})
+
+(ann layoutViewportClientSize (Fn [] LayoutViewportSize))
+(defn layoutViewportClientSize []
+  (let [de jsDocument.documentElement
+        width (if (and (some? de) (> de.clientWidth 0))
+                  de.clientWidth
+                  (max 1 jsWindow.innerWidth))
+        height (if (and (some? de) (> de.clientHeight 0))
+                   de.clientHeight
+                   (max 1 jsWindow.innerHeight))]
+    {:w (max 1 width) :h (max 1 height)}))
+
+(ann clampFixedMenuPositionInViewport (Fn [LayoutViewportSize ClampFixedMenuArgs] FixedMenuPosition))
+(defn clampFixedMenuPositionInViewport [viewport args]
+  (let [vw viewport.w
+        vh viewport.h
+        pw (max 1 args.width)
+        ph (max 1 args.height)
+        below (+ args.flip.anchorBottom args.flip.gap)
+        above (- args.flip.anchorTop ph args.flip.gap)
+        bottomClamped (- vh ph fixedMenuViewportEdge)
+        top (if (> (+ below ph) (- vh fixedMenuViewportEdge)) above below)
+        top2 (if (> (+ top ph) (- vh fixedMenuViewportEdge)) bottomClamped top)
+        finalTop (if (< top2 fixedMenuViewportEdge) fixedMenuViewportEdge top2)
+        rightClamped (- vw pw fixedMenuViewportEdge)
+        left (if (> args.preferredLeft rightClamped) rightClamped args.preferredLeft)
+        finalLeft (if (< left fixedMenuViewportEdge) fixedMenuViewportEdge left)]
+    {:left finalLeft :top finalTop}))
+
+(ann clampFixedMenuPosition (Fn [ClampFixedMenuArgs] FixedMenuPosition))
+(defn clampFixedMenuPosition [args]
+  (clampFixedMenuPositionInViewport (layoutViewportClientSize) args))

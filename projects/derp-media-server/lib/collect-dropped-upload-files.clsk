@@ -1,0 +1,91 @@
+(def jsPromise (js-global Promise))
+(def jsFile (js-global File))
+
+(ann pushAll (Fn [Js Js] Js))
+(defn pushAll [target items]
+  (do
+    (items.forEach (fn [item] (target.push item)))
+    target))
+
+(ann readEntriesPromise (Fn [Js] Js))
+(defn readEntriesPromise [reader]
+  (new jsPromise
+       (fn [resolve reject]
+         (reader.readEntries resolve reject))))
+
+(ann readAllEntriesStep (Fn [Js Js] Js))
+(defn readAllEntriesStep [reader entries]
+  (let [batchPromise (readEntriesPromise reader)]
+    (batchPromise.then
+     (fn [batch]
+       (do
+         (pushAll entries batch)
+         (if (> (count batch) 0)
+             (readAllEntriesStep reader entries)
+             entries))))))
+
+(ann readAllEntries (Fn [Js] Js))
+(defn readAllEntries [reader]
+  (readAllEntriesStep reader []))
+
+(ann fileEntryFilePromise (Fn [Js] Js))
+(defn fileEntryFilePromise [fileEntry]
+  (new jsPromise
+       (fn [resolve reject]
+         (fileEntry.file resolve reject))))
+
+(ann uploadRelativePath (Fn [String String] String))
+(defn uploadRelativePath [basePath name]
+  (if (= basePath "") name (str basePath "/" name)))
+
+(ann readEntry (Fn [Js String Js] Js))
+(defn readEntry [entry basePath files]
+  (if entry.isFile
+      (let [filePromise (fileEntryFilePromise entry)]
+        (filePromise.then
+         (fn [file]
+           (let [relativePath (uploadRelativePath basePath entry.name)
+                 uploadFile (new jsFile [file]
+                                 relativePath
+                                 {:type file.type :lastModified file.lastModified})]
+             (do
+               (files.push uploadFile)
+               nil)))))
+      (if entry.isDirectory
+          (let [reader (entry.createReader)
+                entriesPromise (readAllEntries reader)]
+            (entriesPromise.then
+             (fn [sub]
+               (let [dirPath (uploadRelativePath basePath entry.name)
+                     reads (map sub (fn [child] (readEntry child dirPath files)))]
+                 (jsPromise.all reads)))))
+          (jsPromise.resolve nil))))
+
+(ann entryFromTransferItem (Fn [Js] Js))
+(defn entryFromTransferItem [item]
+  (let [fnValue (get item :webkitGetAsEntry)]
+    (if (some? fnValue)
+        (item.webkitGetAsEntry)
+        nil)))
+
+(ann transferEntries (Fn [Js] Js))
+(defn transferEntries [items]
+  (if (not (some? items))
+      []
+      (filter (map (range 0 items.length)
+                   (fn [index] (entryFromTransferItem (nth items index))))
+              (fn [entry] (some? entry)))))
+
+(ann fileListToArray (Fn [Js] Js))
+(defn fileListToArray [fileList]
+  (map (range 0 fileList.length) (fn [index] (nth fileList index))))
+
+(ann collectDroppedUploadFiles (Fn [Js] Js))
+(defn collectDroppedUploadFiles [dataTransfer]
+  (let [files (unsafe-cast Js [])
+        entries (transferEntries dataTransfer.items)]
+    (if (> (count entries) 0)
+        (let [reads (map entries (fn [entry] (readEntry entry "" files)))
+              all (jsPromise.all reads)]
+          (all.then (fn [_] files)))
+        (jsPromise.resolve (fileListToArray dataTransfer.files)))))

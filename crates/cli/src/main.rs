@@ -742,6 +742,7 @@ fn run_module_tests_in_temp(path: &Path, temp_dir: &Path, json: bool) -> Result<
     check_file(path, &mut modules, &mut checking, false)?;
 
     copy_runtime_package(temp_dir)?;
+    link_source_node_modules(path, temp_dir)?;
     let output = temp_dir.join("__closkell_test_entry.mjs");
     let mut visited = HashSet::new();
     let mut artifacts = Vec::new();
@@ -759,6 +760,7 @@ fn run_module_tests_in_temp(path: &Path, temp_dir: &Path, json: bool) -> Result<
         &mut artifacts,
         "entry",
     )?;
+    link_test_project_aliases(path, temp_dir)?;
     run_node_test_module(&output, json)
 }
 
@@ -1174,6 +1176,181 @@ fn copy_runtime_file(source: &Path, target: &Path) -> Result<(), String> {
             err
         )
     })
+}
+
+fn link_source_node_modules(source: &Path, temp_dir: &Path) -> Result<(), String> {
+    let Some(source_node_modules) = find_nearest_node_modules(source) else {
+        return Ok(());
+    };
+    let temp_node_modules = temp_dir.join("node_modules");
+    fs::create_dir_all(&temp_node_modules).map_err(|err| {
+        format!(
+            "failed to create temp node_modules {}: {}",
+            temp_node_modules.display(),
+            err
+        )
+    })?;
+
+    let entries = fs::read_dir(&source_node_modules).map_err(|err| {
+        format!(
+            "failed to read source node_modules {}: {}",
+            source_node_modules.display(),
+            err
+        )
+    })?;
+
+    for entry in entries {
+        let entry = entry.map_err(|err| {
+            format!(
+                "failed to read source node_modules entry in {}: {}",
+                source_node_modules.display(),
+                err
+            )
+        })?;
+        let name = entry.file_name();
+        let name_text = name.to_string_lossy();
+        if name_text == ".bin" || name_text.starts_with('.') {
+            continue;
+        }
+
+        let source_entry = entry.path();
+        if !source_entry.is_dir() {
+            continue;
+        }
+
+        if name_text.starts_with('@') {
+            link_scoped_node_modules_entry(&source_entry, &temp_node_modules.join(&name))?;
+        } else {
+            link_node_modules_dir(&source_entry, &temp_node_modules.join(&name))?;
+        }
+    }
+
+    Ok(())
+}
+
+fn find_nearest_node_modules(source: &Path) -> Option<PathBuf> {
+    let canonical = fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
+    let start = if canonical.is_dir() {
+        canonical.as_path()
+    } else {
+        canonical.parent().unwrap_or_else(|| Path::new("."))
+    };
+
+    for ancestor in start.ancestors() {
+        let candidate = ancestor.join("node_modules");
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn link_scoped_node_modules_entry(source_scope: &Path, target_scope: &Path) -> Result<(), String> {
+    fs::create_dir_all(target_scope).map_err(|err| {
+        format!(
+            "failed to create temp scoped package directory {}: {}",
+            target_scope.display(),
+            err
+        )
+    })?;
+
+    let entries = fs::read_dir(source_scope).map_err(|err| {
+        format!(
+            "failed to read scoped node_modules directory {}: {}",
+            source_scope.display(),
+            err
+        )
+    })?;
+
+    for entry in entries {
+        let entry = entry.map_err(|err| {
+            format!(
+                "failed to read scoped node_modules entry in {}: {}",
+                source_scope.display(),
+                err
+            )
+        })?;
+        let source_entry = entry.path();
+        if !source_entry.is_dir() {
+            continue;
+        }
+        let target_entry = target_scope.join(entry.file_name());
+        if target_entry.ends_with(Path::new("@closkell").join("runtime")) {
+            continue;
+        }
+        link_node_modules_dir(&source_entry, &target_entry)?;
+    }
+
+    Ok(())
+}
+
+fn link_node_modules_dir(source: &Path, target: &Path) -> Result<(), String> {
+    if target.exists() {
+        return Ok(());
+    }
+    create_dir_symlink(source, target).map_err(|err| {
+        format!(
+            "failed to link node package {} -> {}: {}",
+            target.display(),
+            source.display(),
+            err
+        )
+    })
+}
+
+fn link_test_project_aliases(source: &Path, temp_dir: &Path) -> Result<(), String> {
+    let alias_scope = temp_dir.join("node_modules").join("@");
+    fs::create_dir_all(&alias_scope).map_err(|err| {
+        format!(
+            "failed to create temp project alias scope {}: {}",
+            alias_scope.display(),
+            err
+        )
+    })?;
+
+    let project_root = find_nearest_package_root(source);
+    let lib_source = project_root
+        .as_ref()
+        .map(|root| root.join(".closkell").join("build").join("lib"))
+        .filter(|path| path.is_dir())
+        .unwrap_or_else(|| temp_dir.join("lib"));
+    link_node_modules_dir(&lib_source, &alias_scope.join("lib"))?;
+
+    if let Some(src_source) = project_root
+        .as_ref()
+        .map(|root| root.join("src"))
+        .filter(|path| path.is_dir())
+    {
+        link_node_modules_dir(&src_source, &alias_scope.join("src"))?;
+    }
+
+    Ok(())
+}
+
+fn find_nearest_package_root(source: &Path) -> Option<PathBuf> {
+    let canonical = fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
+    let start = if canonical.is_dir() {
+        canonical.as_path()
+    } else {
+        canonical.parent().unwrap_or_else(|| Path::new("."))
+    };
+
+    for ancestor in start.ancestors() {
+        if ancestor.join("package.json").is_file() {
+            return Some(ancestor.to_path_buf());
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
+fn create_dir_symlink(source: &Path, target: &Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(source, target)
+}
+
+#[cfg(windows)]
+fn create_dir_symlink(source: &Path, target: &Path) -> io::Result<()> {
+    std::os::windows::fs::symlink_dir(source, target)
 }
 
 fn workspace_root() -> PathBuf {
@@ -2365,6 +2542,7 @@ fn runtime_chunk_declared_dependencies(name: &str) -> &'static [&'static str] {
             "commandErrorMessage",
             "commandMessage",
             "commandValueName",
+            "downloadBrowserUrl",
             "downloadWithBrowser",
             "eventListenerOptions",
             "find",
@@ -2380,18 +2558,23 @@ fn runtime_chunk_declared_dependencies(name: &str) -> &'static [&'static str] {
             "nowMs",
             "numberOr",
             "numberOrZero",
+            "openBrowserUrl",
             "parseHeartRateMeasurement",
             "parseStoredValue",
             "persistAuthStorage",
+            "playMediaSelector",
             "proxiedHttpUrl",
             "queueScrollIntoView",
             "readImportedFile",
+            "readBlobAsBase64",
+            "readBlobAsDataUrl",
             "rectFromResizeEntry",
             "refName",
             "removeMediaQueryListener",
             "removeResizeObserver",
             "removeWindowEventListener",
             "replaceBrowserSearchParam",
+            "replaceBrowserHistory",
             "resizeMessage",
             "resolveRef",
             "runTask",
@@ -2399,12 +2582,18 @@ fn runtime_chunk_declared_dependencies(name: &str) -> &'static [&'static str] {
             "setBrowserCookie",
             "setCanvasCssSize",
             "setCanvasTransform",
+            "setDocumentElementAttribute",
+            "setInputSelection",
             "simulationHeartRateBpm",
             "taskErrorMessage",
             "taskSuccessMessage",
             "text",
             "windowEventMessage",
             "writeBrowserRoute",
+            "pushBrowserHistory",
+            "scrollBrowserTo",
+            "assignBrowserLocation",
+            "bytesToBase64String",
         ],
         "createSelectedCommandHandlers" => &[],
         "createCompiledCommandHandlers" => &[],
@@ -2463,11 +2652,19 @@ fn runtime_chunk_declared_dependencies(name: &str) -> &'static [&'static str] {
             &["compiledCommandErrorMessage", "compiledCommandMessage"]
         }
         "registerBrowserCommandHandlers" => &[
+            "assignBrowserLocation",
             "applyBrowserTheme",
             "commandMessage",
+            "downloadBrowserUrl",
             "loadBrowserTheme",
+            "openBrowserUrl",
+            "playMediaSelector",
+            "pushBrowserHistory",
             "replaceBrowserSearchParam",
+            "replaceBrowserHistory",
+            "scrollBrowserTo",
             "setBrowserCookie",
+            "setDocumentElementAttribute",
             "text",
             "writeBrowserRoute",
         ],
@@ -2564,6 +2761,7 @@ fn runtime_chunk_declared_dependencies(name: &str) -> &'static [&'static str] {
             "measureNode",
             "refName",
             "resolveRef",
+            "setInputSelection",
         ],
         "registerCompiledDomRefCommandHandlers" => &[
             "compiledCommandErrorMessage",
@@ -2571,6 +2769,7 @@ fn runtime_chunk_declared_dependencies(name: &str) -> &'static [&'static str] {
             "compiledRefName",
             "measureNode",
             "resolveCompiledRef",
+            "setInputSelection",
         ],
         "registerDomScrollCommandHandlers" => &["commandMessage", "queueScrollIntoView"],
         "registerDomResizeCommandHandlers" => &[
@@ -2663,26 +2862,6 @@ fn runtime_chunk_declared_dependencies(name: &str) -> &'static [&'static str] {
         "startCompiledAppWithoutSubscriptions" => {
             &["compiledCommandErrorMessage", "compiledRefName"]
         }
-        "startServerService" => &[
-            "commandKind",
-            "errorMessage",
-            "findServerRoute",
-            "handleServerRequest",
-            "normalizeServerError",
-            "normalizeServerInitResult",
-            "readServerResources",
-            "readServerRoutes",
-            "runTask",
-        ],
-        "handleServerRequest" => &["normalizeServerError", "runTask"],
-        "findServerRoute" => &["commandKind", "matchServerPath", "serverRequestPath"],
-        "serverRequestPath" => &[],
-        "matchServerPath" => &["trimServerPath"],
-        "trimServerPath" => &[],
-        "normalizeServerError" => &["errorMessage"],
-        "normalizeServerInitResult" => &[],
-        "readServerRoutes" => &[],
-        "readServerResources" => &[],
         "createCompiledSubscriptionHandlersFor" => &[
             "compiledCommandErrorMessage",
             "compiledCommandKind",
@@ -2867,6 +3046,7 @@ fn runtime_chunk_declared_dependencies(name: &str) -> &'static [&'static str] {
             "selectedFileByTestId",
         ],
         "multipartFormBody" => &["hasOwn", "selectedFileByTestId"],
+        "selectedFileByTestId" => &["cssAttr"],
         "primitiveDecoder" => &["decode", "decoderTypeError"],
         "runDecoder" => &["decode"],
         "decoderSpecEntries" => &["decoderFieldName", "plainObject"],
@@ -2899,7 +3079,10 @@ fn runtime_chunk_declared_dependencies(name: &str) -> &'static [&'static str] {
         "parseStoredValue" => &["commandValueName"],
         "downloadWithBrowser" => &[],
         "importWithBrowser" => &["readImportedFile"],
-        "readImportedFile" => &[],
+        "readImportedFile" => &["readBlobAsBase64", "readBlobAsDataUrl"],
+        "readBlobAsBase64" => &["bytesToBase64String"],
+        "readBlobAsDataUrl" => &["readBlobAsBase64"],
+        "bytesToBase64String" => &[],
         _ => &[],
     }
 }
@@ -3002,12 +3185,14 @@ fn build_file(
         module_emit_options.export_top_level = false;
     }
 
-    for import in parse_imports(&input, &source)? {
+    let imports = parse_imports(&input, &source)?;
+    let runtime_symbol_reads = js_emit::collect_runtime_symbol_reads(source);
+    for import in &imports {
         if !is_closkell_import_path(&import.path) {
             continue;
         }
         let import_output = output_for_import(output, &import.path)?;
-        if !import_has_runtime_names(path, &import, modules)? {
+        if !import_has_runtime_names(path, &import, modules, &runtime_symbol_reads)? {
             remove_stale_type_only_output(path, &import.path, &import_output, visited)?;
             continue;
         }
@@ -3057,14 +3242,15 @@ fn build_file(
                 );
             }
             FrameworkTarget::Server => {
-                let init_takes_boot = emitted_function_arity(&emitted, "init").unwrap_or(0) > 0;
-                js_server::wrap_server_app_module(&mut emitted, init_takes_boot);
+                let main_takes_boot = emitted_function_arity(&emitted, "main").unwrap_or(0) > 0;
+                js_server::wrap_server_app_module(&mut emitted, main_takes_boot);
             }
             FrameworkTarget::Core => {
                 return Err("build --app is not supported for --target core".to_string());
             }
         }
     }
+    rewrite_relative_host_imports(path, output, &imports, &mut emitted.code);
     let runtime_exports = collect_runtime_import_exports(&emitted.code);
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)
@@ -3111,23 +3297,119 @@ fn build_file(
     Ok(())
 }
 
+fn rewrite_relative_host_imports(
+    source_path: &Path,
+    output_path: &Path,
+    imports: &[ImportSpec],
+    code: &mut String,
+) {
+    for import in imports {
+        if is_closkell_import_path(&import.path) || !is_relative_import_path(&import.path) {
+            continue;
+        }
+        let source_parent = source_path.parent().unwrap_or_else(|| Path::new("."));
+        let target = normalize_path_lexical(source_parent.join(&import.path));
+        let output_parent = output_path.parent().unwrap_or_else(|| Path::new("."));
+        let next = relative_import_path(output_parent, &target);
+        if next == import.path {
+            continue;
+        }
+        *code = replace_import_specifier(code, &import.path, &next);
+    }
+}
+
+fn is_relative_import_path(path: &str) -> bool {
+    path.starts_with("./") || path.starts_with("../")
+}
+
+fn replace_import_specifier(code: &str, previous: &str, next: &str) -> String {
+    let previous_escaped = escape_js_string_literal(previous);
+    let next_escaped = escape_js_string_literal(next);
+    code.replace(
+        &format!("from \"{}\"", previous_escaped),
+        &format!("from \"{}\"", next_escaped),
+    )
+    .replace(
+        &format!("import \"{}\"", previous_escaped),
+        &format!("import \"{}\"", next_escaped),
+    )
+}
+
+fn escape_js_string_literal(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn relative_import_path(from_dir: &Path, target: &Path) -> String {
+    let from = normalize_path_lexical(from_dir);
+    let target = normalize_path_lexical(target);
+    let from_components = normal_path_components(&from);
+    let target_components = normal_path_components(&target);
+    let mut common = 0;
+    while common < from_components.len()
+        && common < target_components.len()
+        && from_components[common] == target_components[common]
+    {
+        common += 1;
+    }
+
+    let mut parts = Vec::new();
+    for _ in common..from_components.len() {
+        parts.push("..".to_string());
+    }
+    parts.extend(target_components[common..].iter().cloned());
+    let mut path = if parts.is_empty() {
+        ".".to_string()
+    } else {
+        parts.join("/")
+    };
+    if !path.starts_with('.') {
+        path = format!("./{}", path);
+    }
+    path
+}
+
+fn normal_path_components(path: &Path) -> Vec<String> {
+    path.components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => Some(value.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn normalize_path_lexical(path: impl AsRef<Path>) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.as_ref().components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::RootDir | Component::Prefix(_) | Component::Normal(_) => {
+                out.push(component.as_os_str());
+            }
+        }
+    }
+    out
+}
+
 fn import_has_runtime_names(
     source_path: &Path,
     import: &ImportSpec,
     modules: &HashMap<PathBuf, ModuleInfo>,
+    runtime_symbol_reads: &BTreeSet<String>,
 ) -> Result<bool, String> {
     if !is_closkell_import_path(&import.path) {
-        return Ok(import
-            .names
-            .iter()
-            .any(|name| js_emit::is_runtime_import_name(&name.name)));
+        return Ok(import.names.iter().any(|name| {
+            runtime_symbol_reads.contains(&name.name) || js_emit::is_runtime_import_name(&name.name)
+        }));
     }
     let import_source = resolve_import_source(source_path, &import.path)?;
     let canonical = fs::canonicalize(&import_source)
         .map_err(|err| format!("failed to resolve {}: {}", import_source.display(), err))?;
     let imported = modules.get(&canonical);
     Ok(import.names.iter().any(|name| {
-        js_emit::is_runtime_import_name(&name.name)
+        (js_emit::is_runtime_import_name(&name.name) || runtime_symbol_reads.contains(&name.name))
             && !imported.is_some_and(|module| module.macros.contains_key(&name.imported))
     }))
 }
@@ -3633,6 +3915,7 @@ fn collect_called_names(
             };
             if let ExprKind::Symbol(name) = &head.kind {
                 match name.as_str() {
+                    "js-global" | "js-import" => return,
                     "fn" => {
                         let mut nested_bound = bound.clone();
                         if let Some(params) = args.first() {
@@ -4839,7 +5122,7 @@ fn require_app_exports(
     }
     let required: &[&str] = match target {
         FrameworkTarget::Browser => &["init", "update", "view"],
-        FrameworkTarget::Server => &["init", "update", "routes", "resources"],
+        FrameworkTarget::Server => &["main"],
         FrameworkTarget::Core => &[],
     };
     let missing = required
@@ -5687,6 +5970,7 @@ fn collect_symbol_refs_list(items: &[Expr], scope: &BTreeSet<String>, refs: &mut
     };
 
     match head {
+        "js-global" | "js-import" => {}
         "fn" if items.len() >= 3 => {
             let mut inner_scope = scope.clone();
             collect_pattern_bindings(&items[1], &mut inner_scope);

@@ -1,0 +1,327 @@
+(import "path" [(default path)])
+(import "strip-json-comments" [(default stripJsonComments)])
+(import "./host-env.clsk" [hostArgv
+                           hostCwd
+                           hostEnv
+                           readTextFileSync])
+(import "../src/features/media-roots.clsk" [(getLibraryKey as closkellGetLibraryKey)
+                                            (normalizeMediaRoots as closkellNormalizeMediaRoots)])
+(import "../src/features/mcp-config.clsk" [(parseMcpConfig as parseCloskellMcpConfig)])
+
+(def jsNumber (js-global Number))
+(def jsMath (js-global Math))
+(def jsConsole (js-global console))
+(def jsParseInt (js-global parseInt))
+(def DEFAULT_CONFIG_PATH (path.join (hostCwd) "config.jsonc"))
+(def AI_PROVIDERS ["openrouter" "lmstudio" "openai-compatible"])
+
+(ann nonEmptyString? (Fn [Js] Bool))
+(defn nonEmptyString? [value]
+  (and (string? value) (not (= value ""))))
+
+(ann errorMessage (Fn [Js String] String))
+(defn errorMessage [error fallback]
+  (if (and (object? error) (string? error.message))
+      error.message
+      fallback))
+
+(ann absoluteOrCwd (Fn [String] String))
+(defn absoluteOrCwd [value]
+  (if (path.isAbsolute value) value (path.join (hostCwd) value)))
+
+(ann absoluteOrResolveCwd (Fn [String] String))
+(defn absoluteOrResolveCwd [value]
+  (if (path.isAbsolute value) value (path.resolve (hostCwd) value)))
+
+(ann configPathFromArgv (Fn [Js Number] Js))
+(defn configPathFromArgv [argv index]
+  (if (>= index (count argv))
+      nil
+      (let [arg (nth argv index)
+            nextArg (nth argv (+ index 1))]
+        (if (and (= arg "--config-path") (string? nextArg))
+            (absoluteOrResolveCwd nextArg)
+            (if (and (string? arg) (starts-with? arg "--config-path="))
+                (absoluteOrResolveCwd (string-slice arg (count "--config-path=")))
+                (configPathFromArgv argv (+ index 1)))))))
+
+(ann getConfigPath (Fn [] String))
+(defn getConfigPath []
+  (let [env (hostEnv)
+        envPath env.CONFIG_PATH]
+    (if (nonEmptyString? envPath)
+        (absoluteOrCwd envPath)
+        (let [fromArgv (configPathFromArgv (hostArgv) 0)]
+          (if (string? fromArgv) fromArgv DEFAULT_CONFIG_PATH)))))
+
+(ann normalizeEditableFolders (Fn [Js] Js))
+(defn normalizeEditableFolders [raw]
+  (if (vector? raw)
+      (filter (map raw (fn [folder] (trim (str folder))))
+              (fn [folder] (not (= folder ""))))
+      []))
+
+(ann normalizeMediaDirEntry (Fn [Js] Js))
+(defn normalizeMediaDirEntry [entry]
+  (if (or (not (object? entry)) (vector? entry))
+      (fail "Each mediaDirs entry must be an object with a path")
+      (let [rawPath entry.path
+            rawName entry.name
+            rawEditableFolders entry.editableFolders]
+        (if (not (nonEmptyString? rawPath))
+            (fail "Each mediaDirs entry requires a path")
+            (let [base {:path (trim rawPath)
+                        :editableFolders (normalizeEditableFolders rawEditableFolders)}]
+              (if (nonEmptyString? rawName)
+                  (object-assoc base "name" (trim rawName))
+                  base))))))
+
+(ann normalizeMediaDirs (Fn [Js] Js))
+(defn normalizeMediaDirs [raw]
+  (if (vector? raw)
+      (map raw normalizeMediaDirEntry)
+      nil))
+
+(ann normalizeShareLinkDomain (Fn [String] String))
+(defn normalizeShareLinkDomain [value]
+  (let [trimmed (trim value)
+        withoutSlash (if (ends-with? trimmed "/")
+                         (string-slice trimmed 0 (- (count trimmed) 1))
+                         trimmed)]
+    (if (or (starts-with? withoutSlash "http://")
+            (starts-with? withoutSlash "https://"))
+        withoutSlash
+        (str "https://" withoutSlash))))
+
+(ann normalizedDomains (Fn [Js] Js))
+(defn normalizedDomains [raw]
+  (if (vector? raw)
+      (let [items (filter (map raw (fn [item] (lower-case (trim (str item)))))
+                          (fn [item] (not (= item ""))))]
+        (if (> (count items) 0) items nil))
+      nil))
+
+(ann validSessionMaxAge (Fn [Js] Js))
+(defn validSessionMaxAge [raw]
+  (if (and (number? raw) (jsNumber.isFinite raw) (> raw 0))
+      (jsMath.floor raw)
+      nil))
+
+(ann authConfigFromParsed (Fn [Js] Js))
+(defn authConfigFromParsed [auth]
+  (if (object? auth)
+      {:enabled (= auth.enabled true)
+       :password (if (string? auth.password) auth.password nil)
+       :adminAccessDomains (normalizedDomains auth.adminAccessDomains)
+       :sessionMaxAgeSeconds (validSessionMaxAge auth.sessionMaxAgeSeconds)
+       :secureCookies (if (bool? auth.secureCookies) auth.secureCookies nil)}
+      {:enabled false}))
+
+(ann aiConfigFromParsed (Fn [Js] Js))
+(defn aiConfigFromParsed [ai]
+  (if (and (object? ai) (includes? AI_PROVIDERS ai.provider))
+      {:provider ai.provider
+       :apiKey (if (string? ai.apiKey) ai.apiKey nil)
+       :baseUrl (if (string? ai.baseUrl) ai.baseUrl nil)
+       :model (if (string? ai.model) ai.model nil)
+       :systemPrompt (if (string? ai.systemPrompt) ai.systemPrompt nil)}
+      nil))
+
+(ann normalizeMediaRoots (Fn [String Js Js] Js))
+(defn normalizeMediaRoots [mediaDir editableFolders mediaDirs]
+  (closkellNormalizeMediaRoots mediaDir editableFolders mediaDirs))
+
+(ann getLibraryKey (Fn [String Js] String))
+(defn getLibraryKey [mediaDir roots]
+  (closkellGetLibraryKey mediaDir roots))
+
+(ann finalizeMediaConfig (Fn [Js] Js))
+(defn finalizeMediaConfig [cfg]
+  (let [mediaRoots (normalizeMediaRoots cfg.mediaDir cfg.editableFolders cfg.mediaDirs)
+        primaryRoot (first mediaRoots)
+        withMediaDir (object-assoc cfg "mediaDir" primaryRoot.path)
+        withEditable (object-assoc withMediaDir
+                                   "editableFolders"
+                                   (if (= (count mediaRoots) 1)
+                                       primaryRoot.editableFolders
+                                       cfg.editableFolders))
+        withRoots (object-assoc withEditable "mediaRoots" mediaRoots)]
+    (object-assoc withRoots "libraryKey" (getLibraryKey primaryRoot.path mediaRoots))))
+
+(ann parseMcpConfig (Fn [Js] Js))
+(defn parseMcpConfig [parsed]
+  (let [mcp (parseCloskellMcpConfig parsed)]
+    (if (some? mcp) mcp nil)))
+
+(ann withAuthField (Fn [Js String Js] Js))
+(defn withAuthField [cfg key value]
+  (let [auth (if (object? cfg.auth) cfg.auth {:enabled false})]
+    (object-assoc cfg "auth" (object-assoc auth key value))))
+
+(ann withAiProvider (Fn [Js String] Js))
+(defn withAiProvider [cfg provider]
+  (if (includes? AI_PROVIDERS provider)
+      (let [ai (if (object? cfg.ai) cfg.ai {:provider provider})]
+        (object-assoc cfg "ai" (object-assoc ai "provider" provider)))
+      cfg))
+
+(ann withAiField (Fn [Js String String] Js))
+(defn withAiField [cfg key value]
+  (let [ai (if (object? cfg.ai) cfg.ai {:provider "openai-compatible"})]
+    (object-assoc cfg "ai" (object-assoc ai key value))))
+
+(ann envBool (Fn [Js] Bool))
+(defn envBool [value]
+  (or (= value "true") (= value "1")))
+
+(ann envPositiveInt (Fn [Js] Js))
+(defn envPositiveInt [value]
+  (let [n (jsParseInt value 10)]
+    (if (and (not (jsNumber.isNaN n)) (> n 0))
+        n
+        nil)))
+
+(ann applyEnvOverrides (Fn [Js] Js))
+(defn applyEnvOverrides [cfg]
+  (let [env (hostEnv)
+        cfg1 (if (nonEmptyString? env.MEDIA_DIR)
+                 (object-assoc (object-assoc cfg "mediaDir" env.MEDIA_DIR)
+                               "mediaDirs"
+                               nil)
+                 cfg)
+        cfg2 (if (nonEmptyString? env.EDITABLE_FOLDERS)
+                 (object-assoc cfg1
+                               "editableFolders"
+                               (filter (map (split env.EDITABLE_FOLDERS ",")
+                                            (fn [folder] (trim folder)))
+                                       (fn [folder] (not (= folder "")))))
+                 cfg1)
+        cfg3 (if (nonEmptyString? env.SHARE_LINK_DOMAIN)
+                 (object-assoc cfg2
+                               "shareLinkDomain"
+                               (normalizeShareLinkDomain env.SHARE_LINK_DOMAIN))
+                 cfg2)
+        cfg4 (if (some? env.AUTH_ENABLED)
+                 (withAuthField cfg3 "enabled" (envBool env.AUTH_ENABLED))
+                 cfg3)
+        cfg5 (if (some? env.AUTH_PASSWORD)
+                 (withAuthField cfg4
+                                "password"
+                                (if (nonEmptyString? env.AUTH_PASSWORD)
+                                    env.AUTH_PASSWORD
+                                    nil))
+                 cfg4)
+        cfg6 (if (nonEmptyString? env.AUTH_ADMIN_ACCESS_DOMAINS)
+                 (withAuthField cfg5
+                                "adminAccessDomains"
+                                (normalizedDomains (split env.AUTH_ADMIN_ACCESS_DOMAINS ",")))
+                 cfg5)
+        cfg7 (if (some? env.AUTH_SESSION_MAX_AGE)
+                 (let [n (envPositiveInt env.AUTH_SESSION_MAX_AGE)]
+                   (if (some? n)
+                       (withAuthField cfg6 "sessionMaxAgeSeconds" n)
+                       cfg6))
+                 cfg6)
+        cfg8 (if (some? env.AUTH_SECURE_COOKIES)
+                 (withAuthField cfg7 "secureCookies" (envBool env.AUTH_SECURE_COOKIES))
+                 cfg7)
+        cfg9 (if (nonEmptyString? env.AI_PROVIDER)
+                 (withAiProvider cfg8 env.AI_PROVIDER)
+                 cfg8)
+        cfg10 (if (nonEmptyString? env.AI_API_KEY)
+                  (withAiField cfg9 "apiKey" env.AI_API_KEY)
+                  cfg9)
+        cfg11 (if (nonEmptyString? env.AI_BASE_URL)
+                  (withAiField cfg10 "baseUrl" env.AI_BASE_URL)
+                  cfg10)
+        cfg12 (if (nonEmptyString? env.AI_MODEL)
+                  (withAiField cfg11 "model" env.AI_MODEL)
+                  cfg11)
+        cfg13 (if (nonEmptyString? env.AI_SYSTEM_PROMPT)
+                  (withAiField cfg12 "systemPrompt" env.AI_SYSTEM_PROMPT)
+                  cfg12)]
+    (finalizeMediaConfig cfg13)))
+
+(ann readConfigFile (Fn [String Bool] Js))
+(defn readConfigFile [configPath isDefaultPath]
+  (try
+   {:path configPath :content (readTextFileSync configPath)}
+   (catch readError
+     (if (and (= readError.code "ENOENT") isDefaultPath)
+         (let [jsonFallback (path.join (hostCwd) "config.json")]
+           {:path jsonFallback :content (readTextFileSync jsonFallback)})
+         (fail (errorMessage readError "Failed to read config"))))))
+
+(ann loadConfigOnce (Fn [] Js))
+(defn loadConfigOnce []
+  (let [configPath (getConfigPath)
+        isDefaultPath (= configPath DEFAULT_CONFIG_PATH)]
+    (try
+     (let [loaded (readConfigFile configPath isDefaultPath)
+           parsed (json-parse
+                   (stripJsonComments loaded.content {:trailingCommas true}))
+           mediaDir (if (string? parsed.mediaDir) parsed.mediaDir (hostCwd))
+           editableFolders (normalizeEditableFolders parsed.editableFolders)
+           mediaDirs (normalizeMediaDirs parsed.mediaDirs)
+           rawShare (if (nonEmptyString? parsed.shareLinkDomain)
+                        (normalizeShareLinkDomain parsed.shareLinkDomain)
+                        nil)
+           configDir (path.dirname loaded.path)
+           dataPath (if (string? parsed.dataPath)
+                        (path.resolve configDir parsed.dataPath)
+                        configDir)]
+       (applyEnvOverrides
+        {:mediaDir mediaDir
+         :editableFolders editableFolders
+         :mediaDirs mediaDirs
+         :mediaRoots []
+         :libraryKey mediaDir
+         :shareLinkDomain rawShare
+         :auth (authConfigFromParsed parsed.auth)
+         :ai (aiConfigFromParsed parsed.ai)
+         :mcp (parseMcpConfig parsed)
+         :dataPath dataPath}))
+     (catch error
+       (if (= error.code "ENOENT")
+           (do
+             (jsConsole.warn (str "Config file not found at " configPath ", using defaults"))
+             (applyEnvOverrides
+              {:mediaDir (hostCwd)
+               :editableFolders []
+               :mediaDirs nil
+               :mediaRoots []
+               :libraryKey (hostCwd)
+               :shareLinkDomain nil
+               :auth {:enabled false :password nil}
+               :mcp nil
+               :dataPath (path.dirname configPath)}))
+           (fail (errorMessage error "Failed to load config")))))))
+
+(def config (loadConfigOnce))
+
+(ann getMediaRoots (Fn [] Js))
+(defn getMediaRoots []
+  config.mediaRoots)
+
+(ann hasMultipleMediaRoots (Fn [] Bool))
+(defn hasMultipleMediaRoots []
+  (> (count config.mediaRoots) 1))
+
+(ann getMediaRootByName (Fn [String] Js))
+(defn getMediaRootByName [name]
+  (let [matches (filter config.mediaRoots
+                        (fn [root]
+                          (= (lower-case root.name) (lower-case name))))]
+    (if (> (count matches) 0) (first matches) nil)))
+
+(ann getMcpConfig (Fn [] Js))
+(defn getMcpConfig []
+  config.mcp)
+
+(ann getDataFilePath (Fn [String] String))
+(defn getDataFilePath [filename]
+  (path.join config.dataPath filename))
+
+(ann getAiConfig (Fn [] Js))
+(defn getAiConfig []
+  (if (some? config.ai) config.ai nil))

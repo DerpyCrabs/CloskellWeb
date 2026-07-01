@@ -27,4 +27,7 @@ run_test "hrweb" "$ROOT_DIR/projects/hrweb" "test:e2e"
 run_test "better-swagger-ui" "$ROOT_DIR/projects/better-swagger-ui" "test:clsk"
 run_test "better-swagger-ui" "$ROOT_DIR/projects/better-swagger-ui" "test:e2e"
 
+run_test "derp-media-server" "$ROOT_DIR/projects/derp-media-server" "test:unit"
+run_test "derp-media-server" "$ROOT_DIR/projects/derp-media-server" "test:e2e"
+
 printf '\nAll example project tests passed.\n'

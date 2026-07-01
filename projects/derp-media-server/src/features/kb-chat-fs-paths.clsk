@@ -1,0 +1,65 @@
+(import "./knowledge-base.clsk" [getKnowledgeBaseRootForPath])
+(import "./source-context.clsk" [normalizeSlashes])
+
+(ann stripLeadingSlashes (Fn [String] String))
+(defn stripLeadingSlashes [value]
+  (regex-capture value "^/*(.*)$" ""))
+
+(ann stripEdgeSlashes (Fn [String] String))
+(defn stripEdgeSlashes [value]
+  (regex-capture value "^/*(.*?)/*$" ""))
+
+(ann normalizeKbKey (Fn [String] String))
+(defn normalizeKbKey [kbRoot]
+  (stripEdgeSlashes (normalizeSlashes kbRoot)))
+
+(ann assertKbRelativePathSafe (Fn [String] Js))
+(defn assertKbRelativePathSafe [kbRelative]
+  (let [rel (stripLeadingSlashes (normalizeSlashes kbRelative))]
+    (if (or (= rel "") (= rel "."))
+        nil
+        (let [segments (filter (split rel "/") (fn [segment] (not (= segment ""))))]
+          (if (any? segments (fn [segment] (= segment "..")))
+              (fail "Path must not contain \"..\"")
+              nil)))))
+
+(ann kbRelativeToMediaPath (Fn [String String] String))
+(defn kbRelativeToMediaPath [kbRoot kbRelative]
+  (let [kb (normalizeKbKey kbRoot)]
+    (if (= kb "")
+        (fail "Invalid knowledge base root")
+        (let [initialRel (stripLeadingSlashes (normalizeSlashes kbRelative))
+              _ (assertKbRelativePathSafe initialRel)
+              rel (if (starts-with? initialRel (str kb "/"))
+                      (string-slice initialRel (+ (count kb) 1))
+                      initialRel)
+              _ (assertKbRelativePathSafe rel)
+              mediaPath (if (= rel "") kb (str kb "/" rel))
+              resolvedKb (getKnowledgeBaseRootForPath mediaPath [kb])]
+          (if (not (= resolvedKb kb))
+              (fail "Path escapes knowledge base root")
+              (normalizeSlashes mediaPath))))))
+
+(ann mediaPathToKbRelative (Fn [String String] String))
+(defn mediaPathToKbRelative [kbRoot mediaPath]
+  (let [kb (normalizeKbKey kbRoot)
+        media (normalizeSlashes mediaPath)]
+    (if (= media kb)
+        ""
+        (if (starts-with? media (str kb "/"))
+            (string-slice media (+ (count kb) 1))
+            (fail "Path is not under this knowledge base")))))
+
+(ann collapseDuplicateKbPrefix (Fn [String String] String))
+(defn collapseDuplicateKbPrefix [kb media]
+  (let [dupPrefix (str kb "/" kb "/")]
+    (if (starts-with? media dupPrefix)
+        (collapseDuplicateKbPrefix kb (str kb "/" (string-slice media (count dupPrefix))))
+        media)))
+
+(ann canonicalKbRelativePath (Fn [String String] String))
+(defn canonicalKbRelativePath [kbRoot kbRelative]
+  (let [kb (normalizeKbKey kbRoot)
+        media (kbRelativeToMediaPath kbRoot kbRelative)
+        collapsed (collapseDuplicateKbPrefix kb media)]
+    (mediaPathToKbRelative kbRoot collapsed)))

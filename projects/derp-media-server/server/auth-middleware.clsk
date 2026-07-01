@@ -1,0 +1,123 @@
+(import "../lib/config.clsk" [config])
+(import "../lib/auth.clsk" [verifySessionValue SESSION_COOKIE createAuthSessionValue])
+
+(def PUBLIC_PREFIXES ["/login" "/api/auth/" "/share" "/api/share/"])
+
+(ann headerString (Fn [Js String] (Option String)))
+(defn headerString [headers name]
+  (let [value (object-get headers name)]
+    (if (string? value) value nil)))
+
+(ann firstCommaValue (Fn [String] String))
+(defn firstCommaValue [value]
+  (trim (first (split value ","))))
+
+(ann isAssetRequest (Fn [String] Bool))
+(defn isAssetRequest [pathname]
+  (if (or (starts-with? pathname "/@")
+          (starts-with? pathname "/node_modules/")
+          (starts-with? pathname "/src/"))
+      true
+      (let [lastSegment (last (split pathname "/"))]
+        (and (includes? lastSegment ".")
+             (not (starts-with? pathname "/api/"))))))
+
+(ann publicPrefixMatches? (Fn [String String] Bool))
+(defn publicPrefixMatches? [pathname prefix]
+  (or (= pathname prefix) (starts-with? pathname prefix)))
+
+(ann isPublic (Fn [String] Bool))
+(defn isPublic [pathname]
+  (if (isAssetRequest pathname)
+      true
+      (any? PUBLIC_PREFIXES (fn [prefix] (publicPrefixMatches? pathname prefix)))))
+
+(ann requestPathname (Fn [Js] String))
+(defn requestPathname [request]
+  (let [rawHost (headerString request.headers "host")
+        host (if (some? rawHost) rawHost "localhost")
+        href (url-resolve request.url (str "http://" host))
+        pathname (if (string? href) (url-pathname href) nil)]
+    (if (string? pathname) pathname "/")))
+
+(ann requestHost (Fn [Js] String))
+(defn requestHost [request]
+  (let [forwarded (headerString request.headers "x-forwarded-host")
+        forwardedHost (if (some? forwarded) (firstCommaValue forwarded) nil)
+        rawHost (headerString request.headers "host")
+        hostHeader (if (some? forwardedHost) forwardedHost rawHost)]
+    (if (some? hostHeader)
+        (let [hostname (lower-case (trim (first (split hostHeader ":"))))]
+          (if (= hostname "") "" hostname))
+        "")))
+
+(ann adminDomainAllowed? (Fn [Js] Bool))
+(defn adminDomainAllowed? [request]
+  (let [auth config.auth
+        domains (if (object? auth) auth.adminAccessDomains nil)]
+    (if (or (not (vector? domains)) (= (count domains) 0))
+        true
+        (let [host (requestHost request)]
+          (and (not (= host "")) (includes? domains host))))))
+
+(ann sendApiAuthFailure (Fn [Js Number String] Nil))
+(defn sendApiAuthFailure [reply code message]
+  (let [codedReply (reply.code code)]
+    (do
+      (codedReply.send {:error message})
+      nil)))
+
+(ann redirectLogin (Fn [Js] Nil))
+(defn redirectLogin [reply]
+  (do
+    (reply.redirect "/login")
+    nil))
+
+(ann renewSession (Fn [Js] Nil))
+(defn renewSession [reply]
+  (let [renewed (createAuthSessionValue)]
+    (if (some? renewed)
+        (let [cookie (unsafe-cast Js renewed)]
+          (do
+            (reply.setCookie cookie.name cookie.value cookie.options)
+            nil))
+        nil)))
+
+(ann handleVerifiedSession (Fn [Js Js String Js] Nil))
+(defn handleVerifiedSession [request reply pathname done]
+  (if (not (adminDomainAllowed? request))
+      (if (starts-with? pathname "/api/")
+          (sendApiAuthFailure reply 403 "Admin access not allowed from this domain")
+          (redirectLogin reply))
+      (do
+        (renewSession reply)
+        (done)
+        nil)))
+
+(ann handleMissingSession (Fn [Js String] Nil))
+(defn handleMissingSession [reply pathname]
+  (if (starts-with? pathname "/api/")
+      (sendApiAuthFailure reply 401 "Unauthorized")
+      (redirectLogin reply)))
+
+(ann authEnabled? (Fn [] Bool))
+(defn authEnabled? []
+  (and (object? config.auth) (= config.auth.enabled true)))
+
+(ann authMiddleware (Fn [Js Js Js] Nil))
+(defn authMiddleware [request reply done]
+  (if (not (authEnabled?))
+      (do
+        (done)
+        nil)
+      (let [pathname (requestPathname request)]
+        (if (isPublic pathname)
+            (do
+              (done)
+              nil)
+            (let [sessionValue (if (object? request.cookies)
+                                   (object-get request.cookies SESSION_COOKIE)
+                                   nil)]
+              (if (verifySessionValue sessionValue)
+                  (handleVerifiedSession request reply pathname done)
+                  (handleMissingSession reply pathname)))))))

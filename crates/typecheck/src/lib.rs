@@ -1377,7 +1377,11 @@ impl Inferencer {
                 "let" => return self.infer_let(span, args, env),
                 "if" => return self.infer_if(span, args, env),
                 "match" => return self.infer_match(span, args, env),
+                "try" => return self.infer_try(span, args, env),
                 "do" => return self.infer_do(args, env),
+                "new" => return self.infer_new(name, args, env),
+                "js-global" => return self.infer_js_global(name, args),
+                "js-import" => return self.infer_js_import(name, args),
                 "unsafe-cast" => return self.infer_unsafe_cast(name, args, env),
                 "Msg.of" => return self.infer_msg_of(name, args, env),
                 "Msg.with" => return self.infer_msg_with(name, args, env),
@@ -1655,6 +1659,55 @@ impl Inferencer {
         }
         let result = self.check_type_to_type(&overload.result, &mut vars, &actuals);
         self.resolve(result)
+    }
+
+    fn infer_new(&mut self, name: &str, args: &[Expr], env: &mut HashMap<String, Type>) -> Type {
+        if args.is_empty() {
+            self.diagnostics.push(Diagnostic::error(
+                Span::default(),
+                format!("{} expects a constructor and optional arguments", name),
+            ));
+            return Type::Js;
+        }
+
+        for arg in args {
+            self.infer_expr(arg, env);
+        }
+        Type::Js
+    }
+
+    fn infer_js_global(&mut self, name: &str, args: &[Expr]) -> Type {
+        let [global] = args else {
+            self.diagnostics.push(Diagnostic::error(
+                Span::default(),
+                format!("{} expects one global symbol", name),
+            ));
+            return Type::Js;
+        };
+        if !matches!(global.kind, ExprKind::Symbol(_)) {
+            self.diagnostics.push(Diagnostic::error(
+                global.span,
+                "js-global expects a symbol name",
+            ));
+        }
+        Type::Js
+    }
+
+    fn infer_js_import(&mut self, name: &str, args: &[Expr]) -> Type {
+        let [specifier] = args else {
+            self.diagnostics.push(Diagnostic::error(
+                Span::default(),
+                format!("{} expects one module specifier string", name),
+            ));
+            return Type::Js;
+        };
+        if !matches!(specifier.kind, ExprKind::String(_)) {
+            self.diagnostics.push(Diagnostic::error(
+                specifier.span,
+                "js-import expects a module specifier string",
+            ));
+        }
+        Type::Js
     }
 
     fn check_type_to_type(
@@ -2410,6 +2463,59 @@ impl Inferencer {
         }
 
         result_ty.unwrap_or_else(|| self.fresh())
+    }
+
+    fn infer_try(&mut self, span: Span, args: &[Expr], env: &mut HashMap<String, Type>) -> Type {
+        let [body, catch_form] = args else {
+            self.diagnostics.push(Diagnostic::error(
+                span,
+                "try expects a body and `(catch error fallback)`",
+            ));
+            for arg in args {
+                self.infer_expr(arg, env);
+            }
+            return self.fresh();
+        };
+
+        let catch_items = match &catch_form.kind {
+            ExprKind::List(items) => items,
+            _ => {
+                self.diagnostics.push(Diagnostic::error(
+                    catch_form.span,
+                    "try expects `(catch error fallback)`",
+                ));
+                return self.infer_expr(body, env);
+            }
+        };
+        let [catch_head, catch_name, catch_body] = catch_items.as_slice() else {
+            self.diagnostics.push(Diagnostic::error(
+                catch_form.span,
+                "try expects `(catch error fallback)`",
+            ));
+            return self.infer_expr(body, env);
+        };
+        if !matches_symbol(catch_head, "catch") {
+            self.diagnostics.push(Diagnostic::error(
+                catch_head.span,
+                "try catch clause must start with `catch`",
+            ));
+        }
+        let ExprKind::Symbol(catch_symbol) = &catch_name.kind else {
+            self.diagnostics.push(Diagnostic::error(
+                catch_name.span,
+                "catch error binding must be a symbol",
+            ));
+            return self.infer_expr(body, env);
+        };
+
+        let body_ty = self.infer_expr(body, env);
+        let mut catch_env = env.clone();
+        if catch_symbol != "_" {
+            catch_env.insert(catch_symbol.clone(), Type::Js);
+        }
+        let catch_ty = self.infer_expr(catch_body, &mut catch_env);
+        self.unify(body_ty.clone(), catch_ty, catch_body.span);
+        self.resolve(body_ty)
     }
 
     fn infer_pattern(
@@ -9808,6 +9914,9 @@ fn collect_symbols(expr: &Expr, symbols: &mut BTreeSet<String>) {
         }
         ExprKind::List(items) => {
             if let Some((head, args)) = items.split_first() {
+                if matches_symbol(head, "js-global") || matches_symbol(head, "js-import") {
+                    return;
+                }
                 if matches!(&head.kind, ExprKind::Symbol(_)) {
                     for item in args {
                         collect_symbols(item, symbols);
@@ -10060,6 +10169,11 @@ mod tests {
                     .required_fields(["name", "value"])
                     .field("name", CheckType::String)
                     .field("value", CheckType::String),
+            )
+            .command_schema(
+                CommandSchemaRule::new("browser/document-title")
+                    .required_fields(["title"])
+                    .field("title", CheckType::String),
             )
             .command_schema(test_storage_get_command_schema())
             .command_schema(test_storage_set_command_schema())
@@ -11735,6 +11849,41 @@ mod tests {
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
         assert_eq!(result.forms.len(), 1);
         assert!(result.forms[0].ty.starts_with("(Fn ["));
+    }
+
+    #[test]
+    fn new_constructor_interop_types_as_js() {
+        let result = check(
+            "(def Widget (unsafe-cast Js nil))\n\
+             (new Widget {:enabled true})",
+        );
+
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert_eq!(result.forms[1].ty, "Js");
+    }
+
+    #[test]
+    fn js_global_interop_types_as_js() {
+        let result = check("(js-global Promise)");
+
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert_eq!(result.forms[0].ty, "Js");
+    }
+
+    #[test]
+    fn js_import_interop_types_as_js() {
+        let result = check("(js-import \"vite\")");
+
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert_eq!(result.forms[0].ty, "Js");
+    }
+
+    #[test]
+    fn infers_try_catch_result() {
+        let result = check("(try (fail \"boom\") (catch err err.message))");
+
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert_eq!(result.forms[0].ty, "Js");
     }
 
     #[test]

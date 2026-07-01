@@ -1,0 +1,222 @@
+(import "../../model.clsk" [AppState])
+(import "../../../lib/types.clsk" [FileItem MediaType])
+(import "../media-urls.clsk" [MediaShareContext
+                              buildAudioMetadataUrl
+                              buildMediaUrl
+                              buildThumbnailUrl])
+(import "../media-utils.clsk" [getMediaType])
+
+(ann emptyMediaFileItem (Fn [] FileItem))
+(defn emptyMediaFileItem []
+  {:name ""
+   :path ""
+   :type MediaType.OTHER
+   :size 0
+   :extension ""
+   :isDirectory false
+   :isVirtual nil
+   :viewCount nil
+   :shareToken nil
+   :thumbnailGenerated nil})
+
+(ann mediaPathParts (Fn [String] (Vector String)))
+(defn mediaPathParts [path]
+  (filter (split (if (string? path) path "") "/") (fn [part] (not (= part "")))))
+
+(ann mediaFileNameFromPath (Fn [String] String))
+(defn mediaFileNameFromPath [path]
+  (let [parts (mediaPathParts path)
+        name (last parts)]
+    (if (some? name) name path)))
+
+(ann mediaExtensionFromPath (Fn [String] String))
+(defn mediaExtensionFromPath [path]
+  (let [name (mediaFileNameFromPath path)
+        parts (split name ".")
+        ext (last parts)]
+    (if (and (some? ext) (> (count parts) 1)) (lower-case ext) "")))
+
+(ann mediaFileItemFromPath (Fn [String] FileItem))
+(defn mediaFileItemFromPath [path]
+  (let [ext (mediaExtensionFromPath path)]
+    {:name (mediaFileNameFromPath path)
+     :path path
+     :type (getMediaType ext)
+     :size 0
+     :extension ext
+     :isDirectory false
+     :isVirtual nil
+     :viewCount nil
+     :shareToken nil
+     :thumbnailGenerated true}))
+
+(ann selectedFile (Fn [AppState] (Option FileItem)))
+(defn selectedFile [state]
+  (match state.viewingPath
+    nil nil
+    (some path)
+      (find state.files (fn [file] (= file.path path)))))
+
+(ann selectedFileOrEmpty (Fn [AppState] FileItem))
+(defn selectedFileOrEmpty [state]
+  (match (selectedFile state)
+    nil (emptyMediaFileItem)
+    (some file) file))
+
+(ann selectedPlayingFile (Fn [AppState] (Option FileItem)))
+(defn selectedPlayingFile [state]
+  (match state.playingPath
+    nil nil
+    (some path)
+      (let [file (find state.files (fn [item] (= item.path path)))]
+        (if (some? file) file (mediaFileItemFromPath path)))))
+
+(ann unsupportedSelected? (Fn [AppState] Bool))
+(defn unsupportedSelected? [state]
+  (match (selectedFile state)
+    nil false
+    (some file) (= file.type MediaType.OTHER)))
+
+(ann adminImageFilesForUpdate (Fn [AppState] (Vector FileItem)))
+(defn adminImageFilesForUpdate [state]
+  (filter state.files (fn [file] (= file.type MediaType.IMAGE))))
+
+(ann adminImageIndexForUpdate (Fn [(Vector FileItem) String] Number))
+(defn adminImageIndexForUpdate [images path]
+  (let [hit (find (map (range 0 (count images))
+                       (fn [index] {:index index :file (nth images index)}))
+                  (fn [entry] (= entry.file.path path)))]
+    (if (some? hit) hit.index -1)))
+
+(ann showAdminAudioChrome? (Fn [AppState] Bool))
+(defn showAdminAudioChrome? [state]
+  (match (selectedPlayingFile state)
+    nil false
+    (some file)
+      (or (= file.type MediaType.AUDIO)
+          (and (= file.type MediaType.VIDEO) state.audioOnly))))
+
+(ann imageZoomLabel (Fn [Number] String))
+(defn imageZoomLabel [zoom]
+  (if (= zoom 0) "Fit" (str zoom "%")))
+
+(ann imageZoomScale (Fn [Number] Number))
+(defn imageZoomScale [zoom]
+  (if (= zoom 0) 1 (/ zoom 100)))
+
+(ann shareRelativePathForState (Fn [AppState String] String))
+(defn shareRelativePathForState [state path]
+  (if (= state.sharePath "")
+      path
+      (if (= path state.sharePath)
+          ""
+          (if (starts-with? path (str state.sharePath "/"))
+              (string-slice path (+ (count state.sharePath) 1) (count path))
+              path))))
+
+(ann shareFileMatchesPath? (Fn [AppState FileItem String] Bool))
+(defn shareFileMatchesPath? [state file path]
+  (or (= file.path path)
+      (= (shareRelativePathForState state file.path) path)))
+
+(ann directShareFileItem (Fn [AppState] (Option FileItem)))
+(defn directShareFileItem [state]
+  (match state.shareToken
+    nil nil
+    (some token)
+      (if (or state.shareIsDirectory (= state.sharePath ""))
+          nil
+          (let [extension (if (= state.shareExtension "")
+                              (mediaExtensionFromPath state.sharePath)
+                              state.shareExtension)
+                mediaType (if (= state.shareMediaType "")
+                              (getMediaType extension)
+                              state.shareMediaType)]
+            {:name (if (= state.shareName "")
+                       (mediaFileNameFromPath state.sharePath)
+                       state.shareName)
+             :path state.sharePath
+             :type mediaType
+             :size 0
+             :extension extension
+             :isDirectory false
+             :isVirtual nil
+             :viewCount nil
+             :shareToken token
+             :thumbnailGenerated true}))))
+
+(ann directShareFileMatchesPath? (Fn [AppState String] Bool))
+(defn directShareFileMatchesPath? [state path]
+  (or (= path state.sharePath)
+      (= path "")
+      (= path ".")))
+
+(ann selectedDirectShareFile (Fn [AppState String] (Option FileItem)))
+(defn selectedDirectShareFile [state path]
+  (if (directShareFileMatchesPath? state path)
+      (directShareFileItem state)
+      nil))
+
+(ann selectedShareViewingFile (Fn [AppState] (Option FileItem)))
+(defn selectedShareViewingFile [state]
+  (match state.viewingPath
+    nil nil
+    (some path)
+      (let [file (find state.shareFiles (fn [item] (shareFileMatchesPath? state item path)))]
+        (if (some? file) file (selectedDirectShareFile state path)))))
+
+(ann selectedSharePlayingFile (Fn [AppState] (Option FileItem)))
+(defn selectedSharePlayingFile [state]
+  (match state.playingPath
+    nil nil
+    (some path)
+      (let [file (find state.shareFiles (fn [item] (shareFileMatchesPath? state item path)))]
+        (if (some? file) file (selectedDirectShareFile state path)))))
+
+(ann shareMediaContext (Fn [AppState] (Option MediaShareContext)))
+(defn shareMediaContext [state]
+  (match state.shareToken
+    nil nil
+    (some token) {:token token :sharePath state.sharePath}))
+
+(ann shareFileMediaUrl (Fn [AppState FileItem] String))
+(defn shareFileMediaUrl [state file]
+  (buildMediaUrl file.path (shareMediaContext state)))
+
+(ann shareFileThumbnailUrl (Fn [AppState FileItem] String))
+(defn shareFileThumbnailUrl [state file]
+  (buildThumbnailUrl file.path (shareMediaContext state)))
+
+(ann mediaAudioMetadataUrlForPath (Fn [AppState String] String))
+(defn mediaAudioMetadataUrlForPath [state path]
+  (match state.shareToken
+    nil (buildAudioMetadataUrl path nil)
+    (some _token) (buildAudioMetadataUrl path (shareMediaContext state))))
+
+(ann mediaAudioMetadataKeyForPath (Fn [AppState String] String))
+(defn mediaAudioMetadataKeyForPath [state path]
+  (str path "|" (mediaAudioMetadataUrlForPath state path)))
+
+(ann shareWorkspacePath? (Fn [String] Bool))
+(defn shareWorkspacePath? [pathname]
+  (regex-test? pathname "^/share/[^/]+/workspace/?$" ""))
+
+(ann workspaceAudioUrlForPath (Fn [AppState String] String))
+(defn workspaceAudioUrlForPath [state path]
+  (if (shareWorkspacePath? state.pathname)
+      (match state.shareToken
+        nil (buildMediaUrl path nil)
+        (some token) (buildMediaUrl path {:token token :sharePath state.sharePath}))
+      (buildMediaUrl path nil)))
+
+(ann workspaceAudioMetadataUrlForPath (Fn [AppState String] String))
+(defn workspaceAudioMetadataUrlForPath [state path]
+  (if (shareWorkspacePath? state.pathname)
+      (match state.shareToken
+        nil (buildAudioMetadataUrl path nil)
+        (some token) (buildAudioMetadataUrl path {:token token :sharePath state.sharePath}))
+      (buildAudioMetadataUrl path nil)))
+
+(ann workspaceAudioKey (Fn [String String] String))
+(defn workspaceAudioKey [path url]
+  (str path "|" url))

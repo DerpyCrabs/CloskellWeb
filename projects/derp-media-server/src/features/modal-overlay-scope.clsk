@@ -1,0 +1,16 @@
+(type ModalOverlayScope String)
+
+(def backdropBase "inset-0 flex items-center justify-center bg-black/50 p-4")
+
+(ann overlayPositionClass (Fn [Js] String))
+(defn overlayPositionClass [scope]
+  (if (= scope "window") "absolute" "fixed"))
+
+(ann modalDialogBackdropClass (Fn [Js] String))
+(defn modalDialogBackdropClass [scope]
+  (str (overlayPositionClass scope) " " backdropBase " z-60"))
+
+(ann shareDialogBackdropClass (Fn [Js] String))
+(defn shareDialogBackdropClass [scope]
+  (let [z (if (= scope "window") "z-60" "z-550000")]
+    (str (overlayPositionClass scope) " " backdropBase " " z)))

@@ -1,0 +1,24 @@
+(def jsGlobalThis (js-global globalThis))
+(def layerRootBox (unsafe-cast Js [nil]))
+
+(ann boxGet (Fn [Js] Js))
+(defn boxGet [box]
+  (nth box 0))
+
+(ann boxSet (Fn [Js Js] Js))
+(defn boxSet [box value]
+  (box.splice 0 1 value))
+
+(ann getFloatingLayerMount (Fn [] Js))
+(defn getFloatingLayerMount []
+  (let [existing (boxGet layerRootBox)]
+    (if (some? existing)
+        existing
+        (let [doc jsGlobalThis.document
+              root (doc.createElement "div")]
+          (do
+            (root.setAttribute "data-floating-layer-root" "")
+            (root.style.setProperty "isolation" "isolate")
+            (doc.body.appendChild root)
+            (boxSet layerRootBox root)
+            root)))))

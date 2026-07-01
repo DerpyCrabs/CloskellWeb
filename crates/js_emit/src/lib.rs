@@ -239,6 +239,7 @@ pub fn emit_module_with_types_and_options(
 ) -> EmitResult {
     let prelude_code = options.prelude_code.clone();
     let mut emitter = Emitter::new(source, expr_types, options);
+    let runtime_symbol_reads = collect_runtime_symbol_reads(source);
     let mut import_lines = Vec::new();
     let mut lines = Vec::new();
     let mut exports = BTreeMap::new();
@@ -248,7 +249,7 @@ pub fn emit_module_with_types_and_options(
             if let Some(import) = parse_import_form(form) {
                 match import {
                     Ok(spec) => {
-                        if let Some(code) = emit_import(&spec) {
+                        if let Some(code) = emit_import(&spec, &runtime_symbol_reads) {
                             import_lines.push(EmittedLine {
                                 code,
                                 source_offset: form.span.start,
@@ -720,9 +721,89 @@ fn is_foreign_form(expr: &Expr) -> bool {
     matches!(&expr.kind, ExprKind::List(items) if items.first().is_some_and(|head| matches_symbol(head, "foreign")))
 }
 
-fn emit_import(spec: &ImportSpec) -> Option<String> {
+fn is_import_form(expr: &Expr) -> bool {
+    matches!(&expr.kind, ExprKind::List(items) if items.first().is_some_and(|head| matches_symbol(head, "import")))
+}
+
+pub fn collect_runtime_symbol_reads(source: &SourceFile) -> BTreeSet<String> {
+    let mut reads = BTreeSet::new();
+    for form in &source.forms {
+        if is_import_form(form) || is_type_form(form) || is_ann_form(form) || is_foreign_form(form)
+        {
+            continue;
+        }
+        collect_runtime_symbol_reads_expr(form, &mut reads);
+    }
+    reads
+}
+
+fn collect_runtime_symbol_reads_expr(expr: &Expr, reads: &mut BTreeSet<String>) {
+    match &expr.kind {
+        ExprKind::Symbol(name) => record_runtime_symbol_read(name, reads),
+        ExprKind::List(items) | ExprKind::Vector(items) | ExprKind::Set(items) => {
+            for item in items {
+                collect_runtime_symbol_reads_expr(item, reads);
+            }
+        }
+        ExprKind::Map(entries) => {
+            for (key, value) in entries {
+                collect_runtime_symbol_reads_expr(key, reads);
+                collect_runtime_symbol_reads_expr(value, reads);
+            }
+        }
+        ExprKind::HtmlTemplate(node) => collect_runtime_symbol_reads_html(node, reads),
+        ExprKind::Unquote(inner) | ExprKind::UnquoteSplicing(inner) => {
+            collect_runtime_symbol_reads_expr(inner, reads);
+        }
+        ExprKind::Quote(_) | ExprKind::QuasiQuote(_) => {}
+        ExprKind::Nil
+        | ExprKind::Bool(_)
+        | ExprKind::Number(_)
+        | ExprKind::String(_)
+        | ExprKind::Keyword(_) => {}
+    }
+}
+
+fn collect_runtime_symbol_reads_html(node: &HtmlNode, reads: &mut BTreeSet<String>) {
+    match node {
+        HtmlNode::Expr { expr, .. } => collect_runtime_symbol_reads_expr(expr, reads),
+        HtmlNode::Element(element) => {
+            for attr in &element.attrs {
+                if let HtmlAttrValue::Dynamic { expr, .. } = &attr.value {
+                    collect_runtime_symbol_reads_expr(expr, reads);
+                }
+            }
+            for child in &element.children {
+                collect_runtime_symbol_reads_html(child, reads);
+            }
+        }
+        HtmlNode::Text { .. } => {}
+    }
+}
+
+fn record_runtime_symbol_read(name: &str, reads: &mut BTreeSet<String>) {
+    reads.insert(name.to_string());
+    if let Some((base, _)) = name.split_once('.') {
+        if !base.is_empty() {
+            reads.insert(base.to_string());
+        }
+    }
+}
+
+fn import_name_is_runtime(
+    local: &str,
+    emit_all_values: bool,
+    runtime_symbol_reads: &BTreeSet<String>,
+) -> bool {
+    emit_all_values || is_runtime_import_name(local) || runtime_symbol_reads.contains(local)
+}
+
+fn emit_import(spec: &ImportSpec, runtime_symbol_reads: &BTreeSet<String>) -> Option<String> {
+    let emit_all_values = !spec.path.ends_with(".clsk");
     let default_name = spec.names.iter().find_map(|name| match name {
-        ImportName::Default { local } if is_runtime_import_name(local) => {
+        ImportName::Default { local }
+            if import_name_is_runtime(local, emit_all_values, runtime_symbol_reads) =>
+        {
             Some(sanitize_identifier(local))
         }
         _ => None,
@@ -731,7 +812,9 @@ fn emit_import(spec: &ImportSpec) -> Option<String> {
         .names
         .iter()
         .filter_map(|name| match name {
-            ImportName::Named { imported, local } if is_runtime_import_name(local) => {
+            ImportName::Named { imported, local }
+                if import_name_is_runtime(local, emit_all_values, runtime_symbol_reads) =>
+            {
                 let imported = sanitize_identifier(imported);
                 let local = sanitize_identifier(local);
                 if imported == local {
@@ -1505,7 +1588,11 @@ impl Emitter {
                 "let" => return self.emit_let(expr, args),
                 "if" => return self.emit_if(expr, args),
                 "match" => return self.emit_match(expr, args),
+                "try" => return self.emit_try(args),
                 "do" => return self.emit_do(args),
+                "new" => return self.emit_new(args),
+                "js-global" => return self.emit_js_global(args),
+                "js-import" => return self.emit_js_import(args),
                 "unsafe-cast" => return self.emit_unsafe_cast(args),
                 "Msg.of" => return self.emit_msg_of(args),
                 "Msg.with" => return self.emit_msg_with(args),
@@ -1694,6 +1781,72 @@ impl Emitter {
             .collect::<Vec<_>>()
             .join(", ");
         format!("{}({})", callee, args)
+    }
+
+    fn emit_new(&mut self, args: &[Expr]) -> String {
+        let Some((constructor, constructor_args)) = args.split_first() else {
+            return "undefined".to_string();
+        };
+        let constructor_code = match &constructor.kind {
+            ExprKind::Symbol(_) => self.emit_expr(constructor),
+            ExprKind::List(items)
+                if matches_symbol(items.first().unwrap_or(constructor), "js-global") =>
+            {
+                self.emit_expr(constructor)
+            }
+            _ => format!("({})", self.emit_expr(constructor)),
+        };
+        let args = constructor_args
+            .iter()
+            .map(|arg| self.emit_expr(arg))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("new {}({})", constructor_code, args)
+    }
+
+    fn emit_js_global(&mut self, args: &[Expr]) -> String {
+        let [global] = args else {
+            return "undefined".to_string();
+        };
+        match &global.kind {
+            ExprKind::Symbol(name) => emit_symbol_read(name),
+            _ => "undefined".to_string(),
+        }
+    }
+
+    fn emit_js_import(&mut self, args: &[Expr]) -> String {
+        let [specifier] = args else {
+            return "undefined".to_string();
+        };
+        match &specifier.kind {
+            ExprKind::String(_) => format!("import({})", self.emit_expr(specifier)),
+            _ => "undefined".to_string(),
+        }
+    }
+
+    fn emit_try(&mut self, args: &[Expr]) -> String {
+        let [body, catch_form] = args else {
+            return "undefined".to_string();
+        };
+        let ExprKind::List(catch_items) = &catch_form.kind else {
+            return self.emit_expr(body);
+        };
+        let [catch_head, catch_name, catch_body] = catch_items.as_slice() else {
+            return self.emit_expr(body);
+        };
+        if !matches_symbol(catch_head, "catch") {
+            return self.emit_expr(body);
+        }
+        let ExprKind::Symbol(catch_symbol) = &catch_name.kind else {
+            return self.emit_expr(body);
+        };
+        let catch_binding = sanitize_identifier(catch_symbol);
+        let body_code = self.emit_expr(body);
+        let catch_code = self.emit_expr(catch_body);
+        format!(
+            "(() => {{ try {{ return {}; }} catch ({}) {{ return {}; }} }})()",
+            body_code, catch_binding, catch_code
+        )
     }
 
     fn emit_intrinsic_call(&mut self, rule: &IntrinsicCallEmitRule, args: &[Expr]) -> String {
@@ -8436,6 +8589,102 @@ mod tests {
         assert!(emitted.code.contains("expect_not_(2, 3)"));
         assert!(emitted.code.contains("expect_match("));
         assert!(emitted.code.contains("expect_throws("));
+    }
+
+    #[test]
+    fn emits_uppercase_values_from_js_package_imports() {
+        let source = syntax::parse_source(
+            "(import \"fastify\" [(default Fastify)])\n\
+             (defn main []\n\
+               (let [app (Fastify {:logger false})]\n\
+                 (do\n\
+                   (app.get \"/health\" (fn [request reply] (reply.send {:ok true})))\n\
+                   (app.listen {:port 0 :host \"127.0.0.1\"}))))",
+        );
+        let emitted = emit_module_with_html(&source);
+
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        assert!(emitted.code.contains("import Fastify from \"fastify\";"));
+        assert!(emitted.code.contains("Fastify({ logger: false })"));
+        assert!(emitted.code.contains("app.get(\"/health\""));
+        assert!(emitted.code.contains("reply.send({ ok: true })"));
+        assert!(
+            emitted
+                .code
+                .contains("app.listen({ port: 0, host: \"127.0.0.1\" })")
+        );
+    }
+
+    #[test]
+    fn emits_js_constructor_interop() {
+        let source = syntax::parse_source(
+            "(import \"some-package\" [Widget])\n\
+             (def widget (new Widget {:enabled true}))",
+        );
+        let emitted = emit_module_with_html(&source);
+
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        assert!(
+            emitted
+                .code
+                .contains("import { Widget } from \"some-package\";")
+        );
+        assert!(emitted.code.contains("new Widget({ enabled: true })"));
+    }
+
+    #[test]
+    fn emits_uppercase_values_from_closkell_imports_when_read() {
+        let source = syntax::parse_source(
+            "(import \"./types.clsk\" [MediaType Mutex])\n\
+             (def folder-type MediaType.FOLDER)\n\
+             (def mutex (new Mutex))",
+        );
+        let emitted = emit_module_with_html(&source);
+
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        assert!(
+            emitted
+                .code
+                .contains("import { MediaType, Mutex } from \"./types.mjs\";")
+        );
+        assert!(emitted.code.contains("MediaType.FOLDER"));
+        assert!(emitted.code.contains("new Mutex()"));
+    }
+
+    #[test]
+    fn emits_js_global_interop() {
+        let source = syntax::parse_source(
+            "(def make-promise (new (js-global Promise) (fn [resolve _reject] (resolve 1))))",
+        );
+        let emitted = emit_module_with_html(&source);
+
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        assert!(emitted.code.contains("new Promise(((resolve, _reject) =>"));
+    }
+
+    #[test]
+    fn emits_js_dynamic_import_interop() {
+        let source = syntax::parse_source("(def vite-module (js-import \"vite\"))");
+        let emitted = emit_module_with_html(&source);
+
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        assert!(emitted.code.contains("import(\"vite\")"));
+    }
+
+    #[test]
+    fn emits_try_catch_interop() {
+        let source = syntax::parse_source(
+            "(defn message []\n  (try (fail \"boom\") (catch err err.message)))",
+        );
+        let emitted = emit_module_with_html(&source);
+
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        assert!(
+            emitted
+                .code
+                .contains("try { return (() => { throw new Error(\"boom\"); })(); }")
+        );
+        assert!(emitted.code.contains("catch (err) { return err.message; }"));
     }
 
     #[test]

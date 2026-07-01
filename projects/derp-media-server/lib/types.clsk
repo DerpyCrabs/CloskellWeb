@@ -1,0 +1,118 @@
+(def MediaType
+  {:VIDEO "video"
+   :AUDIO "audio"
+   :IMAGE "image"
+   :TEXT "text"
+   :PDF "pdf"
+   :FOLDER "folder"
+   :OTHER "other"})
+
+(type FileItem
+  {:name String
+   :path String
+   :type String
+   :size Number
+   :extension String
+   :isDirectory Bool
+   :isVirtual (Option Bool)
+   :viewCount (Option Number)
+   :shareToken (Option String)
+   :thumbnailGenerated (Option Bool)})
+
+(type AutoSaveSettings
+  {:enabled Bool
+   :readOnly (Option Bool)})
+
+(type ViewModesByPath (Map String String))
+(type CustomIconsByPath (Map String String))
+(type AutoSaveByPath (Map String AutoSaveSettings))
+(type KbChatSystemPromptsByRoot (Map String String))
+
+(type MediaRootSummary
+  {:name String
+   :path String
+   :editableFolders (Vector String)})
+
+(type WorkspaceTaskbarPinSource
+  {:kind String
+   :rootPath (Option String)
+   :token (Option String)
+   :sharePath (Option String)})
+
+(type WorkspaceTaskbarPin
+  {:id String
+   :path String
+   :isDirectory Bool
+   :title String
+   :customIconName (Option String)
+   :source WorkspaceTaskbarPinSource})
+
+(type WorkspaceLayoutPreset
+  {:id String
+   :name String
+   :scope String
+   :snapshot Js
+   :createdAt String
+   :updatedAt (Option String)})
+
+(type GlobalSettings
+  {:viewModes ViewModesByPath
+   :favorites (Vector String)
+   :knowledgeBases (Vector String)
+   :customIcons CustomIconsByPath
+   :autoSave AutoSaveByPath
+   :kbChatSystemPrompts (Option KbChatSystemPromptsByRoot)
+   :workspaceTaskbarPins (Option (Vector WorkspaceTaskbarPin))
+   :workspaceLayoutPresets (Option (Vector WorkspaceLayoutPreset))})
+
+(type AuthConfig
+  {:enabled Bool
+   :shareLinkDomain (Option String)
+   :editableFolders (Vector String)
+   :mediaRoots (Option (Vector MediaRootSummary))})
+
+(type UploadToastState
+  {:kind String
+   :fileCount (Option Number)
+   :message (Option String)
+   :label (Option String)})
+
+(type UploadToastAnchor String)
+
+(type NavigationState
+  {:dir (Option String)
+   :viewing (Option String)
+   :playing (Option String)
+   :audioOnly Bool})
+
+(type ShareRestrictions
+  {:allowDelete (Option Bool)
+   :allowUpload (Option Bool)
+   :allowEdit (Option Bool)
+   :maxUploadBytes (Option Number)})
+
+(type ShareLink
+  {:token String
+   :path String
+   :isDirectory Bool
+   :editable Bool
+   :passcode (Option String)
+   :createdAt Number
+   :restrictions (Option ShareRestrictions)
+   :usedBytes (Option Number)
+   :workspaceTaskbarPins (Option (Vector WorkspaceTaskbarPin))
+   :workspaceLayoutPresets (Option (Vector WorkspaceLayoutPreset))})
+
+(type KbChatMessage
+  {:role String
+   :content String
+   :answerDurationSec (Option Number)})
+
+(type KbChat
+  {:id String
+   :kbRoot String
+   :title String
+   :messages (Vector KbChatMessage)
+   :createdAt Number
+   :updatedAt Number
+   :pinned (Option Bool)})

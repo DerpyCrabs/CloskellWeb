@@ -1,0 +1,9 @@
+(import "fastify" [(default Fastify)])
+
+(ann createFastifyServer (Fn [] Js))
+(defn createFastifyServer []
+  (Fastify {:logger false}))
+
+(ann listenFastifyServer (Fn [Js Number] Js))
+(defn listenFastifyServer [app port]
+  (app.listen {:port port :host "0.0.0.0"}))

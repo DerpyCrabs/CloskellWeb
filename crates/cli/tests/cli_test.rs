@@ -1465,6 +1465,63 @@ fn cli_build_erases_type_only_imports_across_modules() {
 }
 
 #[test]
+fn cli_build_keeps_uppercase_value_imports_when_read() {
+    let temp_dir = temp_dir("closkell-cli-build-uppercase-value-imports");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+
+    let values = temp_dir.join("values.clsk");
+    let app = temp_dir.join("app.clsk");
+    let output = temp_dir.join("dist").join("app.mjs");
+    let values_output = temp_dir.join("dist").join("values.mjs");
+
+    fs::write(
+        &values,
+        "(ann MediaType Js)\n\
+         (def MediaType {:FOLDER \"folder\"})\n\
+         \n\
+         (ann Mutex (Fn [] Js))\n\
+         (defn Mutex [] {:acquire (fn [] nil)})\n",
+    )
+    .expect("values module should be written");
+    fs::write(
+        &app,
+        "(import \"./values.clsk\" [MediaType Mutex])\n\
+         (def folder-type MediaType.FOLDER)\n\
+         (def lock (new Mutex))\n",
+    )
+    .expect("app module should be written");
+
+    let run = Command::new(env!("CARGO_BIN_EXE_closkell"))
+        .arg("build")
+        .arg(&app)
+        .arg("--out")
+        .arg(&output)
+        .output()
+        .expect("closkell build should run");
+
+    assert!(
+        run.status.success(),
+        "closkell build failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let app_js = fs::read_to_string(&output).expect("entry JS should be readable");
+    assert!(
+        app_js.contains("import { MediaType, Mutex } from \"./values.mjs\";"),
+        "entry JS dropped the uppercase runtime import:\n{}",
+        app_js
+    );
+    assert!(
+        values_output.exists(),
+        "uppercase runtime dependency output was not generated"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
 fn cli_build_app_writes_vite_entry_bootstrap() {
     let temp_dir = temp_dir("closkell-cli-build-app");
     let _ = fs::remove_dir_all(&temp_dir);
@@ -1732,7 +1789,7 @@ fn cli_target_flag_can_precede_source_path() {
     let source = workspace_root()
         .join("fixtures")
         .join("server")
-        .join("media_service.clsk");
+        .join("fastify_service.clsk");
 
     let check = Command::new(env!("CARGO_BIN_EXE_closkell"))
         .arg("check")
@@ -1776,7 +1833,7 @@ fn cli_target_flag_can_precede_source_path() {
 }
 
 #[test]
-fn cli_build_server_app_writes_service_bootstrap() {
+fn cli_build_server_app_runs_fastify_entrypoint() {
     if !node_available() {
         eprintln!("skipping server app build smoke test because node is unavailable");
         return;
@@ -1789,7 +1846,7 @@ fn cli_build_server_app_writes_service_bootstrap() {
     let source = workspace_root()
         .join("fixtures")
         .join("server")
-        .join("media_service.clsk");
+        .join("fastify_service.clsk");
 
     let run = Command::new(env!("CARGO_BIN_EXE_closkell"))
         .arg("build")
@@ -1797,7 +1854,6 @@ fn cli_build_server_app_writes_service_bootstrap() {
         .arg("--target")
         .arg("server")
         .arg("--app")
-        .arg("--vendor-runtime")
         .arg("--out")
         .arg(&output)
         .output()
@@ -1811,31 +1867,60 @@ fn cli_build_server_app_writes_service_bootstrap() {
     );
 
     let app_js = fs::read_to_string(&output).expect("server JS should be readable");
-    assert!(app_js.contains("startServerService as __closkellStartServerService"));
-    assert!(app_js.contains("export const __closkellService"));
+    assert!(app_js.contains("import Fastify from \"fastify\";"));
+    assert!(app_js.contains("await main(__closkellServerBoot)"));
+    assert!(!app_js.contains("__closkellService"));
     assert!(!app_js.contains("document.getElementById"));
-    assert!(app_js.contains("kind: Symbol.for(\"server/route\")"));
-    assert!(app_js.contains("kind: Symbol.for(\"response/file\")"));
+    assert!(!app_js.contains("kind: Symbol.for(\"server/route\")"));
+
+    let fastify_dir = temp_dir.join("node_modules").join("fastify");
+    fs::create_dir_all(&fastify_dir).expect("fake fastify package directory should be created");
+    fs::write(
+        fastify_dir.join("package.json"),
+        r#"{"type":"module","exports":"./index.js"}"#,
+    )
+    .expect("fake fastify package manifest should be written");
+    fs::write(
+        fastify_dir.join("index.js"),
+        r#"
+export default function Fastify(options) {
+  const state = { options, routes: [], listenOptions: null, replyPayload: null };
+  globalThis.__closkellFastify = state;
+  return {
+    get(path, handler) {
+      state.routes.push({ method: "GET", path });
+      const reply = {
+        send(payload) {
+          state.replyPayload = payload;
+          return payload;
+        }
+      };
+      handler({ path }, reply);
+      return this;
+    },
+    listen(options) {
+      state.listenOptions = options;
+      return Promise.resolve({ listening: true, options });
+    }
+  };
+}
+"#,
+    )
+    .expect("fake fastify package entry should be written");
 
     let script = format!(
         r#"
 const mod = await import(fileUrl({module_path}));
-const service = mod.__closkellService;
-if (!service) throw new Error("server service was not exported");
+const state = globalThis.__closkellFastify;
+if (!state) throw new Error("Fastify was not constructed");
 if (globalThis.document !== undefined) throw new Error("server runtime import should not create a document");
-if (service.routes.length !== 3) throw new Error(`expected three routes, found ${{service.routes.length}}`);
-if (service.resources.resources.length !== 1) throw new Error("server resource was not registered");
-const health = await service.handle({{ method: "GET", path: "/health" }});
-if (health.kind !== Symbol.for("response/json") || health.body.ok !== true) throw new Error("health response was wrong");
-const status = await service.handle({{ method: "GET", path: "/status" }});
-if (status.status !== 201) throw new Error(`response status override was wrong: ${{JSON.stringify(status)}}`);
-const media = await service.handle({{ method: "GET", path: "/media/movie.mp4" }});
-if (media.kind !== Symbol.for("response/file") || media.path !== "movie.mp4") throw new Error(`media response was wrong: ${{JSON.stringify(media)}}`);
-service.dispatch({{ kind: Symbol.for("files-changed"), path: "updated-root" }});
-if (service.state.root !== "updated-root") throw new Error("server update dispatch did not update state");
-if (service.resources.resources[0].config.root !== "updated-root") throw new Error("server resources did not refresh after update");
-const missing = await service.handle({{ method: "GET", path: "/missing" }});
-if (missing.status !== 404) throw new Error("missing route should return 404");
+if (state.options.logger !== false) throw new Error("Fastify options were not passed through");
+if (state.routes.length !== 1) throw new Error(`expected one route, found ${{state.routes.length}}`);
+if (state.routes[0].method !== "GET" || state.routes[0].path !== "/health") throw new Error("health route was not registered through app.get");
+if (state.replyPayload?.ok !== true) throw new Error("Fastify route handler did not call reply.send");
+if (state.listenOptions?.port !== 0 || state.listenOptions?.host !== "127.0.0.1") throw new Error("Fastify listen options were wrong");
+if (mod.__closkellServerResult?.listening !== true) throw new Error("main listen result was not exported");
+if (mod.__closkellServerBoot?.runtime !== "node") throw new Error("server boot was not passed to main");
 
 function fileUrl(path) {{
   return "file:///" + path.replace(/\\/g, "/").replace(/^([A-Za-z]):/, "$1:");

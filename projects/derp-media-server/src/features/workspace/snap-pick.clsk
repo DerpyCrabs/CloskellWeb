@@ -1,0 +1,285 @@
+(import "./assist-grid.clsk" [assistGridSpansEqual assistShapeToDims])
+
+(type AssistGridSpan
+  {:gridCols Number
+   :gridRows Number
+   :gc0 Number
+   :gc1 Number
+   :gr0 Number
+   :gr1 Number})
+
+(type AssistSlotPick
+  {:kind String
+   :span AssistGridSpan})
+
+(type AssistRect
+  {:left Number
+   :top Number
+   :right Number
+   :bottom Number
+   :width Number
+   :height Number})
+
+(type AssistSlotCandidate
+  {:el Js
+   :span AssistGridSpan
+   :area Number})
+
+(def jsGlobalThis (js-global globalThis))
+(def jsArray (js-global Array))
+(def jsParseInt (js-global parseInt))
+
+(def assistGutterSlopPx 3)
+
+(ann globalConstructor (Fn [String] Js))
+(defn globalConstructor [name]
+  (object-get jsGlobalThis name))
+
+(ann isInstanceOfConstructor (Fn [Js Js] Bool))
+(defn isInstanceOfConstructor [value ctor]
+  (and (some? value)
+       (some? ctor)
+       (some? ctor.prototype)
+       (ctor.prototype.isPrototypeOf value)))
+
+(ann narrowPickToAssistShape (Fn [(Option AssistSlotPick) String] (Option AssistSlotPick)))
+(defn narrowPickToAssistShape [pick shape]
+  (match pick
+    nil nil
+    (some current)
+      (let [dims (assistShapeToDims shape)
+            span current.span]
+        (if (or (not (= span.gridCols dims.cols))
+                (not (= span.gridRows dims.rows)))
+            nil
+            current))))
+
+(ann rectArea (Fn [AssistRect] Number))
+(defn rectArea [rect]
+  (* (max 0 rect.width) (max 0 rect.height)))
+
+(ann spanGutterKind (Fn [AssistGridSpan] (Option String)))
+(defn spanGutterKind [span]
+  (let [cw (- span.gc1 span.gc0)
+        rh (- span.gr1 span.gr0)]
+    (if (and (= cw 0) (= rh 0))
+        nil
+        (if (and (> cw 0) (= rh 0))
+            "v"
+            (if (and (= cw 0) (> rh 0))
+                "h"
+                (if (and (> cw 0) (> rh 0))
+                    "j"
+                    nil))))))
+
+(ann pointInRect (Fn [Number Number AssistRect] Bool))
+(defn pointInRect [clientX clientY rect]
+  (and (>= clientX rect.left)
+       (<= clientX rect.right)
+       (>= clientY rect.top)
+       (<= clientY rect.bottom)
+       (> rect.width 0)
+       (> rect.height 0)))
+
+(ann slopInflatedRect (Fn [AssistRect String] AssistRect))
+(defn slopInflatedRect [rect kind]
+  (let [s assistGutterSlopPx]
+    (if (= kind "v")
+        (let [left (- rect.left s)
+              width (+ rect.width (* 2 s))]
+          {:left left
+           :top rect.top
+           :right (+ left width)
+           :bottom rect.bottom
+           :width width
+           :height rect.height})
+        (if (= kind "h")
+            (let [top (- rect.top s)
+                  height (+ rect.height (* 2 s))]
+              {:left rect.left
+               :top top
+               :right rect.right
+               :bottom (+ top height)
+               :width rect.width
+               :height height})
+            (let [left (- rect.left s)
+                  top (- rect.top s)
+                  width (+ rect.width (* 2 s))
+                  height (+ rect.height (* 2 s))]
+              {:left left
+               :top top
+               :right (+ left width)
+               :bottom (+ top height)
+               :width width
+               :height height})))))
+
+(ann normalizeAssistGridSpan (Fn [Js Js Js Js Js Js] (Option AssistGridSpan)))
+(defn normalizeAssistGridSpan [gc0 gc1 gr0 gr1 gridCols gridRows]
+  (if (or (not (number? gc0))
+          (not (number? gc1))
+          (not (number? gr0))
+          (not (number? gr1))
+          (not (number? gridCols))
+          (not (number? gridRows))
+          (< gridCols 1)
+          (< gridRows 1)
+          (< gc0 0)
+          (< gr0 0)
+          (< gc1 gc0)
+          (< gr1 gr0)
+          (>= gc1 gridCols)
+          (>= gr1 gridRows))
+      nil
+      {:gridCols gridCols
+       :gridRows gridRows
+       :gc0 gc0
+       :gc1 gc1
+       :gr0 gr0
+       :gr1 gr1}))
+
+(ann assistPickMatchesGridSpan (Fn [(Option AssistSlotPick) AssistGridSpan] Bool))
+(defn assistPickMatchesGridSpan [pick span]
+  (match pick
+    nil false
+    (some current) (assistGridSpansEqual current.span span)))
+
+(ann rectLike (Fn [Js] AssistRect))
+(defn rectLike [rect]
+  {:left rect.left
+   :top rect.top
+   :right rect.right
+   :bottom rect.bottom
+   :width rect.width
+   :height rect.height})
+
+(ann attrInt (Fn [Js String] Js))
+(defn attrInt [el name]
+  (let [value (el.getAttribute name)]
+    (jsParseInt (if (some? value) value "") 10)))
+
+(ann parseGridSpan (Fn [Js] (Option AssistGridSpan)))
+(defn parseGridSpan [el]
+  (normalizeAssistGridSpan (attrInt el "data-gc0")
+                           (attrInt el "data-gc1")
+                           (attrInt el "data-gr0")
+                           (attrInt el "data-gr1")
+                           (attrInt el "data-grid-cols")
+                           (attrInt el "data-grid-rows")))
+
+(ann bestAreaCandidate (Fn [AssistSlotCandidate AssistSlotCandidate] AssistSlotCandidate))
+(defn bestAreaCandidate [best item]
+  (if (< item.area best.area) item best))
+
+(ann smallestAreaCandidate (Fn [Js] (Option AssistSlotCandidate)))
+(defn smallestAreaCandidate [items]
+  (if (= (count items) 0)
+      nil
+      (reduce (slice items 1 (count items))
+              (nth items 0)
+              bestAreaCandidate)))
+
+(ann gutterCandidateAtPoint (Fn [Number Number Js] (Option AssistSlotCandidate)))
+(defn gutterCandidateAtPoint [clientX clientY el]
+  (match (parseGridSpan el)
+    nil nil
+    (some span)
+      (match (spanGutterKind span)
+        nil nil
+        (some kind)
+          (let [rect (rectLike (el.getBoundingClientRect))]
+            (if (pointInRect clientX clientY (slopInflatedRect rect kind))
+                {:el el :span span :area (rectArea rect)}
+                nil)))))
+
+(ann pickFromGutterSlop (Fn [Number Number Js] (Option AssistSlotPick)))
+(defn pickFromGutterSlop [clientX clientY root]
+  (let [cells (jsArray.from (root.querySelectorAll "[data-assist-grid-span]"))
+        matches (filter (map cells (fn [el] (gutterCandidateAtPoint clientX clientY el)))
+                        (fn [item] (some? item)))
+        best (smallestAreaCandidate matches)]
+    (match best
+      nil nil
+      (some item) {:kind "grid-span" :span item.span})))
+
+(ann gridElementFromStackNode (Fn [Js Js] Js))
+(defn gridElementFromStackNode [root node]
+  (let [elementCtor (globalConstructor "Element")
+        htmlCtor (globalConstructor "HTMLElement")]
+    (if (not (isInstanceOfConstructor node elementCtor))
+        nil
+        (if (not (root.contains node))
+            nil
+            (let [gridEl (try
+                          (node.closest "[data-assist-grid-span]")
+                          (catch _error nil))]
+              (if (and (some? gridEl)
+                       (root.contains gridEl)
+                       (isInstanceOfConstructor gridEl htmlCtor))
+                  gridEl
+                  nil))))))
+
+(ann bestElementCandidate (Fn [Js Js] AssistSlotCandidate))
+(defn bestElementCandidate [_root el]
+  (let [rect (rectLike (el.getBoundingClientRect))]
+    {:el el
+     :span (unsafe-cast AssistGridSpan nil)
+     :area (rectArea rect)}))
+
+(ann elementWithSmallestArea (Fn [Js] Js))
+(defn elementWithSmallestArea [elements]
+  (let [candidates (map elements (fn [el] (bestElementCandidate nil el)))
+        best (smallestAreaCandidate candidates)]
+    (match best
+      nil nil
+      (some item) item.el)))
+
+(ann pickFromElementsFromPoint (Fn [Number Number Js Js] (Option AssistSlotPick)))
+(defn pickFromElementsFromPoint [clientX clientY root doc]
+  (let [stack (jsArray.from (doc.elementsFromPoint clientX clientY))
+        candidates (filter (map stack (fn [node] (gridElementFromStackNode root node)))
+                           (fn [el] (some? el)))
+        bestEl (elementWithSmallestArea candidates)]
+    (if (not (some? bestEl))
+        nil
+        (match (parseGridSpan bestEl)
+          nil nil
+          (some span) {:kind "grid-span" :span span}))))
+
+(ann containingCellCandidateAtPoint (Fn [Number Number Js] (Option AssistSlotCandidate)))
+(defn containingCellCandidateAtPoint [clientX clientY el]
+  (let [rect (rectLike (el.getBoundingClientRect))]
+    (if (pointInRect clientX clientY rect)
+        (match (parseGridSpan el)
+          nil nil
+          (some span) {:el el :span span :area (rectArea rect)})
+        nil)))
+
+(ann pickFromCellsContainingPoint (Fn [Number Number Js] (Option AssistSlotPick)))
+(defn pickFromCellsContainingPoint [clientX clientY root]
+  (let [cells (jsArray.from (root.querySelectorAll "[data-assist-grid-span]"))
+        candidates (filter (map cells
+                                (fn [el] (containingCellCandidateAtPoint clientX clientY el)))
+                           (fn [item] (some? item)))
+        best (smallestAreaCandidate candidates)]
+    (match best
+      nil nil
+      (some item) {:kind "grid-span" :span item.span})))
+
+(ann pickAssistSlotFromPoint (Fn [Number Number Js] (Option AssistSlotPick)))
+(defn pickAssistSlotFromPoint [clientX clientY root]
+  (let [doc jsGlobalThis.document]
+    (if (or (not (some? root)) (not (some? doc)) (not root.isConnected))
+        nil
+        (let [rootRect (root.getBoundingClientRect)]
+          (if (or (< clientX rootRect.left)
+                  (> clientX rootRect.right)
+                  (< clientY rootRect.top)
+                  (> clientY rootRect.bottom))
+              nil
+              (let [slop (pickFromGutterSlop clientX clientY root)]
+                (match slop
+                  (some item) item
+                  nil (let [stackPick (pickFromElementsFromPoint clientX clientY root doc)]
+                        (match stackPick
+                          (some item) item
+                          nil (pickFromCellsContainingPoint clientX clientY root))))))))))

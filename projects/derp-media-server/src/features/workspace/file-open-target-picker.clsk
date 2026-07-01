@@ -1,0 +1,94 @@
+(import "./tab-groups-core.clsk" [groupIdForWindow tabsInGroup])
+
+(type WorkspaceBounds
+  {:x Number
+   :y Number
+   :width Number
+   :height Number})
+
+(type ClientRect
+  {:left Number
+   :top Number})
+
+(type PickWindowLayout
+  {:bounds (Option WorkspaceBounds)
+   :minimized (Option Bool)
+   :zIndex (Option Number)})
+
+(type PickWindow
+  {:id String
+   :type String
+   :tabGroupId (Option String)
+   :layout PickWindowLayout})
+
+(type PickCandidate
+  {:window PickWindow
+   :z Number})
+
+(ann layoutObject (Fn [PickWindow] PickWindowLayout))
+(defn layoutObject [win]
+  (let [layout (get win :layout)]
+    (if (object? layout) layout {})))
+
+(ann layoutBounds (Fn [PickWindowLayout] (Option WorkspaceBounds)))
+(defn layoutBounds [layout]
+  (let [bounds (get layout :bounds)]
+    (if (object? bounds) (unsafe-cast WorkspaceBounds bounds) nil)))
+
+(ann layoutMinimized? (Fn [PickWindowLayout] Bool))
+(defn layoutMinimized? [layout]
+  (= (get layout :minimized) true))
+
+(ann layoutZIndex (Fn [PickWindowLayout] Number))
+(defn layoutZIndex [layout]
+  (let [z (get layout :zIndex)]
+    (if (number? z) z 0)))
+
+(ann pickCandidates (Fn [(Vector PickWindow)] (Vector PickCandidate)))
+(defn pickCandidates [windows]
+  (sort-with
+    (map (filter windows
+                 (fn [win]
+                   (let [layout (layoutObject win)]
+                     (and (not (layoutMinimized? layout))
+                          (some? (layoutBounds layout))))))
+         (fn [win] {:window win :z (layoutZIndex (layoutObject win))}))
+    (fn [a b] (- b.z a.z))))
+
+(ann pointInBounds? (Fn [Number Number WorkspaceBounds] Bool))
+(defn pointInBounds? [x y bounds]
+  (and (>= x bounds.x)
+       (>= y bounds.y)
+       (<= x (+ bounds.x bounds.width))
+       (<= y (+ bounds.y bounds.height))))
+
+(ann pickWorkspaceWindowAtClientPoint (Fn [(Vector PickWindow) ClientRect Number Number] (Option String)))
+(defn pickWorkspaceWindowAtClientPoint [windows containerRect clientX clientY]
+  (let [localX (- clientX containerRect.left)
+        localY (- clientY containerRect.top)
+        hit (find (pickCandidates windows)
+                  (fn [candidate]
+                    (match (layoutBounds (layoutObject candidate.window))
+                      nil false
+                      (some bounds) (pointInBounds? localX localY bounds))))]
+    (if (some? hit) hit.window.id nil)))
+
+(ann layoutBoundsForWindowHighlight (Fn [(Vector PickWindow) String] (Option WorkspaceBounds)))
+(defn layoutBoundsForWindowHighlight [windows windowId]
+  (let [win (find windows (fn [candidate] (= candidate.id windowId)))]
+    (if (not (some? win))
+        nil
+        (let [layout (layoutObject win)
+              bounds (layoutBounds layout)]
+          (if (or (layoutMinimized? layout) (not (some? bounds)))
+              nil
+              (let [groupId (groupIdForWindow win)
+                    members (tabsInGroup windows groupId)
+                    withBounds (find members
+                                     (fn [member]
+                                       (let [memberLayout (layoutObject member)]
+                                         (and (some? (layoutBounds memberLayout))
+                                              (not (layoutMinimized? memberLayout))))))]
+                (if (some? withBounds)
+                    (layoutBounds (layoutObject withBounds))
+                    bounds)))))))

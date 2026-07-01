@@ -1,0 +1,24 @@
+(type HttpRoute
+  {:method String
+   :path String
+   :handler (Fn [Js Js] Js)})
+
+(ann registerHttpRoute (Fn [Js HttpRoute] Js))
+(defn registerHttpRoute [app route]
+  (do
+    (if (= route.method "GET")
+        (app.get route.path route.handler)
+        (if (= route.method "POST")
+            (app.post route.path route.handler)
+            (if (= route.method "PUT")
+                (app.put route.path route.handler)
+                (if (= route.method "DELETE")
+                    (app.delete route.path route.handler)
+                    (if (= route.method "PATCH")
+                        (app.patch route.path route.handler)
+                        nil)))))
+    app))
+
+(ann registerHttpRoutes (Fn [Js (Vector HttpRoute)] Js))
+(defn registerHttpRoutes [app routes]
+  (reduce routes app registerHttpRoute))

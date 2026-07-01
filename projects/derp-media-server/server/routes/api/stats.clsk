@@ -1,0 +1,85 @@
+(import "../../fs-tasks.clsk" [readFileUtf8 writeFileUtf8])
+(import "../../http-routes.clsk" [HttpRoute registerHttpRoutes])
+(import "../../../lib/config.clsk" [config getDataFilePath])
+
+(def STATS_FILE (getDataFilePath "stats.json"))
+
+(ann defaultStats (Fn [] Js))
+(defn defaultStats []
+  {:views {} :shareViews {}})
+
+(ann readAllStats (Fn [] Js))
+(defn readAllStats []
+  (let [readPromise (readFileUtf8 STATS_FILE)
+        parsedPromise (readPromise.then
+                        (fn [data] (unwrap-or (json-parse-result data) {})))]
+    (parsedPromise.catch (fn [_] {}))))
+
+(ann readStats (Fn [] Js))
+(defn readStats []
+  (let [statsPromise (readAllStats)]
+    (statsPromise.then
+     (fn [allStats]
+       (let [stats (object-get allStats config.libraryKey)]
+         (if (object? stats) stats (defaultStats)))))))
+
+(ann writeStats (Fn [Js] Js))
+(defn writeStats [stats]
+  (let [statsPromise (readAllStats)]
+    (statsPromise.then
+     (fn [allStats]
+       (let [nextAllStats (object-assoc allStats config.libraryKey stats)]
+         (writeFileUtf8 STATS_FILE (json-stringify nextAllStats 2)))))))
+
+(ann viewsObject (Fn [Js] Js))
+(defn viewsObject [stats]
+  (if (object? stats.views) stats.views {}))
+
+(ann shareViewsObject (Fn [Js] Js))
+(defn shareViewsObject [stats]
+  (if (object? stats.shareViews) stats.shareViews {}))
+
+(ann incrementStatsView (Fn [Js String] Js))
+(defn incrementStatsView [stats filePath]
+  (let [views (viewsObject stats)
+        current (object-get views filePath)
+        currentCount (if (number? current) current 0)
+        nextCount (+ currentCount 1)
+        nextViews (object-assoc views filePath nextCount)
+        withViews (object-assoc stats "views" nextViews)]
+    withViews))
+
+(ann sendViewStats (Fn [Js Js] Js))
+(defn sendViewStats [stats reply]
+  (reply.send {:views (viewsObject stats) :shareViews (shareViewsObject stats)}))
+
+(ann handleGetViews (Fn [Js Js] Js))
+(defn handleGetViews [_request reply]
+  (let [statsPromise (readStats)
+        sent (statsPromise.then (fn [stats] (sendViewStats stats reply)))]
+    (sent.catch (fn [_] (reply.send {:views {} :shareViews {}})))))
+
+(ann handlePostViews (Fn [Js Js] Js))
+(defn handlePostViews [request reply]
+  (let [body request.body
+        filePath (if (object? body) body.filePath nil)]
+    (if (or (not (string? filePath)) (= filePath ""))
+        (let [badReply (reply.code 400)]
+          (badReply.send {:error "File path is required"}))
+        (let [statsPromise (readStats)]
+          (statsPromise.then
+           (fn [stats]
+             (let [nextStats (incrementStatsView stats filePath)
+                   nextCount (object-get nextStats.views filePath)
+                   writePromise (writeStats nextStats)]
+               (writePromise.then
+                (fn [_] (reply.send {:success true :viewCount nextCount}))))))))))
+
+(ann statsApiRouteDefinitions (Fn [] (Vector HttpRoute)))
+(defn statsApiRouteDefinitions []
+  [{:method "GET" :path "/api/stats/views" :handler handleGetViews}
+   {:method "POST" :path "/api/stats/views" :handler handlePostViews}])
+
+(ann registerStatsApiRoutes (Fn [Js] Js))
+(defn registerStatsApiRoutes [app]
+  (registerHttpRoutes app (statsApiRouteDefinitions)))

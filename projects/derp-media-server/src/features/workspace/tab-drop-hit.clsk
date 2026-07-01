@@ -1,0 +1,9 @@
+(def tabDropBeforeFraction 0.4)
+
+(ann insertIndexFromTabBodyPointer (Fn [Number Number Number Number] Number))
+(defn insertIndexFromTabBodyPointer [clientX tabLeft tabWidth tabIndex]
+  (if (<= tabWidth 0)
+      (+ tabIndex 1)
+      (let [rel (- clientX tabLeft)
+            before (< rel (* tabDropBeforeFraction tabWidth))]
+        (if before tabIndex (+ tabIndex 1)))))

@@ -1,0 +1,252 @@
+(import "./geometry.clsk" [WorkspaceBounds])
+(import "./tab-groups-core.clsk" [WorkspaceTabLayout WorkspaceTabWindow])
+
+(type ResizeContext
+  {:ox0 Number
+   :oy0 Number
+   :ox1 Number
+   :oy1 Number
+   :nx0 Number
+   :ny0 Number
+   :nx1 Number
+   :ny1 Number
+   :deltaLeft Number
+   :deltaRight Number
+   :deltaTop Number
+   :deltaBottom Number})
+
+(type ResizeResult
+  {:bounds WorkspaceBounds
+   :updated Bool})
+
+(type SiblingUpdate
+  {:groupId String
+   :bounds WorkspaceBounds})
+
+(type ResizePassState
+  {:windows (Vector WorkspaceTabWindow)
+   :updates (Vector SiblingUpdate)})
+
+(def edgeAlignTolerance 8)
+(def minSharedAxis 24)
+
+(ann overlap1d (Fn [Number Number Number Number] Number))
+(defn overlap1d [a0 a1 b0 b1]
+  (max 0 (- (min a1 b1) (max a0 b0))))
+
+(ann gap1d (Fn [Number Number Number Number] Number))
+(defn gap1d [a0 a1 b0 b1]
+  (if (< a1 b0)
+      (- b0 a1)
+      (if (< b1 a0)
+          (- a0 b1)
+          0)))
+
+(ann verticalSpanOverlap (Fn [Number Number Number Number] Bool))
+(defn verticalSpanOverlap [ay0 ay1 by0 by1]
+  (let [overlap (overlap1d ay0 ay1 by0 by1)]
+    (if (>= overlap minSharedAxis)
+        true
+        (<= (gap1d ay0 ay1 by0 by1) edgeAlignTolerance))))
+
+(ann horizontalSpanOverlap (Fn [Number Number Number Number] Bool))
+(defn horizontalSpanOverlap [ax0 ax1 bx0 bx1]
+  (let [overlap (overlap1d ax0 ax1 bx0 bx1)]
+    (if (>= overlap minSharedAxis)
+        true
+        (<= (gap1d ax0 ax1 bx0 bx1) edgeAlignTolerance))))
+
+(ann layoutObject (Fn [WorkspaceTabWindow] WorkspaceTabLayout))
+(defn layoutObject [win]
+  win.layout)
+
+(ann layoutBounds (Fn [WorkspaceTabLayout] (Option WorkspaceBounds)))
+(defn layoutBounds [layout]
+  layout.bounds)
+
+(ann setWindowBounds (Fn [WorkspaceTabWindow WorkspaceBounds] WorkspaceTabWindow))
+(defn setWindowBounds [win bounds]
+  (merge win {:layout (merge (layoutObject win) {:bounds bounds})}))
+
+(ann layoutGroupKey (Fn [WorkspaceTabWindow] String))
+(defn layoutGroupKey [win]
+  (match win.tabGroupId
+    nil win.id
+    (some groupId) groupId))
+
+(ann boundsEqual? (Fn [WorkspaceBounds WorkspaceBounds] Bool))
+(defn boundsEqual? [a b]
+  (and (= a.x b.x)
+       (= a.y b.y)
+       (= a.width b.width)
+       (= a.height b.height)))
+
+(ann resizeContext (Fn [WorkspaceBounds WorkspaceBounds] ResizeContext))
+(defn resizeContext [oldBounds newBounds]
+  (let [ox0 oldBounds.x
+        oy0 oldBounds.y
+        ox1 (+ oldBounds.x oldBounds.width)
+        oy1 (+ oldBounds.y oldBounds.height)
+        nx0 newBounds.x
+        ny0 newBounds.y
+        nx1 (+ newBounds.x newBounds.width)
+        ny1 (+ newBounds.y newBounds.height)]
+    {:ox0 ox0
+     :oy0 oy0
+     :ox1 ox1
+     :oy1 oy1
+     :nx0 nx0
+     :ny0 ny0
+     :nx1 nx1
+     :ny1 ny1
+     :deltaLeft (- nx0 ox0)
+     :deltaRight (- nx1 ox1)
+     :deltaTop (- ny0 oy0)
+     :deltaBottom (- ny1 oy1)}))
+
+(ann adjustRight (Fn [ResizeResult ResizeContext String] ResizeResult))
+(defn adjustRight [result ctx direction]
+  (let [bounds result.bounds]
+    (if (and (includes? direction "right") (not (= ctx.deltaRight 0)))
+        (let [gutter ctx.ox1]
+          (if (verticalSpanOverlap ctx.oy0 ctx.oy1 bounds.y (+ bounds.y bounds.height))
+              (if (<= (abs (- bounds.x gutter)) edgeAlignTolerance)
+                  {:bounds (merge bounds {:x (+ bounds.x ctx.deltaRight)
+                                          :width (- bounds.width ctx.deltaRight)})
+                   :updated true}
+                  (if (and (<= (abs (- (+ bounds.x bounds.width) gutter)) edgeAlignTolerance)
+                           (< bounds.x (- gutter edgeAlignTolerance)))
+                      {:bounds (merge bounds {:width (+ bounds.width ctx.deltaRight)})
+                       :updated true}
+                      result))
+              result))
+        result)))
+
+(ann adjustLeft (Fn [ResizeResult ResizeContext String] ResizeResult))
+(defn adjustLeft [result ctx direction]
+  (let [bounds result.bounds]
+    (if (and (includes? direction "left") (not (= ctx.deltaLeft 0)))
+        (let [gutter ctx.ox0]
+          (if (verticalSpanOverlap ctx.oy0 ctx.oy1 bounds.y (+ bounds.y bounds.height))
+              (if (and (<= (abs (- (+ bounds.x bounds.width) gutter)) edgeAlignTolerance)
+                       (< bounds.x (- gutter edgeAlignTolerance)))
+                  {:bounds (merge bounds {:width (+ bounds.width ctx.deltaLeft)})
+                   :updated true}
+                  (if (and (<= (abs (- bounds.x gutter)) edgeAlignTolerance)
+                           (> (+ bounds.x bounds.width) (+ gutter edgeAlignTolerance)))
+                      {:bounds (merge bounds {:x (+ bounds.x ctx.deltaLeft)
+                                              :width (- bounds.width ctx.deltaLeft)})
+                       :updated true}
+                      result))
+              result))
+        result)))
+
+(ann adjustBottom (Fn [ResizeResult ResizeContext String] ResizeResult))
+(defn adjustBottom [result ctx direction]
+  (let [bounds result.bounds]
+    (if (and (includes? direction "bottom") (not (= ctx.deltaBottom 0)))
+        (let [gutter ctx.oy1]
+          (if (horizontalSpanOverlap ctx.ox0 ctx.ox1 bounds.x (+ bounds.x bounds.width))
+              (if (<= (abs (- bounds.y gutter)) edgeAlignTolerance)
+                  {:bounds (merge bounds {:y (+ bounds.y ctx.deltaBottom)
+                                          :height (- bounds.height ctx.deltaBottom)})
+                   :updated true}
+                  (if (and (<= (abs (- (+ bounds.y bounds.height) gutter)) edgeAlignTolerance)
+                           (< bounds.y (- gutter edgeAlignTolerance)))
+                      {:bounds (merge bounds {:height (+ bounds.height ctx.deltaBottom)})
+                       :updated true}
+                      result))
+              result))
+        result)))
+
+(ann adjustTop (Fn [ResizeResult ResizeContext String] ResizeResult))
+(defn adjustTop [result ctx direction]
+  (let [bounds result.bounds]
+    (if (and (includes? direction "top") (not (= ctx.deltaTop 0)))
+        (let [gutter ctx.oy0]
+          (if (horizontalSpanOverlap ctx.ox0 ctx.ox1 bounds.x (+ bounds.x bounds.width))
+              (if (and (<= (abs (- (+ bounds.y bounds.height) gutter)) edgeAlignTolerance)
+                       (< bounds.y (- gutter edgeAlignTolerance)))
+                  {:bounds (merge bounds {:height (+ bounds.height ctx.deltaTop)})
+                   :updated true}
+                  (if (and (<= (abs (- bounds.y gutter)) edgeAlignTolerance)
+                           (> (+ bounds.y bounds.height) (+ gutter edgeAlignTolerance)))
+                      {:bounds (merge bounds {:y (+ bounds.y ctx.deltaTop)
+                                              :height (- bounds.height ctx.deltaTop)})
+                       :updated true}
+                      result))
+              result))
+        result)))
+
+(ann siblingResizeResult (Fn [WorkspaceBounds ResizeContext String] ResizeResult))
+(defn siblingResizeResult [bounds ctx direction]
+  (adjustTop
+    (adjustBottom
+      (adjustLeft
+        (adjustRight {:bounds bounds :updated false} ctx direction)
+        ctx
+        direction)
+      ctx
+      direction)
+    ctx
+    direction))
+
+(ann updateForGroup (Fn [(Vector SiblingUpdate) String] (Option WorkspaceBounds)))
+(defn updateForGroup [updates groupId]
+  (reduce updates
+          nil
+          (fn [found update]
+            (if (= update.groupId groupId) update.bounds found))))
+
+(ann syncSiblingGroupBounds (Fn [(Vector WorkspaceTabWindow) String (Vector SiblingUpdate)] (Vector WorkspaceTabWindow)))
+(defn syncSiblingGroupBounds [windows targetId updates]
+  (map windows
+       (fn [win]
+         (let [syncBounds (updateForGroup updates (layoutGroupKey win))]
+           (match syncBounds
+             nil win
+             (some bounds)
+               (if (= win.id targetId)
+                   win
+                   (match (layoutBounds (layoutObject win))
+                     nil (setWindowBounds win bounds)
+                     (some currentBounds)
+                       (if (boundsEqual? currentBounds bounds)
+                           win
+                           (setWindowBounds win bounds)))))))))
+
+(ann resizePass (Fn [(Vector WorkspaceTabWindow) String WorkspaceBounds String WorkspaceBounds] ResizePassState))
+(defn resizePass [current windowId newBounds direction oldBounds]
+  (let [ctx (resizeContext oldBounds newBounds)]
+    (reduce current
+            {:windows [] :updates []}
+            (fn [state win]
+              (if (= win.id windowId)
+                  (merge state {:windows (conj state.windows (setWindowBounds win newBounds))})
+                  (match (layoutBounds (layoutObject win))
+                    nil (merge state {:windows (conj state.windows win)})
+                    (some currentBounds)
+                      (let [result (siblingResizeResult currentBounds ctx direction)]
+                        (if (or (not result.updated) (boundsEqual? result.bounds currentBounds))
+                            (merge state {:windows (conj state.windows win)})
+                            (merge state
+                                   {:windows (conj state.windows (setWindowBounds win result.bounds))
+                                    :updates (conj state.updates {:groupId (layoutGroupKey win)
+                                                                  :bounds result.bounds})})))))))))
+
+(ann computeSnappedResizeWindows (Fn [(Vector WorkspaceTabWindow) String WorkspaceBounds String] (Vector WorkspaceTabWindow)))
+(defn computeSnappedResizeWindows [current windowId newBounds direction]
+  (let [target (find current (fn [win] (= win.id windowId)))]
+    (if (not (some? target))
+        current
+        (match (layoutBounds (layoutObject target))
+          nil (map current
+                   (fn [win]
+                     (if (= win.id windowId)
+                         (setWindowBounds win newBounds)
+                         win)))
+          (some oldBounds)
+            (let [state (resizePass current windowId newBounds direction oldBounds)]
+              (if (> (count state.updates) 0)
+                  (syncSiblingGroupBounds state.windows windowId state.updates)
+                  state.windows))))))

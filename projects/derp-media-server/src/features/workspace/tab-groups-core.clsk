@@ -1,0 +1,208 @@
+(import "../../../lib/types.clsk" [FileItem WorkspaceTaskbarPinSource])
+(import "./geometry.clsk" [WorkspaceBounds])
+
+(type WorkspaceTabLayout
+  {:minimized (Option Bool)
+   :bounds (Option WorkspaceBounds)
+   :zIndex (Option Number)
+   :snapZone (Option String)
+   :fullscreen (Option Bool)
+   :restoreBounds (Option WorkspaceBounds)})
+
+(type WorkspaceInitialState
+  {:dir (Option String)
+   :viewing (Option String)
+   :playing (Option String)
+   :kbRoot (Option String)
+   :imageFiles (Option (Vector FileItem))})
+
+(type WorkspaceTabWindow
+  {:id String
+   :type String
+   :tabGroupId (Option String)
+   :layout WorkspaceTabLayout
+   :tabPinned (Option Bool)
+   :title (Option String)
+   :iconName (Option String)
+   :iconPath (Option String)
+   :iconType (Option String)
+   :iconIsVirtual (Option Bool)
+   :source WorkspaceTaskbarPinSource
+   :initialState WorkspaceInitialState
+   :viewingPath (Option String)
+   :openedFromWindowId (Option String)})
+
+(type ActiveTabMap (Map String String))
+
+(type TabGroupSplit
+  {:leftTabId (Option String)
+   :leftPaneFraction (Option Number)})
+
+(type TabGroupSplits (Map String TabGroupSplit))
+
+(ann activeTabMapJs (Fn [ActiveTabMap] Js))
+(defn activeTabMapJs [tabMap]
+  (unsafe-cast Js tabMap))
+
+(ann tabGroupSplitsJs (Fn [TabGroupSplits] Js))
+(defn tabGroupSplitsJs [splits]
+  (unsafe-cast Js splits))
+
+(type TabGroupState
+  {:windows (Vector WorkspaceTabWindow)
+   :activeTabMap ActiveTabMap
+   :tabGroupSplits TabGroupSplits})
+
+(ann tabGroupSignatureSeparator String)
+(def tabGroupSignatureSeparator (unsafe-cast String (json-parse "\"\\u0000\"")))
+
+(ann groupIdForWindow (Fn [WorkspaceTabWindow] String))
+(defn groupIdForWindow [win]
+  (match win.tabGroupId
+    nil win.id
+    (some groupId) groupId))
+
+(ann windowMinimized? (Fn [WorkspaceTabWindow] Bool))
+(defn windowMinimized? [win]
+  (= win.layout.minimized true))
+
+(ann appendGroupIdIfMissing (Fn [(Vector String) String] (Vector String)))
+(defn appendGroupIdIfMissing [order groupId]
+  (if (includes? order groupId) order (conj order groupId)))
+
+(ann orderedVisibleGroupIds (Fn [(Vector WorkspaceTabWindow)] (Vector String)))
+(defn orderedVisibleGroupIds [windows]
+  (reduce windows
+          []
+          (fn [order win]
+            (if (windowMinimized? win)
+                order
+                (appendGroupIdIfMissing order (groupIdForWindow win))))))
+
+(ann orderedAllGroupIds (Fn [(Vector WorkspaceTabWindow)] (Vector String)))
+(defn orderedAllGroupIds [windows]
+  (reduce windows
+          []
+          (fn [order win]
+            (appendGroupIdIfMissing order (groupIdForWindow win)))))
+
+(ann tabsInGroup (Fn [(Vector WorkspaceTabWindow) String] (Vector WorkspaceTabWindow)))
+(defn tabsInGroup [windows groupId]
+  (filter windows (fn [win] (= (groupIdForWindow win) groupId))))
+
+(ann splitLeftTabId (Fn [TabGroupSplits String] (Option String)))
+(defn splitLeftTabId [tabGroupSplits groupId]
+  (let [split (object-get (tabGroupSplitsJs tabGroupSplits) groupId)
+        left (if (object? split) (object-get split "leftTabId") nil)]
+    (if (string? left) left nil)))
+
+(ann visibleTabIdAfterPlayerRemoved (Fn [(Vector WorkspaceTabWindow) String TabGroupSplits] (Option String)))
+(defn visibleTabIdAfterPlayerRemoved [windows groupId tabGroupSplits]
+  (let [members (tabsInGroup windows groupId)]
+    (if (= (count members) 0)
+        nil
+        (match (splitLeftTabId tabGroupSplits groupId)
+          (some leftId)
+            (let [right (find members (fn [member] (not (= member.id leftId))))]
+              (if (some? right) right.id (get (nth members 0) :id)))
+          nil
+            (let [viewer (find members (fn [member] (= member.type "viewer")))]
+              (if (some? viewer) viewer.id (get (nth members (- (count members) 1)) :id)))))))
+
+(ann resolveGroupVisibleTabId (Fn [TabGroupState String] String))
+(defn resolveGroupVisibleTabId [state groupId]
+  (let [groupTabs (tabsInGroup state.windows groupId)]
+    (if (= (count groupTabs) 0)
+        ""
+        (let [leftId (splitLeftTabId state.tabGroupSplits groupId)
+              mappedRaw (object-get (activeTabMapJs state.activeTabMap) groupId)
+              mapped (if (string? mappedRaw) mappedRaw nil)
+              mappedInGroup? (and (some? mapped)
+                                  (some? (find groupTabs (fn [tab] (= tab.id mapped)))))]
+          (if mappedInGroup?
+              (match leftId
+                (some currentLeft)
+                  (if (= mapped currentLeft)
+                      (let [right (find groupTabs (fn [tab] (not (= tab.id currentLeft))))]
+                        (if (some? right) right.id mapped))
+                      mapped)
+                nil mapped)
+              (match leftId
+                (some currentLeft)
+                  (let [right (find groupTabs (fn [tab] (not (= tab.id currentLeft))))]
+                    (if (some? right) right.id (get (nth groupTabs 0) :id)))
+                nil (get (nth groupTabs 0) :id)))))))
+
+(ann isSplitLeftTab (Fn [TabGroupSplits String String] Bool))
+(defn isSplitLeftTab [tabGroupSplits groupId tabId]
+  (= (splitLeftTabId tabGroupSplits groupId) tabId))
+
+(ann insertIndexAfterAllRightTabs (Fn [(Vector WorkspaceTabWindow) String] Number))
+(defn insertIndexAfterAllRightTabs [groupMembers leftTabId]
+  (+ (reduce-indexed groupMembers
+                     -1
+                     (fn [lastRight member index]
+                       (if (not (= member.id leftTabId)) index lastRight)))
+     1))
+
+(ann windowIndexById (Fn [(Vector WorkspaceTabWindow) String] Number))
+(defn windowIndexById [windows targetId]
+  (reduce-indexed windows
+                  -1
+                  (fn [found member index]
+                    (if (and (< found 0) (= member.id targetId)) index found))))
+
+(ann rightStripIndexToGroupInsertIndex (Fn [(Vector WorkspaceTabWindow) (Option String) Number] Number))
+(defn rightStripIndexToGroupInsertIndex [groupMembers leftTabId rightStripIndex]
+  (match leftTabId
+    nil rightStripIndex
+    (some currentLeft)
+      (let [rightOrdered (filter groupMembers (fn [member] (not (= member.id currentLeft))))]
+        (if (>= rightStripIndex (count rightOrdered))
+            (insertIndexAfterAllRightTabs groupMembers currentLeft)
+            (let [targetId (get (nth rightOrdered rightStripIndex) :id)
+                  index (windowIndexById groupMembers targetId)]
+              (if (< index 0) (count groupMembers) index))))))
+
+(ann mergeInsertIndexToRightStripSlot (Fn [(Vector WorkspaceTabWindow) (Option String) Number] Number))
+(defn mergeInsertIndexToRightStripSlot [groupMembers leftTabId fullGroupInsertIndex]
+  (match leftTabId
+    nil fullGroupInsertIndex
+    (some currentLeft)
+      (reduce (range 0 (min fullGroupInsertIndex (count groupMembers)))
+              0
+              (fn [rightSlot index]
+                (if (not (= (get (nth groupMembers index) :id) currentLeft))
+                    (+ rightSlot 1)
+                    rightSlot)))))
+
+(ann tabPinned? (Fn [WorkspaceTabWindow] Bool))
+(defn tabPinned? [win]
+  (= win.tabPinned true))
+
+(ann pinnedCountInGroup (Fn [(Vector WorkspaceTabWindow) String] Number))
+(defn pinnedCountInGroup [windows groupId]
+  (count (filter (tabsInGroup windows groupId) tabPinned?)))
+
+(ann leadingPinnedTabCountFrom (Fn [(Vector WorkspaceTabWindow) Number Number] Number))
+(defn leadingPinnedTabCountFrom [tabs index total]
+  (if (>= index (count tabs))
+      total
+      (if (tabPinned? (nth tabs index))
+          (leadingPinnedTabCountFrom tabs (+ index 1) (+ total 1))
+          total)))
+
+(ann leadingPinnedTabCount (Fn [(Vector WorkspaceTabWindow)] Number))
+(defn leadingPinnedTabCount [tabs]
+  (leadingPinnedTabCountFrom tabs 0 0))
+
+(ann clampTabInsertIndex (Fn [(Vector WorkspaceTabWindow) String Number] Number))
+(defn clampTabInsertIndex [windows groupId insertIndex]
+  (max insertIndex (pinnedCountInGroup windows groupId)))
+
+(ann mergeTargetGroupSignature (Fn [(Vector WorkspaceTabWindow)] String))
+(defn mergeTargetGroupSignature [windows]
+  (join (map windows
+             (fn [win]
+               (str win.id tabGroupSignatureSeparator (groupIdForWindow win) tabGroupSignatureSeparator)))
+        ""))

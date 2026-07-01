@@ -1,0 +1,115 @@
+(import "crypto" [createHmac scrypt timingSafeEqual])
+(import "util" [promisify])
+(import "node:buffer" [Buffer])
+(import "./config.clsk" [config])
+
+(def scryptAsync (promisify scrypt))
+(def SALT "derp-media-server")
+(def KEY_LEN 64)
+(def SESSION_COOKIE "auth_session")
+(def DEFAULT_SESSION_MAX_AGE_SECONDS (* 60 60 24 7))
+(def expectedHashCache (new (js-global Map)))
+(def jsPromise (js-global Promise))
+(def jsMath (js-global Math))
+(def jsNumber (js-global Number))
+(def jsDate (js-global Date))
+(def jsProcess (js-global process))
+
+(ann getAuthSessionMaxAgeSeconds (Fn [] Number))
+(defn getAuthSessionMaxAgeSeconds []
+  (let [n config.auth.sessionMaxAgeSeconds]
+    (if (and (number? n) (> n 0) (jsNumber.isFinite n))
+        (jsMath.floor n)
+        DEFAULT_SESSION_MAX_AGE_SECONDS)))
+
+(ann shouldUseSecureAuthCookie (Fn [] Bool))
+(defn shouldUseSecureAuthCookie []
+  (let [secure config.auth.secureCookies]
+    (if (bool? secure) secure (= jsProcess.env.NODE_ENV "production"))))
+
+(ann signSession (Fn [String String] String))
+(defn signSession [secret payload]
+  (let [hmac (createHmac "sha256" secret)
+        updated (hmac.update payload)]
+    (updated.digest "base64url")))
+
+(ann verifySignedCookie (Fn [String String] Bool))
+(defn verifySignedCookie [value secret]
+  (let [valueJs (unsafe-cast Js value)
+        dot (valueJs.indexOf ".")]
+    (if (or (<= dot 0) (>= dot (- (count value) 1)))
+        false
+        (let [payload (string-slice value 0 dot)
+              sig (string-slice value (+ dot 1))
+              expected (signSession secret payload)]
+          (if (not (= (count sig) (count expected)))
+              false
+              (try
+               (timingSafeEqual (Buffer.from sig "base64url")
+                                (Buffer.from expected "base64url"))
+               (catch _error false)))))))
+
+(ann getExpectedHash (Fn [String] Js))
+(defn getExpectedHash [password]
+  (let [cached (expectedHashCache.get "value")]
+    (if (some? cached)
+        (jsPromise.resolve cached)
+        (let [hashed (scryptAsync password SALT KEY_LEN)]
+          (hashed.then
+           (fn [hash]
+             (do
+               (expectedHashCache.set "value" hash)
+               hash)))))))
+
+(ann verifyPassword (Fn [String] Js))
+(defn verifyPassword [password]
+  (let [expected config.auth.password]
+    (if (or (not (string? expected))
+            (= expected "")
+            (not (string? password))
+            (= password ""))
+        (jsPromise.resolve false)
+        (try
+         (let [both (jsPromise.all [(scryptAsync password SALT KEY_LEN)
+                                    (getExpectedHash expected)])
+               checked (both.then
+                        (fn [values]
+                          (let [inputHash (nth values 0)
+                                expectedHash (nth values 1)]
+                            (if (= inputHash.length expectedHash.length)
+                                (timingSafeEqual inputHash expectedHash)
+                                false))))]
+           (checked.catch (fn [_error] false)))
+         (catch _error (jsPromise.resolve false))))))
+
+(ann createAuthSessionValue (Fn [] Js))
+(defn createAuthSessionValue []
+  (let [secret config.auth.password]
+    (if (not (string? secret))
+        nil
+        (if (= secret "")
+            nil
+            (let [timestamp (str (jsMath.floor (/ (jsDate.now) 1000)))
+                  signature (signSession secret timestamp)
+                  value (str timestamp "." signature)
+                  maxAge (getAuthSessionMaxAgeSeconds)]
+              {:name SESSION_COOKIE
+               :value value
+               :options {:httpOnly true
+                         :secure (shouldUseSecureAuthCookie)
+                         :sameSite "lax"
+                         :maxAge maxAge
+                         :path "/"}})))))
+
+(ann verifySessionValue (Fn [Js] Bool))
+(defn verifySessionValue [value]
+  (let [secret config.auth.password]
+    (if (or (not (string? secret)) (= secret "") (not (string? value)))
+        false
+        (if (not (verifySignedCookie value secret))
+            false
+            (let [valueJs (unsafe-cast Js value)
+                  dot (valueJs.indexOf ".")
+                  timestamp ((js-global parseInt) (string-slice value 0 dot) 10)
+                  now (jsMath.floor (/ (jsDate.now) 1000))]
+              (<= (- now timestamp) (getAuthSessionMaxAgeSeconds)))))))

@@ -1,0 +1,101 @@
+(import "./api.clsk" [api])
+(import "./query-keys.clsk" [queryKeys])
+(import "../src/features/client-paths.clsk" [getKnowledgeBaseRoot])
+(import "../src/features/source-context.clsk" [normalizeSlashes stripSharePrefix])
+
+(def jsURLSearchParams (js-global URLSearchParams))
+
+(ann fetchShareFiles (Fn [String String] Js))
+(defn fetchShareFiles [token subDir]
+  (api (str "/api/share/" token "/files?dir=" (encode-uri-component subDir)) nil))
+
+(ann prefetchKbRecentForPath (Fn [Js String] Nil))
+(defn prefetchKbRecentForPath [queryClient pathWithinKb]
+  (do
+    (queryClient.prefetchQuery
+     {:queryKey (queryKeys.kbRecent pathWithinKb)
+      :queryFn (fn []
+                 (api (str "/api/kb/recent?root="
+                           (encode-uri-component pathWithinKb))
+                      nil))})
+    nil))
+
+(ann prefetchShareKbRecent (Fn [Js String String] Nil))
+(defn prefetchShareKbRecent [queryClient token subDir]
+  (let [dirArg (if (= subDir "") nil subDir)]
+    (do
+      (queryClient.prefetchQuery
+       {:queryKey (queryKeys.shareKbRecent token dirArg)
+        :queryFn (fn []
+                   (let [params (new jsURLSearchParams)]
+                     (do
+                       (if (not (= subDir ""))
+                           (params.set "dir" subDir)
+                           nil)
+                       (api (str "/api/share/" token "/kb/recent?" (params.toString)) nil))))})
+      nil)))
+
+(ann prefetchDirectoryListingAtPath (Fn [Js String] Nil))
+(defn prefetchDirectoryListingAtPath [ctx dirPath]
+  (let [share (get ctx :share)
+        norm (normalizeSlashes dirPath)]
+    (if (some? share)
+        (let [subDir (stripSharePrefix norm (normalizeSlashes share.sharePath))]
+          (do
+            (ctx.queryClient.prefetchQuery
+             {:queryKey (queryKeys.shareFiles share.token subDir)
+              :queryFn (fn [] (fetchShareFiles share.token subDir))})
+            (if (= ctx.shareIsKnowledgeBase true)
+                (prefetchShareKbRecent ctx.queryClient share.token subDir)
+                nil)
+            nil))
+        (do
+          (ctx.queryClient.prefetchQuery
+           {:queryKey (queryKeys.files norm)
+            :queryFn (fn []
+                       (api (str "/api/files?dir=" (encode-uri-component norm)) nil))})
+          (if (and (vector? ctx.knowledgeBases)
+                   (> (count ctx.knowledgeBases) 0)
+                   (some? (getKnowledgeBaseRoot norm ctx.knowledgeBases)))
+              (prefetchKbRecentForPath ctx.queryClient norm)
+              nil)
+          nil))))
+
+(ann prefetchFolderContentsOnHover (Fn [Js Js] Nil))
+(defn prefetchFolderContentsOnHover [ctx file]
+  (if (= file.isDirectory true)
+      (prefetchDirectoryListingAtPath ctx file.path)
+      nil))
+
+(ann parentPathForHover (Fn [String Bool] (Option String)))
+(defn parentPathForHover [currentPath isVirtualFolder]
+  (let [cur (normalizeSlashes currentPath)]
+    (if (= cur "")
+        nil
+        (if isVirtualFolder
+            ""
+            (let [parts (filter (split cur "/") (fn [part] (not (= part ""))))]
+              (if (= (count parts) 0)
+                  nil
+                  (join (slice parts 0 (- (count parts) 1)) "/")))))))
+
+(ann prefetchParentDirectoryHover (Fn [Js Js] Nil))
+(defn prefetchParentDirectoryHover [ctx args]
+  (match (parentPathForHover args.currentPath (= args.isVirtualFolder true))
+    nil nil
+    (some parentPath) (prefetchDirectoryListingAtPath ctx parentPath)))
+
+(ann prefetchShareDirHover (Fn [Js String] Nil))
+(defn prefetchShareDirHover [ctx subDirRelativeToShare]
+  (let [share (get ctx :share)]
+    (if (not (some? share))
+        nil
+        (let [sub (normalizeSlashes subDirRelativeToShare)]
+          (do
+            (ctx.queryClient.prefetchQuery
+             {:queryKey (queryKeys.shareFiles share.token sub)
+              :queryFn (fn [] (fetchShareFiles share.token sub))})
+            (if (= ctx.shareIsKnowledgeBase true)
+                (prefetchShareKbRecent ctx.queryClient share.token sub)
+                nil)
+            nil)))))

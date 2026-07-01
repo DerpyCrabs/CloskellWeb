@@ -156,7 +156,16 @@ class CloskellTestElement {
     clone.value = this.value;
     clone.checked = this.checked;
     if (deep) {
-      for (const child of this.children) clone.appendChild(child.cloneNode?.(true) ?? child);
+      const childClones = new Map();
+      for (const child of this.children) {
+        const childClone = child.cloneNode?.(true) ?? child;
+        childClones.set(child, childClone);
+        clone.appendChild(childClone);
+      }
+      if (this.__closkellPathChildren) {
+        clone.__closkellPathChildren = this.__closkellPathChildren.map((child) => childClones.get(child));
+        clone.__closkellPathChildIndex = this.__closkellPathChildIndex;
+      }
     }
     return clone;
   }
@@ -239,7 +248,11 @@ function parseTestHtmlFragment(value, documentRef) {
     const token = tokens[tokenIndex];
     const parent = stack[stack.length - 1];
     if (token.startsWith("<!--")) {
-      parent.appendChild(createRuntimeTextNode(documentRef, ""));
+      if (isCompiledTextPlaceholderComment(tokens, tokenIndex)) {
+        skipParsedPathChild(parent);
+        continue;
+      }
+      appendParsedNode(parent, createRuntimeTextNode(documentRef, ""));
       continue;
     }
     if (token.startsWith("</")) {
@@ -255,13 +268,41 @@ function parseTestHtmlFragment(value, documentRef) {
       for (const [name, attrValue] of parseTestHtmlAttrs(rawAttrs)) {
         node.setAttribute(name, attrValue);
       }
-      parent.appendChild(node);
+      appendParsedNode(parent, node);
       if (!token.endsWith("/>") && !isTestVoidElement(tagName)) stack.push(node);
       continue;
     }
-    parent.appendChild(createRuntimeTextNode(documentRef, decodeTestHtml(token)));
+    appendParsedNode(parent, createRuntimeTextNode(documentRef, decodeTestHtml(token)));
   }
   return fragment;
+}
+
+function appendParsedNode(parent, node) {
+  const index = parsedPathChildIndex(parent);
+  parent.__closkellPathChildren[index] = node;
+  parent.__closkellPathChildIndex = index + 1;
+  return parent.appendChild(node);
+}
+
+function skipParsedPathChild(parent) {
+  const index = parsedPathChildIndex(parent);
+  parent.__closkellPathChildren[index] = undefined;
+  parent.__closkellPathChildIndex = index + 1;
+}
+
+function parsedPathChildIndex(parent) {
+  if (!parent.__closkellPathChildren) parent.__closkellPathChildren = [];
+  if (!Number.isFinite(parent.__closkellPathChildIndex)) parent.__closkellPathChildIndex = 0;
+  return parent.__closkellPathChildIndex;
+}
+
+function isCompiledTextPlaceholderComment(tokens, index) {
+  const previous = tokens[index - 1] || "";
+  const beforePrevious = tokens[index - 2] || "";
+  const next = tokens[index + 1] || "";
+  const afterNext = tokens[index + 2] || "";
+  if (next && !next.startsWith("<") && afterNext.startsWith("<!--")) return true;
+  return previous && !previous.startsWith("<") && beforePrevious.startsWith("<!--");
 }
 
 function createRuntimeTextNode(documentRef, value) {
@@ -292,6 +333,7 @@ function isTestVoidElement(tagName) {
 
 function ensureRuntimeDocument() {
   if (globalThis.document?.createElement && globalThis.document?.createTextNode) {
+    ensureRuntimeWindow(globalThis.document);
     return globalThis.document;
   }
   const listeners = {};
@@ -333,9 +375,135 @@ function ensureRuntimeDocument() {
       return !event.defaultPrevented;
     }
   };
+  documentRef.documentElement = new CloskellTestElement("html", documentRef);
+  documentRef.documentElement.clientWidth = 1024;
+  documentRef.documentElement.clientHeight = 768;
   documentRef.body = new CloskellTestElement("body", documentRef);
   globalThis.document = documentRef;
+  ensureRuntimeWindow(documentRef);
   return documentRef;
+}
+
+function ensureRuntimeWindow(documentRef) {
+  if (globalThis.window?.document) {
+    globalThis.window.document ||= documentRef;
+    globalThis.localStorage ||= globalThis.window.localStorage;
+    globalThis.history ||= globalThis.window.history;
+    globalThis.location ||= globalThis.window.location;
+    return globalThis.window;
+  }
+
+  const listeners = {};
+  const location = {
+    href: "http://localhost/",
+    origin: "http://localhost",
+    pathname: "/",
+    search: "",
+    hash: "",
+    assign(value) {
+      updateTestLocation(this, value);
+    }
+  };
+  const history = {
+    pushState(_state, _title, url) {
+      updateTestLocation(location, url);
+    },
+    replaceState(_state, _title, url) {
+      updateTestLocation(location, url);
+    }
+  };
+  const localStorage = createTestLocalStorage();
+  const windowRef = {
+    document: documentRef,
+    localStorage,
+    history,
+    location,
+    navigator: { clipboard: null },
+    innerWidth: 1024,
+    innerHeight: 768,
+    scrollX: 0,
+    scrollY: 0,
+    fetch: globalThis.fetch?.bind(globalThis),
+    setTimeout: globalThis.setTimeout?.bind(globalThis),
+    clearTimeout: globalThis.clearTimeout?.bind(globalThis),
+    requestAnimationFrame(callback) {
+      return (globalThis.setTimeout || setTimeout)(() => callback(Date.now()), 16);
+    },
+    cancelAnimationFrame(id) {
+      return (globalThis.clearTimeout || clearTimeout)(id);
+    },
+    matchMedia(query) {
+      return {
+        media: String(query ?? ""),
+        matches: false,
+        addEventListener() {},
+        removeEventListener() {},
+        addListener() {},
+        removeListener() {}
+      };
+    },
+    getComputedStyle() {
+      return { getPropertyValue: () => "" };
+    },
+    addEventListener(type, listener) {
+      listeners[type] ||= [];
+      listeners[type].push(listener);
+    },
+    removeEventListener(type, listener) {
+      listeners[type] = (listeners[type] || []).filter((entry) => entry !== listener);
+    },
+    dispatchEvent(event) {
+      event.target ||= windowRef;
+      event.currentTarget = windowRef;
+      for (const listener of [...(listeners[event.type] || [])]) listener(event);
+      return !event.defaultPrevented;
+    },
+    open() {
+      return null;
+    },
+    alert() {},
+    scrollTo() {}
+  };
+
+  globalThis.window = windowRef;
+  globalThis.localStorage = localStorage;
+  globalThis.history = history;
+  globalThis.location = location;
+  return windowRef;
+}
+
+function updateTestLocation(location, url) {
+  const next = new URL(String(url ?? "/"), location.href || "http://localhost/");
+  location.href = next.href;
+  location.origin = next.origin;
+  location.pathname = next.pathname;
+  location.search = next.search;
+  location.hash = next.hash;
+}
+
+function createTestLocalStorage() {
+  const values = new Map();
+  return {
+    get length() {
+      return values.size;
+    },
+    getItem(key) {
+      const normalized = String(key);
+      return values.has(normalized) ? values.get(normalized) : null;
+    },
+    setItem(key, value) {
+      values.set(String(key), String(value));
+    },
+    removeItem(key) {
+      values.delete(String(key));
+    },
+    clear() {
+      values.clear();
+    },
+    key(index) {
+      return [...values.keys()][Number(index)] ?? null;
+    }
+  };
 }
 
 export function htmlTemplate(source) {
@@ -827,10 +995,12 @@ function compiledHtmlTemplateNode(root, path) {
   if (path === null) return root;
   let node = root;
   for (let index = 0; index < path.length; index += 1) {
+    const pathChildren = node.__closkellPathChildren;
     const children = node.childNodes || node.children;
-    node = children[path[index]]
+    node = pathChildren?.[path[index]]
+      ?? children[path[index]]
       ?? (children.length === 1 ? children[0] : undefined)
-      ?? (children.length === path[index] ? children[children.length - 1] : undefined);
+      ?? (path[index] >= children.length ? children[children.length - 1] : undefined);
   }
   return node;
 }
@@ -2251,11 +2421,15 @@ export function setComponent(instance, slot, marker, render, args, dispatch, upd
 
   if (current.component) {
     const nextArgs = Array.isArray(args) ? args : [];
+    const arity = compiledComponentArity(current.component);
     const params = componentParams(current.component);
     const componentContext = fresh
       ? forceUpdateContext(updateContext)
       : componentUpdateContext(updateContext, params, current.args, nextArgs);
-    if (params.length) {
+    if (arity > 0) {
+      current.component.update(...nextArgs.slice(0, arity), dispatch, componentContext);
+      current.args = nextArgs;
+    } else if (params.length) {
       current.component.update(...nextArgs, dispatch, componentContext);
       current.args = nextArgs;
     } else {
@@ -2271,16 +2445,19 @@ export function setComponent(instance, slot, marker, render, args, dispatch, upd
 }
 
 export function setCompiledComponent(instance, slot, marker, render, args, dispatch, updateContext = null, expectedKey) {
-  if (updateContext && !shouldUpdateSlot(instance, slot, updateContext)) return;
   const parent = marker.parentNode;
   if (!parent) return;
 
   const current = instance.componentSlots[slot] || {};
+  const nextArgs = Array.isArray(args) ? args : [];
   const currentArity = compiledComponentArity(current.component);
+  const argsChanged = !sameCompiledComponentArgs(current.args, nextArgs);
+  if (updateContext && !argsChanged && !shouldUpdateSlot(instance, slot, updateContext)) return;
+
   const shouldRecreate =
     !current.component ||
     current.renderKey !== expectedKey ||
-    (args.length > 0 && currentArity === 0 && !sameCompiledComponentArgs(current.args, args));
+    (nextArgs.length > 0 && currentArity === 0 && argsChanged);
   if (shouldRecreate) {
     if (current.component?.root?.parentNode) {
       current.component.root.parentNode.removeChild(current.component.root);
@@ -2288,16 +2465,16 @@ export function setCompiledComponent(instance, slot, marker, render, args, dispa
     disposeComponent(current.component);
     current.component = render();
     current.renderKey = expectedKey;
-    current.args = args.slice();
   }
 
   if (current.component) {
     const arity = compiledComponentArity(current.component);
-    const nextArgs = Array.isArray(args) ? args : [];
     const params = componentParams(current.component);
     const componentContext = shouldRecreate
       ? forceUpdateContext(updateContext)
-      : componentUpdateContext(updateContext, params, current.args, nextArgs);
+      : (argsChanged && arity > 0 && (!Array.isArray(params) || params.length === 0))
+        ? forceUpdateContext(updateContext)
+        : componentUpdateContext(updateContext, params, current.args, nextArgs);
     if (arity > 0) {
       current.component.update(...nextArgs.slice(0, arity), dispatch, componentContext);
     } else {
@@ -2494,6 +2671,9 @@ export const Cmd = {
   },
   fileReadSelected(ref, format = "text", onSuccess, onError) {
     return { kind: Symbol.for("file/read-selected"), ref, format, onSuccess, onError };
+  },
+  fileReadBlob(blob, format = "text", onSuccess, onError) {
+    return { kind: Symbol.for("file/read-blob"), blob, format, onSuccess, onError };
   },
   canvasDraw(ref, ops, msg, onError, options = {}) {
     return { kind: Symbol.for("canvas/draw"), ref, ops, msg, onError, ...options };
@@ -3123,6 +3303,7 @@ export function createCommandHandlers(env = {}) {
   const sessionStorage = env.sessionStorage || host.sessionStorage;
   const documentRef = env.document || host.document;
   const FormDataCtor = env.FormData || host.FormData || globalThis.FormData;
+  const EventSourceCtor = env.EventSource || host.EventSource || globalThis.EventSource;
   const requestAnimationFrameImpl = env.requestAnimationFrame || animation.requestAnimationFrame?.bind(animation);
   const cancelAnimationFrameImpl = env.cancelAnimationFrame || animation.cancelAnimationFrame?.bind(animation);
   const matchMedia = env.matchMedia || host.matchMedia?.bind(host);
@@ -3139,6 +3320,7 @@ export function createCommandHandlers(env = {}) {
   const mediaQueries = new Map();
   const resizeObservers = new Map();
   const windowEvents = new Map();
+  const eventSources = new Map();
 
   const cleanupBluetoothConnection = (connection) => {
     if (!connection) return;
@@ -3178,6 +3360,9 @@ export function createCommandHandlers(env = {}) {
 
     for (const entry of windowEvents.values()) removeWindowEventListener(entry);
     windowEvents.clear();
+
+    for (const entry of eventSources.values()) closeEventSourceEntry(timers, entry);
+    eventSources.clear();
   };
 
   const handlers = {
@@ -3360,8 +3545,73 @@ export function createCommandHandlers(env = {}) {
       replaceBrowserSearchParam(host, command.name, command.value);
       return commandMessage(command);
     },
+    "browser/history-push"(command) {
+      pushBrowserHistory(host, command.url);
+      return commandMessage(command);
+    },
+    "browser/history-replace"(command) {
+      replaceBrowserHistory(host, command.url);
+      return commandMessage(command);
+    },
     "browser/history-write-route"(command) {
       writeBrowserRoute(host, command.url, command.op, command.definition);
+      return commandMessage(command);
+    },
+    "browser/location-assign"(command) {
+      assignBrowserLocation(host, command.url);
+      return commandMessage(command);
+    },
+    "browser/open-url"(command) {
+      openBrowserUrl(host, command.url, command.target);
+      return commandMessage(command);
+    },
+    "browser/download-url"(command) {
+      downloadBrowserUrl(host, command.url, command.filename || command.name, env);
+      return commandMessage(command);
+    },
+    "browser/document-title"(command) {
+      setDocumentTitle(host, command.title);
+      return commandMessage(command);
+    },
+    "browser/scroll-to"(command) {
+      scrollBrowserTo(host, command.x, command.y);
+      return commandMessage(command);
+    },
+    "event-source/open"(command) {
+      if (!EventSourceCtor) return commandErrorMessage(command, new Error("EventSource is unavailable."));
+      try {
+        return commandMessage(command, openEventSourceConnection(EventSourceCtor, host, timers, eventSources, command));
+      } catch (error) {
+        return commandErrorMessage(command, error);
+      }
+    },
+    "event-source/close"(command) {
+      const id = command.id || command.url || "event-source";
+      const existing = eventSources.get(id);
+      if (existing) {
+        closeEventSourceEntry(timers, existing);
+        eventSources.delete(id);
+      }
+      return commandMessage(command, { id });
+    },
+    "media/play-selector"(command) {
+      playMediaSelector(host, command.selector);
+      return commandMessage(command);
+    },
+    "media/restore-current-time"(command) {
+      restoreMediaCurrentTime(host, command);
+      return commandMessage(command);
+    },
+    "media/sync-audio-element"(command) {
+      syncAudioElement(host, command);
+      return commandMessage(command);
+    },
+    "dom/breadcrumb-adaptive"(command) {
+      ensureBreadcrumbAdaptive(host);
+      return commandMessage(command);
+    },
+    "dom/focus-selector"(command) {
+      focusSelector(host, command);
       return commandMessage(command);
     },
     "browser/theme-load"(command) {
@@ -3378,6 +3628,10 @@ export function createCommandHandlers(env = {}) {
     },
     "browser/set-cookie"(command) {
       setBrowserCookie(host, command.name, command.value);
+      return commandMessage(command);
+    },
+    "dom/document-set-attribute"(command) {
+      setDocumentElementAttribute(host, command.name, command.value);
       return commandMessage(command);
     },
     "auth-storage/persist"(command) {
@@ -3513,6 +3767,13 @@ export function createCommandHandlers(env = {}) {
         return commandErrorMessage(command, error);
       }
     },
+    "file/read-blob": async function(command) {
+      try {
+        return commandMessage(command, await readImportedFile(command.blob, commandValueName(command.format || command.parse || "text")));
+      } catch (error) {
+        return commandErrorMessage(command, error);
+      }
+    },
     "canvas/draw"(command, dispatch) {
       const canvas = resolveRef(command.ref, dispatch);
       if (!canvas) return commandErrorMessage(command, new Error(`Canvas ref ${String(command.ref)} was not found.`));
@@ -3580,6 +3841,10 @@ export function createCommandHandlers(env = {}) {
       if (!node) return commandErrorMessage(command, new Error(`DOM ref ${String(command.ref)} was not found.`));
       const rect = measureNode(node);
       return commandMessage(command, { ref: refName(command.ref), ...rect });
+    },
+    "dom/input-set-selection"(command) {
+      setInputSelection(command.target, command.start, command.end);
+      return commandMessage(command, { start: command.start ?? 0, end: command.end ?? command.start ?? 0 });
     },
     "dom/scroll-into-view"(command) {
       queueScrollIntoView(command, {
@@ -4201,14 +4466,101 @@ export function registerBrowserCommandHandlers(handlers, context) {
   const storage = env.storage || host.localStorage;
   const sessionStorage = env.sessionStorage || host.sessionStorage;
   const clipboard = env.clipboard || host.navigator?.clipboard;
+  const timers = env.timers || host;
+  const EventSourceCtor = env.EventSource || host.EventSource || globalThis.EventSource;
+  const eventSources = new Map();
+
+  addCommandDisposer(context, () => {
+    for (const entry of eventSources.values()) closeEventSourceEntry(timers, entry);
+    eventSources.clear();
+  });
 
   handlers["browser/history-replace-search-param"] = function(command) {
     replaceBrowserSearchParam(host, command.name, command.value);
     return commandMessage(command);
   };
 
+  handlers["browser/history-push"] = function(command) {
+    pushBrowserHistory(host, command.url);
+    return commandMessage(command);
+  };
+
+  handlers["browser/history-replace"] = function(command) {
+    replaceBrowserHistory(host, command.url);
+    return commandMessage(command);
+  };
+
   handlers["browser/history-write-route"] = function(command) {
     writeBrowserRoute(host, command.url, command.op, command.definition);
+    return commandMessage(command);
+  };
+
+  handlers["browser/location-assign"] = function(command) {
+    assignBrowserLocation(host, command.url);
+    return commandMessage(command);
+  };
+
+  handlers["browser/open-url"] = function(command) {
+    openBrowserUrl(host, command.url, command.target);
+    return commandMessage(command);
+  };
+
+  handlers["browser/download-url"] = function(command) {
+    downloadBrowserUrl(host, command.url, command.filename || command.name, env);
+    return commandMessage(command);
+  };
+
+  handlers["browser/document-title"] = function(command) {
+    setDocumentTitle(host, command.title);
+    return commandMessage(command);
+  };
+
+  handlers["browser/scroll-to"] = function(command) {
+    scrollBrowserTo(host, command.x, command.y);
+    return commandMessage(command);
+  };
+
+  handlers["event-source/open"] = function(command) {
+    if (!EventSourceCtor) return commandErrorMessage(command, new Error("EventSource is unavailable."));
+    try {
+      return commandMessage(command, openEventSourceConnection(EventSourceCtor, host, timers, eventSources, command));
+    } catch (error) {
+      return commandErrorMessage(command, error);
+    }
+  };
+
+  handlers["event-source/close"] = function(command) {
+    const id = command.id || command.url || "event-source";
+    const existing = eventSources.get(id);
+    if (existing) {
+      closeEventSourceEntry(timers, existing);
+      eventSources.delete(id);
+    }
+    return commandMessage(command, { id });
+  };
+
+  handlers["media/play-selector"] = function(command) {
+    playMediaSelector(host, command.selector);
+    return commandMessage(command);
+  };
+
+  handlers["media/restore-current-time"] = function(command) {
+    restoreMediaCurrentTime(host, command);
+    return commandMessage(command);
+  };
+
+  handlers["media/sync-audio-element"] = function(command) {
+    syncAudioElement(host, command);
+    return commandMessage(command);
+  };
+
+  handlers["dom/breadcrumb-adaptive"] = function(command) {
+    ensureBreadcrumbAdaptive(host);
+    return commandMessage(command);
+  };
+
+  handlers["dom/focus-selector"] = function(command) {
+    focusSelector(host, command);
     return commandMessage(command);
   };
 
@@ -4229,6 +4581,11 @@ export function registerBrowserCommandHandlers(handlers, context) {
 
   handlers["browser/set-cookie"] = function(command) {
     setBrowserCookie(host, command.name, command.value);
+    return commandMessage(command);
+  };
+
+  handlers["dom/document-set-attribute"] = function(command) {
+    setDocumentElementAttribute(host, command.name, command.value);
     return commandMessage(command);
   };
 }
@@ -4508,6 +4865,14 @@ export function registerFileReadSelectedCommandHandlers(handlers) {
       return commandErrorMessage(command, error);
     }
   };
+
+  handlers["file/read-blob"] = async function(command) {
+    try {
+      return commandMessage(command, await readImportedFile(command.blob, commandValueName(command.format || command.parse || "text")));
+    } catch (error) {
+      return commandErrorMessage(command, error);
+    }
+  };
 }
 
 export function registerCompiledFileReadSelectedCommandHandlers(handlers) {
@@ -4531,6 +4896,14 @@ export function registerCompiledFileReadSelectedCommandHandlers(handlers) {
       return compiledCommandMessage(command, imported);
     } catch (error) {
       if (shouldClear) clearFileInput(input);
+      return compiledCommandErrorMessage(command, error);
+    }
+  };
+
+  handlers["file/read-blob"] = async function(command) {
+    try {
+      return compiledCommandMessage(command, await readImportedFile(command.blob, commandValueName(command.format || command.parse || "text")));
+    } catch (error) {
       return compiledCommandErrorMessage(command, error);
     }
   };
@@ -4640,6 +5013,11 @@ export function registerDomRefCommandHandlers(handlers) {
     const rect = measureNode(node);
     return commandMessage(command, { ref: refName(command.ref), ...rect });
   };
+
+  handlers["dom/input-set-selection"] = function(command) {
+    setInputSelection(command.target, command.start, command.end);
+    return commandMessage(command, { start: command.start ?? 0, end: command.end ?? command.start ?? 0 });
+  };
 }
 
 export function registerCompiledDomRefCommandHandlers(handlers) {
@@ -4661,6 +5039,11 @@ export function registerCompiledDomRefCommandHandlers(handlers) {
     const node = resolveCompiledRef(command.ref, dispatch);
     if (!node) return compiledCommandErrorMessage(command, new Error("Missing DOM ref"));
     return compiledCommandMessage(command, { ref: compiledRefName(command.ref), ...measureNode(node) });
+  };
+
+  handlers["dom/input-set-selection"] = function(command) {
+    setInputSelection(command.target, command.start, command.end);
+    return compiledCommandMessage(command, { start: command.start ?? 0, end: command.end ?? command.start ?? 0 });
   };
 }
 
@@ -5330,145 +5713,6 @@ export function startCompiledAppWithoutSubscriptions(options = {}) {
       handlers.dispose?.();
       component?.dispose?.();
     }
-  };
-}
-
-export function startServerService(options = {}) {
-  const boot = options.boot;
-  const initResult = typeof options.init === "function"
-    ? (boot === undefined ? options.init() : options.init(boot))
-    : [{}, { kind: "none" }];
-  const [initialState, initialCommand] = normalizeServerInitResult(initResult);
-  const service = {
-    boot,
-    state: initialState,
-    commands: initialCommand && commandKind(initialCommand) !== "none" ? [initialCommand] : [],
-    routes: [],
-    resources: { kind: "server/resources", resources: [] },
-    dispatch(message) {
-      if (typeof options.update !== "function") return service.state;
-      const [nextState, command] = normalizeServerInitResult(options.update(service.state, message));
-      service.state = nextState;
-      if (command && commandKind(command) !== "none") service.commands.push(command);
-      service.routes = readServerRoutes(options.routes, service.state);
-      service.resources = readServerResources(options.resources, service.state);
-      return service.state;
-    },
-    async handle(request, context = {}) {
-      return handleServerRequest(service, request, context);
-    }
-  };
-  service.routes = readServerRoutes(options.routes, service.state);
-  service.resources = readServerResources(options.resources, service.state);
-  return service;
-}
-
-function normalizeServerInitResult(result) {
-  if (Array.isArray(result)) return [result[0], result[1] ?? { kind: "none" }];
-  return [result ?? {}, { kind: "none" }];
-}
-
-function readServerRoutes(routes, state) {
-  if (typeof routes !== "function") return [];
-  const value = routes(state);
-  return Array.isArray(value) ? value.flat().filter(Boolean) : [];
-}
-
-function readServerResources(resources, state) {
-  if (typeof resources !== "function") return { kind: "server/resources", resources: [] };
-  const value = resources(state);
-  if (!value) return { kind: "server/resources", resources: [] };
-  if (Array.isArray(value)) return { kind: "server/resources", resources: value };
-  return value;
-}
-
-async function handleServerRequest(service, request = {}, context = {}) {
-  const match = findServerRoute(service.routes, request);
-  if (!match) {
-    return { kind: "response/json", status: 404, headers: {}, body: { error: "Not found" } };
-  }
-  const routeRequest = normalizeServerRequest(request, match.params);
-  try {
-    return await runTask(match.route.handler(routeRequest), context);
-  } catch (error) {
-    return normalizeServerError(error);
-  }
-}
-
-function normalizeServerRequest(request = {}, params = {}) {
-  const path = serverRequestPath(request);
-  return {
-    ...request,
-    method: request.method || "GET",
-    url: request.url ?? request.path ?? path,
-    path,
-    headers: request.headers || {},
-    query: request.query || {},
-    params: { ...(request.params || {}), ...params },
-  };
-}
-
-function findServerRoute(routes, request) {
-  const requestMethod = String(request.method || "GET").toUpperCase();
-  const requestPath = serverRequestPath(request);
-  for (const route of routes) {
-    if (!route || commandKind(route) !== "server/route") continue;
-    if (String(route.method || "GET").toUpperCase() !== requestMethod) continue;
-    const params = matchServerPath(String(route.path || ""), requestPath);
-    if (params) return { route, params };
-  }
-  return null;
-}
-
-function serverRequestPath(request) {
-  const raw = request.path ?? request.url ?? "/";
-  try {
-    return new URL(String(raw), "http://closkell.local").pathname;
-  } catch {
-    return String(raw).split("?")[0] || "/";
-  }
-}
-
-function matchServerPath(pattern, path) {
-  if (pattern === path) return {};
-  const patternParts = trimServerPath(pattern).split("/");
-  const pathParts = trimServerPath(path).split("/");
-  const params = {};
-  for (let index = 0; index < patternParts.length; index += 1) {
-    const patternPart = patternParts[index];
-    const pathPart = pathParts[index];
-    if (patternPart === "*") {
-      params.path = pathParts.slice(index).join("/");
-      return params;
-    }
-    if (pathPart == null) return null;
-    if (patternPart.startsWith(":")) {
-      params[patternPart.slice(1)] = decodeURIComponent(pathPart);
-      continue;
-    }
-    if (patternPart !== pathPart) return null;
-  }
-  return patternParts.length === pathParts.length ? params : null;
-}
-
-function trimServerPath(value) {
-  return String(value || "/").replace(/^\/+|\/+$/g, "");
-}
-
-function normalizeServerError(error) {
-  if (error && typeof error === "object" && "status" in error) {
-    return {
-      kind: "response/json",
-      status: error.status || 500,
-      headers: error.headers || {},
-      body: error.body ?? { error: error.message || "Server error" },
-    };
-  }
-  return {
-    kind: "response/json",
-    status: 500,
-    headers: {},
-    body: { error: errorMessage(error) },
   };
 }
 
@@ -6969,6 +7213,7 @@ function namedCommandMessage(kind, fields = {}) {
 
 function compiledNamedCommandMessage(kind, fields = {}) {
   if (kind === undefined) return undefined;
+  if (typeof kind === "function") return kind(fields);
   return { kind, ...fields };
 }
 
@@ -7349,7 +7594,8 @@ function multipartFormBody(env, fields, values) {
     if (!name) continue;
 
     if (field.kind === "file") {
-      const file = selectedFileByTestId(env.document, `request-body-multipart-${name}`);
+      const testId = field.testId || `request-body-multipart-${name}`;
+      const file = selectedFileByTestId(env.document, testId);
       if (file) form.append(name, file, file.name);
     } else {
       const value = values && hasOwn(values, name) ? values[name] : "";
@@ -7590,6 +7836,9 @@ function windowEventPayload(event = {}, host = globalThis) {
   const href = String(host.location?.href || "");
   const path = String(host.location?.pathname || "");
   const search = String(host.location?.search || "");
+  const target = event.target;
+  const targetTag = String(target?.tagName || "").toLowerCase();
+  const targetFileBrowser = target?.getAttribute?.("data-testid") === "file-browser";
   return {
     type: String(event.type || ""),
     href,
@@ -7613,7 +7862,11 @@ function windowEventPayload(event = {}, host = globalThis) {
     altKey: Boolean(event.altKey),
     ctrlKey: Boolean(event.ctrlKey),
     metaKey: Boolean(event.metaKey),
-    shiftKey: Boolean(event.shiftKey)
+    shiftKey: Boolean(event.shiftKey),
+    targetEditable: targetTag === "input"
+      || targetTag === "textarea"
+      || targetTag === "select"
+      || (Boolean(target?.isContentEditable) && !targetFileBrowser)
   };
 }
 
@@ -7785,6 +8038,46 @@ function removeResizeObserver(entry) {
 
 function removeWindowEventListener(entry) {
   entry.target?.removeEventListener?.(entry.type, entry.listener, entry.options);
+}
+
+function closeEventSourceEntry(timers, entry) {
+  if (entry.interval !== undefined && entry.interval !== null) {
+    timers.clearInterval?.(entry.interval);
+  }
+  try {
+    entry.source?.close?.();
+  } catch {}
+}
+
+function dispatchHostEvent(host, eventType) {
+  if (!eventType) return;
+  try {
+    const EventCtor = host.Event || globalThis.Event;
+    if (!EventCtor) return;
+    host.dispatchEvent?.(new EventCtor(String(eventType)));
+  } catch {}
+}
+
+function openEventSourceConnection(EventSourceCtor, host, timers, connections, command) {
+  const id = String(command.id || command.url || "event-source");
+  const url = String(command.url || "");
+  const eventType = String(command.eventType || command.dispatchEvent || "");
+  const refreshMs = Number(command.refreshMs || command.intervalMs || 0);
+  const logMessage = command.logMessage == null ? "" : String(command.logMessage);
+  const existing = connections.get(id);
+  if (existing) closeEventSourceEntry(timers, existing);
+
+  const source = new EventSourceCtor(url);
+  const refresh = () => dispatchHostEvent(host, eventType);
+  const interval = refreshMs > 0 && timers.setInterval ? timers.setInterval(refresh, refreshMs) : null;
+  if (logMessage && timers.setTimeout) timers.setTimeout(() => host.console?.log?.(logMessage), 500);
+  source.onopen = () => {
+    if (logMessage) host.console?.log?.(logMessage);
+  };
+  source.onmessage = refresh;
+
+  connections.set(id, { source, interval });
+  return { id, url };
 }
 
 function cancelAnimationFrameEntry(entry) {
@@ -7975,7 +8268,7 @@ function parseStoredValue(value, format) {
 }
 
 function parseCompiledStoredValue(value, format) {
-  const mode = format == null ? "auto" : format;
+  const mode = format == null ? "auto" : commandValueName(format);
   if (mode === "json") return JSON.parse(value);
   if (mode === "text" || mode === "string" || mode === "raw") return value;
   try {
@@ -7994,6 +8287,18 @@ function replaceBrowserSearchParam(host, name, value) {
   } catch {}
 }
 
+function pushBrowserHistory(host, url) {
+  try {
+    host.history?.pushState?.(null, "", String(url ?? ""));
+  } catch {}
+}
+
+function replaceBrowserHistory(host, url) {
+  try {
+    host.history?.replaceState?.(null, "", String(url ?? ""));
+  } catch {}
+}
+
 function writeBrowserRoute(host, url, op, definition) {
   try {
     const params = new URLSearchParams();
@@ -8006,6 +8311,363 @@ function writeBrowserRoute(host, url, op, definition) {
     const pathname = host.location?.pathname ?? "/";
     const next = query ? `${pathname}?${query}` : pathname;
     if (next !== `${pathname}${host.location?.search ?? ""}`) host.history?.replaceState?.(null, "", next);
+  } catch {}
+}
+
+function assignBrowserLocation(host, url) {
+  try {
+    host.location?.assign?.(String(url ?? ""));
+  } catch {}
+}
+
+function openBrowserUrl(host, url, target = "_blank") {
+  try {
+    host.open?.(String(url ?? ""), String(target || "_blank"));
+  } catch {}
+}
+
+function downloadBrowserUrl(host, url, filename, env = {}) {
+  try {
+    const documentRef = env.document || host.document;
+    const link = documentRef?.createElement?.("a");
+    if (!link) return;
+    link.setAttribute?.("href", String(url ?? ""));
+    link.setAttribute?.("download", String(filename ?? ""));
+    link.setAttribute?.("style", "display:none");
+    documentRef.body?.appendChild?.(link);
+    link.click?.();
+    link.remove?.();
+  } catch {}
+}
+
+function scrollBrowserTo(host, x, y) {
+  try {
+    host.scrollTo?.(Number(x) || 0, Number(y) || 0);
+  } catch {}
+}
+
+function setDisplayImportant(el, value) {
+  try {
+    el?.style?.setProperty?.("display", value, "important");
+  } catch {}
+}
+
+function syncBreadcrumbBar(bar) {
+  try {
+    const slot = bar.closest?.("[data-breadcrumb-slot]");
+    const width = slot ? slot.clientWidth : bar.clientWidth;
+    const count = Number.parseInt(bar.getAttribute?.("data-breadcrumb-count") || "0", 10);
+    const compact = count <= 2 ? width < 80 : count <= 3 ? width < 260 : width < 180;
+    const ellipsis = !compact && count > 3 && width < 700;
+    const showParent = width >= 420;
+    const wrappers = Array.from(bar.querySelectorAll?.("[data-breadcrumb-wrapper]") || []);
+    const ellipsisButton = bar.querySelector?.("[data-testid='breadcrumb-ellipsis']");
+    const picker = bar.querySelector?.("[data-breadcrumb-segment='path-picker']");
+    if (compact) {
+      bar.setAttribute?.("data-breadcrumb-layout", "compact");
+      bar.removeAttribute?.("data-breadcrumb-path-ellipsis");
+      setDisplayImportant(picker, "flex");
+      setDisplayImportant(ellipsisButton, "none");
+      wrappers.forEach((el) => setDisplayImportant(el, "none"));
+      return;
+    }
+    bar.setAttribute?.("data-breadcrumb-layout", "inline");
+    if (ellipsis) bar.setAttribute?.("data-breadcrumb-path-ellipsis", "");
+    else bar.removeAttribute?.("data-breadcrumb-path-ellipsis");
+    setDisplayImportant(picker, "none");
+    setDisplayImportant(ellipsisButton, ellipsis ? "flex" : "none");
+    wrappers.forEach((el) => {
+      const index = Number.parseInt(el.getAttribute?.("data-breadcrumb-index") || "0", 10);
+      const visible = ellipsis ? index === 0 || index === count - 1 || (showParent && index === count - 2) : true;
+      setDisplayImportant(el, visible ? "flex" : "none");
+    });
+  } catch {}
+}
+
+function syncBreadcrumbBars(host) {
+  const bars = Array.from(host.document?.querySelectorAll?.("[data-testid='breadcrumb-bar']") || []);
+  bars.forEach(syncBreadcrumbBar);
+}
+
+function ensureBreadcrumbAdaptive(host) {
+  const run = () => syncBreadcrumbBars(host);
+  try {
+    if (host.__closkellBreadcrumbAdaptiveInstalled === true) {
+      host.setTimeout?.(run, 0);
+      return;
+    }
+    try {
+      Object.defineProperty(host, "__closkellBreadcrumbAdaptiveInstalled", {
+        value: true,
+        configurable: true,
+        writable: true
+      });
+    } catch {
+      host.__closkellBreadcrumbAdaptiveInstalled = true;
+    }
+    host.setInterval?.(run, 100);
+    host.setTimeout?.(run, 0);
+  } catch {}
+}
+
+function focusSelector(host, command) {
+  const run = () => {
+    try {
+      const selector = String(command.selector ?? "");
+      const el = host.document?.querySelector?.(selector);
+      if (!el?.focus) return;
+      if (command.whenBody === true) {
+        const active = host.document?.activeElement;
+        const body = host.document?.body;
+        if (active && body && active !== body) return;
+      }
+      el.focus();
+    } catch {}
+  };
+  if (command.defer === true) {
+    try {
+      host.setTimeout?.(run, 0);
+      host.setTimeout?.(run, 25);
+      host.setTimeout?.(run, 100);
+    } catch {}
+  } else {
+    run();
+  }
+}
+
+function playMediaSelector(host, selector) {
+  try {
+    const node = host.document?.querySelector?.(String(selector ?? ""));
+    const played = node?.play?.();
+    played?.catch?.(() => {});
+  } catch {}
+}
+
+function restoreMediaCurrentTime(host, command) {
+  const selector = String(command.selector ?? "");
+  const time = Number(command.currentTime ?? command.time ?? 0);
+  if (!selector || !Number.isFinite(time) || time <= 0) return;
+  const apply = () => {
+    try {
+      const el = host.document?.querySelector?.(selector);
+      if (!el) return false;
+      const setTime = () => {
+        try {
+          el.currentTime = time;
+        } catch {}
+      };
+      if (Number(el.readyState ?? 0) >= 1) {
+        setTime();
+      } else {
+        el.addEventListener?.("loadedmetadata", setTime, { once: true });
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  if (!apply()) {
+    try {
+      host.setTimeout?.(apply, 0);
+      host.setTimeout?.(apply, 50);
+    } catch {}
+  }
+}
+
+function stampMediaElementDuration(el, duration) {
+  const value = Number.isFinite(Number(duration)) && Number(duration) > 0 ? Number(duration) : 2;
+  try {
+    Object.defineProperty(el, "__closkellMediaDuration", {
+      value,
+      configurable: true,
+      writable: true
+    });
+  } catch {}
+  try {
+    Object.defineProperty(el, "duration", {
+      value,
+      configurable: true,
+      writable: true
+    });
+  } catch {}
+}
+
+function installMediaElementLoopFallback(el, play) {
+  if (el.__closkellMediaLoopFallbackInstalled === true) return;
+  const loop = () => {
+    if (el.loop !== true) return;
+    try {
+      el.currentTime = 0;
+    } catch {}
+    try {
+      Object.defineProperty(el, "paused", {
+        value: false,
+        configurable: true,
+        writable: true
+      });
+    } catch {}
+    play();
+  };
+  try {
+    Object.defineProperty(el, "__closkellMediaLoopFallbackInstalled", {
+      value: true,
+      configurable: true,
+      writable: true
+    });
+  } catch {
+    el.__closkellMediaLoopFallbackInstalled = true;
+  }
+  try {
+    el.addEventListener?.("ended", loop);
+  } catch {}
+}
+
+function installMediaElementGlobalLoopFallback(host, selector) {
+  const documentRef = host.document;
+  if (!documentRef || documentRef.__closkellMediaGlobalLoopSelector === selector) return;
+  const resumeElement = (el) => {
+    if (el.loop !== true || el.isConnected === false) return;
+    if (
+      el.__closkellMediaShouldPlay !== true &&
+      documentRef.__closkellMediaShouldPlay !== true
+    ) return;
+    try {
+      el.currentTime = 0;
+    } catch {}
+    try {
+      Object.defineProperty(el, "paused", {
+        value: false,
+        configurable: true,
+        writable: true
+      });
+    } catch {}
+    const played = el.play?.();
+    played?.catch?.(() => {});
+  };
+  const resume = (event) => {
+    const el = event?.target;
+    if (!el?.matches?.(selector)) return;
+    resumeElement(el);
+  };
+  const tick = () => {
+    const el = documentRef.querySelector?.(selector);
+    if (!el || el.loop !== true || el.paused !== true) return;
+    if (
+      el.__closkellMediaShouldPlay !== true &&
+      documentRef.__closkellMediaShouldPlay !== true
+    ) return;
+    const duration = Number.isFinite(Number(el.duration))
+      ? Number(el.duration)
+      : Number(el.__closkellMediaDuration || 0);
+    const currentTime = Number(el.currentTime || 0);
+    if (
+      el.ended === true ||
+      currentTime <= 0.1 ||
+      (duration > 0 && currentTime >= Math.max(0, duration - 0.6))
+    ) {
+      resumeElement(el);
+    }
+  };
+  try {
+    documentRef.addEventListener("pause", resume, true);
+    documentRef.addEventListener("ended", resume, true);
+    host.setInterval?.(tick, 100);
+    Object.defineProperty(documentRef, "__closkellMediaGlobalLoopSelector", {
+      value: selector,
+      configurable: true,
+      writable: true
+    });
+  } catch {}
+}
+
+function syncAudioElement(host, command) {
+  const selector = String(command.selector ?? "");
+  const documentRef = host.document;
+  installMediaElementGlobalLoopFallback(host, selector);
+  const run = () => {
+    try {
+      const el = documentRef?.querySelector?.(selector);
+      if (!el) return false;
+      const key = String(command.key ?? "");
+      const url = String(command.url ?? "");
+      const stamp = () => stampMediaElementDuration(el, command.duration);
+      const play = () => {
+        const played = el.play?.();
+        played?.catch?.(() => {});
+      };
+      stamp();
+      installMediaElementLoopFallback(el, play);
+      if (el.__closkellMediaKey !== key) {
+        try {
+          el.pause?.();
+        } catch {}
+        try {
+          Object.defineProperty(el, "__closkellMediaKey", {
+            value: key,
+            configurable: true,
+            writable: true
+          });
+        } catch {
+          el.__closkellMediaKey = key;
+        }
+        if (url) {
+          el.src = url;
+          el.load?.();
+        }
+      }
+      if (command.play === true) {
+        try {
+          Object.defineProperty(el, "__closkellMediaShouldPlay", {
+            value: true,
+            configurable: true,
+            writable: true
+          });
+        } catch {
+          el.__closkellMediaShouldPlay = true;
+        }
+        try {
+          Object.defineProperty(documentRef, "__closkellMediaShouldPlay", {
+            value: true,
+            configurable: true,
+            writable: true
+          });
+        } catch {
+          documentRef.__closkellMediaShouldPlay = true;
+        }
+        play();
+        try {
+          el.addEventListener?.("loadedmetadata", stamp, { once: true });
+          el.addEventListener?.("canplay", play, { once: true });
+        } catch {}
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  if (!run()) {
+    try {
+      host.setTimeout?.(run, 0);
+      host.setTimeout?.(run, 25);
+      host.setTimeout?.(run, 100);
+      host.setTimeout?.(run, 250);
+      host.setTimeout?.(run, 500);
+      host.setTimeout?.(run, 1000);
+      host.setTimeout?.(run, 2000);
+    } catch {}
+  }
+}
+
+function setDocumentElementAttribute(host, name, value) {
+  try {
+    host.document?.documentElement?.setAttribute?.(String(name ?? ""), String(value ?? ""));
+  } catch {}
+}
+
+function setDocumentTitle(host, title) {
+  try {
+    const documentRef = host.document;
+    if (documentRef) documentRef.title = String(title ?? "");
   } catch {}
 }
 
@@ -8136,12 +8798,35 @@ function importWithBrowser(payload, env, host) {
 }
 
 async function readImportedFile(file, format) {
+  if (format === "base64") return readBlobAsBase64(file);
+  if (format === "data-url") return readBlobAsDataUrl(file);
   const text = await file.text();
   if (format === "json") return JSON.parse(text);
   if (format === "record") {
     return { name: file.name, type: file.type, text };
   }
   return text;
+}
+
+async function readBlobAsBase64(blob) {
+  const buffer = await blob.arrayBuffer();
+  return bytesToBase64String(buffer);
+}
+
+async function readBlobAsDataUrl(blob) {
+  const base64 = await readBlobAsBase64(blob);
+  return `data:${blob?.type || "application/octet-stream"};base64,${base64}`;
+}
+
+function bytesToBase64String(buffer) {
+  const bytes = new Uint8Array(buffer);
+  const chunkSize = 32768;
+  let binary = "";
+  for (let start = 0; start < bytes.length; start += chunkSize) {
+    const chunk = bytes.subarray(start, Math.min(bytes.length, start + chunkSize));
+    binary += String.fromCharCode.apply(null, chunk);
+  }
+  return globalThis.btoa(binary);
 }
 
 function clearFileInput(input) {
@@ -8155,4 +8840,12 @@ function clearFileInput(input) {
   } catch {
     // Browser FileList is read-only; clearing value is the portable path.
   }
+}
+
+function setInputSelection(target, start, end) {
+  if (!target?.setSelectionRange) return;
+  const from = Math.max(0, Number(start) || 0);
+  const to = Math.max(from, Number(end ?? start) || from);
+  target.focus?.();
+  target.setSelectionRange(from, to);
 }

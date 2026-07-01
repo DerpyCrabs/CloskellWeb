@@ -1,0 +1,128 @@
+(import "path" [(default path)])
+(import "./fs-tasks.clsk" [readDirWithFileTypes readFileUtf8 statPath])
+(import "../src/features/kb-chat-fs-paths.clsk" [mediaPathToKbRelative])
+(import "../lib/file-system.clsk" [resolveMediaPath shouldExcludeFolder toLogicalMediaPath])
+
+(def TEXT_EXTENSIONS [".md" ".txt"])
+(def DEFAULT_CHAR_BUDGET 32000)
+(def jsPromise (js-global Promise))
+
+(ann normalizeSlashes (Fn [String] String))
+(defn normalizeSlashes [value]
+  (join (split value "\\") "/"))
+
+(ann textFile? (Fn [String] Bool))
+(defn textFile? [name]
+  (includes? TEXT_EXTENSIONS (lower-case (path.extname name))))
+
+(ann readKbFile (Fn [String Js Js] Js))
+(defn readKbFile [fullPath root results]
+  (let [both (jsPromise.all [(readFileUtf8 fullPath) (statPath fullPath)])
+        saved (both.then
+               (fn [values]
+                 (let [content (nth values 0)
+                       stat (nth values 1)
+                       relPath (normalizeSlashes (path.relative root.path fullPath))]
+                   (results.push {:relPath (toLogicalMediaPath root relPath)
+                                  :content content
+                                  :mtime stat.mtimeMs}))))]
+    (saved.catch (fn [_error] nil))))
+
+(ann walkKbFiles (Fn [String Js Js] Js))
+(defn walkKbFiles [dirPath root results]
+  (let [entriesPromise (readDirWithFileTypes dirPath)
+        safeEntries (entriesPromise.catch (fn [_error] []))]
+    (safeEntries.then
+     (fn [entries]
+       (jsPromise.all
+        (map entries
+             (fn [entry]
+               (let [fullPath (path.join dirPath entry.name)]
+                 (if (entry.isDirectory)
+                     (if (shouldExcludeFolder entry.name)
+                         nil
+                         (walkKbFiles fullPath root results))
+                     (if (textFile? entry.name)
+                         (readKbFile fullPath root results)
+                         nil))))))))))
+
+(ann queryTerms (Fn [String] Js))
+(defn queryTerms [userQuery]
+  (filter (split (lower-case (trim userQuery)) " ")
+          (fn [term] (> (count (str term)) 2))))
+
+(ann termScore (Fn [String String String] Number))
+(defn termScore [term lowerContent lowerPath]
+  (+ (if (includes? lowerContent term) 10 0)
+     (if (includes? lowerPath term) 5 0)))
+
+(ann fileScore (Fn [Js Js] Number))
+(defn fileScore [terms file]
+  (let [lowerContent (lower-case file.content)
+        lowerPath (lower-case file.relPath)
+        score (reduce terms
+                      0
+                      (fn [total term]
+                        (+ total (termScore term lowerContent lowerPath))))]
+    (if (= score 0) -1 score)))
+
+(ann scoreFile (Fn [Js Js] Js))
+(defn scoreFile [terms file]
+  {:relPath file.relPath
+   :content file.content
+   :mtime file.mtime
+   :score (fileScore terms file)})
+
+(ann compareScoredFiles (Fn [Js Js] Number))
+(defn compareScoredFiles [first second]
+  (if (not (= second.score first.score))
+      (- second.score first.score)
+      (- second.mtime first.mtime)))
+
+(ann headingForFile (Fn [String Js] String))
+(defn headingForFile [kbRoot file]
+  (try
+   (let [relative (mediaPathToKbRelative kbRoot file.relPath)]
+     (if (and (string? relative) (not (= relative "")))
+         relative
+         "(root)"))
+   (catch _error file.relPath)))
+
+(ann contextStep (Fn [String Number Js Js] Js))
+(defn contextStep [kbRoot charBudget state file]
+  (let [heading (headingForFile kbRoot file)
+        block (str "## " heading "\n\n" file.content "\n")
+        nextUsed (+ state.used (count block))]
+    (if (and (> nextUsed charBudget) (> (count state.parts) 0))
+        state
+        {:used nextUsed :parts (conj state.parts block)})))
+
+(ann buildContextBody (Fn [String Number Js] String))
+(defn buildContextBody [kbRoot charBudget scored]
+  (let [state (reduce scored
+                      {:used 0 :parts []}
+                      (fn [next file]
+                        (contextStep kbRoot charBudget next file)))
+        body (join state.parts "\n---\n\n")]
+    (if (= body "")
+        ""
+        (join ["Paths in headings are relative to the knowledge base root only (not the parent media-library folder on disk)."
+               ""
+               body]
+              "\n"))))
+
+(ann gatherKbContext (Fn [String String Js] Js))
+(defn gatherKbContext [kbRoot userQuery charBudgetRaw]
+  (let [charBudget (if (number? charBudgetRaw) charBudgetRaw DEFAULT_CHAR_BUDGET)
+        resolvedRoot (resolveMediaPath kbRoot)
+        files (unsafe-cast Js [])
+        walked (walkKbFiles resolvedRoot.fullPath resolvedRoot.root files)]
+    (walked.then
+     (fn [_]
+       (if (= files.length 0)
+           ""
+           (let [terms (queryTerms userQuery)
+                 scored (sort-with
+                         (map files (fn [file] (scoreFile terms file)))
+                         compareScoredFiles)]
+             (buildContextBody kbRoot charBudget scored)))))))

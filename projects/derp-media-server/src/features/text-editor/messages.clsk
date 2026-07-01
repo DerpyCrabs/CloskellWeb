@@ -1,0 +1,7 @@
+(import "../../model.clsk" [BasicResponse])
+
+(type TextEditorMsg
+  (Union {:kind :pasted-kb-image-start :filePath String :blob Js :target Js :content String :selectionStart Number :selectionEnd Number :imagePath String :fileName String :mimeType String}
+         {:kind :pasted-kb-image-read :filePath String :target Js :content String :selectionStart Number :selectionEnd Number :imagePath String :fileName String :mimeType String :base64Content String}
+         {:kind :pasted-kb-image-uploaded :value BasicResponse :filePath String :target Js :content String :selectionStart Number :selectionEnd Number :fileName String}
+         {:kind :pasted-kb-image-failed :error String}))

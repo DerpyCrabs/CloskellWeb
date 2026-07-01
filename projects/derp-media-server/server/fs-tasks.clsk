@@ -1,0 +1,53 @@
+(import "fs" [readdirSync (promises as fs)])
+
+(ann readFileUtf8 (Fn [String] Js))
+(defn readFileUtf8 [fullPath]
+  (fs.readFile fullPath "utf-8"))
+
+(ann readFileBytes (Fn [String] Js))
+(defn readFileBytes [fullPath]
+  (fs.readFile fullPath))
+
+(ann writeFileUtf8 (Fn [String String] Js))
+(defn writeFileUtf8 [fullPath content]
+  (fs.writeFile fullPath content "utf-8"))
+
+(ann writeFileBytes (Fn [String Js] Js))
+(defn writeFileBytes [fullPath content]
+  (fs.writeFile fullPath content))
+
+(ann statPath (Fn [String] Js))
+(defn statPath [fullPath]
+  (fs.stat fullPath))
+
+(ann readDirWithFileTypes (Fn [String] Js))
+(defn readDirWithFileTypes [dirPath]
+  (fs.readdir dirPath {:withFileTypes true}))
+
+(ann accessPath (Fn [String] Js))
+(defn accessPath [fullPath]
+  (fs.access fullPath))
+
+(ann readDirNamesSync (Fn [String] Js))
+(defn readDirNamesSync [dirPath]
+  (readdirSync dirPath))
+
+(ann mkdirRecursive (Fn [String] Js))
+(defn mkdirRecursive [dirPath]
+  (fs.mkdir dirPath {:recursive true}))
+
+(ann unlinkPath (Fn [String] Js))
+(defn unlinkPath [fullPath]
+  (fs.unlink fullPath))
+
+(ann removePathRecursive (Fn [String] Js))
+(defn removePathRecursive [fullPath]
+  (fs.rm fullPath {:recursive true}))
+
+(ann renamePath (Fn [String String] Js))
+(defn renamePath [fromPath toPath]
+  (fs.rename fromPath toPath))
+
+(ann copyPathRecursive (Fn [String String] Js))
+(defn copyPathRecursive [fromPath toPath]
+  (fs.cp fromPath toPath {:recursive true}))

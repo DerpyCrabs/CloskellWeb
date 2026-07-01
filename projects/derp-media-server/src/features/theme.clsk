@@ -1,0 +1,28 @@
+(def defaultThemePalette "default")
+(def defaultThemeMode "dark")
+
+(ann isThemePalette (Fn [Js] Bool))
+(defn isThemePalette [value]
+  (or (= value "default")
+      (= value "caffeine")
+      (= value "cosmic-night")))
+
+(ann isThemeMode (Fn [Js] Bool))
+(defn isThemeMode [value]
+  (or (= value "light")
+      (= value "dark")
+      (= value "system")))
+
+(ann normalizeLegacyThemePalette (Fn [Js] String))
+(defn normalizeLegacyThemePalette [value]
+  (if (or (= value "caffeine") (= value "cosmic-night")) value defaultThemePalette))
+
+(ann normalizeLegacyThemeMode (Fn [Js] String))
+(defn normalizeLegacyThemeMode [value]
+  (if (or (= value "light") (= value "system")) value defaultThemeMode))
+
+(ann resolveThemeFromPreference (Fn [String String Bool] String))
+(defn resolveThemeFromPreference [palette mode systemPrefersDark]
+  (let [isDark (or (= mode "dark")
+                   (and (= mode "system") systemPrefersDark))]
+    (str palette "-" (if isDark "dark" "light"))))

@@ -1,0 +1,704 @@
+(import "path" [(default path)])
+(import "node:buffer" [Buffer])
+(import "../../fs-tasks.clsk" [readFileUtf8 statPath writeFileUtf8])
+(import "../../http-routes.clsk" [HttpRoute registerHttpRoutes])
+(import "../../../lib/shares.clsk" [getShare
+                               getEffectiveRestrictions
+                               checkUploadQuota
+                               addShareUsedBytes
+                               createShareSessionValue
+                               isShareAccessAuthorized
+                               resolveShareSubPath
+                               updateShareWorkspaceTaskbarPins
+                               updateShareWorkspaceLayoutPresets])
+(import "../../../src/features/workspace/taskbar-pins.clsk" [filterShareWorkspaceTaskbarPins
+                                                                 parseWorkspaceTaskbarPins])
+(import "../../../src/features/workspace/layout-presets.clsk" [parseWorkspaceLayoutPresetsListWithNow
+                                                                    sanitizeShareWorkspaceLayoutPresets])
+(import "../../../lib/file-system.clsk" [listDirectory
+                                      createDirectory
+                                      writeFile
+                                      writeBinaryFile
+                                      fileExists
+                                      deleteDirectory
+                                      deleteFile
+                                      validatePath
+                                      renameFileOrDirectory
+                                      resolveMediaPath])
+(import "../../../lib/file-change-emitter.clsk" [broadcastFileChange])
+(import "../../../lib/knowledge-base.clsk" [getKnowledgeBases getKnowledgeBaseRootForPath])
+(import "../../../src/features/media-utils.clsk" [getMediaType])
+(import "../../../lib/config.clsk" [config getDataFilePath])
+(import "../../../lib/mutex.clsk" [Mutex])
+(import "./kb.clsk" [walkTextFiles
+                    walkMarkdownFiles
+                    extractSnippet
+                    modifiedAtIso
+                    normalizeSlashes])
+
+(def STATS_FILE (getDataFilePath "stats.json"))
+(def SETTINGS_FILE (getDataFilePath "settings.json"))
+(def statsMutex (new Mutex))
+(def verifyAttempts (new (js-global Map)))
+(def MAX_ATTEMPTS 10)
+(def WINDOW_MS (* 15 60 1000))
+(def SEARCH_RESULT_LIMIT 50)
+(def KB_RECENT_LIMIT 10)
+(def jsPromise (js-global Promise))
+(def jsDate (js-global Date))
+
+(ann codeSend (Fn [Js Number Js] Js))
+(defn codeSend [reply code payload]
+  (let [codedReply (reply.code code)]
+    (codedReply.send payload)))
+
+(ann statusSend (Fn [Js Number Js] Js))
+(defn statusSend [reply code payload]
+  (let [codedReply (reply.code code)]
+    (codedReply.send payload)))
+
+(ann requestToken (Fn [Js] String))
+(defn requestToken [request]
+  (let [token request.params.token]
+    (if (string? token) token "")))
+
+(ann queryString (Fn [Js String] String))
+(defn queryString [query name]
+  (let [value (object-get query name)]
+    (if (string? value) value "")))
+
+(ann requestCookies (Fn [Js] Js))
+(defn requestCookies [request]
+  (if (object? request.cookies) request.cookies {}))
+
+(ann cookieJar (Fn [Js] Js))
+(defn cookieJar [cookies]
+  {:get (fn [name]
+          (let [value (object-get cookies name)]
+            (if (string? value) {:value value} nil)))})
+
+(ann checkRateLimit (Fn [String] Bool))
+(defn checkRateLimit [token]
+  (let [now (jsDate.now)
+        entryRaw (verifyAttempts.get token)]
+    (if (not (object? entryRaw))
+        (do
+          (verifyAttempts.set token {:count 1 :resetAt (+ now WINDOW_MS)})
+          true)
+        (let [entry entryRaw]
+          (if (> now entry.resetAt)
+              (do
+                (verifyAttempts.set token {:count 1 :resetAt (+ now WINDOW_MS)})
+                true)
+              (if (>= entry.count MAX_ATTEMPTS)
+                  false
+                  (do
+                    (verifyAttempts.set token {:count (+ entry.count 1)
+                                               :resetAt entry.resetAt})
+                    true)))))))
+
+(ann normalizeParent (Fn [String] String))
+(defn normalizeParent [dir]
+  (let [normalized (normalizeSlashes dir)]
+    (if (= normalized ".") "" normalized)))
+
+(ann estimateContentSize (Fn [Js Js] Number))
+(defn estimateContentSize [content base64Content]
+  (if (and (string? base64Content) (not (= base64Content "")))
+      (ceil (/ (* (count base64Content) 3) 4))
+      (if (string? content)
+          (Buffer.byteLength content "utf8")
+          0)))
+
+(ann resolveSharePath (Fn [Js String] Js))
+(defn resolveSharePath [share subPath]
+  (resolveShareSubPath share subPath))
+
+(ann currentIso (Fn [] String))
+(defn currentIso []
+  (let [date (new (js-global Date))]
+    (date.toISOString)))
+
+(ann parseLayoutPresets (Fn [Js] Js))
+(defn parseLayoutPresets [raw]
+  (parseWorkspaceLayoutPresetsListWithNow raw (currentIso)))
+
+(ann validateShareAccessLocal (Fn [Js String] Js))
+(defn validateShareAccessLocal [request token]
+  (let [sharePromise (getShare token)]
+    (sharePromise.then
+     (fn [share]
+       (if (not (some? share))
+           {:error {:status 404 :message "Share not found"}}
+           (if (isShareAccessAuthorized share (cookieJar (requestCookies request)))
+               {:share share}
+               {:error {:status 401 :message "Passcode required"}}))))))
+
+(ann withShareAccess (Fn [Js Js String Js] Js))
+(defn withShareAccess [request reply token handler]
+  (let [accessPromise (validateShareAccessLocal request token)]
+    (accessPromise.then
+     (fn [access]
+       (if (object? access.error)
+           (codeSend reply access.error.status {:error access.error.message})
+           (handler access.share))))))
+
+(ann basenameOrPath (Fn [String] String))
+(defn basenameOrPath [value]
+  (let [base (path.basename value)]
+    (if (= base "") value base)))
+
+(ann optionalAssoc (Fn [Js String Js Bool] Js))
+(defn optionalAssoc [payload key value include?]
+  (if include? (object-assoc payload key value) payload))
+
+(ann workspaceTaskbarPinsForShare (Fn [String Js Bool] Js))
+(defn workspaceTaskbarPinsForShare [token share include?]
+  (if include?
+      (filterShareWorkspaceTaskbarPins
+       share.path
+       token
+       (parseWorkspaceTaskbarPins share.workspaceTaskbarPins))
+      nil))
+
+(ann workspaceLayoutPresetsForShare (Fn [String Js Bool] Js))
+(defn workspaceLayoutPresetsForShare [token share include?]
+  (if include?
+      (sanitizeShareWorkspaceLayoutPresets
+       share.path
+       token
+       (parseLayoutPresets share.workspaceLayoutPresets))
+      nil))
+
+(ann shareInfoPayload (Fn [String Js Bool Bool Js String] Js))
+(defn shareInfoPayload [token share authorized isKnowledgeBase knowledgeBaseRoot adminViewMode]
+  (let [name (basenameOrPath share.path)
+        extWithDot (if share.isDirectory "" (path.extname share.path))
+        extension (if share.isDirectory
+                      ""
+                      (lower-case (string-slice extWithDot 1 (count extWithDot))))
+        mediaType (if share.isDirectory "folder" (getMediaType extension))
+        restrictions (if share.editable (getEffectiveRestrictions share) nil)
+        usedBytes (if share.editable
+                      (if (number? share.usedBytes) share.usedBytes 0)
+                      nil)
+        includeWorkspace (and authorized share.isDirectory)
+        workspaceTaskbarPins (workspaceTaskbarPinsForShare token share includeWorkspace)
+        workspaceLayoutPresets (workspaceLayoutPresetsForShare token share includeWorkspace)
+        base {:name name
+              :isDirectory share.isDirectory
+              :editable share.editable
+              :mediaType mediaType
+              :extension extension
+              :needsPasscode (some? share.passcode)
+              :authorized authorized}
+        withPath (optionalAssoc base "path" share.path authorized)
+        withRestrictions (optionalAssoc withPath "restrictions" restrictions (some? restrictions))
+        withUsed (optionalAssoc withRestrictions "usedBytes" usedBytes (some? usedBytes))
+        withKb (optionalAssoc withUsed "isKnowledgeBase" isKnowledgeBase authorized)
+        withKbRoot (optionalAssoc withKb
+                                  "knowledgeBaseRoot"
+                                  knowledgeBaseRoot
+                                  (and authorized (string? knowledgeBaseRoot)))
+        withMode (optionalAssoc withKbRoot
+                                "adminViewMode"
+                                adminViewMode
+                                includeWorkspace)
+        withPins (optionalAssoc withMode
+                                "workspaceTaskbarPins"
+                                workspaceTaskbarPins
+                                (some? workspaceTaskbarPins))]
+    (optionalAssoc withPins
+                   "workspaceLayoutPresets"
+                   workspaceLayoutPresets
+                   (some? workspaceLayoutPresets))))
+
+(ann readAdminViewMode (Fn [String] Js))
+(defn readAdminViewMode [sharePath]
+  (let [readPromise (readFileUtf8 SETTINGS_FILE)
+        parsed (readPromise.then
+                (fn [settingsData]
+                  (let [allSettings (unwrap-or (json-parse-result settingsData) {})
+                        settings (object-get allSettings config.libraryKey)
+                        viewModes (if (object? settings.viewModes) settings.viewModes {})
+                        mode (object-get viewModes sharePath)]
+                    (if (string? mode) mode "list"))))]
+    (parsed.catch (fn [_error] "list"))))
+
+(ann sendDirectoryInfo (Fn [Js String Js Bool] Js))
+(defn sendDirectoryInfo [reply token share authorized]
+  (let [knowledgePromise (getKnowledgeBases)]
+    (knowledgePromise.then
+     (fn [knowledgeBases]
+       (let [knowledgeBaseRoot (getKnowledgeBaseRootForPath
+                                (normalizeSlashes share.path)
+                                knowledgeBases)
+             isKnowledgeBase (some? knowledgeBaseRoot)
+             modePromise (readAdminViewMode share.path)]
+         (modePromise.then
+          (fn [adminViewMode]
+            (reply.send
+             (shareInfoPayload token
+                               share
+                               authorized
+                               isKnowledgeBase
+                               knowledgeBaseRoot
+                               adminViewMode)))))))))
+
+(ann handleShareInfo (Fn [Js Js] Js))
+(defn handleShareInfo [request reply]
+  (let [token (requestToken request)
+        sharePromise (getShare token)]
+    (sharePromise.then
+     (fn [share]
+       (if (not (some? share))
+           (codeSend reply 404 {:error "Share not found"})
+           (let [authorized (isShareAccessAuthorized share (cookieJar (requestCookies request)))]
+             (if (and authorized share.isDirectory)
+                 (sendDirectoryInfo reply token share authorized)
+                 (reply.send
+                  (shareInfoPayload token share authorized false nil "list")))))))))
+
+(ann handleShareVerify (Fn [Js Js] Js))
+(defn handleShareVerify [request reply]
+  (let [token (requestToken request)
+        body request.body
+        sharePromise (getShare token)]
+    (sharePromise.then
+     (fn [share]
+       (if (not (some? share))
+           (codeSend reply 404 {:error "Share not found"})
+           (if (not (some? share.passcode))
+               (reply.send {:success true})
+               (if (not (checkRateLimit token))
+                   (codeSend reply
+                             429
+                             {:error "Too many attempts. Try again in 15 minutes."})
+                   (if (not (= (if (string? body.passcode) body.passcode "") share.passcode))
+                       (codeSend reply 401 {:error "Invalid passcode"})
+                       (do
+                         (verifyAttempts.delete token)
+                         (let [session (createShareSessionValue share.token)]
+                           (reply.setCookie session.name session.value session.options))
+                         (reply.send {:success true}))))))))))
+
+(ann handleShareTaskbarPins (Fn [Js Js] Js))
+(defn handleShareTaskbarPins [request reply]
+  (let [token (requestToken request)
+        body request.body]
+    (withShareAccess
+     request
+     reply
+     token
+     (fn [share]
+       (if (not share.isDirectory)
+           (codeSend reply 400 {:error "Share is not a directory"})
+           (let [parsed (filterShareWorkspaceTaskbarPins
+                         share.path
+                         token
+                         (parseWorkspaceTaskbarPins body.items))
+                 updated (updateShareWorkspaceTaskbarPins token parsed)]
+             (updated.then
+              (fn [_] (reply.send {:success true :workspaceTaskbarPins parsed})))))))))
+
+(ann handleShareLayoutPresets (Fn [Js Js] Js))
+(defn handleShareLayoutPresets [request reply]
+  (let [token (requestToken request)
+        body request.body]
+    (withShareAccess
+     request
+     reply
+     token
+     (fn [share]
+       (if (not share.isDirectory)
+           (codeSend reply 400 {:error "Share is not a directory"})
+           (let [parsed (sanitizeShareWorkspaceLayoutPresets
+                         share.path
+                         token
+                         (parseLayoutPresets body.presets))
+                 updated (updateShareWorkspaceLayoutPresets token parsed)]
+             (updated.then
+              (fn [_] (reply.send {:success true :workspaceLayoutPresets parsed})))))))))
+
+(ann handleShareFiles (Fn [Js Js] Js))
+(defn handleShareFiles [request reply]
+  (let [token (requestToken request)
+        dir (queryString request.query "dir")]
+    (withShareAccess
+     request
+     reply
+     token
+     (fn [share]
+       (if (not share.isDirectory)
+           (codeSend reply 400 {:error "Share is not a directory"})
+           (let [resolved (resolveSharePath share dir)]
+             (if (not (some? resolved))
+                 (codeSend reply 403 {:error "Path outside share boundary"})
+                 (let [filesPromise (listDirectory resolved)]
+                   (filesPromise.then
+                    (fn [allFiles]
+                      (reply.send
+                       {:files (filter allFiles (fn [file] (not file.isVirtual)))})))))))))))
+
+(ann readStatsFile (Fn [] Js))
+(defn readStatsFile []
+  (let [readPromise (readFileUtf8 STATS_FILE)
+        parsed (readPromise.then (fn [raw] (unwrap-or (json-parse-result raw) {})))]
+    (parsed.catch (fn [_error] {}))))
+
+(ann writeShareViewStat (Fn [String] Js))
+(defn writeShareViewStat [resolvedPath]
+  (let [releasePromise (statsMutex.acquire)]
+    (releasePromise.then
+     (fn [release]
+       (let [statsPromise (readStatsFile)
+             written (statsPromise.then
+                      (fn [allStats]
+                        (let [stored (object-get allStats config.libraryKey)
+                              stats (if (object? stored)
+                                        stored
+                                        {:views {} :shareViews {}})
+                              shareViews (if (object? stats.shareViews)
+                                             stats.shareViews
+                                             {})
+                              current (object-get shareViews resolvedPath)
+                              nextViews (object-assoc shareViews
+                                                      resolvedPath
+                                                      (+ (if (number? current) current 0) 1))
+                              nextStats (object-assoc stats "shareViews" nextViews)
+                              nextAll (object-assoc allStats
+                                                    config.libraryKey
+                                                    nextStats)]
+                          (writeFileUtf8 STATS_FILE
+                                         (json-stringify nextAll 2)))))]
+         (written.finally release))))))
+
+(ann handleShareView (Fn [Js Js] Js))
+(defn handleShareView [request reply]
+  (let [token (requestToken request)
+        body request.body]
+    (withShareAccess
+     request
+     reply
+     token
+     (fn [share]
+       (let [resolvedPath (if (and share.isDirectory (string? body.filePath) (not (= body.filePath "")))
+                              (resolveSharePath share body.filePath)
+                              share.path)]
+         (if (not (some? resolvedPath))
+             (codeSend reply 403 {:error "Path outside share boundary"})
+             (let [written (writeShareViewStat resolvedPath)]
+               (written.then (fn [_] (reply.send {:success true}))))))))))
+
+(ann ensureEditableUpload (Fn [Js Js] Js))
+(defn ensureEditableUpload [reply share]
+  (if (not share.editable)
+      (codeSend reply 403 {:error "Share is not editable"})
+      (let [restrictions (getEffectiveRestrictions share)]
+        (if (not restrictions.allowUpload)
+            (codeSend reply
+                      403
+                      {:error "Creating files/folders is not allowed for this share"})
+            nil))))
+
+(ann hasFileContent? (Fn [Js] Bool))
+(defn hasFileContent? [body]
+  (or (some? body.content) (some? body.base64Content)))
+
+(ann writeBodyFile (Fn [String Js] Js))
+(defn writeBodyFile [resolved body]
+  (if (and (string? body.base64Content) (not (= body.base64Content "")))
+      (writeBinaryFile resolved body.base64Content)
+      (writeFile resolved body.content)))
+
+(ann handleShareCreateAfterExists (Fn [String Js Js Js String Bool] Js))
+(defn handleShareCreateAfterExists [token reply share body resolved exists]
+  (if exists
+      (let [itemType (if (= body.type "folder") "folder" "file")]
+        (codeSend reply
+                  409
+                  {:error (str "A " itemType " with this name already exists")}))
+      (let [parentDir (normalizeParent (path.dirname resolved))]
+        (if (= body.type "folder")
+            (let [created (createDirectory resolved)]
+              (created.then
+               (fn [_]
+                 (do
+                   (broadcastFileChange parentDir resolved)
+                   (reply.send {:success true :message "Folder created"})))))
+            (if (not (hasFileContent? body))
+                (codeSend reply 400 {:error "Content is required for files"})
+                (let [contentSize (estimateContentSize body.content body.base64Content)
+                      quota (checkUploadQuota share contentSize)]
+                  (if (not quota.allowed)
+                      (codeSend reply
+                                413
+                                {:error "Upload quota exceeded for this share"})
+                      (let [written (writeBodyFile resolved body)]
+                        (written.then
+                         (fn [_]
+                           (let [added (if (> contentSize 0)
+                                           (addShareUsedBytes token contentSize)
+                                           (jsPromise.resolve nil))]
+                             (added.then
+                              (fn [_]
+                                (do
+                                  (broadcastFileChange parentDir resolved)
+                                  (reply.send {:success true
+                                               :message "File saved"})))))))))))))))
+
+(ann handleShareCreate (Fn [Js Js] Js))
+(defn handleShareCreate [request reply]
+  (let [token (requestToken request)
+        body request.body]
+    (withShareAccess
+     request
+     reply
+     token
+     (fn [share]
+       (let [blocked (ensureEditableUpload reply share)]
+         (if (some? blocked)
+             blocked
+             (let [resolved (resolveSharePath share body.path)]
+               (if (not (some? resolved))
+                   (codeSend reply 403 {:error "Path outside share boundary"})
+                   (let [existsPromise (fileExists resolved)]
+                     (existsPromise.then
+                      (fn [exists]
+                        (handleShareCreateAfterExists
+                         token
+                         reply
+                         share
+                         body
+                         resolved
+                         exists))))))))))))
+
+(ann handleShareEdit (Fn [Js Js] Js))
+(defn handleShareEdit [request reply]
+  (let [token (requestToken request)
+        body request.body]
+    (withShareAccess
+     request
+     reply
+     token
+     (fn [share]
+       (if (not share.editable)
+           (codeSend reply 403 {:error "Share is not editable"})
+           (let [restrictions (getEffectiveRestrictions share)]
+             (if (not restrictions.allowEdit)
+                 (codeSend reply 403 {:error "Editing files is not allowed for this share"})
+                 (let [resolved (resolveSharePath share body.path)]
+                   (if (not (some? resolved))
+                       (codeSend reply 403 {:error "Path outside share boundary"})
+                       (if (not (hasFileContent? body))
+                           (codeSend reply 400 {:error "Content is required"})
+                           (let [contentSize (estimateContentSize body.content body.base64Content)
+                                 quota (checkUploadQuota share contentSize)]
+                             (if (not quota.allowed)
+                                 (codeSend reply
+                                           413
+                                           {:error "Upload quota exceeded for this share"})
+                                 (let [written (writeBodyFile resolved body)]
+                                   (written.then
+                                    (fn [_]
+                                      (let [added (if (> contentSize 0)
+                                                      (addShareUsedBytes token contentSize)
+                                                      (jsPromise.resolve nil))]
+                                        (added.then
+                                         (fn [_]
+                                           (let [parentDir (normalizeParent (path.dirname resolved))]
+                                             (do
+                                               (broadcastFileChange parentDir resolved)
+                                               (reply.send {:success true
+                                                            :message "File saved"})))))))))))))))))))))
+
+(ann handleShareDelete (Fn [Js Js] Js))
+(defn handleShareDelete [request reply]
+  (let [token (requestToken request)
+        body request.body]
+    (withShareAccess
+     request
+     reply
+     token
+     (fn [share]
+       (if (not share.editable)
+           (codeSend reply 403 {:error "Share is not editable"})
+           (let [restrictions (getEffectiveRestrictions share)]
+             (if (not restrictions.allowDelete)
+               (codeSend reply 403 {:error "Deletion is not allowed for this share"})
+               (let [resolved (resolveSharePath share body.path)]
+                 (if (not (some? resolved))
+                     (codeSend reply 403 {:error "Path outside share boundary"})
+                     (if (= resolved share.path)
+                         (codeSend reply 403 {:error "Cannot delete share root"})
+                         (let [fullPath (validatePath resolved)
+                               statPromise (statPath fullPath)]
+                           (statPromise.then
+                            (fn [stats]
+                              (let [parentDir (normalizeParent (path.dirname resolved))]
+                                (if (stats.isDirectory)
+                                    (let [deleted (deleteDirectory resolved)]
+                                      (deleted.then
+                                       (fn [_]
+                                         (do
+                                           (broadcastFileChange parentDir resolved)
+                                           (reply.send {:success true
+                                                        :message "Folder deleted"})))))
+                                    (let [deleted (deleteFile resolved)]
+                                      (deleted.then
+                                       (fn [_]
+                                         (do
+                                           (broadcastFileChange parentDir resolved)
+                                           (reply.send {:success true
+                                                        :message "File deleted"}))))))))))))))))))))
+
+(ann handleShareRename (Fn [Js Js] Js))
+(defn handleShareRename [request reply]
+  (let [token (requestToken request)
+        body request.body]
+    (withShareAccess
+     request
+     reply
+     token
+     (fn [share]
+       (if (not share.editable)
+           (codeSend reply 403 {:error "Share is not editable"})
+           (let [restrictions (getEffectiveRestrictions share)]
+             (if (not restrictions.allowEdit)
+               (codeSend reply 403 {:error "Editing is not allowed for this share"})
+               (let [resolvedOld (resolveSharePath share body.oldPath)
+                     resolvedNew (resolveSharePath share body.newPath)]
+                 (if (or (not (some? resolvedOld)) (not (some? resolvedNew)))
+                     (codeSend reply 403 {:error "Path outside share boundary"})
+                     (let [renamed (renameFileOrDirectory resolvedOld resolvedNew)]
+                       (renamed.then
+                        (fn [_]
+                          (let [oldParent (normalizeParent (path.dirname resolvedOld))
+                                newParent (normalizeParent (path.dirname resolvedNew))]
+                            (do
+                              (broadcastFileChange oldParent resolvedOld)
+                              (if (not (= newParent oldParent))
+                                  (broadcastFileChange newParent resolvedNew)
+                                  nil)
+                              (reply.send {:success true
+                                           :message "Renamed successfully"})))))))))))))))
+
+(ann shareIsKnowledgeBase? (Fn [Js Js] Bool))
+(defn shareIsKnowledgeBase? [share knowledgeBases]
+  (some? (getKnowledgeBaseRootForPath share.path knowledgeBases)))
+
+(ann searchTextFile (Fn [String String Js] Js))
+(defn searchTextFile [lowerQuery rawQuery file]
+  (let [contentPromise (readFileUtf8 file.fullPath)]
+    (contentPromise.then
+     (fn [content]
+       (if (includes? (lower-case content) lowerQuery)
+           {:path (normalizeSlashes file.path)
+            :name (path.basename file.path)
+            :snippet (extractSnippet content rawQuery)}
+           nil)))))
+
+(ann sendShareKbSearchResults (Fn [Js String Js] Js))
+(defn sendShareKbSearchResults [reply trimmedQ resolvedRoot]
+  (let [textFiles (unsafe-cast Js [])
+        walked (walkTextFiles resolvedRoot.fullPath resolvedRoot.root textFiles)]
+    (walked.then
+     (fn [_]
+       (let [lowerQuery (lower-case trimmedQ)
+             resultPromises (map textFiles
+                                 (fn [file] (searchTextFile lowerQuery trimmedQ file)))
+             resultsPromise (jsPromise.all resultPromises)]
+         (resultsPromise.then
+          (fn [results]
+            (reply.send
+             {:results (slice (filter results (fn [item] (some? item)))
+                              0
+                              SEARCH_RESULT_LIMIT)}))))))))
+
+(ann handleShareKbSearch (Fn [Js Js] Js))
+(defn handleShareKbSearch [request reply]
+  (let [token (requestToken request)
+        q (queryString request.query "q")
+        dir (queryString request.query "dir")]
+    (withShareAccess
+     request
+     reply
+     token
+     (fn [share]
+       (if (not share.isDirectory)
+           (codeSend reply 400 {:error "Share is not a directory"})
+           (let [knowledgeBasesPromise (getKnowledgeBases)]
+             (knowledgeBasesPromise.then
+              (fn [knowledgeBases]
+                (if (not (shareIsKnowledgeBase? share knowledgeBases))
+                    (codeSend reply 400 {:error "Share is not a knowledge base"})
+                    (let [trimmedQ (trim q)]
+                      (if (= trimmedQ "")
+                          (reply.send {:results []})
+                          (let [searchRoot (resolveSharePath share dir)]
+                            (if (not (some? searchRoot))
+                                (codeSend reply 403 {:error "Path outside share boundary"})
+                                (sendShareKbSearchResults
+                                 reply
+                                 trimmedQ
+                                 (resolveMediaPath searchRoot)))))))))))))))
+
+(ann recentFilePayload (Fn [Js] Js))
+(defn recentFilePayload [file]
+  {:path file.path
+   :name (path.basename file.path)
+   :modifiedAt (modifiedAtIso file.mtime)})
+
+(ann sendShareKbRecentResults (Fn [Js Js] Js))
+(defn sendShareKbRecentResults [reply resolvedRoot]
+  (let [files (unsafe-cast Js [])
+        walked (walkMarkdownFiles resolvedRoot.fullPath resolvedRoot.root files)]
+    (walked.then
+     (fn [_]
+       (reply.send
+        {:results (map (slice (sort-by-desc files (fn [file] file.mtime))
+                              0
+                              KB_RECENT_LIMIT)
+                       recentFilePayload)})))))
+
+(ann handleShareKbRecent (Fn [Js Js] Js))
+(defn handleShareKbRecent [request reply]
+  (let [token (requestToken request)
+        dir (queryString request.query "dir")]
+    (withShareAccess
+     request
+     reply
+     token
+     (fn [share]
+       (if (not share.isDirectory)
+           (codeSend reply 400 {:error "Share is not a directory"})
+           (let [knowledgeBasesPromise (getKnowledgeBases)]
+             (knowledgeBasesPromise.then
+              (fn [knowledgeBases]
+                (if (not (shareIsKnowledgeBase? share knowledgeBases))
+                    (codeSend reply 400 {:error "Share is not a knowledge base"})
+                    (let [scopePath (resolveSharePath share dir)]
+                      (if (not (some? scopePath))
+                          (codeSend reply 403 {:error "Path outside share boundary"})
+                          (sendShareKbRecentResults
+                           reply
+                           (resolveMediaPath scopePath)))))))))))))
+
+(ann shareAccessApiRouteDefinitions (Fn [] (Vector HttpRoute)))
+(defn shareAccessApiRouteDefinitions []
+  [{:method "GET" :path "/api/share/:token/info" :handler handleShareInfo}
+   {:method "POST" :path "/api/share/:token/verify" :handler handleShareVerify}
+   {:method "POST" :path "/api/share/:token/workspaceTaskbarPins" :handler handleShareTaskbarPins}
+   {:method "POST" :path "/api/share/:token/workspaceLayoutPresets" :handler handleShareLayoutPresets}
+   {:method "GET" :path "/api/share/:token/files" :handler handleShareFiles}
+   {:method "POST" :path "/api/share/:token/view" :handler handleShareView}
+   {:method "POST" :path "/api/share/:token/create" :handler handleShareCreate}
+   {:method "POST" :path "/api/share/:token/edit" :handler handleShareEdit}
+   {:method "POST" :path "/api/share/:token/delete" :handler handleShareDelete}
+   {:method "POST" :path "/api/share/:token/rename" :handler handleShareRename}
+   {:method "GET" :path "/api/share/:token/kb/search" :handler handleShareKbSearch}
+   {:method "GET" :path "/api/share/:token/kb/recent" :handler handleShareKbRecent}])
+
+(ann registerShareAccessApiRoutes (Fn [Js] Js))
+(defn registerShareAccessApiRoutes [app]
+  (registerHttpRoutes app (shareAccessApiRouteDefinitions)))

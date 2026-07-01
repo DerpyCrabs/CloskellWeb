@@ -1,0 +1,141 @@
+(import "music-metadata" [parseFile])
+(import "path" [(default path)])
+(import "node:buffer" [Buffer])
+(import "node:console" [(error as consoleError)])
+(import "../http-capabilities.clsk" [fileStatsSync sendRawResponse])
+(import "../process-tasks.clsk" [spawnProcess])
+
+(def VIDEO_EXTENSIONS ["mp4" "webm" "ogg" "mov" "avi" "mkv" "m4v"])
+
+(ann maybeValue (Fn [Js] Js))
+(defn maybeValue [value]
+  (if (some? value) value nil))
+
+(ann firstPicture (Fn [Js] Js))
+(defn firstPicture [metadata]
+  (let [pictures metadata.common.picture]
+    (if (and (vector? pictures) (> (count pictures) 0))
+        (nth pictures 0)
+        nil)))
+
+(ann coverArtFromPicture (Fn [Js] Js))
+(defn coverArtFromPicture [picture]
+  (if (object? picture)
+      (let [buffer (Buffer.from picture.data)
+            base64 (buffer.toString "base64")]
+        (str "data:" picture.format ";base64," base64))
+      nil))
+
+(ann trackNumber (Fn [Js] Js))
+(defn trackNumber [metadata]
+  (let [track metadata.common.track]
+    (if (and (object? track) (some? track.no)) track.no nil)))
+
+(ann extractAudioMetadata (Fn [String] Js))
+(defn extractAudioMetadata [fullPath]
+  (let [metadataPromise (parseFile fullPath)]
+    (metadataPromise.then
+     (fn [metadata]
+       (let [picture (firstPicture metadata)]
+         {:title (maybeValue metadata.common.title)
+          :artist (maybeValue metadata.common.artist)
+          :album (maybeValue metadata.common.album)
+          :year (maybeValue metadata.common.year)
+          :genre (maybeValue metadata.common.genre)
+          :duration (maybeValue metadata.format.duration)
+          :coverArt (coverArtFromPicture picture)
+          :trackNumber (trackNumber metadata)
+          :albumArtist (maybeValue metadata.common.albumartist)})))))
+
+(ann ffmpegArgs (Fn [String] Js))
+(defn ffmpegArgs [fullPath]
+  ["-i" fullPath "-vn" "-c:a" "libopus" "-b:a" "128k" "-f" "webm" "pipe:1"])
+
+(ann extractAudioBuffer (Fn [String] Js))
+(defn extractAudioBuffer [fullPath]
+  (new (js-global Promise)
+       (fn [resolve reject]
+         (let [chunks (unsafe-cast Js [])
+               errors (unsafe-cast Js [])
+               ffmpeg (spawnProcess "ffmpeg"
+                                     (ffmpegArgs fullPath)
+                                     {:stdio ["ignore" "pipe" "pipe"]})]
+           (do
+             (ffmpeg.stdout.on "data" (fn [chunk] (chunks.push chunk)))
+             (ffmpeg.stderr.on "data" (fn [data] (errors.push (data.toString))))
+             (ffmpeg.on "close"
+                        (fn [code]
+                          (if (= code 0)
+                              (resolve (Buffer.concat chunks))
+                              (do
+                                (consoleError (str "FFmpeg exited with code " code))
+                                (consoleError "FFmpeg stderr:" (errors.join ""))
+                                (reject (new (js-global Error)
+                                             (str "FFmpeg failed with code " code)))))))
+             (ffmpeg.on "error" reject))))))
+
+(ann codeSend (Fn [Js Number Js] Js))
+(defn codeSend [reply code payload]
+  (let [codedReply (reply.status code)]
+    (codedReply.send payload)))
+
+(ann extensionOfPath (Fn [String] String))
+(defn extensionOfPath [fullPath]
+  (let [ext (path.extname fullPath)]
+    (lower-case (string-slice ext 1 (count ext)))))
+
+(ann rangeBody (Fn [String] String))
+(defn rangeBody [range]
+  (if (starts-with? range "bytes=")
+      (string-slice range 6 (count range))
+      range))
+
+(ann rangeEnd (Fn [Js Number] Number))
+(defn rangeEnd [parts fallback]
+  (let [raw (second parts)]
+    (if (and (string? raw) (not (= raw "")))
+        (to-number raw)
+        fallback)))
+
+(ann extractedRangeHeaders (Fn [Number Number Number Number] Js))
+(defn extractedRangeHeaders [start end total chunkSize]
+  {"Content-Range" (str "bytes " start "-" end "/" total)
+   "Accept-Ranges" "bytes"
+   "Content-Length" chunkSize
+   "Content-Type" "audio/webm"
+   "Cache-Control" "public, max-age=3600"})
+
+(ann extractedWholeHeaders (Fn [Number] Js))
+(defn extractedWholeHeaders [length]
+  {"Content-Type" "audio/webm"
+   "Content-Length" length
+   "Accept-Ranges" "bytes"
+   "Cache-Control" "public, max-age=3600"})
+
+(ann sendAudioBufferRange (Fn [Js Js Js] Js))
+(defn sendAudioBufferRange [request reply audioBuffer]
+  (let [range request.headers.range]
+	    (if (string? range)
+	        (let [parts (split (rangeBody range) "-")
+	              start (to-number (first parts))
+	              end (rangeEnd parts (- audioBuffer.length 1))
+	              chunkSize (+ (- end start) 1)]
+	          (sendRawResponse
+	           reply
+	           206
+	           (extractedRangeHeaders start end audioBuffer.length chunkSize)
+	           (audioBuffer.subarray start (+ end 1))))
+	        (sendRawResponse reply 200 (extractedWholeHeaders audioBuffer.length) audioBuffer))))
+
+(ann extractAudioTrack (Fn [String Js Js] Js))
+(defn extractAudioTrack [fullPath request reply]
+  (let [stats (fileStatsSync fullPath)]
+    (if (not (stats.isFile))
+        (codeSend reply 400 {:error "Not a file"})
+        (let [extension (extensionOfPath fullPath)]
+          (if (not (includes? VIDEO_EXTENSIONS extension))
+              (codeSend reply 400 {:error "Not a video file"})
+              (let [bufferPromise (extractAudioBuffer fullPath)]
+                (bufferPromise.then
+                 (fn [audioBuffer]
+                   (sendAudioBufferRange request reply audioBuffer)))))))))

@@ -1,0 +1,110 @@
+(def snapResizeEdgeTolerance 6)
+
+(type WorkspaceBounds
+  {:x Number
+   :y Number
+   :width Number
+   :height Number})
+
+(type WorkspaceCanvasSize
+  {:width Number
+   :height Number})
+
+(type ResizeHandleMap
+  {:top Bool
+   :bottom Bool
+   :left Bool
+   :right Bool
+   :topLeft Bool
+   :topRight Bool
+   :bottomLeft Bool
+   :bottomRight Bool})
+
+(ann emptyResizeHandleMap (Fn [] ResizeHandleMap))
+(defn emptyResizeHandleMap []
+  {:top false
+   :bottom false
+   :left false
+   :right false
+   :topLeft false
+   :topRight false
+   :bottomLeft false
+   :bottomRight false})
+
+(ann resizeHandleMap (Fn [Bool Bool Bool Bool] ResizeHandleMap))
+(defn resizeHandleMap [top bottom left right]
+  {:top top
+   :bottom bottom
+   :left left
+   :right right
+   :topLeft (and top left)
+   :topRight (and top right)
+   :bottomLeft (and bottom left)
+   :bottomRight (and bottom right)})
+
+(ann snapResizeHandlesFromBounds (Fn [WorkspaceBounds WorkspaceCanvasSize] ResizeHandleMap))
+(defn snapResizeHandlesFromBounds [bounds canvas]
+  (let [left (> bounds.x snapResizeEdgeTolerance)
+        right (< (+ bounds.x bounds.width) (- canvas.width snapResizeEdgeTolerance))
+        top (> bounds.y snapResizeEdgeTolerance)
+        bottom (< (+ bounds.y bounds.height) (- canvas.height snapResizeEdgeTolerance))]
+    (resizeHandleMap top bottom left right)))
+
+(def rightEdgeZones
+  ["left"
+   "top-left"
+   "bottom-left"
+   "left-third"
+   "center-third"
+   "left-two-thirds"
+   "top-left-third"
+   "top-center-third"
+   "bottom-left-third"
+   "bottom-center-third"])
+
+(def leftEdgeZones
+  ["right"
+   "top-right"
+   "bottom-right"
+   "right-third"
+   "center-third"
+   "right-two-thirds"
+   "top-right-third"
+   "top-center-third"
+   "bottom-right-third"
+   "bottom-center-third"])
+
+(def bottomEdgeZones
+  ["top-left"
+   "top-right"
+   "top-left-third"
+   "top-center-third"
+   "top-right-third"])
+
+(def topEdgeZones
+  ["bottom-left"
+   "bottom-right"
+   "bottom-left-third"
+   "bottom-center-third"
+   "bottom-right-third"])
+
+(ann getWorkspaceSnapResizeHandleMap (Fn [Bool (Option String) (Option WorkspaceBounds) (Option WorkspaceCanvasSize)] Js))
+(defn getWorkspaceSnapResizeHandleMap [isSnapped zone bounds canvas]
+  (match zone
+    nil (unsafe-cast Js "all")
+    (some currentZone)
+      (if (not isSnapped)
+          (unsafe-cast Js "all")
+          (if (= currentZone "assist-custom")
+              (match bounds
+                nil (unsafe-cast Js (emptyResizeHandleMap))
+                (some currentBounds)
+                  (match canvas
+                    nil (unsafe-cast Js (emptyResizeHandleMap))
+                    (some currentCanvas)
+                      (unsafe-cast Js (snapResizeHandlesFromBounds currentBounds currentCanvas))))
+              (let [right (includes? rightEdgeZones currentZone)
+                    left (includes? leftEdgeZones currentZone)
+                    bottom (includes? bottomEdgeZones currentZone)
+                    top (includes? topEdgeZones currentZone)]
+                (unsafe-cast Js (resizeHandleMap top bottom left right)))))))

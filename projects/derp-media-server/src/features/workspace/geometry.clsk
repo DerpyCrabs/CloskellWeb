@@ -1,0 +1,499 @@
+(import "../media-utils.clsk" [getMediaType])
+(import "../source-context.clsk" [normalizeSlashes])
+
+(type WorkspaceBounds
+  {:x Number
+   :y Number
+   :width Number
+   :height Number})
+
+(type WorkspaceCanvasSize
+  {:width Number
+   :height Number})
+
+(type WorkspaceGeometryLayout
+  {:bounds (Option WorkspaceBounds)
+   :zIndex (Option Number)
+   :snapZone (Option String)
+   :fullscreen (Option Bool)
+   :minimized (Option Bool)})
+
+(type WorkspaceGeometryWindow
+  {:id String
+   :type String
+   :tabGroupId (Option String)
+   :layout WorkspaceGeometryLayout})
+
+(type OccupiedSnapBounds
+  {:bounds WorkspaceBounds
+   :snapZone String})
+
+(type GroupBounds
+  {:groupId String
+   :bounds WorkspaceBounds})
+
+(def workspaceTitleBarPx 32)
+(def workspaceWindowMinVisiblePx 100)
+(def edgeFlushTolerance 4)
+(def workspaceTaskbarHeight 32)
+(def jsGlobalThis (js-global globalThis))
+(def WORKSPACE_TITLE_BAR_PX workspaceTitleBarPx)
+(def WORKSPACE_WINDOW_MIN_VISIBLE_PX workspaceWindowMinVisiblePx)
+
+(def leftSideZones
+  ["left"
+   "top-left"
+   "bottom-left"
+   "left-third"
+   "left-two-thirds"
+   "top-left-third"
+   "bottom-left-third"])
+
+(def rightSideZones
+  ["right"
+   "top-right"
+   "bottom-right"
+   "right-third"
+   "right-two-thirds"
+   "top-right-third"
+   "bottom-right-third"])
+
+(def topSideZones
+  ["top-left"
+   "top-right"
+   "top-half"
+   "top-third"
+   "middle-third"
+   "top-left-third"
+   "top-center-third"
+   "top-right-third"])
+
+(def bottomSideZones
+  ["bottom-left"
+   "bottom-right"
+   "bottom-half"
+   "middle-third"
+   "bottom-third"
+   "bottom-left-third"
+   "bottom-center-third"
+   "bottom-right-third"])
+
+(ann getSourceLabel (Fn [Js] String))
+(defn getSourceLabel [source]
+  (if (and (object? source) (= (get source :kind) "share")) "Share" "Browser"))
+
+(ann getViewportSize (Fn [] WorkspaceCanvasSize))
+(defn getViewportSize []
+  (let [win jsGlobalThis.window]
+    (if (some? win)
+        {:width win.innerWidth
+         :height (max (- win.innerHeight workspaceTaskbarHeight) 480)}
+        {:width 1280 :height 720})))
+
+(ann layoutObject (Fn [WorkspaceGeometryWindow] WorkspaceGeometryLayout))
+(defn layoutObject [win]
+  (let [layout (get win :layout)]
+    (if (object? layout) layout {})))
+
+(ann layoutBoolTrue? (Fn [WorkspaceGeometryLayout String] Bool))
+(defn layoutBoolTrue? [layout field]
+  (= (object-get layout field) true))
+
+(ann layoutNumberOr (Fn [WorkspaceGeometryLayout String Number] Number))
+(defn layoutNumberOr [layout field fallback]
+  (let [value (object-get layout field)]
+    (if (number? value) value fallback)))
+
+(ann layoutSnapZone (Fn [WorkspaceGeometryLayout] (Option String)))
+(defn layoutSnapZone [layout]
+  (let [zone (get layout :snapZone)]
+    (if (string? zone) zone nil)))
+
+(ann layoutBounds (Fn [WorkspaceGeometryLayout] (Option WorkspaceBounds)))
+(defn layoutBounds [layout]
+  (let [bounds (get layout :bounds)]
+    (if (object? bounds) (unsafe-cast WorkspaceBounds bounds) nil)))
+
+(ann maxWorkspaceWindowZ (Fn [(Vector WorkspaceGeometryWindow)] Number))
+(defn maxWorkspaceWindowZ [windows]
+  (reduce windows
+          1
+          (fn [current win]
+            (max current (layoutNumberOr (layoutObject win) "zIndex" 1)))))
+
+(ann getPlayerBoundsForAspectRatioInViewport (Fn [Number (Option WorkspaceBounds) WorkspaceCanvasSize] WorkspaceBounds))
+(defn getPlayerBoundsForAspectRatioInViewport [aspectRatio currentBounds viewport]
+  (let [maxWidth (max (- viewport.width 48) 420)
+        maxWindowHeight (max (- viewport.height 48) 320)
+        maxContentHeight (- maxWindowHeight workspaceTitleBarPx)
+        minWidth 360
+        minWindowHeight 240
+        content (if (<= (* maxContentHeight aspectRatio) maxWidth)
+                    {:width (round (* maxContentHeight aspectRatio))
+                     :height maxContentHeight}
+                    {:width maxWidth
+                     :height (round (/ maxWidth aspectRatio))})
+        width0 (max minWidth (min maxWidth content.width))
+        height0 (+ (round (/ width0 aspectRatio)) workspaceTitleBarPx)
+        size (if (> height0 maxWindowHeight)
+                 (let [height maxWindowHeight
+                       width (max minWidth
+                                  (min maxWidth
+                                       (round (* (- height workspaceTitleBarPx) aspectRatio))))]
+                   {:width width :height height})
+                 (if (< height0 minWindowHeight)
+                     (let [height minWindowHeight
+                           width (max minWidth
+                                      (min maxWidth
+                                           (round (* (- height workspaceTitleBarPx) aspectRatio))))]
+                       {:width width :height height})
+                     {:width width0 :height height0}))
+        centered (match currentBounds
+                   nil {:x (round (/ (- viewport.width size.width) 2))
+                        :y (round (/ (- viewport.height size.height) 2))}
+                   (some current)
+                     {:x (round (+ current.x (/ (- current.width size.width) 2)))
+                      :y (round (+ current.y (/ (- current.height size.height) 2)))})
+        x (max 16 (min (- viewport.width size.width 16) centered.x))
+        y (max 16 (min (- viewport.height size.height 16) centered.y))]
+    {:x x :y y :width size.width :height size.height}))
+
+(ann getPlayerBoundsForAspectRatio (Fn [Number (Option WorkspaceBounds)] WorkspaceBounds))
+(defn getPlayerBoundsForAspectRatio [aspectRatio currentBounds]
+  (getPlayerBoundsForAspectRatioInViewport aspectRatio currentBounds (getViewportSize)))
+
+(ann createDefaultBoundsForViewport (Fn [Number String WorkspaceCanvasSize] WorkspaceBounds))
+(defn createDefaultBoundsForViewport [index _type viewport]
+  (let [maxWidth (max (- viewport.width 48) 420)
+        maxHeight (max (- viewport.height 48) 320)
+        isVertical (> viewport.height viewport.width)
+        size (if isVertical
+                 {:width (min (max (round (* viewport.width 0.9)) 360) maxWidth)
+                  :height (min (max (round (* viewport.height 0.55)) 360) maxHeight)}
+                 {:width (min (max (round (* viewport.width 0.34)) 420) maxWidth)
+                  :height (min (max (round (* viewport.height 0.58)) 360) maxHeight)})
+        offset (* index 28)]
+    {:x (min (+ 24 offset) (max (- viewport.width size.width 16) 16))
+     :y (min (+ 24 offset) (max (- viewport.height size.height 16) 16))
+     :width size.width
+     :height size.height}))
+
+(ann createDefaultBounds (Fn [Number String] WorkspaceBounds))
+(defn createDefaultBounds [index type]
+  (createDefaultBoundsForViewport index type (getViewportSize)))
+
+(ann createFullscreenBoundsForCanvas (Fn [WorkspaceCanvasSize] WorkspaceBounds))
+(defn createFullscreenBoundsForCanvas [canvas]
+  {:x 0
+   :y 0
+   :width (max canvas.width 360)
+   :height (max canvas.height 240)})
+
+(ann resolveCanvas (Fn [Js] WorkspaceCanvasSize))
+(defn resolveCanvas [canvas]
+  (if (some? canvas) (unsafe-cast WorkspaceCanvasSize canvas) (getViewportSize)))
+
+(ann createFullscreenBounds (Fn [Js] WorkspaceBounds))
+(defn createFullscreenBounds [canvas]
+  (createFullscreenBoundsForCanvas (resolveCanvas canvas)))
+
+(ann valueOr (Fn [Js Js] Js))
+(defn valueOr [value fallback]
+  (if (some? value) value fallback))
+
+(ann createWindowLayout (Fn [Js WorkspaceBounds Number] Js))
+(defn createWindowLayout [layout fallbackBounds zIndex]
+  (let [current (if (object? layout) layout {})]
+    {:bounds (valueOr (get current :bounds) fallbackBounds)
+     :fullscreen (valueOr (get current :fullscreen) false)
+     :snapZone (valueOr (get current :snapZone) nil)
+     :minimized (valueOr (get current :minimized) false)
+     :zIndex (valueOr (get current :zIndex) zIndex)
+     :restoreBounds (valueOr (get current :restoreBounds) nil)}))
+
+(ann defaultSnapZoneBounds (Fn [String WorkspaceCanvasSize] WorkspaceBounds))
+(defn defaultSnapZoneBounds [zone viewport]
+  (let [halfW (round (/ viewport.width 2))
+        halfH (round (/ viewport.height 2))
+        thirdW (round (/ viewport.width 3))
+        twoThirdW (round (/ (* viewport.width 2) 3))
+        thirdH (round (/ viewport.height 3))
+        twoThirdH (round (/ (* viewport.height 2) 3))]
+    (match zone
+      "assist-custom" {:x 0 :y 0 :width viewport.width :height viewport.height}
+      "left" {:x 0 :y 0 :width halfW :height viewport.height}
+      "right" {:x halfW :y 0 :width (- viewport.width halfW) :height viewport.height}
+      "top-left" {:x 0 :y 0 :width halfW :height halfH}
+      "top-right" {:x halfW :y 0 :width (- viewport.width halfW) :height halfH}
+      "bottom-left" {:x 0 :y halfH :width halfW :height (- viewport.height halfH)}
+      "bottom-right" {:x halfW :y halfH :width (- viewport.width halfW) :height (- viewport.height halfH)}
+      "top-half" {:x 0 :y 0 :width viewport.width :height halfH}
+      "bottom-half" {:x 0 :y halfH :width viewport.width :height (- viewport.height halfH)}
+      "top-third" {:x 0 :y 0 :width viewport.width :height thirdH}
+      "middle-third" {:x 0 :y thirdH :width viewport.width :height (- twoThirdH thirdH)}
+      "bottom-third" {:x 0 :y twoThirdH :width viewport.width :height (- viewport.height twoThirdH)}
+      "left-third" {:x 0 :y 0 :width thirdW :height viewport.height}
+      "center-third" {:x thirdW :y 0 :width (- twoThirdW thirdW) :height viewport.height}
+      "right-third" {:x twoThirdW :y 0 :width (- viewport.width twoThirdW) :height viewport.height}
+      "left-two-thirds" {:x 0 :y 0 :width twoThirdW :height viewport.height}
+      "right-two-thirds" {:x thirdW :y 0 :width (- viewport.width thirdW) :height viewport.height}
+      "top-left-third" {:x 0 :y 0 :width thirdW :height halfH}
+      "top-center-third" {:x thirdW :y 0 :width (- twoThirdW thirdW) :height halfH}
+      "top-right-third" {:x twoThirdW :y 0 :width (- viewport.width twoThirdW) :height halfH}
+      "bottom-left-third" {:x 0 :y halfH :width thirdW :height (- viewport.height halfH)}
+      "bottom-center-third" {:x thirdW :y halfH :width (- twoThirdW thirdW) :height (- viewport.height halfH)}
+      "bottom-right-third" {:x twoThirdW :y halfH :width (- viewport.width twoThirdW) :height (- viewport.height halfH)}
+      _ {:x 0 :y 0 :width viewport.width :height viewport.height})))
+
+(ann rightEdgeOf (Fn [OccupiedSnapBounds] Number))
+(defn rightEdgeOf [item]
+  (+ item.bounds.x item.bounds.width))
+
+(ann bottomEdgeOf (Fn [OccupiedSnapBounds] Number))
+(defn bottomEdgeOf [item]
+  (+ item.bounds.y item.bounds.height))
+
+(ann maxRightEdge (Fn [(Vector OccupiedSnapBounds)] Number))
+(defn maxRightEdge [items]
+  (reduce items 0 (fn [edge item] (max edge (rightEdgeOf item)))))
+
+(ann maxBottomEdge (Fn [(Vector OccupiedSnapBounds)] Number))
+(defn maxBottomEdge [items]
+  (reduce items 0 (fn [edge item] (max edge (bottomEdgeOf item)))))
+
+(ann minLeftEdge (Fn [(Vector OccupiedSnapBounds) Number] Number))
+(defn minLeftEdge [items fallback]
+  (reduce items fallback (fn [edge item] (min edge item.bounds.x))))
+
+(ann minTopEdge (Fn [(Vector OccupiedSnapBounds) Number] Number))
+(defn minTopEdge [items fallback]
+  (reduce items fallback (fn [edge item] (min edge item.bounds.y))))
+
+(ann adjustHorizontalForOccupied (Fn [WorkspaceBounds String (Vector OccupiedSnapBounds) WorkspaceCanvasSize] WorkspaceBounds))
+(defn adjustHorizontalForOccupied [rect zone occupied viewport]
+  (let [isThirdZone (includes? zone "third")
+        leftOccupied (filter occupied (fn [item] (includes? leftSideZones item.snapZone)))
+        rightOccupied (filter occupied (fn [item] (includes? rightSideZones item.snapZone)))]
+    (if isThirdZone
+        rect
+        (let [rightAdjusted (if (and (includes? rightSideZones zone) (> (count leftOccupied) 0))
+                                (let [leftEdge (maxRightEdge leftOccupied)]
+                                  (merge rect {:x leftEdge :width (- viewport.width leftEdge)}))
+                                rect)]
+          (if (and (includes? leftSideZones zone) (> (count rightOccupied) 0))
+              (let [rightEdge (minLeftEdge rightOccupied viewport.width)]
+                (merge rightAdjusted {:width rightEdge}))
+              rightAdjusted)))))
+
+(ann adjustVerticalForOccupied (Fn [WorkspaceBounds String (Vector OccupiedSnapBounds) WorkspaceCanvasSize] WorkspaceBounds))
+(defn adjustVerticalForOccupied [rect zone occupied viewport]
+  (let [topOccupied (filter occupied (fn [item] (includes? topSideZones item.snapZone)))
+        bottomOccupied (filter occupied (fn [item] (includes? bottomSideZones item.snapZone)))
+        bottomAdjusted (if (and (includes? bottomSideZones zone) (> (count topOccupied) 0))
+                           (let [topEdge (maxBottomEdge topOccupied)]
+                             (merge rect {:y topEdge :height (- viewport.height topEdge)}))
+                           rect)]
+    (if (and (includes? topSideZones zone) (> (count bottomOccupied) 0))
+        (let [bottomEdge (minTopEdge bottomOccupied viewport.height)]
+          (merge bottomAdjusted {:height (- bottomEdge bottomAdjusted.y)}))
+        bottomAdjusted)))
+
+(ann snapZoneToBoundsWithOccupied (Fn [String (Vector OccupiedSnapBounds) WorkspaceCanvasSize] WorkspaceBounds))
+(defn snapZoneToBoundsWithOccupied [zone occupied canvas]
+  (let [defaultBounds (defaultSnapZoneBounds zone canvas)]
+    (if (= (count occupied) 0)
+        defaultBounds
+        (adjustVerticalForOccupied
+          (adjustHorizontalForOccupied defaultBounds zone occupied canvas)
+          zone
+          occupied
+          canvas))))
+
+(ann snapZoneToBounds (Fn [String WorkspaceCanvasSize] WorkspaceBounds))
+(defn snapZoneToBounds [zone canvas]
+  (snapZoneToBoundsWithOccupied zone [] canvas))
+
+(ann setWindowBounds (Fn [WorkspaceGeometryWindow WorkspaceBounds] WorkspaceGeometryWindow))
+(defn setWindowBounds [win bounds]
+  (let [layout (layoutObject win)]
+    (merge win {:layout (object-assoc layout "bounds" bounds)})))
+
+(ann nudgeBoundsToCanvasEdges (Fn [WorkspaceBounds WorkspaceCanvasSize] WorkspaceBounds))
+(defn nudgeBoundsToCanvasEdges [bounds canvas]
+  (let [cw (max canvas.width 1)
+        ch (max canvas.height 1)
+        right (+ bounds.x bounds.width)
+        width (if (or (<= (abs (- right cw)) edgeFlushTolerance) (> right cw))
+                  (max 100 (- cw bounds.x))
+                  bounds.width)
+        bottom (+ bounds.y bounds.height)
+        height (if (or (<= (abs (- bottom ch)) edgeFlushTolerance) (> bottom ch))
+                   (max 100 (- ch bounds.y))
+                   bounds.height)]
+    {:x bounds.x :y bounds.y :width width :height height}))
+
+(ann nudgeSnappedBoundsToCanvasEdges (Fn [(Vector WorkspaceGeometryWindow) WorkspaceCanvasSize] (Vector WorkspaceGeometryWindow)))
+(defn nudgeSnappedBoundsToCanvasEdges [windows canvas]
+  (map windows
+       (fn [win]
+         (let [layout (layoutObject win)
+               zone (layoutSnapZone layout)
+               bounds (layoutBounds layout)]
+           (if (or (not (some? zone))
+                   (layoutBoolTrue? layout "fullscreen")
+                   (layoutBoolTrue? layout "minimized")
+                   (not (some? bounds)))
+               win
+               (match bounds
+                 nil win
+                 (some currentBounds)
+                   (setWindowBounds win (nudgeBoundsToCanvasEdges currentBounds canvas))))))))
+
+(ann scaleSnappedWindowsBoundsForCanvasResize (Fn [(Vector WorkspaceGeometryWindow) WorkspaceCanvasSize WorkspaceCanvasSize] (Vector WorkspaceGeometryWindow)))
+(defn scaleSnappedWindowsBoundsForCanvasResize [windows prev next]
+  (if (or (<= prev.width 0) (<= prev.height 0))
+      windows
+      (let [sx (/ next.width prev.width)
+            sy (/ next.height prev.height)
+            scaled (map windows
+                        (fn [win]
+                          (let [layout (layoutObject win)
+                                zone (layoutSnapZone layout)
+                                bounds (layoutBounds layout)]
+                            (if (layoutBoolTrue? layout "fullscreen")
+                                (setWindowBounds win (createFullscreenBoundsForCanvas next))
+                                (if (or (not (some? zone))
+                                        (layoutBoolTrue? layout "minimized")
+                                        (not (some? bounds)))
+                                    win
+                                    (match bounds
+                                      nil win
+                                      (some currentBounds)
+                                        (setWindowBounds win
+                                                         {:x (round (* currentBounds.x sx))
+                                                          :y (round (* currentBounds.y sy))
+                                                          :width (round (* currentBounds.width sx))
+                                                          :height (round (* currentBounds.height sy))})))))))]
+        (nudgeSnappedBoundsToCanvasEdges scaled next))))
+
+(ann layoutGroupKey (Fn [WorkspaceGeometryWindow] String))
+(defn layoutGroupKey [win]
+  (match win.tabGroupId
+    nil win.id
+    (some groupId) groupId))
+
+(ann includesLayoutGroup? (Fn [(Vector WorkspaceGeometryWindow) String] Bool))
+(defn includesLayoutGroup? [windows groupId]
+  (some? (find windows (fn [win] (= (layoutGroupKey win) groupId)))))
+
+(ann firstWindowPerLayoutGroup (Fn [(Vector WorkspaceGeometryWindow)] (Vector WorkspaceGeometryWindow)))
+(defn firstWindowPerLayoutGroup [windows]
+  (reduce windows
+          []
+          (fn [groups win]
+            (if (includesLayoutGroup? groups (layoutGroupKey win))
+                groups
+                (conj groups win)))))
+
+(ann snappedReconcileWindow? (Fn [WorkspaceGeometryWindow] Bool))
+(defn snappedReconcileWindow? [win]
+  (let [layout (layoutObject win)
+        zone (layoutSnapZone layout)]
+    (and (some? zone)
+         (not (= zone "assist-custom"))
+         (not (layoutBoolTrue? layout "fullscreen"))
+         (not (layoutBoolTrue? layout "minimized")))))
+
+(ann snapZoneOrder (Fn [WorkspaceGeometryWindow WorkspaceGeometryWindow WorkspaceCanvasSize] Number))
+(defn snapZoneOrder [a b canvas]
+  (let [za (match (layoutSnapZone (layoutObject a)) nil "" (some z) z)
+        zb (match (layoutSnapZone (layoutObject b)) nil "" (some z) z)
+        aa (snapZoneToBounds za canvas)
+        bb (snapZoneToBounds zb canvas)
+        areaA (* aa.width aa.height)
+        areaB (* bb.width bb.height)]
+    (if (not (= aa.x bb.x))
+        (- aa.x bb.x)
+        (if (not (= aa.y bb.y))
+            (- aa.y bb.y)
+            (if (not (= areaA areaB))
+                (- areaB areaA)
+                (locale-compare za zb))))))
+
+(ann reconcileBoundsState (Fn [Js WorkspaceGeometryWindow WorkspaceCanvasSize] Js))
+(defn reconcileBoundsState [state win canvas]
+  (let [zone (match (layoutSnapZone (layoutObject win)) nil "" (some z) z)
+        bounds (snapZoneToBoundsWithOccupied zone state.occupied canvas)
+        groupId (layoutGroupKey win)]
+    {:occupied (conj state.occupied {:bounds bounds :snapZone zone})
+     :entries (conj state.entries {:groupId groupId :bounds bounds})}))
+
+(ann boundsForGroup (Fn [(Vector GroupBounds) String] (Option WorkspaceBounds)))
+(defn boundsForGroup [entries groupId]
+  (let [entry (find entries (fn [item] (= item.groupId groupId)))]
+    (if (some? entry) entry.bounds nil)))
+
+(ann reconcileLayoutBoundsFromSnapZonesForCanvas (Fn [(Vector WorkspaceGeometryWindow) WorkspaceCanvasSize] (Vector WorkspaceGeometryWindow)))
+(defn reconcileLayoutBoundsFromSnapZonesForCanvas [windows canvas]
+  (if (= (count windows) 0)
+      windows
+      (let [snappedReps (filter (firstWindowPerLayoutGroup windows) snappedReconcileWindow?)]
+        (if (= (count snappedReps) 0)
+            windows
+            (let [sorted (sort-with snappedReps (fn [a b] (snapZoneOrder a b canvas)))
+                  state (reduce sorted
+                                {:occupied [] :entries []}
+                                (fn [current win] (reconcileBoundsState current win canvas)))]
+              (map windows
+                   (fn [win]
+                     (let [layout (layoutObject win)
+                           zone (layoutSnapZone layout)
+                           bounds (boundsForGroup state.entries (layoutGroupKey win))]
+                       (if (or (not (some? zone))
+                               (layoutBoolTrue? layout "fullscreen")
+                               (layoutBoolTrue? layout "minimized")
+                               (not (some? bounds)))
+                           win
+	                           (match bounds
+	                             nil win
+	                             (some currentBounds) (setWindowBounds win currentBounds)))))))))))
+
+(ann reconcileLayoutBoundsFromSnapZones (Fn [(Vector WorkspaceGeometryWindow) Js] (Vector WorkspaceGeometryWindow)))
+(defn reconcileLayoutBoundsFromSnapZones [windows canvas]
+  (reconcileLayoutBoundsFromSnapZonesForCanvas windows (resolveCanvas canvas)))
+
+(ann getPlaybackTitle (Fn [(Option String)] String))
+(defn getPlaybackTitle [path]
+  (match path
+    nil "Video Player"
+    (some current)
+      (if (= current "")
+          "Video Player"
+          (let [normalized (normalizeSlashes current)
+                fileName (last (split normalized "/"))]
+            (if (or (not (some? fileName)) (= fileName ""))
+                "Video Player"
+                fileName)))))
+
+(ann isVideoPath (Fn [String] Bool))
+(defn isVideoPath [path]
+  (let [parts (split path ".")
+        extension (if (> (count parts) 0) (lower-case (last parts)) "")]
+    (= (getMediaType extension) "video")))
+
+(ann appendAll (Fn [(Vector WorkspaceGeometryWindow) (Vector WorkspaceGeometryWindow)] (Vector WorkspaceGeometryWindow)))
+(defn appendAll [items more]
+  (reduce more items (fn [next item] (conj next item))))
+
+(ann insertWindowAtGroupIndex (Fn [(Vector WorkspaceGeometryWindow) WorkspaceGeometryWindow String Number] (Vector WorkspaceGeometryWindow)))
+(defn insertWindowAtGroupIndex [current windowToInsert groupId insertIndex]
+  (let [groupIndices (reduce-indexed current
+                                     []
+                                     (fn [indices win index]
+                                       (let [gid (match win.tabGroupId nil win.id (some currentGroupId) currentGroupId)]
+                                         (if (= gid groupId) (conj indices index) indices))))
+        targetGlobalIndex (if (>= insertIndex (count groupIndices))
+                              (+ (if (= (count groupIndices) 0) -1 (last groupIndices)) 1)
+                              (nth groupIndices insertIndex))]
+    (appendAll (conj (slice current 0 targetGlobalIndex) windowToInsert)
+               (slice current targetGlobalIndex (count current)))))

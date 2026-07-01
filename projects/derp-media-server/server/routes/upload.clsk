@@ -1,0 +1,178 @@
+(import "path" [(default path)])
+(import "node:buffer" [Buffer])
+(import "node:console" [(error as consoleError)])
+(import "../../lib/file-system.clsk" [validatePath isPathEditable])
+(import "../../lib/file-change-emitter.clsk" [broadcastFileChange])
+(import "../fs-tasks.clsk" [mkdirRecursive writeFileBytes])
+(import "../http-routes.clsk" [HttpRoute registerHttpRoutes])
+
+(def jsPromise (js-global Promise))
+(def asyncIteratorSymbol (js-global Symbol.asyncIterator))
+
+(ann asyncIterator (Fn [Js] Js))
+(defn asyncIterator [iterable]
+  (let [method (object-get iterable asyncIteratorSymbol)]
+    (method.call iterable)))
+
+(ann readIteratorChunks (Fn [Js Js] Js))
+(defn readIteratorChunks [iterator chunks]
+  (let [nextPromise (iterator.next)]
+    (nextPromise.then
+     (fn [result]
+       (if result.done
+           (Buffer.concat chunks)
+           (do
+             (chunks.push result.value)
+             (readIteratorChunks iterator chunks)))))))
+
+(ann readFilePartBuffer (Fn [Js] Js))
+(defn readFilePartBuffer [fileStream]
+  (readIteratorChunks (asyncIterator fileStream) (unsafe-cast Js [])))
+
+(ann initialUploadState (Fn [] Js))
+(defn initialUploadState []
+  (let [state (new (js-global Map))]
+    (do
+      (state.set "targetDir" "")
+      (state.set "files" (unsafe-cast Js []))
+      state)))
+
+(ann stateTargetDir (Fn [Js] String))
+(defn stateTargetDir [state]
+  (let [value (state.get "targetDir")]
+    (if (string? value) value "")))
+
+(ann stateFiles (Fn [Js] Js))
+(defn stateFiles [state]
+  (state.get "files"))
+
+(ann collectUploadParts (Fn [Js Js] Js))
+(defn collectUploadParts [iterator state]
+  (let [nextPromise (iterator.next)]
+    (nextPromise.then
+     (fn [partResult]
+       (if partResult.done
+           state
+           (let [part partResult.value]
+             (if (and (= part.type "field") (= part.fieldname "targetDir"))
+                 (do
+                   (state.set "targetDir" part.value)
+                   (collectUploadParts iterator state))
+                 (if (= part.type "file")
+                     (let [bufferPromise (readFilePartBuffer part.file)]
+                       (bufferPromise.then
+                        (fn [data]
+                          (let [files (stateFiles state)]
+                            (do
+                              (files.push {:name part.filename :data data})
+                              (collectUploadParts iterator state))))))
+                     (collectUploadParts iterator state)))))))))
+
+(ann normalizeParent (Fn [String] String))
+(defn normalizeParent [dir]
+  (let [normalized (join (split dir "\\") "/")]
+    (if (= normalized ".") "" normalized)))
+
+(ann normalizedRelative (Fn [String] String))
+(defn normalizedRelative [value]
+  (join (split value "\\") "/"))
+
+(ann relativeUploadPath (Fn [String Js] String))
+(defn relativeUploadPath [targetDir file]
+  (if (= targetDir "")
+      file.name
+      (str targetDir "/" file.name)))
+
+(ann writeUploadedFile (Fn [String Js] Js))
+(defn writeUploadedFile [targetDir file]
+  (let [relativePath (relativeUploadPath targetDir file)
+        parentDir (normalizeParent (path.dirname relativePath))]
+    (if (not (or (isPathEditable parentDir) (isPathEditable relativePath)))
+        (jsPromise.resolve nil)
+        (let [fullPath (validatePath relativePath)
+              mkdirPromise (mkdirRecursive (path.dirname fullPath))]
+          (mkdirPromise.then
+           (fn [_]
+             (let [writePromise (writeFileBytes fullPath file.data)]
+               (writePromise.then
+                (fn [_]
+                  {:normalizedParent parentDir
+                   :rel (normalizedRelative relativePath)})))))))))
+
+(ann emptyUploadResponse (Fn [Js] Js))
+(defn emptyUploadResponse [reply]
+  (let [codedReply (reply.status 400)]
+    (codedReply.send {:error "No files provided"})))
+
+(ann forbiddenUploadResponse (Fn [Js] Js))
+(defn forbiddenUploadResponse [reply]
+  (let [codedReply (reply.status 403)]
+    (codedReply.send {:error "No files were uploaded — target path is not editable"})))
+
+(ann errorMessage (Fn [Js] String))
+(defn errorMessage [error]
+  (if (and (object? error) (string? error.message))
+      error.message
+      "Upload failed"))
+
+(ann uploadErrorResponse (Fn [Js Js] Js))
+(defn uploadErrorResponse [reply error]
+  (do
+    (consoleError "Error uploading files:" error)
+    (let [codedReply (reply.status 500)]
+      (codedReply.send {:error (errorMessage error)}))))
+
+(ann applyWrittenEntry (Fn [Js Js] Js))
+(defn applyWrittenEntry [state entry]
+  (if (object? entry)
+      (do
+        (state.events.set entry.normalizedParent entry.rel)
+        {:events state.events :count (+ state.count 1)})
+      state))
+
+(ann broadcastUploadedFiles (Fn [Js] Nil))
+(defn broadcastUploadedFiles [events]
+  (do
+    (events.forEach
+     (fn [changedPath dir] (broadcastFileChange dir changedPath)))
+    nil))
+
+(ann finishUploadedWrites (Fn [Js Js] Js))
+(defn finishUploadedWrites [reply written]
+  (let [state (reduce written
+                      {:events (new (js-global Map)) :count 0}
+                      applyWrittenEntry)]
+    (if (= state.count 0)
+        (forbiddenUploadResponse reply)
+        (do
+          (broadcastUploadedFiles state.events)
+          (reply.send {:success true :uploaded state.count})))))
+
+(ann processUploadState (Fn [Js Js] Js))
+(defn processUploadState [reply state]
+  (let [files (stateFiles state)]
+    (if (= files.length 0)
+        (emptyUploadResponse reply)
+        (let [targetDir (stateTargetDir state)
+              writePromises (map files (fn [file] (writeUploadedFile targetDir file)))
+              writtenPromise (jsPromise.all writePromises)]
+          (writtenPromise.then
+           (fn [written] (finishUploadedWrites reply written)))))))
+
+(ann handleUpload (Fn [Js Js] Js))
+(defn handleUpload [request reply]
+  (try
+   (let [parts (request.parts)
+         state (initialUploadState)
+         collected (collectUploadParts (asyncIterator parts) state)
+         handled (collected.then (fn [nextState] (processUploadState reply nextState)))]
+     (handled.catch (fn [error] (uploadErrorResponse reply error))))
+   (catch error (uploadErrorResponse reply error))))
+
+(ann uploadRouteDefinitions (Fn [] (Vector HttpRoute)))
+(defn uploadRouteDefinitions []
+  [{:method "POST" :path "/api/files/upload" :handler handleUpload}])
+
+(ann registerUploadRoutes (Fn [Js] Js))
+(defn registerUploadRoutes [app]
+  (registerHttpRoutes app (uploadRouteDefinitions)))

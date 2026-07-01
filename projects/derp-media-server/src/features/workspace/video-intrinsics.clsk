@@ -1,0 +1,140 @@
+(import "../media-urls.clsk" [buildAdminMediaUrl buildShareMediaUrl])
+(import "../source-context.clsk" [normalizeSlashes])
+(import "./geometry.clsk" [createDefaultBoundsForViewport getPlayerBoundsForAspectRatioInViewport getViewportSize])
+
+(def jsGlobalThis (js-global globalThis))
+(def jsMap (js-global Map))
+(def jsSet (js-global Set))
+(def jsURL (js-global URL))
+(def workspaceVideoIntrinsicsCache (new jsMap))
+(def workspaceVideoIntrinsicsInFlight (new jsSet))
+
+(ann boxGet (Fn [Js] Js))
+(defn boxGet [box]
+  (nth box 0))
+
+(ann boxSet (Fn [Js Js] Js))
+(defn boxSet [box value]
+  (box.splice 0 1 value))
+
+(type WorkspaceSource
+  {:kind String
+   :rootPath (Option String)
+   :token (Option String)
+   :sharePath (Option String)})
+
+(type VideoIntrinsics
+  {:width Number
+   :height Number})
+
+(type WorkspaceCanvasSize
+  {:width Number
+   :height Number})
+
+(type WorkspaceBounds
+  {:x Number
+   :y Number
+   :width Number
+   :height Number})
+
+(ann workspaceVideoIntrinsicsCacheKey (Fn [WorkspaceSource String] String))
+(defn workspaceVideoIntrinsicsCacheKey [source filePath]
+  (let [token (if (= source.kind "share")
+                  (if (some? source.token) source.token "")
+                  "")]
+    (str source.kind ":" token ":" filePath)))
+
+(ann validVideoIntrinsics (Fn [Number Number] Bool))
+(defn validVideoIntrinsics [width height]
+  (and (> width 0) (> height 0)))
+
+(ann getWorkspaceVideoIntrinsics (Fn [String] Js))
+(defn getWorkspaceVideoIntrinsics [key]
+  (workspaceVideoIntrinsicsCache.get key))
+
+(ann rememberWorkspaceVideoIntrinsics (Fn [WorkspaceSource String Number Number] Nil))
+(defn rememberWorkspaceVideoIntrinsics [source filePath width height]
+  (if (validVideoIntrinsics width height)
+      (do
+        (workspaceVideoIntrinsicsCache.set
+         (workspaceVideoIntrinsicsCacheKey source filePath)
+         {:width width :height height})
+        nil)
+      nil))
+
+(ann mediaUrlForVideoIntrinsicsPreload (Fn [WorkspaceSource String String] String))
+(defn mediaUrlForVideoIntrinsicsPreload [source filePath shareBasePath]
+  (if (and (= source.kind "share") (some? source.token) (not (= source.token "")))
+      (buildShareMediaUrl source.token (normalizeSlashes shareBasePath) filePath)
+      (buildAdminMediaUrl filePath)))
+
+(ann preloadWorkspaceVideoIntrinsics (Fn [WorkspaceSource String String] Nil))
+(defn preloadWorkspaceVideoIntrinsics [source filePath shareBasePath]
+  (let [doc jsGlobalThis.document
+        win jsGlobalThis.window]
+    (if (or (not (some? doc)) (not (some? win)))
+        nil
+        (let [key (workspaceVideoIntrinsicsCacheKey source filePath)]
+          (if (or (workspaceVideoIntrinsicsCache.has key)
+                  (workspaceVideoIntrinsicsInFlight.has key))
+              nil
+              (let [url (mediaUrlForVideoIntrinsicsPreload source filePath shareBasePath)
+                    urlObj (new jsURL url win.location.origin)
+                    abs urlObj.href
+                    video (doc.createElement "video")
+                    metaBox (unsafe-cast Js [nil])
+                    errBox (unsafe-cast Js [nil])
+                    cleanup (fn []
+                              (do
+                                (workspaceVideoIntrinsicsInFlight.delete key)
+                                (if (some? (boxGet metaBox))
+                                    (video.removeEventListener "loadedmetadata" (boxGet metaBox))
+                                    nil)
+                                (if (some? (boxGet errBox))
+                                    (video.removeEventListener "error" (boxGet errBox))
+                                    nil)
+                                (video.removeAttribute "src")
+                                (video.load)
+                                nil))
+                    onMeta (fn []
+                             (let [width video.videoWidth
+                                   height video.videoHeight]
+                               (do
+                                 (cleanup)
+                                 (if (validVideoIntrinsics width height)
+                                     (workspaceVideoIntrinsicsCache.set key {:width width :height height})
+                                     nil)
+                                 nil)))
+                    onErr (fn [] (cleanup))]
+                (do
+                  (workspaceVideoIntrinsicsInFlight.add key)
+                  (boxSet metaBox onMeta)
+                  (boxSet errBox onErr)
+                  (video.setAttribute "preload" "metadata")
+                  (video.setAttribute "muted" "")
+                  (video.setAttribute "playsinline" "")
+                  (video.addEventListener "loadedmetadata" onMeta)
+                  (video.addEventListener "error" onErr)
+                  (video.setAttribute "src" abs)
+                  (video.load)
+                  nil)))))))
+
+(ann viewerBoundsForVideoOpenInViewport
+     (Fn [String WorkspaceSource (Option VideoIntrinsics) Number WorkspaceCanvasSize] WorkspaceBounds))
+(defn viewerBoundsForVideoOpenInViewport [_filePath _source dims defaultIndex viewport]
+  (match dims
+    nil (createDefaultBoundsForViewport defaultIndex "viewer" viewport)
+    (some current)
+      (if (validVideoIntrinsics current.width current.height)
+          (getPlayerBoundsForAspectRatioInViewport (/ current.width current.height) nil viewport)
+          (createDefaultBoundsForViewport defaultIndex "viewer" viewport))))
+
+(ann viewerBoundsForVideoOpen (Fn [String WorkspaceSource Number] WorkspaceBounds))
+(defn viewerBoundsForVideoOpen [filePath source defaultIndex]
+  (let [key (workspaceVideoIntrinsicsCacheKey source filePath)
+        dims (getWorkspaceVideoIntrinsics key)]
+    (viewerBoundsForVideoOpenInViewport filePath
+                                        source
+                                        (if (some? dims) dims nil)
+                                        defaultIndex
+                                        (getViewportSize))))

@@ -1,0 +1,84 @@
+(def jsGlobalThis (js-global globalThis))
+(def jsJSON (js-global JSON))
+
+(type ShareTextViewerSettings
+  {:enabled Bool
+   :readOnly Bool})
+
+(def STORAGE_KEY "share-text-viewer-settings")
+
+(ann emptyPersisted (Fn [] Js))
+(defn emptyPersisted []
+  {:byKey {}})
+
+(ann localStorageOrNil (Fn [] Js))
+(defn localStorageOrNil []
+  (let [storage jsGlobalThis.localStorage]
+    (if (some? storage) storage nil)))
+
+(ann readFull (Fn [] Js))
+(defn readFull []
+  (let [storage (localStorageOrNil)]
+    (if (not (some? storage))
+        (emptyPersisted)
+        (let [s (unsafe-cast Js storage)]
+          (try
+           (let [raw (s.getItem STORAGE_KEY)]
+             (if (not (some? raw))
+                 (emptyPersisted)
+                 (let [parsed (jsJSON.parse raw)]
+                   (if (and (object? parsed) (object? parsed.byKey)) parsed (emptyPersisted)))))
+           (catch _error (emptyPersisted)))))))
+
+(ann writeFull (Fn [Js] Nil))
+(defn writeFull [persisted]
+  (let [storage (localStorageOrNil)]
+    (if (not (some? storage))
+        nil
+        (let [s (unsafe-cast Js storage)]
+          (try
+           (do
+             (s.setItem STORAGE_KEY (jsJSON.stringify persisted))
+             nil)
+           (catch _error nil))))))
+
+(ann getShareTextViewerSettings (Fn [String ShareTextViewerSettings] ShareTextViewerSettings))
+(defn getShareTextViewerSettings [storageKey defaults]
+  (if (= storageKey "")
+      defaults
+      (let [full (readFull)
+            existing (object-get full.byKey storageKey)]
+        (if (object? existing) existing defaults))))
+
+(ann setShareTextViewerSettings (Fn [String ShareTextViewerSettings] Nil))
+(defn setShareTextViewerSettings [storageKey next]
+  (if (= storageKey "")
+      nil
+      (let [full (readFull)]
+        (writeFull {:byKey (object-assoc full.byKey storageKey next)}))))
+
+(ann migrateLegacyShareTextViewerKey (Fn [String ShareTextViewerSettings] Nil))
+(defn migrateLegacyShareTextViewerKey [storageKey defaults]
+  (let [storage (localStorageOrNil)]
+    (if (not (some? storage))
+        nil
+        (let [s (unsafe-cast Js storage)]
+          (if (= storageKey "")
+              nil
+              (let [full (readFull)
+                    existing (object-get full.byKey storageKey)]
+                (if (some? existing)
+                    nil
+                    (try
+                     (let [raw (s.getItem storageKey)]
+                       (if (not (some? raw))
+                           nil
+                           (let [parsed (jsJSON.parse raw)
+                                 enabled (if (some? parsed.enabled) parsed.enabled defaults.enabled)
+                                 readOnly (if (some? parsed.readOnly) parsed.readOnly defaults.readOnly)]
+                             (do
+                               (setShareTextViewerSettings storageKey
+                                                           {:enabled enabled :readOnly readOnly})
+                               (s.removeItem storageKey)
+                               nil))))
+                     (catch _error nil)))))))))

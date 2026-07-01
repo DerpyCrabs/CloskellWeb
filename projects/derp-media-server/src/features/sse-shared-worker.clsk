@@ -1,0 +1,357 @@
+(def INITIAL_DELAY_MS 5000)
+(def MAX_DELAY_MS 60000)
+(def BACKOFF_MULTIPLIER 2)
+
+(def jsGlobalThis (js-global globalThis))
+(def jsObject (js-global Object))
+(def jsMap (js-global Map))
+(def jsEventSource (js-global EventSource))
+(def jsJSON (js-global JSON))
+(def jsMath (js-global Math))
+(def jsSetTimeout (js-global setTimeout))
+(def jsClearTimeout (js-global clearTimeout))
+(def jsEncodeURIComponent (js-global encodeURIComponent))
+
+(def portStates (new jsMap))
+(def adminRefTotalBox (unsafe-cast Js [0]))
+(def adminSourceBox (unsafe-cast Js [nil]))
+(def adminRetryBox (unsafe-cast Js [0]))
+(def adminReconnectTimerBox (unsafe-cast Js [nil]))
+(def shareRefTotal (new jsMap))
+(def shareSources (new jsMap))
+(def shareRetry (new jsMap))
+(def shareReconnectTimers (new jsMap))
+
+(ann boxGet (Fn [Js] Js))
+(defn boxGet [box]
+  (nth box 0))
+
+(ann boxSet (Fn [Js Js] Js))
+(defn boxSet [box value]
+  (box.splice 0 1 value))
+
+(ann getDelayMs (Fn [Number] Number))
+(defn getDelayMs [retryCount]
+  (min (* INITIAL_DELAY_MS (jsMath.pow BACKOFF_MULTIPLIER retryCount))
+       MAX_DELAY_MS))
+
+(ann portState (Fn [Js] Js))
+(defn portState [port]
+  (let [existing (portStates.get port)]
+    (if (some? existing)
+        existing
+        (let [state {:adminBox (unsafe-cast Js [0])
+                     :shares (new jsMap)}]
+          (do
+            (portStates.set port state)
+            state)))))
+
+(ann portAdminCount (Fn [Js] Number))
+(defn portAdminCount [state]
+  (boxGet state.adminBox))
+
+(ann setPortAdminCount (Fn [Js Number] Nil))
+(defn setPortAdminCount [state value]
+  (do
+    (boxSet state.adminBox value)
+    nil))
+
+(ann adminRefTotal (Fn [] Number))
+(defn adminRefTotal []
+  (boxGet adminRefTotalBox))
+
+(ann setAdminRefTotal (Fn [Number] Nil))
+(defn setAdminRefTotal [value]
+  (do
+    (boxSet adminRefTotalBox value)
+    nil))
+
+(ann adminRetry (Fn [] Number))
+(defn adminRetry []
+  (boxGet adminRetryBox))
+
+(ann setAdminRetry (Fn [Number] Nil))
+(defn setAdminRetry [value]
+  (do
+    (boxSet adminRetryBox value)
+    nil))
+
+(ann cancelAdminReconnect (Fn [] Nil))
+(defn cancelAdminReconnect []
+  (let [timer (boxGet adminReconnectTimerBox)]
+    (if (some? timer)
+        (do
+          (jsClearTimeout timer)
+          (boxSet adminReconnectTimerBox nil)
+          nil)
+        nil)))
+
+(ann cancelShareReconnect (Fn [String] Nil))
+(defn cancelShareReconnect [token]
+  (let [timer (shareReconnectTimers.get token)]
+    (if (some? timer)
+        (do
+          (jsClearTimeout timer)
+          (shareReconnectTimers.delete token)
+          nil)
+        nil)))
+
+(ann safePostMessage (Fn [Js Js] Nil))
+(defn safePostMessage [port msg]
+  (try
+   (do
+     (port.postMessage msg)
+     nil)
+   (catch _error nil)))
+
+(ann broadcastAdminToPort (Fn [Js Js Js] Nil))
+(defn broadcastAdminToPort [data state port]
+  (if (> (portAdminCount state) 0)
+      (safePostMessage port {:type "admin-sse" :data data})
+      nil))
+
+(ann broadcastAdmin (Fn [Js] Nil))
+(defn broadcastAdmin [data]
+  (do
+    (portStates.forEach (fn [state port] (broadcastAdminToPort data state port)))
+    nil))
+
+(ann broadcastShareToPort (Fn [String Js Js Js] Nil))
+(defn broadcastShareToPort [token data state port]
+  (let [count (state.shares.get token)]
+    (if (> (if (number? count) count 0) 0)
+        (safePostMessage port {:type "share-sse" :token token :data data})
+        nil)))
+
+(ann broadcastShare (Fn [String Js] Nil))
+(defn broadcastShare [token data]
+  (do
+    (portStates.forEach (fn [state port] (broadcastShareToPort token data state port)))
+    nil))
+
+(ann parseEventData (Fn [Js] Js))
+(defn parseEventData [event]
+  (try
+   (jsJSON.parse event.data)
+   (catch _error nil)))
+
+(ann adminSource (Fn [] Js))
+(defn adminSource []
+  (boxGet adminSourceBox))
+
+(ann setAdminSource (Fn [Js] Nil))
+(defn setAdminSource [source]
+  (do
+    (boxSet adminSourceBox source)
+    nil))
+
+(ann openAdminStream (Fn [] Nil))
+(defn openAdminStream []
+  (do
+    (cancelAdminReconnect)
+    (if (or (some? (adminSource)) (<= (adminRefTotal) 0))
+        nil
+        (let [es (new jsEventSource "/api/events/stream")
+              onMessage (fn [event]
+                          (let [data (parseEventData event)]
+                            (do
+                              (setAdminRetry 0)
+                              (if (some? data) (broadcastAdmin data) nil)
+                              nil)))
+              onError (fn []
+                        (do
+                          (let [source (adminSource)]
+                            (if (some? source)
+                                (do
+                                  (source.close)
+                                  (setAdminSource nil))
+                                nil))
+                          (if (<= (adminRefTotal) 0)
+                              nil
+                              (let [delay (getDelayMs (adminRetry))
+                                    timer (jsSetTimeout
+                                           (fn []
+                                             (do
+                                               (boxSet adminReconnectTimerBox nil)
+                                               (openAdminStream)
+                                               nil))
+                                           delay)]
+                                (do
+                                  (setAdminRetry (+ (adminRetry) 1))
+                                  (cancelAdminReconnect)
+                                  (boxSet adminReconnectTimerBox timer)
+                                  nil)))))]
+          (do
+            (setAdminSource es)
+            (jsObject.defineProperty es "onmessage" {:value onMessage :configurable true :writable true})
+            (jsObject.defineProperty es "onerror" {:value onError :configurable true :writable true})
+            nil)))))
+
+(ann closeAdminStreamIfIdle (Fn [] Nil))
+(defn closeAdminStreamIfIdle []
+  (do
+    (cancelAdminReconnect)
+    (if (> (adminRefTotal) 0)
+        nil
+        (do
+          (setAdminRetry 0)
+          (let [source (adminSource)]
+            (if (some? source)
+                (do
+                  (source.close)
+                  (setAdminSource nil)
+                  nil)
+                nil))))))
+
+(ann shareTotal (Fn [String] Number))
+(defn shareTotal [token]
+  (let [value (shareRefTotal.get token)]
+    (if (number? value) value 0)))
+
+(ann setShareTotal (Fn [String Number] Nil))
+(defn setShareTotal [token value]
+  (if (= value 0)
+      (do
+        (shareRefTotal.delete token)
+        nil)
+      (do
+        (shareRefTotal.set token value)
+        nil)))
+
+(ann shareRetryCount (Fn [String] Number))
+(defn shareRetryCount [token]
+  (let [value (shareRetry.get token)]
+    (if (number? value) value 0)))
+
+(ann openShareStream (Fn [String] Nil))
+(defn openShareStream [token]
+  (do
+    (cancelShareReconnect token)
+    (if (or (shareSources.has token) (<= (shareTotal token) 0))
+        nil
+        (let [url (str "/api/share/" (jsEncodeURIComponent token) "/stream")
+              es (new jsEventSource url)
+              onMessage (fn [event]
+                          (let [data (parseEventData event)]
+                            (do
+                              (shareRetry.set token 0)
+                              (if (some? data) (broadcastShare token data) nil)
+                              nil)))
+              onError (fn []
+                        (do
+                          (let [cur (shareSources.get token)]
+                            (if (some? cur)
+                                (do
+                                  (cur.close)
+                                  (shareSources.delete token)
+                                  nil)
+                                nil))
+                          (if (<= (shareTotal token) 0)
+                              nil
+                              (let [retry (shareRetryCount token)
+                                    delay (getDelayMs retry)
+                                    timer (jsSetTimeout
+                                           (fn []
+                                             (do
+                                               (shareReconnectTimers.delete token)
+                                               (openShareStream token)
+                                               nil))
+                                           delay)]
+                                (do
+                                  (shareRetry.set token (+ retry 1))
+                                  (cancelShareReconnect token)
+                                  (shareReconnectTimers.set token timer)
+                                  nil)))))]
+          (do
+            (shareSources.set token es)
+            (jsObject.defineProperty es "onmessage" {:value onMessage :configurable true :writable true})
+            (jsObject.defineProperty es "onerror" {:value onError :configurable true :writable true})
+            nil)))))
+
+(ann closeShareStreamIfIdle (Fn [String] Nil))
+(defn closeShareStreamIfIdle [token]
+  (do
+    (cancelShareReconnect token)
+    (if (> (shareTotal token) 0)
+        nil
+        (do
+          (shareRetry.delete token)
+          (let [es (shareSources.get token)]
+            (if (some? es)
+                (do
+                  (es.close)
+                  (shareSources.delete token)
+                  nil)
+                nil))))))
+
+(ann maybeDeletePortState (Fn [Js Js] Nil))
+(defn maybeDeletePortState [port state]
+  (if (and (= (portAdminCount state) 0) (= state.shares.size 0))
+      (do
+        (portStates.delete port)
+        nil)
+      nil))
+
+(ann onPortMessage (Fn [Js Js] Nil))
+(defn onPortMessage [port raw]
+  (if (not (object? raw))
+      nil
+      (let [msg raw]
+        (if (= msg.type "subscribe-admin")
+            (let [state (portState port)]
+              (do
+                (setPortAdminCount state (+ (portAdminCount state) 1))
+                (setAdminRefTotal (+ (adminRefTotal) 1))
+                (if (= (adminRefTotal) 1) (openAdminStream) nil)
+                nil))
+            (if (= msg.type "unsubscribe-admin")
+                (let [state (portStates.get port)]
+                  (if (not (some? state))
+                      nil
+                      (if (<= (portAdminCount state) 0)
+                          nil
+                          (do
+                            (setPortAdminCount state (- (portAdminCount state) 1))
+                            (setAdminRefTotal (max 0 (- (adminRefTotal) 1)))
+                            (maybeDeletePortState port state)
+                            (closeAdminStreamIfIdle)
+                            nil))))
+                (if (and (= msg.type "subscribe-share") (string? msg.token) (not (= msg.token "")))
+                    (let [token msg.token
+                          state (portState port)
+                          current (state.shares.get token)
+                          next (+ (if (number? current) current 0) 1)]
+                      (do
+                        (state.shares.set token next)
+                        (setShareTotal token (+ (shareTotal token) 1))
+                        (if (= (shareTotal token) 1) (openShareStream token) nil)
+                        nil))
+                    (if (and (= msg.type "unsubscribe-share") (string? msg.token))
+                        (let [token msg.token
+                              state (portStates.get port)]
+                          (if (not (some? state))
+                              nil
+                              (let [cur (state.shares.get token)]
+                                (if (<= (if (number? cur) cur 0) 0)
+                                    nil
+                                    (do
+                                      (if (<= cur 1)
+                                          (state.shares.delete token)
+                                          (state.shares.set token (- cur 1)))
+                                      (setShareTotal token (max 0 (- (shareTotal token) 1)))
+                                      (maybeDeletePortState port state)
+                                      (closeShareStreamIfIdle token)
+                                      nil)))))
+                        nil)))))))
+
+(ann handleConnect (Fn [Js] Nil))
+(defn handleConnect [event]
+  (let [port (nth event.ports 0)]
+    (if (not (some? port))
+        nil
+        (do
+          (port.start)
+          (port.addEventListener "message" (fn [ev] (onPortMessage port ev.data)))
+          nil))))
+
+(jsObject.defineProperty jsGlobalThis "onconnect" {:value handleConnect :configurable true :writable true})

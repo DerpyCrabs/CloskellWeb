@@ -1,0 +1,72 @@
+(import "../../model.clsk" [AppState BasicResponse])
+(import "../../messages.clsk" [AppMsg])
+
+(type BasicResponseCast BasicResponse)
+
+(def jsJSON (js-global JSON))
+
+(ann readPastedKbImageCommand (Fn [Js String Js String Number Number String String String] (Cmd AppMsg)))
+(defn readPastedKbImageCommand [blob filePath target content start end imagePath fileName mimeType]
+  {:kind :file/read-blob
+   :blob blob
+   :format :base64
+   :toMessage (fn [base64]
+                {:kind :pasted-kb-image-read
+                 :filePath filePath
+                 :target target
+                 :content content
+                 :selectionStart start
+                 :selectionEnd end
+                 :imagePath imagePath
+                 :fileName fileName
+                 :mimeType mimeType
+                 :base64Content base64})
+   :onError :pasted-kb-image-failed})
+
+(ann uploadPastedKbImageCommand (Fn [AppState String Js String Number Number String String String String] (Cmd AppMsg)))
+(defn uploadPastedKbImageCommand [state filePath target content start end imagePath fileName mimeType base64Content]
+  (match state.shareToken
+    nil {:kind :http/request
+         :request {:url "/api/files/create"
+                   :method "POST"
+                   :headers {"Content-Type" "application/json"}
+                   :body (jsJSON.stringify {:type "file"
+                                             :path imagePath
+                                             :base64Content base64Content})}
+         :response :json
+         :toMessage (fn [response]
+                      {:kind :pasted-kb-image-uploaded
+                       :value (unsafe-cast BasicResponseCast response)
+                       :filePath filePath
+                       :target target
+                       :content content
+                       :selectionStart start
+                       :selectionEnd end
+                       :fileName fileName})
+         :onError :pasted-kb-image-failed}
+    (some token)
+      {:kind :http/request
+       :request {:url (str "/api/share/" token "/upload-image")
+                 :method "POST"
+                 :headers {"Content-Type" "application/json"}
+                 :body (jsJSON.stringify {:base64Content base64Content
+                                           :mimeType mimeType
+                                           :fileName fileName})}
+       :response :json
+       :toMessage (fn [response]
+                    {:kind :pasted-kb-image-uploaded
+                     :value (unsafe-cast BasicResponseCast response)
+                     :filePath filePath
+                     :target target
+                     :content content
+                     :selectionStart start
+                     :selectionEnd end
+                     :fileName (if (string? response.body.fileName) response.body.fileName fileName)})
+       :onError :pasted-kb-image-failed}))
+
+(ann restoreInputSelectionCommand (Fn [Js Number Number] (Cmd AppMsg)))
+(defn restoreInputSelectionCommand [target start end]
+  {:kind :dom/input-set-selection
+   :target target
+   :start start
+   :end end})

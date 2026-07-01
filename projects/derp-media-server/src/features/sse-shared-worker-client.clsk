@@ -1,0 +1,400 @@
+(import "./sse-reconnect.clsk" [createReconnectScheduler])
+
+(def sseSharedWorkerUrl "/assets/sse-shared-worker.js")
+(def jsGlobalThis (js-global globalThis))
+(def jsObject (js-global Object))
+(def jsSharedWorker (js-global SharedWorker))
+(def jsEventSource (js-global EventSource))
+(def jsSet (js-global Set))
+(def jsMap (js-global Map))
+(def jsJSON (js-global JSON))
+(def jsMath (js-global Math))
+(def jsEncodeURIComponent (js-global encodeURIComponent))
+(def adminListeners (new jsSet))
+(def shareListeners (new jsMap))
+(def sharedWorkerBox (unsafe-cast Js [nil]))
+(def fallbackAdminEsBox (unsafe-cast Js [nil]))
+(def fallbackAdminRefBox (unsafe-cast Js [0]))
+(def fallbackAdminReconnectCleanupBox (unsafe-cast Js [nil]))
+(def fallbackShare (new jsMap))
+(def fallbackVisibilityAttachedBox (unsafe-cast Js [false]))
+
+(ann boxGet (Fn [Js] Js))
+(defn boxGet [box]
+  (nth box 0))
+
+(ann boxSet (Fn [Js Js] Js))
+(defn boxSet [box value]
+  (box.splice 0 1 value))
+
+(ann connectAfterPageLoad (Fn [Js] Js))
+(defn connectAfterPageLoad [connect]
+  (let [doc jsGlobalThis.document
+        win jsGlobalThis.window]
+    (if (or (not (some? doc)) (= doc.readyState "complete") (not (some? win)))
+        (let [timeoutId (jsGlobalThis.setTimeout connect 0)]
+          (fn [] (jsGlobalThis.clearTimeout timeoutId)))
+        (let [calledBox (unsafe-cast Js [false])
+              handlerBox (unsafe-cast Js [nil])
+              handler (fn []
+                        (if (boxGet calledBox)
+                            nil
+                            (do
+                              (boxSet calledBox true)
+                              (win.removeEventListener "load" (boxGet handlerBox))
+                              (connect)
+                              nil)))]
+          (do
+            (boxSet handlerBox handler)
+            (win.addEventListener "load" handler {:once true})
+            (fn []
+              (do
+                (boxSet calledBox true)
+                (win.removeEventListener "load" (boxGet handlerBox))
+                nil)))))))
+
+(ann sharedWorkerAvailable (Fn [] Bool))
+(defn sharedWorkerAvailable []
+  false)
+
+(ann safeListenerCall (Fn [Js Js] Nil))
+(defn safeListenerCall [listener data]
+  (try
+   (do
+     (listener data)
+     nil)
+   (catch _error nil)))
+
+(ann dispatchAdmin (Fn [Js] Nil))
+(defn dispatchAdmin [data]
+  (do
+    (adminListeners.forEach (fn [listener] (safeListenerCall listener data)))
+    nil))
+
+(ann dispatchShare (Fn [String Js] Nil))
+(defn dispatchShare [token data]
+  (let [listeners (shareListeners.get token)]
+    (if (some? listeners)
+        (do
+          (listeners.forEach (fn [listener] (safeListenerCall listener data)))
+          nil)
+        nil)))
+
+(ann handleSharedWorkerMessage (Fn [Js] Nil))
+(defn handleSharedWorkerMessage [event]
+  (let [msg event.data]
+    (if (and (= msg.type "admin-sse") (some? msg.data))
+        (dispatchAdmin msg.data)
+        (if (and (= msg.type "share-sse") (string? msg.token) (some? msg.data))
+            (dispatchShare msg.token msg.data)
+            nil))))
+
+(ann ensureSharedWorkerPort (Fn [] Js))
+(defn ensureSharedWorkerPort []
+  (let [current (boxGet sharedWorkerBox)]
+    (if (some? current)
+        current.port
+        (let [worker (new jsSharedWorker sseSharedWorkerUrl {:type "module" :name "derp-sse"})]
+          (do
+            (boxSet sharedWorkerBox worker)
+            (worker.port.start)
+            (worker.port.addEventListener "message" handleSharedWorkerMessage)
+            worker.port)))))
+
+(ann fallbackAdminRef (Fn [] Number))
+(defn fallbackAdminRef []
+  (boxGet fallbackAdminRefBox))
+
+(ann setFallbackAdminRef (Fn [Number] Nil))
+(defn setFallbackAdminRef [value]
+  (do
+    (boxSet fallbackAdminRefBox value)
+    nil))
+
+(ann fallbackAdminEs (Fn [] Js))
+(defn fallbackAdminEs []
+  (boxGet fallbackAdminEsBox))
+
+(ann setFallbackAdminEs (Fn [Js] Nil))
+(defn setFallbackAdminEs [value]
+  (do
+    (boxSet fallbackAdminEsBox value)
+    nil))
+
+(ann isTabVisible (Fn [] Bool))
+(defn isTabVisible []
+  (let [doc jsGlobalThis.document]
+    (and (some? doc) (not doc.hidden))))
+
+(ann cleanupFallbackAdminReconnect (Fn [] Nil))
+(defn cleanupFallbackAdminReconnect []
+  (let [cleanup (boxGet fallbackAdminReconnectCleanupBox)]
+    (if (some? cleanup)
+        (do
+          (cleanup)
+          (boxSet fallbackAdminReconnectCleanupBox nil)
+          nil)
+        nil)))
+
+(ann parseEventData (Fn [Js] Js))
+(defn parseEventData [event]
+  (try
+   (jsJSON.parse event.data)
+   (catch _error nil)))
+
+(ann connectFallbackAdmin (Fn [] Nil))
+(defn connectFallbackAdmin []
+  (if (or (not (isTabVisible)) (some? (fallbackAdminEs)))
+      nil
+      (do
+        (cleanupFallbackAdminReconnect)
+        (let [scheduler (createReconnectScheduler
+                         (fn []
+                           (if (> (fallbackAdminRef) 0)
+                               (connectFallbackAdmin)
+                               nil)))
+              es (new jsEventSource "/api/events/stream")
+              onMessage (fn [event]
+                          (let [data (parseEventData event)]
+                            (if (some? data) (dispatchAdmin data) nil)))
+              onError (fn []
+                        (do
+                          (let [source (fallbackAdminEs)]
+                            (if (some? source)
+                                (do
+                                  (source.close)
+                                  (setFallbackAdminEs nil)
+                                  nil)
+                                nil))
+                          (if (> (fallbackAdminRef) 0) (scheduler.schedule) nil)))]
+          (do
+            (boxSet fallbackAdminReconnectCleanupBox scheduler.cleanup)
+            (setFallbackAdminEs es)
+            (jsObject.defineProperty es "onmessage" {:value onMessage :configurable true :writable true})
+            (jsObject.defineProperty es "onerror" {:value onError :configurable true :writable true})
+            nil)))))
+
+(ann disconnectFallbackAdminIfIdle (Fn [] Nil))
+(defn disconnectFallbackAdminIfIdle []
+  (if (> (fallbackAdminRef) 0)
+      nil
+      (do
+        (cleanupFallbackAdminReconnect)
+        (let [source (fallbackAdminEs)]
+          (if (some? source)
+              (do
+                (source.close)
+                (setFallbackAdminEs nil)
+                nil)
+              nil)))))
+
+(ann getFallbackShareEntry (Fn [String] Js))
+(defn getFallbackShareEntry [token]
+  (let [existing (fallbackShare.get token)]
+    (if (some? existing)
+        existing
+        (let [entry {:esBox (unsafe-cast Js [nil])
+                     :refBox (unsafe-cast Js [0])
+                     :reconnectCleanupBox (unsafe-cast Js [nil])}]
+          (do
+            (fallbackShare.set token entry)
+            entry)))))
+
+(ann fallbackShareRef (Fn [Js] Number))
+(defn fallbackShareRef [entry]
+  (boxGet entry.refBox))
+
+(ann setFallbackShareRef (Fn [Js Number] Nil))
+(defn setFallbackShareRef [entry value]
+  (do
+    (boxSet entry.refBox value)
+    nil))
+
+(ann cleanupFallbackShareReconnect (Fn [Js] Nil))
+(defn cleanupFallbackShareReconnect [entry]
+  (let [cleanup (boxGet entry.reconnectCleanupBox)]
+    (if (some? cleanup)
+        (do
+          (cleanup)
+          (boxSet entry.reconnectCleanupBox nil)
+          nil)
+        nil)))
+
+(ann connectFallbackShare (Fn [String] Nil))
+(defn connectFallbackShare [token]
+  (let [entry (getFallbackShareEntry token)]
+    (if (or (not (isTabVisible)) (some? (boxGet entry.esBox)))
+        nil
+        (do
+          (cleanupFallbackShareReconnect entry)
+          (let [scheduler (createReconnectScheduler
+                           (fn []
+                             (let [cur (fallbackShare.get token)]
+                               (if (and (some? cur) (> (fallbackShareRef cur) 0))
+                                   (connectFallbackShare token)
+                                   nil))))
+                url (str "/api/share/" (jsEncodeURIComponent token) "/stream")
+                es (new jsEventSource url)
+                onMessage (fn [event]
+                            (let [data (parseEventData event)]
+                              (if (some? data) (dispatchShare token data) nil)))
+                onError (fn []
+                          (do
+                            (let [current (boxGet entry.esBox)]
+                              (if (some? current)
+                                  (do
+                                    (current.close)
+                                    (boxSet entry.esBox nil)
+                                    nil)
+                                  nil))
+                            (if (> (fallbackShareRef entry) 0) (scheduler.schedule) nil)))]
+            (do
+              (boxSet entry.reconnectCleanupBox scheduler.cleanup)
+              (boxSet entry.esBox es)
+              (jsObject.defineProperty es "onmessage" {:value onMessage :configurable true :writable true})
+              (jsObject.defineProperty es "onerror" {:value onError :configurable true :writable true})
+              nil))))))
+
+(ann disconnectFallbackShareIfIdle (Fn [String] Nil))
+(defn disconnectFallbackShareIfIdle [token]
+  (let [entry (fallbackShare.get token)]
+    (if (or (not (some? entry)) (> (fallbackShareRef entry) 0))
+        nil
+        (do
+          (cleanupFallbackShareReconnect entry)
+          (let [es (boxGet entry.esBox)]
+            (if (some? es)
+                (do
+                  (es.close)
+                  (boxSet entry.esBox nil)
+                  nil)
+                nil))
+          (fallbackShare.delete token)
+          nil))))
+
+(ann closeFallbackShareEntry (Fn [Js Js] Nil))
+(defn closeFallbackShareEntry [entry _token]
+  (let [es (boxGet entry.esBox)]
+    (if (some? es)
+        (do
+          (es.close)
+          (boxSet entry.esBox nil)
+          nil)
+        nil)))
+
+(ann reconnectFallbackShareEntry (Fn [Js String] Nil))
+(defn reconnectFallbackShareEntry [entry token]
+  (if (> (fallbackShareRef entry) 0)
+      (connectFallbackShare token)
+      nil))
+
+(ann attachFallbackVisibilityHandlers (Fn [] Nil))
+(defn attachFallbackVisibilityHandlers []
+  (if (or (boxGet fallbackVisibilityAttachedBox) (not (some? jsGlobalThis.document)))
+      nil
+      (do
+        (boxSet fallbackVisibilityAttachedBox true)
+        (jsGlobalThis.document.addEventListener
+         "visibilitychange"
+         (fn []
+           (if (not (isTabVisible))
+               (do
+                 (let [source (fallbackAdminEs)]
+                   (if (some? source)
+                       (do
+                         (source.close)
+                         (setFallbackAdminEs nil)
+                         nil)
+                       nil))
+                 (fallbackShare.forEach closeFallbackShareEntry)
+                 nil)
+               (do
+                 (if (> (fallbackAdminRef) 0) (connectFallbackAdmin) nil)
+                 (fallbackShare.forEach reconnectFallbackShareEntry)
+                 nil))))
+        nil)))
+
+(ann subscribeSseAdmin (Fn [Js] Js))
+(defn subscribeSseAdmin [onData]
+  (do
+    (adminListeners.add onData)
+    (if (sharedWorkerAvailable)
+        (let [port (ensureSharedWorkerPort)]
+          (do
+            (port.postMessage {:type "subscribe-admin"})
+            (fn []
+              (do
+                (adminListeners.delete onData)
+                (let [worker (boxGet sharedWorkerBox)]
+                  (if (some? worker)
+                      (worker.port.postMessage {:type "unsubscribe-admin"})
+                      nil))
+                nil))))
+        (do
+          (setFallbackAdminRef (+ (fallbackAdminRef) 1))
+          (attachFallbackVisibilityHandlers)
+          (let [connectCleanup (connectAfterPageLoad connectFallbackAdmin)]
+            (fn []
+              (do
+                (connectCleanup)
+                (adminListeners.delete onData)
+                (setFallbackAdminRef (jsMath.max 0 (- (fallbackAdminRef) 1)))
+                (disconnectFallbackAdminIfIdle)
+                nil)))))))
+
+(ann getShareListenerSet (Fn [String] Js))
+(defn getShareListenerSet [token]
+  (let [existing (shareListeners.get token)]
+    (if (some? existing)
+        existing
+        (let [listeners (new jsSet)]
+          (do
+            (shareListeners.set token listeners)
+            listeners)))))
+
+(ann removeShareListener (Fn [String Js] Nil))
+(defn removeShareListener [token onData]
+  (let [listeners (shareListeners.get token)]
+    (if (some? listeners)
+        (do
+          (listeners.delete onData)
+          (if (= listeners.size 0)
+              (shareListeners.delete token)
+              nil)
+          nil)
+        nil)))
+
+(ann subscribeSseShare (Fn [String Js] Js))
+(defn subscribeSseShare [token onData]
+  (let [listeners (getShareListenerSet token)]
+    (do
+      (listeners.add onData)
+      (if (sharedWorkerAvailable)
+          (let [port (ensureSharedWorkerPort)]
+            (do
+              (port.postMessage {:type "subscribe-share" :token token})
+              (fn []
+                (do
+                  (removeShareListener token onData)
+                  (let [worker (boxGet sharedWorkerBox)]
+                    (if (some? worker)
+                        (worker.port.postMessage {:type "unsubscribe-share" :token token})
+                        nil))
+                  nil))))
+          (let [entry (getFallbackShareEntry token)]
+            (do
+              (setFallbackShareRef entry (+ (fallbackShareRef entry) 1))
+              (attachFallbackVisibilityHandlers)
+              (let [connectCleanup (connectAfterPageLoad (fn [] (connectFallbackShare token)))]
+                (fn []
+                  (do
+                    (connectCleanup)
+                    (removeShareListener token onData)
+                    (let [cur (fallbackShare.get token)]
+                      (if (some? cur)
+                          (do
+                            (setFallbackShareRef cur (jsMath.max 0 (- (fallbackShareRef cur) 1)))
+                            (disconnectFallbackShareIfIdle token)
+                            nil)
+                          nil))
+                    nil)))))))))

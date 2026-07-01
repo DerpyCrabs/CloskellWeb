@@ -1,0 +1,28 @@
+(import "../source-context.clsk" [normalizeSlashes])
+
+(ann nonEmptyPathSegments (Fn [String] (Vector String)))
+(defn nonEmptyPathSegments [path]
+  (filter (split (normalizeSlashes path) "/")
+          (fn [segment] (not (= segment "")))))
+
+(ann lastNonEmptyPathSegment (Fn [String] (Option String)))
+(defn lastNonEmptyPathSegment [path]
+  (last (nonEmptyPathSegments path)))
+
+(ann workspaceBrowserDirTitle (Fn [String] String))
+(defn workspaceBrowserDirTitle [dir]
+  (match (lastNonEmptyPathSegment dir)
+    nil "Home"
+    (some segment) segment))
+
+(ann workspaceKbRootDisplayName (Fn [String] String))
+(defn workspaceKbRootDisplayName [kbRoot]
+  (match (lastNonEmptyPathSegment kbRoot)
+    nil "Knowledge base"
+    (some segment)
+      (let [trimmed (trim segment)]
+        (if (> (count trimmed) 0) trimmed "Knowledge base"))))
+
+(ann workspaceKbChatWindowTitle (Fn [String] String))
+(defn workspaceKbChatWindowTitle [kbRoot]
+  (str (workspaceKbRootDisplayName kbRoot) " Chat"))

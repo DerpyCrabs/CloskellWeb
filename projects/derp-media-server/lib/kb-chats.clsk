@@ -1,0 +1,162 @@
+(import "crypto" [randomBytes])
+(import "./config.clsk" [config getDataFilePath])
+(import "./mutex.clsk" [Mutex])
+(import "../server/fs-tasks.clsk" [readFileUtf8 writeFileUtf8])
+
+(def jsDate (js-global Date))
+
+(def CHATS_FILE (getDataFilePath "kb-chats.json"))
+(def chatsMutex (new Mutex))
+
+(ann readChatsFile (Fn [] Js))
+(defn readChatsFile []
+  (let [readPromise (readFileUtf8 CHATS_FILE)
+        parsed (readPromise.then (fn [raw] (json-parse raw)))]
+    (parsed.catch (fn [_error] {}))))
+
+(ann writeChatsFile (Fn [Js] Js))
+(defn writeChatsFile [all]
+  (writeFileUtf8 CHATS_FILE (json-stringify all 2)))
+
+(ann readChatsData (Fn [] Js))
+(defn readChatsData []
+  (let [allPromise (readChatsFile)]
+    (allPromise.then
+     (fn [all]
+       (let [data (object-get all config.libraryKey)]
+         (if (object? data) data {:chats []}))))))
+
+(ann writeChatsData (Fn [Js] Js))
+(defn writeChatsData [data]
+  (let [allPromise (readChatsFile)]
+    (allPromise.then
+     (fn [all]
+       (let [nextAll (object-assoc all config.libraryKey data)]
+         (writeChatsFile nextAll))))))
+
+(ann generateChatId (Fn [] String))
+(defn generateChatId []
+  (let [bytes (randomBytes 12)]
+    (bytes.toString "base64url")))
+
+(ann titleFromFirstMessage (Fn [String] String))
+(defn titleFromFirstMessage [msg]
+  (let [trimmedFull (trim msg)
+        trimmed (string-slice trimmedFull 0 80)]
+    (if (< (count trimmed) (count trimmedFull))
+        (str trimmed "...")
+        trimmed)))
+
+(ann withChatsLock (Fn [Js] Js))
+(defn withChatsLock [work]
+  (let [releasePromise (chatsMutex.acquire)]
+    (releasePromise.then
+     (fn [release]
+       (let [resultPromise (work)]
+         (resultPromise.finally release))))))
+
+(ann createChat (Fn [String Js] Js))
+(defn createChat [kbRoot messages]
+  (withChatsLock
+   (fn []
+     (let [dataPromise (readChatsData)]
+       (dataPromise.then
+        (fn [data]
+          (let [chats (unsafe-cast Js data.chats)
+                firstMessage (nth messages 0)
+                titleSource (if (and (object? firstMessage) (string? firstMessage.content))
+                                firstMessage.content
+                                "New chat")
+                now (jsDate.now)
+                chat {:id (generateChatId)
+                      :kbRoot kbRoot
+                      :title (titleFromFirstMessage titleSource)
+                      :messages messages
+                      :createdAt now
+                      :updatedAt now}]
+            (do
+              (chats.push chat)
+              (let [writePromise (writeChatsData data)]
+                (writePromise.then (fn [_] chat)))))))))))
+
+(ann updateChatMessages (Fn [String Js] Js))
+(defn updateChatMessages [chatId messages]
+  (withChatsLock
+   (fn []
+     (let [dataPromise (readChatsData)]
+       (dataPromise.then
+        (fn [data]
+          (let [chats (unsafe-cast Js data.chats)
+                index (chats.findIndex (fn [chat] (= chat.id chatId)))]
+            (if (= index -1)
+                nil
+	                (let [base (nth chats index)
+	                      withMessages (object-assoc base "messages" messages)
+	                      nextChat (object-assoc withMessages "updatedAt" (jsDate.now))]
+                  (do
+                    (chats.splice index 1 nextChat)
+                    (let [writePromise (writeChatsData data)]
+                      (writePromise.then (fn [_] nextChat)))))))))))))
+
+(ann getChat (Fn [String] Js))
+(defn getChat [chatId]
+  (let [dataPromise (readChatsData)]
+    (dataPromise.then
+     (fn [data]
+       (let [chats (unsafe-cast Js data.chats)
+             chat (chats.find (fn [item] (= item.id chatId)))]
+         (if (some? chat) chat nil))))))
+
+(ann chatHistoryEntry (Fn [Js] Js))
+(defn chatHistoryEntry [chat]
+  (object-dissoc chat "messages"))
+
+(ann compareChatHistory (Fn [Js Js] Number))
+(defn compareChatHistory [a b]
+  (let [pa (if a.pinned 1 0)
+        pb (if b.pinned 1 0)]
+    (if (not (= pa pb)) (- pb pa) (- b.updatedAt a.updatedAt))))
+
+(ann getChatHistory (Fn [String] Js))
+(defn getChatHistory [kbRoot]
+  (let [dataPromise (readChatsData)]
+    (dataPromise.then
+     (fn [data]
+       (map (sort-with (filter data.chats (fn [chat] (= chat.kbRoot kbRoot)))
+                       compareChatHistory)
+            chatHistoryEntry)))))
+
+(ann setChatPinned (Fn [String Bool] Js))
+(defn setChatPinned [chatId pinned]
+  (withChatsLock
+   (fn []
+     (let [dataPromise (readChatsData)]
+       (dataPromise.then
+        (fn [data]
+          (let [chats (unsafe-cast Js data.chats)
+                index (chats.findIndex (fn [chat] (= chat.id chatId)))]
+            (if (= index -1)
+                nil
+	                (let [base (nth chats index)
+	                      withPinned (object-assoc base "pinned" pinned)
+	                      nextChat (object-assoc withPinned "updatedAt" (jsDate.now))]
+                  (do
+                    (chats.splice index 1 nextChat)
+                    (let [writePromise (writeChatsData data)]
+                      (writePromise.then (fn [_] nextChat)))))))))))))
+
+(ann deleteChat (Fn [String] Js))
+(defn deleteChat [chatId]
+  (withChatsLock
+   (fn []
+     (let [dataPromise (readChatsData)]
+       (dataPromise.then
+        (fn [data]
+          (let [chats (unsafe-cast Js data.chats)
+                index (chats.findIndex (fn [chat] (= chat.id chatId)))]
+            (if (= index -1)
+                false
+                (do
+                  (chats.splice index 1)
+                  (let [writePromise (writeChatsData data)]
+	                    (writePromise.then (fn [_] true))))))))))))

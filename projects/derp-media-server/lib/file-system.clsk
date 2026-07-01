@@ -1,0 +1,429 @@
+(import "path" [(default path)])
+(import "node:buffer" [Buffer])
+(import "./types.clsk" [MediaType])
+(import "../src/features/media-utils.clsk" [getMediaType])
+(import "./constants.clsk" [VIRTUAL_FOLDERS])
+(import "../server/lib/thumbnails.clsk" [hasCachedThumbnail])
+(import "./config.clsk" [config
+                         getMediaRootByName
+                         getMediaRoots
+                         hasMultipleMediaRoots])
+(import "../server/fs-tasks.clsk" [accessPath
+                                  copyPathRecursive
+                                  mkdirRecursive
+                                  readDirWithFileTypes
+                                  removePathRecursive
+                                  renamePath
+                                  statPath
+                                  unlinkPath
+                                  writeFileBytes
+                                  writeFileUtf8])
+
+(def EXCLUDED_FOLDERS ["node_modules"
+                       "$RECYCLE.BIN"
+                       "System Volume Information"
+                       ".git"
+                       ".svn"
+                       ".hg"
+                       "__pycache__"
+                       ".DS_Store"])
+
+(def EXCLUDED_FILES ["pagefile.sys"
+                     "swapfile.sys"
+                     "hiberfil.sys"
+                     "DumpStack.log"
+                     "DumpStack.log.tmp"
+                     "desktop.ini"
+                     "Thumbs.db"
+                     ".DS_Store"])
+
+(def jsPromise (js-global Promise))
+(def jsError (js-global Error))
+(def jsUndefined (js-global undefined))
+(def jsConsole (js-global console))
+
+(ann promiseReject (Fn [Js] Js))
+(defn promiseReject [error]
+  (jsPromise.reject error))
+
+(ann error (Fn [String] Js))
+(defn error [message]
+  (new jsError message))
+
+(ann shouldExcludeFolder (Fn [String] Bool))
+(defn shouldExcludeFolder [folderName]
+  (or (starts-with? folderName ".") (includes? EXCLUDED_FOLDERS folderName)))
+
+(ann normalizeLogicalPath (Fn [String] String))
+(defn normalizeLogicalPath [relativePath]
+  (let [normalized (join (split relativePath "\\") "/")
+        clean (path.posix.normalize normalized)
+        stripped (if (starts-with? clean "/") (string-slice clean 1) clean)]
+    (if (= stripped ".") "" stripped)))
+
+(ann isInsideRoot (Fn [String String] Bool))
+(defn isInsideRoot [resolvedPath resolvedRoot]
+  (let [rel (path.relative resolvedRoot resolvedPath)]
+    (or (= rel "")
+        (and (not (starts-with? rel ".."))
+             (not (path.isAbsolute rel))))))
+
+(ann toLogicalMediaPath (Fn [Js String] String))
+(defn toLogicalMediaPath [root rootRelativePath]
+  (let [normalized (join (split rootRelativePath "\\") "/")]
+    (if (not (hasMultipleMediaRoots))
+        normalized
+        (if (= normalized "") root.name (str root.name "/" normalized)))))
+
+(ann rootRelativeForLogicalPath (Fn [String] Js))
+(defn rootRelativeForLogicalPath [logicalPath]
+  (if (hasMultipleMediaRoots)
+      (let [parts (filter (split logicalPath "/") (fn [part] (not (= part ""))))
+            rootName (if (> (count parts) 0) (first parts) "")]
+        (if (= rootName "")
+            (fail "Invalid path: Media root is required")
+            (let [found (getMediaRootByName rootName)]
+              (if (not (some? found))
+                  (fail "Invalid path: Unknown media root")
+                  {:root found :rootRelativePath (join (slice parts 1) "/")}))))
+      {:root (first (getMediaRoots)) :rootRelativePath logicalPath}))
+
+(ann stripLeadingParentSegments (Fn [String] String))
+(defn stripLeadingParentSegments [value]
+  (let [valueJs (unsafe-cast Js value)
+        re (new (js-global RegExp) "^(\\.\\.(/|\\\\|$))+")]
+    (valueJs.replace re "")))
+
+(ann resolveMediaPath (Fn [String] Js))
+(defn resolveMediaPath [relativePath]
+  (let [logicalPath (normalizeLogicalPath relativePath)
+        rootInfo (rootRelativeForLogicalPath logicalPath)
+        root (unsafe-cast Js rootInfo.root)
+        rootRelativePath rootInfo.rootRelativePath
+        platformPath (join (split rootRelativePath "/") path.sep)
+        normalizedPath (stripLeadingParentSegments (path.normalize platformPath))
+        fullPath (path.join root.path normalizedPath)
+        resolvedPath (path.resolve fullPath)
+        resolvedRoot (path.resolve root.path)]
+    (if (not (isInsideRoot resolvedPath resolvedRoot))
+        (fail "Invalid path: Path traversal detected")
+        {:root root
+         :relativePath rootRelativePath
+         :logicalPath (toLogicalMediaPath root rootRelativePath)
+         :fullPath resolvedPath})))
+
+(ann validatePath (Fn [String] String))
+(defn validatePath [relativePath]
+  (let [resolved (resolveMediaPath relativePath)]
+    resolved.fullPath))
+
+(ann getLibraryKey (Fn [] String))
+(defn getLibraryKey []
+  config.libraryKey)
+
+(ann createVirtualFolderItems (Fn [] Js))
+(defn createVirtualFolderItems []
+  [{:name "Favorites"
+    :path VIRTUAL_FOLDERS.FAVORITES
+    :type MediaType.FOLDER
+    :size 0
+    :extension ""
+    :isDirectory true
+    :isVirtual true}
+   {:name "Most Played"
+    :path VIRTUAL_FOLDERS.MOST_PLAYED
+    :type MediaType.FOLDER
+    :size 0
+    :extension ""
+    :isDirectory true
+    :isVirtual true}
+   {:name "Shares"
+    :path VIRTUAL_FOLDERS.SHARES
+    :type MediaType.FOLDER
+    :size 0
+    :extension ""
+    :isDirectory true
+    :isVirtual true}])
+
+(ann createRootFolderItems (Fn [] Js))
+(defn createRootFolderItems []
+  (if (not (hasMultipleMediaRoots))
+      []
+      (map (getMediaRoots)
+           (fn [root]
+             {:name root.name
+              :path root.name
+              :type MediaType.FOLDER
+              :size 0
+              :extension ""
+              :isDirectory true}))))
+
+(ann pushAll (Fn [Js Js] Js))
+(defn pushAll [target items]
+  (reduce items
+          target
+          (fn [out item]
+            (do
+              (out.push item)
+              out))))
+
+(ann rootFileItems (Fn [] Js))
+(defn rootFileItems []
+  (pushAll (createVirtualFolderItems) (createRootFolderItems)))
+
+(ann fileItemCompare (Fn [Js Js] Number))
+(defn fileItemCompare [a b]
+  (if (and a.isVirtual (not b.isVirtual))
+      -1
+      (if (and (not a.isVirtual) b.isVirtual)
+          1
+          (if (and a.isDirectory (not b.isDirectory))
+              -1
+              (if (and (not a.isDirectory) b.isDirectory)
+                  1
+                  (let [name (unsafe-cast Js a.name)]
+                    (name.localeCompare b.name jsUndefined {:numeric true})))))))
+
+(ann sortedFileItems (Fn [Js] Js))
+(defn sortedFileItems [items]
+  (do
+    (items.sort fileItemCompare)
+    items))
+
+(ann entryFileItemPromise (Fn [Js Js String] Js))
+(defn entryFileItemPromise [resolved entry fullPath]
+  (try
+   (let [entryPath (path.join fullPath entry.name)
+         relPath (join (split (path.relative resolved.root.path entryPath) "\\") "/")
+         logicalPath (toLogicalMediaPath resolved.root relPath)]
+     (if (entry.isDirectory)
+         (jsPromise.resolve
+          {:name entry.name
+           :path logicalPath
+           :type MediaType.FOLDER
+           :size 0
+           :extension ""
+           :isDirectory true})
+         (let [statPromise (statPath entryPath)]
+           (statPromise.then
+            (fn [stats]
+              (let [extension (lower-case (string-slice (path.extname entry.name) 1))
+                    mediaType (getMediaType extension)
+                    item {:name entry.name
+                          :path logicalPath
+                          :type mediaType
+                          :size stats.size
+                          :extension extension
+                          :isDirectory false}
+                    withThumb (if (or (= mediaType MediaType.IMAGE)
+                                      (= mediaType MediaType.VIDEO))
+                                  (object-assoc item
+                                                "thumbnailGenerated"
+                                                (hasCachedThumbnail entryPath stats.mtime))
+                                  item)]
+                withThumb))))))
+   (catch _error (jsPromise.resolve nil))))
+
+(ann listDirectoryAfterEntries (Fn [Js Js String] Js))
+(defn listDirectoryAfterEntries [fileItems entries fullPath]
+  (let [filteredEntries (filter entries
+                                (fn [entry]
+                                  (if (entry.isDirectory)
+                                      (not (shouldExcludeFolder entry.name))
+                                      (not (includes? EXCLUDED_FILES entry.name)))))
+        itemPromises (map filteredEntries
+                          (fn [entry] (entryFileItemPromise fileItems.resolved entry fullPath)))
+        resultsPromise (jsPromise.all itemPromises)]
+    (resultsPromise.then
+     (fn [results]
+       (do
+         (pushAll fileItems.items (filter results (fn [item] (some? item))))
+         (sortedFileItems fileItems.items))))))
+
+(ann listDirectory (Fn [Js] Js))
+(defn listDirectory [relativePathRaw]
+  (try
+   (let [relativePath (if (string? relativePathRaw) relativePathRaw "")
+         normalizedRelativePath (normalizeLogicalPath relativePath)
+         fileItems (if (= normalizedRelativePath "") (rootFileItems) [])]
+     (if (and (hasMultipleMediaRoots) (= normalizedRelativePath ""))
+         (jsPromise.resolve (sortedFileItems fileItems))
+         (let [resolved (resolveMediaPath relativePath)
+               fullPath resolved.fullPath
+               statsPromise (statPath fullPath)]
+           (statsPromise.then
+            (fn [stats]
+              (if (not (stats.isDirectory))
+                  (promiseReject (error "Path is not a directory"))
+                  (let [entriesPromise (readDirWithFileTypes fullPath)]
+                    (entriesPromise.then
+                     (fn [entries]
+                       (listDirectoryAfterEntries {:items fileItems :resolved resolved}
+                                                  entries
+                                                  fullPath))))))))))
+   (catch err
+     (do
+      (jsConsole.error "Error listing directory:" err)
+       (promiseReject err)))))
+
+(ann fileExists (Fn [String] Js))
+(defn fileExists [relativePath]
+  (try
+   (let [fullPath (validatePath relativePath)
+         accessPromise (accessPath fullPath)
+         exists (accessPromise.then (fn [_] true))]
+     (exists.catch (fn [_] false)))
+   (catch _error (jsPromise.resolve false))))
+
+(ann getFilePath (Fn [String] String))
+(defn getFilePath [relativePath]
+  (validatePath relativePath))
+
+(ann normalizedDirname (Fn [String] String))
+(defn normalizedDirname [relativePath]
+  (let [dir (join (split (path.dirname relativePath) "\\") "/")]
+    (if (= dir ".") "" dir)))
+
+(ann isPathEditable (Fn [String] Bool))
+(defn isPathEditable [relativePath]
+  (try
+   (let [resolved (resolveMediaPath relativePath)
+         root (unsafe-cast Js resolved.root)
+         editableFolders root.editableFolders
+         normalizedPath (join (split resolved.relativePath "\\") "/")]
+     (if (= (count editableFolders) 0)
+         false
+         (any? editableFolders
+               (fn [folder]
+                 (let [normalizedFolder (join (split folder "\\") "/")]
+                   (or (= normalizedPath normalizedFolder)
+                       (starts-with? normalizedPath (str normalizedFolder "/"))))))))
+   (catch _error false)))
+
+(ann prefixEditableFolder (Fn [Js String] String))
+(defn prefixEditableFolder [root folder]
+  (str root.name "/" (join (split folder "\\") "/")))
+
+(ann getEditableFolders (Fn [] Js))
+(defn getEditableFolders []
+  (if (not (hasMultipleMediaRoots))
+      (let [root (first config.mediaRoots)]
+        (if (some? root) root.editableFolders []))
+      (reduce config.mediaRoots
+              []
+              (fn [out root]
+                (pushAll out (map root.editableFolders
+                                  (fn [folder] (prefixEditableFolder root folder))))))))
+
+(ann editableTarget? (Fn [String] Bool))
+(defn editableTarget? [relativePath]
+  (let [dirPath (normalizedDirname relativePath)]
+    (or (isPathEditable dirPath) (isPathEditable relativePath))))
+
+(ann createDirectory (Fn [String] Js))
+(defn createDirectory [relativePath]
+  (try
+   (let [fullPath (validatePath relativePath)]
+     (if (not (editableTarget? relativePath))
+         (promiseReject (error "Cannot create directory: Path is not in an editable folder"))
+         (mkdirRecursive fullPath)))
+   (catch err (promiseReject err))))
+
+(ann writeFile (Fn [String String] Js))
+(defn writeFile [relativePath content]
+  (try
+   (let [fullPath (validatePath relativePath)]
+     (if (not (editableTarget? relativePath))
+         (promiseReject (error "Cannot write file: Path is not in an editable folder"))
+         (let [made (mkdirRecursive (path.dirname fullPath))]
+           (made.then (fn [_] (writeFileUtf8 fullPath content))))))
+   (catch err (promiseReject err))))
+
+(ann writeBinaryFile (Fn [String String] Js))
+(defn writeBinaryFile [relativePath base64Content]
+  (try
+   (let [fullPath (validatePath relativePath)]
+     (if (not (editableTarget? relativePath))
+         (promiseReject (error "Cannot write file: Path is not in an editable folder"))
+         (let [made (mkdirRecursive (path.dirname fullPath))
+               buffer (Buffer.from base64Content "base64")]
+           (made.then (fn [_] (writeFileBytes fullPath buffer))))))
+   (catch err (promiseReject err))))
+
+(ann deleteDirectory (Fn [String] Js))
+(defn deleteDirectory [relativePath]
+  (try
+   (let [fullPath (validatePath relativePath)]
+     (if (not (isPathEditable relativePath))
+         (promiseReject (error "Cannot delete directory: Path is not in an editable folder"))
+         (let [statsPromise (statPath fullPath)]
+           (statsPromise.then
+            (fn [stats]
+              (if (not (stats.isDirectory))
+                  (promiseReject (error "Path is not a directory"))
+                  (removePathRecursive fullPath)))))))
+   (catch err (promiseReject err))))
+
+(ann deleteFile (Fn [String] Js))
+(defn deleteFile [relativePath]
+  (try
+   (let [fullPath (validatePath relativePath)]
+     (if (not (isPathEditable relativePath))
+         (promiseReject (error "Cannot delete file: Path is not in an editable folder"))
+         (let [statsPromise (statPath fullPath)]
+           (statsPromise.then
+            (fn [stats]
+              (if (stats.isDirectory)
+                  (promiseReject (error "Path is a directory, not a file"))
+                  (unlinkPath fullPath)))))))
+   (catch err (promiseReject err))))
+
+(ann renameFileOrDirectory (Fn [String String] Js))
+(defn renameFileOrDirectory [oldRelativePath newRelativePath]
+  (try
+   (let [oldFullPath (validatePath oldRelativePath)
+         newFullPath (validatePath newRelativePath)]
+     (if (not (isPathEditable oldRelativePath))
+         (promiseReject (error "Cannot rename: Source path is not in an editable folder"))
+         (if (not (isPathEditable newRelativePath))
+             (promiseReject (error "Cannot rename: Destination path is not in an editable folder"))
+             (let [existsPromise (fileExists oldRelativePath)]
+               (existsPromise.then
+                (fn [exists]
+                  (if (not exists)
+                      (promiseReject (error "Source file or directory does not exist"))
+                      (let [newExistsPromise (fileExists newRelativePath)]
+                        (newExistsPromise.then
+                         (fn [newExists]
+                           (if newExists
+                               (promiseReject (error "Destination file or directory already exists"))
+                               (renamePath oldFullPath newFullPath))))))))))))
+   (catch err (promiseReject err))))
+
+(ann copyFileOrDirectory (Fn [String String] Js))
+(defn copyFileOrDirectory [sourceRelativePath destinationDir]
+  (try
+   (let [sourceFullPath (validatePath sourceRelativePath)
+         destDirPath (join (split destinationDir "\\") "/")
+         parts (split sourceRelativePath "/")
+         fileName (last parts)]
+     (if (not (string? fileName))
+         (promiseReject (error "Invalid source path"))
+         (let [destRelativePath (if (= destDirPath "")
+                                    fileName
+                                    (str destDirPath "/" fileName))
+               destFullPath (validatePath destRelativePath)]
+           (if (not (isPathEditable destRelativePath))
+               (promiseReject (error "Cannot copy: Destination is not in an editable folder"))
+               (let [statsPromise (statPath sourceFullPath)]
+                 (statsPromise.then
+                  (fn [sourceStats]
+                    (if (not (or (sourceStats.isDirectory) (sourceStats.isFile)))
+                        (promiseReject (error "Source is not a file or directory"))
+                        (let [destExistsPromise (fileExists destRelativePath)]
+                          (destExistsPromise.then
+                           (fn [destExists]
+                             (if destExists
+                                 (promiseReject (error "Destination file or directory already exists"))
+                                 (copyPathRecursive sourceFullPath destFullPath)))))))))))))
+   (catch err (promiseReject err))))

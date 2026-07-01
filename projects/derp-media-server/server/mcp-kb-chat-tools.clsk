@@ -1,0 +1,136 @@
+(import "@modelcontextprotocol/sdk/client" [Client])
+(import "@modelcontextprotocol/sdk/client/streamableHttp.js" [StreamableHTTPClientTransport])
+(import "ai" [dynamicTool jsonSchema])
+(import "../src/features/mcp-ai-tool-key.clsk" [mcpAiToolKey])
+
+(def jsPromise (js-global Promise))
+(def jsUndefined (js-global undefined))
+
+(ann textContentPart (Fn [Js] Js))
+(defn textContentPart [item]
+  (if (and (object? item) (contains? item "type"))
+      (if (and (= item.type "text") (string? item.text))
+          item.text
+          (json-stringify item))
+      nil))
+
+(ann extractTextParts (Fn [Js] Js))
+(defn extractTextParts [content]
+  (if (not (vector? content))
+      []
+      (filter (map content textContentPart) (fn [part] (some? part)))))
+
+(ann formatMcpToolResult (Fn [Js] String))
+(defn formatMcpToolResult [result]
+  (let [parts (extractTextParts result.content)]
+    (if result.isError
+        (let [message (if (> (count parts) 0) (join parts "\n") "Tool error")]
+          (str "Error: " message))
+        (if (> (count parts) 0)
+            (join parts "\n")
+            (json-stringify result)))))
+
+(ann defaultInputSchema (Fn [] Js))
+(defn defaultInputSchema []
+  {:type "object" :properties {}})
+
+(ann promiseReduce (Fn [Js Js Js] Js))
+(defn promiseReduce [items initial step]
+  (reduce items
+          (jsPromise.resolve initial)
+          (fn [statePromise item]
+            (statePromise.then (fn [state] (step state item))))))
+
+(ann closeSession (Fn [Js] Js))
+(defn closeSession [session]
+  (let [closed (session.client.close)]
+    (closed.catch (fn [_error] jsUndefined))))
+
+(ann closeAllSessions (Fn [Js] Js))
+(defn closeAllSessions [sessions]
+  (let [closed (jsPromise.all (map sessions closeSession))]
+    (closed.then (fn [_] jsUndefined))))
+
+(ann registerKey (Fn [Js String Number] String))
+(defn registerKey [usedKeys base n]
+  (let [candidate (if (= n 0) base (str base "_" n))]
+    (if (usedKeys.has candidate)
+        (registerKey usedKeys base (+ n 1))
+        (do
+          (usedKeys.add candidate)
+          candidate))))
+
+(ann schemaForTool (Fn [Js] Js))
+(defn schemaForTool [toolDef]
+  (if (object? toolDef.inputSchema)
+      toolDef.inputSchema
+      (defaultInputSchema)))
+
+(ann toolDescription (Fn [Js] Js))
+(defn toolDescription [toolDef]
+  (let [titlePart (if (and (string? toolDef.title) (not (= toolDef.title "")))
+                      (str "(" toolDef.title ")")
+                      nil)
+        parts (filter [titlePart toolDef.description]
+                      (fn [part]
+                        (and (string? part) (not (= part "")))))
+        description (join parts " ")]
+    (if (= description "") jsUndefined description)))
+
+(ann buildAiTool (Fn [Js Js] Js))
+(defn buildAiTool [client toolDef]
+  (let [toolName toolDef.name
+        schema (schemaForTool toolDef)]
+    (dynamicTool
+     {:description (toolDescription toolDef)
+      :inputSchema (jsonSchema schema)
+      :execute (fn [input]
+                 (let [called (client.callTool {:name toolName :arguments input})]
+                   (called.then formatMcpToolResult)))})))
+
+(ann addMcpTool (Fn [String Js Js Js] Js))
+(defn addMcpTool [serverName client state toolDef]
+  (let [baseKey (mcpAiToolKey serverName toolDef.name)
+        aiName (registerKey state.usedKeys baseKey 0)]
+    {:tools (object-assoc state.tools aiName (buildAiTool client toolDef))
+     :usedKeys state.usedKeys}))
+
+(ann addServerTools (Fn [String Js Js Js] Js))
+(defn addServerTools [serverName client state listed]
+  (let [mcpTools (if (vector? listed.tools) listed.tools [])]
+    (reduce mcpTools
+            state
+            (fn [next toolDef] (addMcpTool serverName client next toolDef)))))
+
+(ann connectMcpServer (Fn [Js Js Js] Js))
+(defn connectMcpServer [sessions state entry]
+  (let [serverName entry.key
+        url entry.value.url
+        transport (new StreamableHTTPClientTransport (new (js-global URL) url))
+        client (new Client {:name "derp-media-kb-chat" :version "0.1.0"})
+        connected (client.connect transport)]
+    (connected.then
+     (fn [_]
+       (do
+         (sessions.push {:client client :transport transport})
+         (let [listedPromise (client.listTools)]
+           (listedPromise.then
+            (fn [listed] (addServerTools serverName client state listed)))))))))
+
+(ann buildMcpToolsetForKbChat (Fn [Js] Js))
+(defn buildMcpToolsetForKbChat [mcp]
+  (let [sessions (unsafe-cast Js [])
+        usedKeys (new (js-global Set))
+        serverEntries (object-entries mcp.servers)
+        built (promiseReduce
+               serverEntries
+               {:tools {} :usedKeys usedKeys}
+               (fn [state entry] (connectMcpServer sessions state entry)))
+        withCleanup (built.then
+                     (fn [state]
+                       {:tools state.tools
+                        :cleanup (fn [] (closeAllSessions sessions))}))]
+    (withCleanup.catch
+     (fn [err]
+       (let [closed (closeAllSessions sessions)]
+         (closed.then (fn [_] (jsPromise.reject err))))))))

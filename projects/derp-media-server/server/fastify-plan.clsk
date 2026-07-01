@@ -1,0 +1,69 @@
+(import "@fastify/cookie" [(default fastifyCookie)])
+(import "@fastify/multipart" [(default fastifyMultipart)])
+(import "./auth-middleware.clsk" [authMiddleware])
+(import "./app-helpers.clsk" [registerErrorHandler
+                              registerHtmlRoutes])
+(import "./routes/api/files.clsk" [registerFilesApiRoutes])
+(import "./routes/api/settings.clsk" [registerSettingsApiRoutes])
+(import "./routes/api/stats.clsk" [registerStatsApiRoutes])
+(import "./routes/api/auth.clsk" [registerAuthApiRoutes])
+(import "./routes/api/shares.clsk" [registerSharesApiRoutes])
+(import "./routes/api/shareAccess.clsk" [registerShareAccessApiRoutes])
+(import "./routes/api/kb.clsk" [registerKbApiRoutes])
+(import "./routes/api/kb-chat.clsk" [registerKbChatApiRoutes])
+(import "./routes/media.clsk" [registerMediaRoutes])
+(import "./routes/thumbnail.clsk" [registerThumbnailRoutes])
+(import "./routes/download.clsk" [registerDownloadRoutes])
+(import "./routes/upload.clsk" [registerUploadRoutes])
+(import "./routes/sse.clsk" [registerSSERoutes])
+(import "./routes/shareMedia.clsk" [registerShareMediaRoutes])
+
+(type FastifyRouteGroup
+  {:name String
+   :register (Fn [Js] Js)})
+
+(ann jsonApiRouteGroups (Fn [] (Vector FastifyRouteGroup)))
+(defn jsonApiRouteGroups []
+  [{:name "files-api" :register registerFilesApiRoutes}
+   {:name "settings-api" :register registerSettingsApiRoutes}
+   {:name "stats-api" :register registerStatsApiRoutes}
+   {:name "auth-api" :register registerAuthApiRoutes}
+   {:name "shares-api" :register registerSharesApiRoutes}
+   {:name "share-access-api" :register registerShareAccessApiRoutes}
+   {:name "knowledge-base-api" :register registerKbApiRoutes}
+   {:name "knowledge-base-chat-api" :register registerKbChatApiRoutes}])
+
+(ann httpRouteGroups (Fn [] (Vector FastifyRouteGroup)))
+(defn httpRouteGroups []
+  [{:name "media" :register registerMediaRoutes}
+   {:name "thumbnail" :register registerThumbnailRoutes}
+   {:name "download" :register registerDownloadRoutes}
+   {:name "upload" :register registerUploadRoutes}
+   {:name "sse" :register registerSSERoutes}
+   {:name "share-media" :register registerShareMediaRoutes}])
+
+(ann applyRouteGroups (Fn [Js (Vector FastifyRouteGroup)] Js))
+(defn applyRouteGroups [app groups]
+  (reduce groups
+          app
+          (fn [current group]
+            (do
+              (group.register current)
+              current))))
+
+(ann registerCorePlugins (Fn [Js] Js))
+(defn registerCorePlugins [app]
+  (do
+    (app.register fastifyCookie)
+    (app.register fastifyMultipart {:limits {:fileSize 10000000000}})
+    app))
+
+(ann registerFastifyServerPlan (Fn [Js ServerBoot Js Js] Js))
+(defn registerFastifyServerPlan [app boot fastifyMiddie fastifyStatic]
+  (do
+    (registerCorePlugins app)
+    (app.addHook "onRequest" authMiddleware)
+    (registerErrorHandler app)
+    (applyRouteGroups app (jsonApiRouteGroups))
+    (applyRouteGroups app (httpRouteGroups))
+    (registerHtmlRoutes app boot fastifyMiddie fastifyStatic)))

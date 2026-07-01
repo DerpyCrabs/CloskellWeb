@@ -1,0 +1,21 @@
+(import "@fastify/middie" [(default fastifyMiddie)])
+(import "@fastify/static" [(default fastifyStatic)])
+(import "./app-helpers.clsk" [logServerStarted
+                              handleServerStartFailure])
+(import "./fastify-host.clsk" [createFastifyServer
+                               listenFastifyServer])
+(import "./fastify-plan.clsk" [registerFastifyServerPlan])
+
+(ann serverPort (Fn [ServerBoot] Number))
+(defn serverPort [boot]
+  (let [parsed (to-number (object-get boot.env "PORT"))]
+    (if (> parsed 0) parsed 3000)))
+
+(ann main (Fn [ServerBoot] Js))
+(defn main [boot]
+  (let [app (createFastifyServer)
+        port (serverPort boot)
+        ready (registerFastifyServerPlan app boot fastifyMiddie fastifyStatic)
+        started (ready.then (fn [_] (listenFastifyServer app port)))
+        logged (started.then (fn [_] (logServerStarted port)))]
+    (logged.catch handleServerStartFailure)))

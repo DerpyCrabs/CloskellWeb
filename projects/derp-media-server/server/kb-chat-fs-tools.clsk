@@ -1,0 +1,230 @@
+(import "path" [(default path)])
+(import "ai" [(tool as aiTool) zodSchema])
+(import "zod" [z])
+(import "../lib/file-change-emitter.clsk" [broadcastFileChange])
+(import "../lib/file-system.clsk" [createDirectory
+                                 fileExists
+                                 listDirectory
+                                 renameFileOrDirectory
+                                 writeFile])
+(import "../src/features/kb-chat-fs-paths.clsk" [canonicalKbRelativePath
+                                                       kbRelativeToMediaPath
+                                                       mediaPathToKbRelative])
+
+(def KB_FS_MAX_OPS 50)
+(def jsPromise (js-global Promise))
+
+(ann normalizeSlashes (Fn [String] String))
+(defn normalizeSlashes [value]
+  (join (split value "\\") "/"))
+
+(ann normalizeParentDir (Fn [String] String))
+(defn normalizeParentDir [mediaPath]
+  (let [parent (normalizeSlashes (path.dirname mediaPath))]
+    (if (= parent ".") "" parent)))
+
+(ann describedString (Fn [String] Js))
+(defn describedString [description]
+  (let [schema (z.string)]
+    (schema.describe description)))
+
+(ann optionalDescribedString (Fn [String] Js))
+(defn optionalDescribedString [description]
+  (let [schema (describedString description)]
+    (schema.optional)))
+
+(ann kbFsOpSchema (Fn [] Js))
+(defn kbFsOpSchema []
+  (z.discriminatedUnion
+   "type"
+   [(z.object
+     {:type (z.literal "create_folder")
+      :path (describedString
+             "Folder path relative to KB root only (e.g. Logs/inbox). Never prefix the host media-library folder name.")})
+    (z.object
+     {:type (z.literal "create_file")
+      :path (describedString
+             "File path relative to KB root only. Never prefix the host media-library folder name.")
+      :content (describedString "Full file contents as UTF-8 text")})
+    (z.object
+     {:type (z.literal "move")
+      :from (describedString
+             "Source path relative to KB root only; no host library folder prefix.")
+      :to (describedString
+           "Destination path relative to KB root only; no host library folder prefix.")})]))
+
+(ann operationsSchema (Fn [] Js))
+(defn operationsSchema []
+  (let [arraySchema (z.array (kbFsOpSchema))
+        minSchema (arraySchema.min 1)
+        maxSchema (minSchema.max KB_FS_MAX_OPS)]
+    (maxSchema.describe (str "Ordered file operations (max " KB_FS_MAX_OPS ")"))))
+
+(def kbApplyChangesInputSchema
+  (z.object {:operations (operationsSchema)}))
+
+(ann safeCanonicalKbRel (Fn [String String] String))
+(defn safeCanonicalKbRel [kbRoot raw]
+  (try
+   (canonicalKbRelativePath kbRoot raw)
+   (catch _error raw)))
+
+(ann describeKbApplyOperation (Fn [String Js] String))
+(defn describeKbApplyOperation [kbRoot op]
+  (if (= op.type "create_folder")
+      (let [safe (safeCanonicalKbRel kbRoot (if (string? op.path) op.path ""))]
+        (str "Create folder: " (if (= safe "") "." safe)))
+      (if (= op.type "create_file")
+          (str "Create file: " (safeCanonicalKbRel kbRoot op.path))
+          (if (= op.type "move")
+              (str "Move or rename: "
+                   (safeCanonicalKbRel kbRoot op.from)
+                   " → "
+                   (safeCanonicalKbRel kbRoot op.to))
+              (str op)))))
+
+(ann describeKbApplyOperations (Fn [Js String] Js))
+(defn describeKbApplyOperations [input kbRoot]
+  (map input.operations (fn [op] (describeKbApplyOperation kbRoot op))))
+
+(ann errorMessage (Fn [Js String] String))
+(defn errorMessage [error fallback]
+  (if (and (object? error) (string? error.message))
+      error.message
+      fallback))
+
+(ann listFolderTool (Fn [String] Js))
+(defn listFolderTool [kbRoot]
+  (aiTool
+   {:description "List files and folders inside the knowledge base at a path relative to the KB root. Read-only."
+    :inputSchema (zodSchema
+                  (z.object
+                   {:relativePath (optionalDescribedString
+                                   "Path under the KB root only — e.g. \"Logs\" or \"Projects/readme.md\" parent folder \"Projects\"; do NOT prefix with the KB folder name again. Omit or \"\" for the KB root.")}))
+    :execute (fn [input]
+               (try
+                (let [relativePath (if (string? input.relativePath) input.relativePath "")
+                      mediaDirPath (kbRelativeToMediaPath kbRoot relativePath)
+                      filesPromise (listDirectory mediaDirPath)
+                      entriesPromise (filesPromise.then
+                                      (fn [files]
+                                        {:entries
+                                         (map (filter files
+                                                      (fn [file] (not file.isVirtual)))
+                                              (fn [file]
+                                                {:name file.name
+                                                 :path (mediaPathToKbRelative
+                                                        kbRoot
+                                                        (normalizeSlashes file.path))
+                                                 :isDirectory file.isDirectory}))}))]
+                  (entriesPromise.catch
+                   (fn [error] {:error (errorMessage error "list failed")})))
+                (catch error {:error (errorMessage error "list failed")})))}))
+
+(ann rejectError (Fn [String] Js))
+(defn rejectError [message]
+  (jsPromise.reject (new (js-global Error) message)))
+
+(ann applyCreateFolder (Fn [String Js Js] Js))
+(defn applyCreateFolder [kbRoot state op]
+  (let [rawPath (if (string? op.path) op.path "")
+        mediaPath (kbRelativeToMediaPath kbRoot rawPath)
+        existsPromise (fileExists mediaPath)]
+    (existsPromise.then
+     (fn [exists]
+       (if exists
+           (rejectError (str "Already exists: " (if (= rawPath "") "." rawPath)))
+           (let [created (createDirectory mediaPath)]
+             (created.then
+              (fn [_]
+                (let [parent (normalizeParentDir mediaPath)
+                      appliedText (str "create_folder "
+                                       (let [safe (safeCanonicalKbRel kbRoot rawPath)]
+                                         (if (= safe "") "." safe)))]
+                  (do
+                    (broadcastFileChange parent mediaPath)
+                    (state.applied.push appliedText)
+                    state))))))))))
+
+(ann applyCreateFile (Fn [String Js Js] Js))
+(defn applyCreateFile [kbRoot state op]
+  (let [mediaPath (kbRelativeToMediaPath kbRoot op.path)
+        existsPromise (fileExists mediaPath)]
+    (existsPromise.then
+     (fn [exists]
+       (if exists
+           (rejectError (str "File already exists: " op.path))
+           (let [written (writeFile mediaPath op.content)]
+             (written.then
+              (fn [_]
+                (let [parent (normalizeParentDir mediaPath)]
+                  (do
+                    (broadcastFileChange parent mediaPath)
+                    (state.applied.push
+                     (str "create_file " (safeCanonicalKbRel kbRoot op.path)))
+                    state))))))))))
+
+(ann applyMove (Fn [String Js Js] Js))
+(defn applyMove [kbRoot state op]
+  (let [fromMedia (kbRelativeToMediaPath kbRoot op.from)
+        toMedia (kbRelativeToMediaPath kbRoot op.to)
+        moved (renameFileOrDirectory fromMedia toMedia)]
+    (moved.then
+     (fn [_]
+       (let [oldParent (normalizeParentDir fromMedia)
+             newParent (normalizeParentDir toMedia)]
+         (do
+           (broadcastFileChange oldParent fromMedia)
+           (broadcastFileChange newParent toMedia)
+           (state.applied.push
+            (str "move "
+                 (safeCanonicalKbRel kbRoot op.from)
+                 " → "
+                 (safeCanonicalKbRel kbRoot op.to)))
+           state))))))
+
+(ann applyOperation (Fn [String Js Js] Js))
+(defn applyOperation [kbRoot state op]
+  (if (= op.type "create_folder")
+      (applyCreateFolder kbRoot state op)
+      (if (= op.type "create_file")
+          (applyCreateFile kbRoot state op)
+          (if (= op.type "move")
+              (applyMove kbRoot state op)
+              (rejectError "Unknown operation")))))
+
+(ann promiseReduce (Fn [Js Js Js] Js))
+(defn promiseReduce [items initial step]
+  (reduce items
+          (jsPromise.resolve initial)
+          (fn [statePromise item]
+            (statePromise.then (fn [state] (step state item))))))
+
+(ann applyChangesExecute (Fn [String Js] Js))
+(defn applyChangesExecute [kbRoot input]
+  (let [applied (unsafe-cast Js [])
+        appliedPromise (promiseReduce
+                        input.operations
+                        {:applied applied}
+                        (fn [state op] (applyOperation kbRoot state op)))
+        handled (appliedPromise.then
+                 (fn [state] {:ok true :applied state.applied}))]
+    (handled.catch
+     (fn [error]
+       {:ok false :error (errorMessage error "apply failed") :applied applied}))))
+
+(ann applyChangesTool (Fn [String] Js))
+(defn applyChangesTool [kbRoot]
+  (aiTool
+   {:description (join ["Apply structural changes inside this knowledge base (create folders/files, move or rename)."
+                        "Use one call with multiple operations when possible; the user confirms the whole batch once."
+                        "Paths are always relative to the KB root with forward slashes. move covers rename."]
+                       " ")
+    :inputSchema (zodSchema kbApplyChangesInputSchema)
+    :needsApproval true
+    :execute (fn [input] (applyChangesExecute kbRoot input))}))
+
+(ann buildKbFsTools (Fn [String] Js))
+(defn buildKbFsTools [kbRoot]
+  {:kb_list_folder (listFolderTool kbRoot)
+   :kb_apply_changes (applyChangesTool kbRoot)})

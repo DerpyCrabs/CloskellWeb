@@ -1,0 +1,300 @@
+(import "path" [(default path)])
+(import "../../fs-tasks.clsk" [readFileUtf8 statPath])
+(import "../../http-routes.clsk" [HttpRoute registerHttpRoutes])
+(import "../../../lib/file-system.clsk" [listDirectory
+                                      createDirectory
+                                      writeFile
+                                      writeBinaryFile
+                                      isPathEditable
+                                      fileExists
+                                      deleteDirectory
+                                      deleteFile
+                                      validatePath
+                                      renameFileOrDirectory
+                                      copyFileOrDirectory
+                                      resolveMediaPath])
+(import "../../../lib/file-change-emitter.clsk" [broadcastFileChange])
+(import "../../../lib/shares.clsk" [getSharesAsFileItems])
+(import "../../../lib/constants.clsk" [VIRTUAL_FOLDERS])
+(import "../../../src/features/media-utils.clsk" [getMediaType])
+(import "../../../lib/types.clsk" [MediaType])
+(import "../../../lib/config.clsk" [config getDataFilePath])
+(import "../../lib/thumbnails.clsk" [hasCachedThumbnail])
+
+(def STATS_FILE (getDataFilePath "stats.json"))
+(def SETTINGS_FILE (getDataFilePath "settings.json"))
+(def jsPromise (js-global Promise))
+(def jsUndefined (js-global undefined))
+
+(ann normalizeSlashes (Fn [String] String))
+(defn normalizeSlashes [value]
+  (join (split value "\\") "/"))
+
+(ann normalizeParent (Fn [String] String))
+(defn normalizeParent [dir]
+  (let [normalized (normalizeSlashes dir)]
+    (if (= normalized ".") "" normalized)))
+
+(ann codeSend (Fn [Js Number Js] Js))
+(defn codeSend [reply code payload]
+  (let [codedReply (reply.code code)]
+    (codedReply.send payload)))
+
+(ann readJsonOr (Fn [String Js] Js))
+(defn readJsonOr [filePath fallback]
+  (let [readPromise (readFileUtf8 filePath)
+        parsed (readPromise.then
+                (fn [raw] (unwrap-or (json-parse-result raw) fallback)))]
+    (parsed.catch (fn [_error] fallback))))
+
+(ann mediaThumbnail (Fn [String Js Js] Js))
+(defn mediaThumbnail [fullPath stat mediaType]
+  (if (or (= mediaType MediaType.IMAGE) (= mediaType MediaType.VIDEO))
+      (hasCachedThumbnail fullPath stat.mtime)
+      jsUndefined))
+
+(ann statsFileItem (Fn [Js] Js))
+(defn statsFileItem [entry]
+  (try
+   (let [filePath entry.key
+         viewCount entry.value
+         resolved (resolveMediaPath filePath)
+         statPromise (statPath resolved.fullPath)]
+     (statPromise.then
+      (fn [stat]
+        (if (stat.isDirectory)
+            nil
+            (let [fileName (path.basename filePath)
+                  extWithDot (path.extname fileName)
+                  extension (lower-case (string-slice extWithDot 1 (count extWithDot)))
+                  mediaType (getMediaType extension)]
+              {:name fileName
+               :path filePath
+               :type mediaType
+               :size stat.size
+               :extension extension
+               :isDirectory false
+               :viewCount viewCount
+               :thumbnailGenerated (mediaThumbnail resolved.fullPath stat mediaType)})))))
+   (catch _error (jsPromise.resolve nil))))
+
+(ann getMostPlayedFiles (Fn [] Js))
+(defn getMostPlayedFiles []
+  (let [allStatsPromise (readJsonOr STATS_FILE {})
+        filesPromise (allStatsPromise.then
+                      (fn [allStats]
+                        (let [stored (object-get allStats config.libraryKey)
+                              stats (if (object? stored) stored {:views {}})
+                              views (if (object? stats.views) stats.views {})
+                              sortedFiles (slice (sort-with
+                                                  (object-entries views)
+                                                  (fn [a b] (- b.value a.value)))
+                                                 0
+                                                 50)
+                              itemPromises (map sortedFiles statsFileItem)]
+                          (jsPromise.all itemPromises))))]
+    (filesPromise.then
+     (fn [results] (filter results (fn [item] (some? item)))))))
+
+(ann favoriteFileItem (Fn [String] Js))
+(defn favoriteFileItem [filePath]
+  (try
+   (let [resolved (resolveMediaPath filePath)
+         statPromise (statPath resolved.fullPath)]
+     (statPromise.then
+      (fn [stat]
+        (let [fileName (path.basename filePath)
+              extWithDot (path.extname fileName)
+              extension (lower-case (string-slice extWithDot 1 (count extWithDot)))
+              mediaType (if (stat.isDirectory)
+                            MediaType.FOLDER
+                            (getMediaType extension))]
+          {:name fileName
+           :path filePath
+           :type mediaType
+           :size (if (stat.isDirectory) 0 stat.size)
+           :extension extension
+           :isDirectory (stat.isDirectory)
+           :thumbnailGenerated (mediaThumbnail resolved.fullPath stat mediaType)}))))
+   (catch _error (jsPromise.resolve nil))))
+
+(ann getFavoriteFiles (Fn [] Js))
+(defn getFavoriteFiles []
+  (let [allSettingsPromise (readJsonOr SETTINGS_FILE {})
+        filesPromise (allSettingsPromise.then
+                      (fn [allSettings]
+                        (let [stored (object-get allSettings config.libraryKey)
+                              settings (if (object? stored) stored {:favorites []})
+                              favorites (if (vector? settings.favorites)
+                                            settings.favorites
+                                            [])
+                              itemPromises (map favorites favoriteFileItem)]
+                          (jsPromise.all itemPromises))))]
+    (filesPromise.then
+     (fn [results] (filter results (fn [item] (some? item)))))))
+
+(ann sendFilesPromise (Fn [Js Js] Js))
+(defn sendFilesPromise [reply filesPromise]
+  (filesPromise.then (fn [files] (reply.send {:files files}))))
+
+(ann handleGetFiles (Fn [Js Js] Js))
+(defn handleGetFiles [request reply]
+  (let [dirRaw (object-get request.query "dir")
+        dir (if (string? dirRaw) dirRaw "")]
+    (if (= dir VIRTUAL_FOLDERS.MOST_PLAYED)
+        (sendFilesPromise reply (getMostPlayedFiles))
+        (if (= dir VIRTUAL_FOLDERS.FAVORITES)
+            (sendFilesPromise reply (getFavoriteFiles))
+            (if (= dir VIRTUAL_FOLDERS.SHARES)
+                (sendFilesPromise reply (getSharesAsFileItems))
+                (sendFilesPromise reply (listDirectory dir)))))))
+
+(ann hasFileContent? (Fn [Js] Bool))
+(defn hasFileContent? [body]
+  (or (some? body.content) (some? body.base64Content)))
+
+(ann writeBodyFile (Fn [Js] Js))
+(defn writeBodyFile [body]
+  (if (and (string? body.base64Content) (not (= body.base64Content "")))
+      (writeBinaryFile body.path body.base64Content)
+      (writeFile body.path body.content)))
+
+(ann sendCreatedFile (Fn [Js String String] Js))
+(defn sendCreatedFile [reply parentPath filePath]
+  (do
+    (broadcastFileChange parentPath filePath)
+    (reply.send {:success true :message "File saved"})))
+
+(ann handleCreateFileAfterExists (Fn [Js Js String Bool] Js))
+(defn handleCreateFileAfterExists [reply body parentPath exists]
+  (if exists
+      (let [itemType (if (= body.type "folder") "folder" "file")]
+        (codeSend reply
+                  409
+                  {:error (str "A " itemType " with this name already exists")}))
+      (if (= body.type "folder")
+          (let [created (createDirectory body.path)]
+            (created.then
+             (fn [_]
+               (do
+                 (broadcastFileChange parentPath body.path)
+                 (reply.send {:success true :message "Folder created"})))))
+          (if (not (hasFileContent? body))
+              (codeSend reply 400 {:error "Content is required for files"})
+              (let [written (writeBodyFile body)]
+                (written.then
+                 (fn [_] (sendCreatedFile reply parentPath body.path))))))))
+
+(ann handleCreateFile (Fn [Js Js] Js))
+(defn handleCreateFile [request reply]
+  (let [body request.body]
+    (if (not (and (object? body) (string? body.path) (not (= body.path ""))))
+        (codeSend reply 400 {:error "Path is required"})
+        (let [parentPath (normalizeParent (path.dirname body.path))]
+          (if (not (or (isPathEditable parentPath) (isPathEditable body.path)))
+              (codeSend reply 403 {:error "Path is not in an editable folder"})
+              (let [existsPromise (fileExists body.path)]
+                (existsPromise.then
+                 (fn [exists]
+                   (handleCreateFileAfterExists reply body parentPath exists)))))))))
+
+(ann handleEditFile (Fn [Js Js] Js))
+(defn handleEditFile [request reply]
+  (let [body request.body]
+    (if (not (and (object? body) (string? body.path) (not (= body.path ""))))
+        (codeSend reply 400 {:error "Path is required"})
+        (if (not (isPathEditable body.path))
+            (codeSend reply 403 {:error "Path is not in an editable folder"})
+            (if (not (hasFileContent? body))
+                (codeSend reply 400 {:error "Content is required"})
+                (let [written (writeBodyFile body)]
+                  (written.then
+                   (fn [_]
+                     (let [parentDir (normalizeParent (path.dirname body.path))]
+                       (do
+                         (broadcastFileChange parentDir body.path)
+                         (reply.send {:success true
+                                      :message "File saved"})))))))))))
+
+(ann handleDeleteFile (Fn [Js Js] Js))
+(defn handleDeleteFile [request reply]
+  (let [body request.body]
+    (if (not (and (object? body) (string? body.path) (not (= body.path ""))))
+        (codeSend reply 400 {:error "Path is required"})
+        (let [fullPath (validatePath body.path)
+              statPromise (statPath fullPath)]
+          (statPromise.then
+           (fn [stats]
+             (let [parentDir (normalizeParent (path.dirname body.path))]
+               (if (stats.isDirectory)
+                   (let [deleted (deleteDirectory body.path)]
+                     (deleted.then
+                      (fn [_]
+                        (do
+                          (broadcastFileChange parentDir body.path)
+                          (reply.send {:success true :message "Folder deleted"})))))
+                   (let [deleted (deleteFile body.path)]
+                     (deleted.then
+                      (fn [_]
+                        (do
+                          (broadcastFileChange parentDir body.path)
+                          (reply.send {:success true
+                                       :message "File deleted"})))))))))))))
+
+(ann handleRenameFile (Fn [Js Js] Js))
+(defn handleRenameFile [request reply]
+  (let [body request.body]
+    (if (not (and (object? body)
+                  (string? body.oldPath)
+                  (not (= body.oldPath ""))
+                  (string? body.newPath)
+                  (not (= body.newPath ""))))
+        (codeSend reply 400 {:error "Both oldPath and newPath are required"})
+        (let [renamed (renameFileOrDirectory body.oldPath body.newPath)]
+          (renamed.then
+           (fn [_]
+             (let [oldParent (normalizeParent (path.dirname body.oldPath))
+                   newParent (normalizeParent (path.dirname body.newPath))]
+               (do
+                 (broadcastFileChange oldParent body.oldPath)
+                 (if (not (= newParent oldParent))
+                     (broadcastFileChange newParent body.newPath)
+                     nil)
+                 (reply.send {:success true :message "Renamed successfully"})))))))))
+
+(ann sourceName (Fn [String] String))
+(defn sourceName [sourcePath]
+  (let [parts (split (normalizeSlashes sourcePath) "/")
+        lastPart (last parts)]
+    (if (some? lastPart) lastPart "")))
+
+(ann handleCopyFile (Fn [Js Js] Js))
+(defn handleCopyFile [request reply]
+  (let [body request.body]
+    (if (not (and (object? body) (string? body.sourcePath) (not (= body.sourcePath ""))))
+        (codeSend reply 400 {:error "sourcePath is required"})
+        (let [copied (copyFileOrDirectory body.sourcePath body.destinationDir)]
+          (copied.then
+           (fn [_]
+             (let [destParent (normalizeSlashes body.destinationDir)
+                   normalizedDestParent (if (= destParent "") "" destParent)
+                   name (sourceName body.sourcePath)
+                   createdPath (if (= normalizedDestParent "")
+                                   name
+                                   (str normalizedDestParent "/" name))]
+               (do
+                 (broadcastFileChange normalizedDestParent createdPath)
+                 (reply.send {:success true :message "Copied successfully"})))))))))
+
+(ann filesApiRouteDefinitions (Fn [] (Vector HttpRoute)))
+(defn filesApiRouteDefinitions []
+  [{:method "GET" :path "/api/files" :handler handleGetFiles}
+   {:method "POST" :path "/api/files/create" :handler handleCreateFile}
+   {:method "POST" :path "/api/files/edit" :handler handleEditFile}
+   {:method "POST" :path "/api/files/delete" :handler handleDeleteFile}
+   {:method "POST" :path "/api/files/rename" :handler handleRenameFile}
+   {:method "POST" :path "/api/files/copy" :handler handleCopyFile}])
+
+(ann registerFilesApiRoutes (Fn [Js] Js))
+(defn registerFilesApiRoutes [app]
+  (registerHttpRoutes app (filesApiRouteDefinitions)))

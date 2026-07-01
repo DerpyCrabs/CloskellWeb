@@ -1,0 +1,31 @@
+(import "./source-context.clsk" [normalizeSlashes])
+
+(ann pathInsideKnowledgeBase? (Fn [String String] Bool))
+(defn pathInsideKnowledgeBase? [normalizedPath normalizedKb]
+  (or (= normalizedPath normalizedKb)
+      (starts-with? normalizedPath (str normalizedKb "/"))))
+
+(ann getKnowledgeBaseRootForPath (Fn [String (Vector String)] (Option String)))
+(defn getKnowledgeBaseRootForPath [filePath knowledgeBases]
+  (let [normalized (normalizeSlashes filePath)
+        found (find knowledgeBases
+                    (fn [kb]
+                      (pathInsideKnowledgeBase? normalized (normalizeSlashes kb))))]
+    (match found
+      nil nil
+      _ (normalizeSlashes found))))
+
+(ann isKnowledgeBaseImagePath (Fn [String String (Vector String)] Bool))
+(defn isKnowledgeBaseImagePath [requestedPath sharePath knowledgeBases]
+  (let [normalized (normalizeSlashes requestedPath)]
+    (if (includes? normalized "..")
+        false
+        (let [kbRoot (getKnowledgeBaseRootForPath sharePath knowledgeBases)]
+          (if (not (some? kbRoot))
+              false
+              (let [imagesDir (str (normalizeSlashes kbRoot) "/images/")
+                    relativeToImages (string-slice normalized (count imagesDir))]
+                (and (starts-with? normalized imagesDir)
+                     (> (count relativeToImages) 0)
+                     (not (includes? relativeToImages "/"))
+                     (not (includes? relativeToImages "\\")))))))))

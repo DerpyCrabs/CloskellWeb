@@ -1,0 +1,37 @@
+(def jsDate (js-global Date))
+
+(ann pastedImageExtensionForMimeType (Fn [String] String))
+(defn pastedImageExtensionForMimeType [mimeType]
+  (let [mt (lower-case mimeType)]
+    (if (or (= mt "image/jpeg") (= mt "image/jpg"))
+        "jpg"
+        (if (= mt "image/png")
+            "png"
+            (if (= mt "image/gif")
+                "gif"
+                (if (= mt "image/webp") "webp" "png"))))))
+
+(ann formatObsidianPastedImageFileNameWithStamp (Fn [String String] String))
+(defn formatObsidianPastedImageFileNameWithStamp [stamp mimeType]
+  (str "Pasted image " stamp "." (pastedImageExtensionForMimeType mimeType)))
+
+(ann pad2 (Fn [Number] String))
+(defn pad2 [n]
+  (if (< n 10) (str "0" n) (str n)))
+
+(ann formatObsidianPastedImageFileName (Fn [String] String))
+(defn formatObsidianPastedImageFileName [mimeType]
+  (let [date (new jsDate)
+        stamp (str (date.getFullYear)
+                   (pad2 (+ (date.getMonth) 1))
+                   (pad2 (date.getDate))
+                   (pad2 (date.getHours))
+                   (pad2 (date.getMinutes))
+                   (pad2 (date.getSeconds)))]
+    (formatObsidianPastedImageFileNameWithStamp stamp (if (= mimeType "") "image/png" mimeType))))
+
+(ann spliceString (Fn [String Number Number String] String))
+(defn spliceString [value start end insert]
+  (str (string-slice value 0 start)
+       insert
+       (string-slice value end)))

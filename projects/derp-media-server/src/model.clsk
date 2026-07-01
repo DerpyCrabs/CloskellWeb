@@ -1,0 +1,373 @@
+(import "../lib/types.clsk" [FileItem AuthConfig GlobalSettings ShareLink ShareRestrictions MediaRootSummary WorkspaceLayoutPreset WorkspaceTaskbarPin ViewModesByPath])
+(import "./features/workspace/assist-grid.clsk" [AssistGridSpan])
+(import "./features/workspace/geometry.clsk" [WorkspaceBounds])
+(import "./features/workspace/types.clsk" [WorkspaceState])
+
+(type WindowEventPayload
+  {:type String
+   :clientX Number
+   :clientY Number
+   :pageX Number
+   :pageY Number
+   :screenX Number
+   :screenY Number
+   :movementX Number
+   :movementY Number
+   :button Number
+   :buttons Number
+   :pointerId Number
+   :pointerType String
+   :isPrimary Bool
+   :key String
+   :code String
+   :altKey Bool
+   :ctrlKey Bool
+   :metaKey Bool
+   :shiftKey Bool})
+
+(type WorkspaceWindowDragSession
+  {:groupId String
+   :windowId String
+   :grabDx Number
+   :grabDy Number
+   :canvasLeft Number
+   :canvasTop Number
+   :canvasWidth Number
+   :canvasHeight Number
+   :clientX Number
+   :clientY Number
+   :assistActive Bool
+   :liveBounds WorkspaceBounds
+   :snapSpan (Option AssistGridSpan)})
+
+(type WorkspaceWindowResizeSession
+  {:windowId String
+   :direction String
+   :startX Number
+   :startY Number
+   :canvasWidth Number
+   :canvasHeight Number
+   :startBounds WorkspaceBounds})
+
+(type WorkspaceTabDragSession
+  {:groupId String
+   :tabId String
+   :startX Number
+   :startY Number
+   :canvasLeft Number
+   :canvasTop Number
+   :canvasWidth Number
+   :canvasHeight Number})
+
+(type WorkspaceSplitResizeSession
+  {:groupId String
+   :groupLeft Number
+   :groupWidth Number})
+
+(type RouteState
+  {:currentUrl String
+   :pathname String
+   :search String
+   :currentDir String
+   :viewingPath (Option String)
+   :playingPath (Option String)
+   :audioOnly Bool
+   :shareToken (Option String)
+   :sharePasscodeParam (Option String)})
+
+(type AppState
+  {:currentUrl String
+   :pathname String
+   :search String
+   :currentDir String
+   :viewingPath (Option String)
+   :playingPath (Option String)
+   :audioOnly Bool
+   :shareToken (Option String)
+   :sharePasscodeParam (Option String)
+   :loginPassword String
+   :loginPending Bool
+   :loginError (Option String)
+   :authPending Bool
+   :authError (Option String)
+   :editableFolders (Vector String)
+   :mediaRoots (Vector MediaRootSummary)
+   :shareLinkDomain (Option String)
+   :settingsPending Bool
+   :settingsError (Option String)
+   :viewModes ViewModesByPath
+   :viewMode String
+   :viewModeTouched Bool
+   :favorites (Vector String)
+   :knowledgeBases (Vector String)
+   :viewCounts (Map String Number)
+   :shareViewCounts (Map String Number)
+   :kbSearchOpen Bool
+   :kbSearchQuery String
+   :sharesPending Bool
+   :sharesError (Option String)
+   :shares (Vector ShareLink)
+   :filesPending Bool
+   :filesError (Option String)
+   :files (Vector FileItem)
+   :pendingViewPath (Option String)
+	   :menuOpen Bool
+	   :menuKind String
+	   :menuPath String
+	   :menuFile (Option FileItem)
+	   :menuIsDirectory Bool
+	   :menuX Number
+	   :menuY Number
+   :adminUploadMenuOpen Bool
+   :adminUploadPending Bool
+   :adminUploadStatus (Option String)
+   :adminExternalDragOver Bool
+   :adminCreateKind String
+   :adminCreateName String
+   :adminCreatePending Bool
+   :adminCreateError (Option String)
+   :adminRenameOpen Bool
+   :adminRenameOldPath String
+   :adminRenameName String
+   :adminRenameIsDirectory Bool
+   :adminRenamePending Bool
+   :adminRenameError (Option String)
+   :adminDeleteOpen Bool
+   :adminDeletePath String
+   :adminDeleteName String
+   :adminDeleteIsDirectory Bool
+   :adminDeletePending Bool
+   :adminDeleteError (Option String)
+   :adminTransferMode String
+   :adminTransferPath String
+   :adminTransferName String
+   :adminTransferIsDirectory Bool
+   :adminTransferBrowsePath String
+   :adminTransferPending Bool
+   :adminTransferError (Option String)
+	   :adminShareOpen Bool
+	   :adminSharePath String
+	   :adminShareName String
+	   :adminShareIsDirectory Bool
+	   :adminShareCreateOpen Bool
+	   :adminShareEditable Bool
+	   :adminShareAllowUpload Bool
+	   :adminShareAllowEdit Bool
+	   :adminShareAllowDelete Bool
+	   :adminSharePending Bool
+	   :adminShareError (Option String)
+	   :adminShareDeletingToken String
+	   :adminPasteOpen Bool
+   :adminPasteContent String
+   :adminPasteName String
+   :adminPastePending Bool
+   :adminPasteError (Option String)
+   :adminTextPath String
+   :adminTextContent String
+   :adminTextDraft String
+   :adminTextPending Bool
+   :adminTextError (Option String)
+   :adminTextSaving Bool
+   :adminTextReadOnly Bool
+   :adminTextAutoSave Bool
+   :adminMarkdownImageOpen Bool
+   :adminMarkdownImageSrc String
+   :adminImageZoom Number
+   :adminImageRotation Number
+   :adminIconDialogOpen Bool
+   :adminIconPath String
+   :adminIconName String
+	   :adminIconPending Bool
+	   :adminIconError (Option String)
+	   :themeMenuOpen Bool
+	   :themeMode String
+	   :themePalette String
+	   :scrollY Number
+   :draggedPath (Option String)
+   :shareInfoPending Bool
+   :shareInfoError (Option String)
+   :shareInfoStatus Number
+   :shareName String
+   :sharePath String
+   :shareIsDirectory Bool
+   :shareMediaType String
+   :shareExtension String
+   :shareEditable Bool
+   :shareAllowUpload Bool
+   :shareAllowEdit Bool
+   :shareAllowDelete Bool
+   :shareNeedsPasscode Bool
+   :shareAuthorized Bool
+   :sharePasscodeInput String
+   :sharePasscodePending Bool
+   :sharePasscodeError (Option String)
+   :sharePasscodeAutoTried Bool
+   :shareFilesPending Bool
+   :shareFilesError (Option String)
+   :shareFiles (Vector FileItem)
+   :shareUploadMenuOpen Bool
+   :shareUploadSelected Bool
+   :shareUploadPending Bool
+   :shareUploadStatus (Option String)
+   :shareCreateKind String
+   :shareCreateName String
+   :shareCreatePending Bool
+   :shareCreateError (Option String)
+   :shareRenameOpen Bool
+   :shareRenameOldPath String
+	   :shareRenameName String
+	   :shareRenamePending Bool
+	   :shareRenameError (Option String)
+	   :shareDeleteOpen Bool
+	   :shareDeletePath String
+	   :shareDeleteName String
+	   :shareDeletePending Bool
+	   :shareDeleteError (Option String)
+	   :shareTextPath String
+	   :shareTextContent String
+	   :shareTextPending Bool
+	   :shareTextError (Option String)
+		   :shareTextSaving Bool
+		   :shareImageZoom Number
+		   :shareImageRotation Number
+			   :shareAudioRepeat Bool
+			   :mediaAudioMetadataKey String
+			   :mediaAudioDuration Number
+			   :mediaAudioTitle (Option String)
+			   :mediaAudioArtist (Option String)
+			   :mediaAudioCoverArt (Option String)
+			   :workspace WorkspaceState
+	   :workspaceRevision Number
+	   :workspaceStorageLoaded Bool
+	   :workspaceHasPersistedDraft Bool
+	   :workspaceAudioPath String
+	   :workspaceAudioName String
+	   :workspaceAudioDir String
+	   :workspaceAudioOpen Bool
+	   :workspaceAudioRepeat Bool
+	   :workspaceAudioDuration Number
+	   :workspaceAudioVideoWindowId String
+	   :workspaceAudioVideoHidden Bool
+	   :workspaceSettingsOpen Bool
+	   :workspaceSnapAssistEnabled Bool
+	   :workspaceAssistGridShape String
+	   :workspaceFileOpenTarget String
+	   :workspaceLayoutPresets (Vector WorkspaceLayoutPreset)
+	   :workspaceLayoutPresetsReady Bool
+	   :workspaceLayoutMenuOpen Bool
+	   :workspaceLayoutSaveOpen Bool
+	   :workspaceLayoutSaveName String
+	   :workspaceLayoutBaselineSnapshot (Option WorkspaceState)
+	   :workspaceLayoutBaselinePresetId (Option String)
+		   :workspaceLayoutPickerOpen Bool
+		   :workspaceLayoutPickerWindowId String
+		   :workspaceLayoutPickerX Number
+		   :workspaceLayoutPickerY Number
+	   :workspaceContextMenuWindowId String
+	   :workspaceWindowDrag (Option WorkspaceWindowDragSession)
+	   :workspaceWindowResize (Option WorkspaceWindowResizeSession)
+	   :workspaceTabDrag (Option WorkspaceTabDragSession)
+	   :workspaceSplitResize (Option WorkspaceSplitResizeSession)
+		   :workspaceTabMenuOpen Bool
+		   :workspaceTabMenuTabId String
+		   :workspaceTabMenuX Number
+		   :workspaceTabMenuY Number
+				   :shareVideoCompact Bool})
+
+(type LoginPayload
+  {:success (Option Bool)
+   :error (Option String)})
+
+(type LoginResponse
+  {:ok Bool
+   :status Number
+   :body LoginPayload})
+
+(type AuthResponse
+  {:ok Bool
+   :status Number
+   :body AuthConfig})
+
+(type SettingsResponse
+  {:ok Bool
+   :status Number
+   :body GlobalSettings})
+
+(type FilesPayload
+  {:files (Vector FileItem)})
+
+(type FilesResponse
+  {:ok Bool
+   :status Number
+   :body FilesPayload})
+
+(type SharesPayload
+  {:shares (Vector ShareLink)})
+
+(type SharesResponse
+  {:ok Bool
+   :status Number
+   :body SharesPayload})
+
+(type ShareInfo
+  {:name String
+   :path (Option String)
+   :isDirectory Bool
+   :editable Bool
+   :mediaType String
+   :extension String
+   :editable Bool
+   :restrictions (Option ShareRestrictions)
+   :needsPasscode Bool
+   :authorized Bool
+   :adminViewMode (Option String)
+   :workspaceTaskbarPins (Option (Vector WorkspaceTaskbarPin))
+   :workspaceLayoutPresets (Option (Vector WorkspaceLayoutPreset))})
+
+(type ShareInfoResponse
+  {:ok Bool
+   :status Number
+   :body ShareInfo})
+
+(type BasicPayload
+  {:success (Option Bool)
+   :error (Option String)
+   :message (Option String)
+   :favorites (Option (Vector String))
+   :knowledgeBases (Option (Vector String))
+   :viewCount (Option Number)
+   :uploaded (Option Number)
+   :path (Option String)
+   :fileName (Option String)
+   :workspaceLayoutPresets (Option (Vector WorkspaceLayoutPreset))})
+
+(type BasicResponse
+  {:ok Bool
+   :status Number
+   :body BasicPayload})
+
+(type ViewStatsPayload
+  {:views (Map String Number)
+   :shareViews (Map String Number)})
+
+(type ViewStatsResponse
+  {:ok Bool
+   :status Number
+   :body ViewStatsPayload})
+
+(type AudioMetadataPayload
+  {:duration (Option Number)
+   :title (Option String)
+   :artist (Option String)
+   :coverArt (Option String)
+   :error (Option String)})
+
+(type AudioMetadataResponse
+  {:ok Bool
+   :status Number
+   :body AudioMetadataPayload})
+
+(type TextResponse
+  {:ok Bool
+   :status Number
+   :body String})

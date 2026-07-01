@@ -1,0 +1,45 @@
+(def jsGlobalThis (js-global globalThis))
+(def jsJSON (js-global JSON))
+(def jsSet (js-global Set))
+
+(ann browserWindow (Fn [] Js))
+(defn browserWindow []
+  jsGlobalThis.window)
+
+(ann readPersistedState (Fn [String] Js))
+(defn readPersistedState [key]
+  (let [win (browserWindow)]
+    (if (not (some? win))
+        nil
+        (try
+         (let [raw (win.localStorage.getItem key)]
+           (if (not (some? raw))
+               nil
+               (let [parsed (jsJSON.parse raw)]
+                 (if (and (object? parsed) (contains? parsed "state"))
+                     parsed.state
+                     nil))))
+         (catch _error nil)))))
+
+(ann writePersistedState (Fn [String Js] Nil))
+(defn writePersistedState [key state]
+  (let [win (browserWindow)]
+    (if (some? win)
+        (try
+         (do
+           (win.localStorage.setItem key (jsJSON.stringify {:state state :version 0}))
+           nil)
+         (catch _error nil))
+        nil)))
+
+(ann createStoreListeners (Fn [] Js))
+(defn createStoreListeners []
+  (let [listeners (new jsSet)]
+    {:notify (fn []
+               (do
+                 (listeners.forEach (fn [listener] (listener)))
+                 nil))
+     :subscribe (fn [listener]
+                  (do
+                    (listeners.add listener)
+                    (fn [] (listeners.delete listener))))}))

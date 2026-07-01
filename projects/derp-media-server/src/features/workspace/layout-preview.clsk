@@ -1,0 +1,211 @@
+(import "./geometry.clsk" [createFullscreenBoundsForCanvas getViewportSize])
+(import "./state-core.clsk" [clampSplitPaneFraction normalizePersistedWorkspaceState])
+(import "./tab-groups-core.clsk" [orderedAllGroupIds tabsInGroup])
+
+(def tabLabelMax 22)
+
+(type WorkspaceBounds
+  {:x Number
+   :y Number
+   :width Number
+   :height Number})
+
+(type WorkspaceCanvasSize
+  {:width Number
+   :height Number})
+
+(type PreviewWindowLayout
+  {:bounds (Option WorkspaceBounds)
+   :zIndex (Option Number)
+   :fullscreen (Option Bool)
+   :minimized (Option Bool)})
+
+(type PreviewWindow
+  {:id String
+   :title String
+   :type String
+   :tabGroupId (Option String)
+   :tabPinned (Option Bool)
+   :layout PreviewWindowLayout})
+
+(type PreviewTabGroupSplit
+  {:leftTabId (Option String)
+   :leftPaneFraction (Option Number)})
+
+(type PreviewTabGroupSplits Js)
+
+(type PreviewState
+  {:windows (Vector PreviewWindow)
+   :tabGroupSplits PreviewTabGroupSplits})
+
+(type LayoutPreviewTab
+  {:id String
+   :label String
+   :pinned Bool})
+
+(ann truncateTabTitle (Fn [String] String))
+(defn truncateTabTitle [title]
+  (let [value (trim title)
+        normalized (if (= value "") "Untitled" value)]
+    (if (<= (count normalized) tabLabelMax)
+        normalized
+        (str (string-slice normalized 0 (- tabLabelMax 1)) "…"))))
+
+(ann previewTab (Fn [PreviewWindow] LayoutPreviewTab))
+(defn previewTab [win]
+  {:id win.id
+   :label (truncateTabTitle win.title)
+   :pinned (= win.tabPinned true)})
+
+(ann layoutObject (Fn [PreviewWindow] PreviewWindowLayout))
+(defn layoutObject [win]
+  (let [layout (get win :layout)]
+    (if (object? layout) layout {})))
+
+(ann layoutBounds (Fn [PreviewWindowLayout] (Option WorkspaceBounds)))
+(defn layoutBounds [layout]
+  (let [bounds (get layout :bounds)]
+    (if (object? bounds) (unsafe-cast WorkspaceBounds bounds) nil)))
+
+(ann layoutNumberOr (Fn [PreviewWindowLayout String Number] Number))
+(defn layoutNumberOr [layout field fallback]
+  (let [value (object-get layout field)]
+    (if (number? value) value fallback)))
+
+(ann layoutBoolTrue? (Fn [PreviewWindowLayout String] Bool))
+(defn layoutBoolTrue? [layout field]
+  (= (object-get layout field) true))
+
+(ann groupZIndex (Fn [(Vector PreviewWindow) String] Number))
+(defn groupZIndex [windows groupId]
+  (reduce (tabsInGroup windows groupId)
+          1
+          (fn [z member]
+            (max z (layoutNumberOr (layoutObject member) "zIndex" 1)))))
+
+(ann groupOuterBounds (Fn [(Vector PreviewWindow) String WorkspaceCanvasSize] (Option WorkspaceBounds)))
+(defn groupOuterBounds [windows groupId canvas]
+  (let [members (tabsInGroup windows groupId)]
+    (if (= (count members) 0)
+        nil
+        (if (any? members (fn [member] (layoutBoolTrue? (layoutObject member) "fullscreen")))
+            (createFullscreenBoundsForCanvas canvas)
+            (let [withBounds (find members (fn [member] (some? (layoutBounds (layoutObject member)))))]
+              (if (some? withBounds)
+                  (layoutBounds (layoutObject withBounds))
+                  nil))))))
+
+(ann allMinimized? (Fn [(Vector PreviewWindow)] Bool))
+(defn allMinimized? [members]
+  (every? members (fn [member] (layoutBoolTrue? (layoutObject member) "minimized"))))
+
+(ann splitLeftTabId (Fn [PreviewTabGroupSplits String] (Option String)))
+(defn splitLeftTabId [splits groupId]
+  (let [split (object-get splits groupId)
+        left (if (object? split) (object-get split "leftTabId") nil)]
+    (if (string? left) left nil)))
+
+(ann splitLeftPaneFraction (Fn [PreviewTabGroupSplits String] Number))
+(defn splitLeftPaneFraction [splits groupId]
+  (let [split (object-get splits groupId)
+        fraction (if (object? split) (object-get split "leftPaneFraction") nil)]
+    (clampSplitPaneFraction fraction)))
+
+(ann pixelGroupForId (Fn [PreviewState String WorkspaceCanvasSize] (Option Js)))
+(defn pixelGroupForId [state groupId canvas]
+  (let [members (tabsInGroup state.windows groupId)]
+    (if (= (count members) 0)
+        nil
+        (match (groupOuterBounds state.windows groupId canvas)
+          nil nil
+          (some outer)
+            (let [z (groupZIndex state.windows groupId)
+                  minimized (allMinimized? members)
+                  leftId (splitLeftTabId state.tabGroupSplits groupId)]
+              (match leftId
+                nil (unsafe-cast Js (merge outer
+                                           {:z z
+                                            :minimized minimized
+                                            :mode "tabs"
+                                            :tabs (map members previewTab)}))
+                (some currentLeftId)
+                  (unsafe-cast Js (merge outer
+                                         {:z z
+                                          :minimized minimized
+                                          :mode "split"
+                                          :leftPaneFraction (splitLeftPaneFraction state.tabGroupSplits groupId)
+                                          :leftTabs (map (filter members (fn [member] (= member.id currentLeftId))) previewTab)
+                                          :rightTabs (map (filter members (fn [member] (not (= member.id currentLeftId)))) previewTab)}))))))))
+
+(ann pixelGroupsFromState (Fn [PreviewState WorkspaceCanvasSize] (Vector Js)))
+(defn pixelGroupsFromState [state canvas]
+  (sort-with
+    (reduce (orderedAllGroupIds state.windows)
+            []
+            (fn [groups groupId]
+              (match (pixelGroupForId state groupId canvas)
+                nil groups
+                (some group) (conj groups group))))
+    (fn [a b] (- a.z b.z))))
+
+(ann groupPercentBase (Fn [Js WorkspaceCanvasSize] Js))
+(defn groupPercentBase [group canvas]
+  {:leftPct (* (/ group.x canvas.width) 100)
+   :topPct (* (/ group.y canvas.height) 100)
+   :widthPct (* (/ group.width canvas.width) 100)
+   :heightPct (* (/ group.height canvas.height) 100)
+   :z group.z
+   :minimized group.minimized})
+
+(ann previewGroupFromPixel (Fn [Js WorkspaceCanvasSize] Js))
+(defn previewGroupFromPixel [group canvas]
+  (let [base (groupPercentBase group canvas)]
+    (if (= group.mode "split")
+        (merge base
+               {:mode "split"
+                :leftPaneFraction group.leftPaneFraction
+                :leftTabs group.leftTabs
+                :rightTabs group.rightTabs})
+        (merge base
+               {:mode "tabs"
+                :tabs group.tabs}))))
+
+(ann computeLayoutPreviewDetailForCanvas (Fn [PreviewState WorkspaceCanvasSize] (Option Js)))
+(defn computeLayoutPreviewDetailForCanvas [state canvas]
+  (let [pixel (pixelGroupsFromState state canvas)]
+    (if (or (= (count pixel) 0) (not (> canvas.width 0)) (not (> canvas.height 0)))
+        nil
+        {:groups (map pixel (fn [group] (previewGroupFromPixel group canvas)))
+         :aspectRatio (/ canvas.width canvas.height)})))
+
+(ann computeLayoutPreviewNormForCanvas (Fn [PreviewState WorkspaceCanvasSize] (Option Js)))
+(defn computeLayoutPreviewNormForCanvas [state canvas]
+  (match (computeLayoutPreviewDetailForCanvas state canvas)
+    nil nil
+    (some detail)
+      {:aspectRatio detail.aspectRatio
+       :panes (map detail.groups
+                   (fn [group]
+                     {:leftPct group.leftPct
+                      :topPct group.topPct
+                      :widthPct group.widthPct
+                      :heightPct group.heightPct
+                      :z group.z}))}))
+
+(ann cloneJson (Fn [Js] Js))
+(defn cloneJson [value]
+  (unwrap-or (json-parse-result (json-stringify value)) value))
+
+(ann computeLayoutPreviewDetail (Fn [Js] (Option Js)))
+(defn computeLayoutPreviewDetail [snapshot]
+  (let [state (normalizePersistedWorkspaceState (cloneJson snapshot) nil)]
+    (if (some? state)
+        (computeLayoutPreviewDetailForCanvas state (getViewportSize))
+        nil)))
+
+(ann computeLayoutPreviewNorm (Fn [Js] (Option Js)))
+(defn computeLayoutPreviewNorm [snapshot]
+  (let [state (normalizePersistedWorkspaceState (cloneJson snapshot) nil)]
+    (if (some? state)
+        (computeLayoutPreviewNormForCanvas state (getViewportSize))
+        nil)))

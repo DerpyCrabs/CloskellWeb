@@ -1,0 +1,83 @@
+(import "./source-context.clsk" [normalizeSlashes stripSharePrefix])
+
+(type MediaShareContext
+  {:token String
+   :sharePath String})
+
+(ann encodeSegments (Fn [String] String))
+(defn encodeSegments [path]
+  (let [safePath (if (string? path) path "")]
+    (join (map (split safePath "/") (fn [segment] (encode-uri-component segment))) "/")))
+
+(ann shareRelativePath (Fn [String String] String))
+(defn shareRelativePath [shareBasePath filePath]
+  (let [relative (stripSharePrefix filePath (normalizeSlashes shareBasePath))]
+    (if (= relative "") "." relative)))
+
+(ann buildAdminMediaUrl (Fn [String] String))
+(defn buildAdminMediaUrl [filePath]
+  (str "/api/media/" (encodeSegments filePath)))
+
+(ann buildShareMediaUrl (Fn [String String String] String))
+(defn buildShareMediaUrl [shareToken shareBasePath filePath]
+  (str "/api/share/"
+       shareToken
+       "/media/"
+       (encodeSegments (shareRelativePath shareBasePath filePath))))
+
+(ann buildMediaUrl (Fn [String (Option MediaShareContext)] String))
+(defn buildMediaUrl [filePath ctx]
+  (match ctx
+    (some current) (buildShareMediaUrl current.token current.sharePath filePath)
+    nil (buildAdminMediaUrl filePath)))
+
+(ann buildAdminAudioExtractUrl (Fn [String] String))
+(defn buildAdminAudioExtractUrl [filePath]
+  (str "/api/audio/extract/" filePath))
+
+(ann buildShareAudioExtractUrl (Fn [String String String] String))
+(defn buildShareAudioExtractUrl [shareToken shareBasePath filePath]
+  (str "/api/share/"
+       shareToken
+       "/audio/extract/"
+       (encodeSegments (shareRelativePath shareBasePath filePath))))
+
+(ann buildAudioExtractUrl (Fn [String (Option MediaShareContext)] String))
+(defn buildAudioExtractUrl [filePath ctx]
+  (match ctx
+    (some current) (buildShareAudioExtractUrl current.token current.sharePath filePath)
+    nil (buildAdminAudioExtractUrl filePath)))
+
+(ann buildAdminAudioMetadataUrl (Fn [String] String))
+(defn buildAdminAudioMetadataUrl [filePath]
+  (str "/api/audio/metadata/" filePath))
+
+(ann buildShareAudioMetadataUrl (Fn [String String String] String))
+(defn buildShareAudioMetadataUrl [shareToken shareBasePath filePath]
+  (str "/api/share/"
+       shareToken
+       "/audio/metadata/"
+       (encodeSegments (shareRelativePath shareBasePath filePath))))
+
+(ann buildAudioMetadataUrl (Fn [String (Option MediaShareContext)] String))
+(defn buildAudioMetadataUrl [filePath ctx]
+  (match ctx
+    (some current) (buildShareAudioMetadataUrl current.token current.sharePath filePath)
+    nil (buildAdminAudioMetadataUrl filePath)))
+
+(ann buildAdminThumbnailUrl (Fn [String] String))
+(defn buildAdminThumbnailUrl [filePath]
+  (str "/api/thumbnail/" (encodeSegments filePath)))
+
+(ann buildShareThumbnailUrl (Fn [String String String] String))
+(defn buildShareThumbnailUrl [shareToken shareBasePath filePath]
+  (str "/api/share/"
+       shareToken
+       "/thumbnail/"
+       (encodeSegments (shareRelativePath shareBasePath filePath))))
+
+(ann buildThumbnailUrl (Fn [String (Option MediaShareContext)] String))
+(defn buildThumbnailUrl [filePath ctx]
+  (match ctx
+    (some current) (buildShareThumbnailUrl current.token current.sharePath filePath)
+    nil (buildAdminThumbnailUrl filePath)))

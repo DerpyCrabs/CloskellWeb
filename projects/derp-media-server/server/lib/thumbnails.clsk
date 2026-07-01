@@ -1,0 +1,498 @@
+(import "path" [(default path)])
+(import "sharp" [(default sharp)])
+(import "node:buffer" [Buffer])
+(import "../fs-tasks.clsk" [mkdirRecursive
+                            readDirNamesSync
+                            readFileBytes
+                            renamePath
+                            unlinkPath])
+(import "../http-capabilities.clsk" [sendRawResponse])
+(import "../process-tasks.clsk" [spawnProcess])
+(import "../../src/features/media-utils.clsk" [getMediaType])
+(import "../../lib/types.clsk" [MediaType])
+(import "../../lib/host-env.clsk" [hostCwd hostPid])
+
+(def CACHE_DIR (path.join (hostCwd) ".thumbnails"))
+(def jsPromise (js-global Promise))
+(def jsObject (js-global Object))
+(def jsRegExp (js-global RegExp))
+(def jsDate (js-global Date))
+(def jsMath (js-global Math))
+(def jsNumber (js-global Number))
+(def jsParseFloat (js-global parseFloat))
+(def jsSetTimeout (js-global setTimeout))
+(def jsClearTimeout (js-global clearTimeout))
+(def jsUndefined (js-global undefined))
+(def cachedThumbnailNamesByDir (new (js-global Map)))
+(def ffmpegAvailableBox (unsafe-cast Js [nil]))
+
+(ann boxGet (Fn [Js] Js))
+(defn boxGet [box]
+  (nth box 0))
+
+(ann boxSet (Fn [Js Js] Js))
+(defn boxSet [box value]
+  (box.splice 0 1 value))
+
+(ann promiseResolve (Fn [Js] Js))
+(defn promiseResolve [value]
+  (jsPromise.resolve value))
+
+(ann promiseReject (Fn [Js] Js))
+(defn promiseReject [error]
+  (jsPromise.reject error))
+
+(ann signalAborted? (Fn [Js] Bool))
+(defn signalAborted? [signal]
+  (and (some? signal) signal.aborted))
+
+(ann makeError (Fn [String] Js))
+(defn makeError [message]
+  (new (js-global Error) message))
+
+(ann ThumbnailRequestAborted (Fn [] Js))
+(defn ThumbnailRequestAborted []
+  (let [error (makeError "Thumbnail request aborted")]
+    (do
+      (jsObject.defineProperty error "name" {:value "AbortError"
+                                             :configurable true})
+      error)))
+
+(ann isThumbnailAbortError (Fn [Js] Bool))
+(defn isThumbnailAbortError [error]
+  (= (object-get error "name") "AbortError"))
+
+(ann abortError (Fn [] Js))
+(defn abortError []
+  (ThumbnailRequestAborted))
+
+(ann ensureCacheDir (Fn [] Js))
+(defn ensureCacheDir []
+  (mkdirRecursive CACHE_DIR))
+
+(ann jpgName? (Fn [String] Bool))
+(defn jpgName? [name]
+  (ends-with? name ".jpg"))
+
+(ann rememberCachedThumbnails (Fn [String Js] Js))
+(defn rememberCachedThumbnails [dir names]
+  (do
+    (cachedThumbnailNamesByDir.set dir names)
+    names))
+
+(ann readCachedThumbnails (Fn [String] Js))
+(defn readCachedThumbnails [dir]
+  (let [names (new (js-global Set) (filter (readDirNamesSync dir) jpgName?))]
+    (rememberCachedThumbnails dir names)))
+
+(ann emptyCachedThumbnails (Fn [String] Js))
+(defn emptyCachedThumbnails [dir]
+  (rememberCachedThumbnails dir (new (js-global Set))))
+
+(ann cachedThumbnails (Fn [String] Js))
+(defn cachedThumbnails [dir]
+  (let [existing (cachedThumbnailNamesByDir.get dir)]
+    (if (some? existing)
+        existing
+        (try (readCachedThumbnails dir)
+             (catch _error (emptyCachedThumbnails dir))))))
+
+(ann getCacheKey (Fn [String Js] String))
+(defn getCacheKey [filePath mtime]
+  (let [hashBuffer (Buffer.from (str filePath "-" (mtime.getTime)))
+        base64 (hashBuffer.toString "base64")
+        safe (base64.replace (new jsRegExp "[^a-zA-Z0-9]" "g") "")]
+    (str safe ".jpg")))
+
+(ann hasCachedThumbnail (Fn [String Js] Bool))
+(defn hasCachedThumbnail [filePath mtime]
+  (let [names (cachedThumbnails CACHE_DIR)]
+    (names.has (getCacheKey filePath mtime))))
+
+(ann cachePathExists (Fn [String] Bool))
+(defn cachePathExists [cachePath]
+  (let [names (cachedThumbnails (path.dirname cachePath))]
+    (names.has (path.basename cachePath))))
+
+(ann markCachePathExists (Fn [String] Js))
+(defn markCachePathExists [cachePath]
+  (let [names (cachedThumbnails (path.dirname cachePath))]
+    (names.add (path.basename cachePath))))
+
+(ann thumbnailTempPath (Fn [String] String))
+(defn thumbnailTempPath [cachePath]
+  (let [randomValue (jsMath.random)
+        randomText (randomValue.toString 36)
+        randomId (string-slice randomText 2 (count randomText))
+        id (str (hostPid) "-" (jsDate.now) "-" randomId)]
+    (str cachePath "." id ".tmp.jpg")))
+
+(ann runProcess (Fn [String Js Js] Js))
+(defn runProcess [command args options]
+  (if (signalAborted? options.signal)
+      (promiseReject (abortError))
+      (new jsPromise
+           (fn [resolve reject]
+             (let [child (spawnProcess command args {:windowsHide true})
+                   stdoutChunks (unsafe-cast Js [])
+                   stderrChunks (unsafe-cast Js [])
+                   timeoutBox (unsafe-cast Js [nil])
+                   onAbortBox (unsafe-cast Js [nil])
+                   settledBox (unsafe-cast Js [false])
+                   finish (fn [error result]
+                            (if (boxGet settledBox)
+                                nil
+                                (do
+                                  (boxSet settledBox true)
+                                  (jsClearTimeout (boxGet timeoutBox))
+                                  (if (some? options.signal)
+                                      (options.signal.removeEventListener
+                                       "abort"
+                                       (boxGet onAbortBox))
+                                      nil)
+                                  (if (some? error)
+                                      (reject error)
+                                      (resolve (if (some? result)
+                                                   result
+                                                   {:stdout (stdoutChunks.join "")}))))))
+                   onAbort (fn []
+                             (do
+                               (child.kill)
+                               (finish (abortError) jsUndefined)))
+                   timeout (jsSetTimeout
+                            (fn []
+                              (do
+                                (child.kill)
+                                (finish (makeError (str command " timed out")) jsUndefined)))
+	                            options.timeoutMs)]
+	               (do
+                 (boxSet onAbortBox onAbort)
+                 (boxSet timeoutBox timeout)
+	                 (if (some? child.stdout)
+	                     (child.stdout.on "data" (fn [chunk] (stdoutChunks.push (str chunk))))
+                     nil)
+                 (if (some? child.stderr)
+                     (child.stderr.on "data" (fn [chunk] (stderrChunks.push (str chunk))))
+                     nil)
+                 (child.on "error" finish)
+                 (child.on
+                  "close"
+                  (fn [code]
+                    (if (boxGet settledBox)
+                        nil
+                        (if (= code 0)
+                            (finish nil {:stdout (stdoutChunks.join "")})
+                            (finish (makeError
+                                     (str command
+                                          " exited with code "
+                                          code
+                                          ": "
+                                          (trim (stderrChunks.join ""))))
+                                    jsUndefined)))))
+                 (if (some? options.signal)
+                     (options.signal.addEventListener "abort" onAbort {:once true})
+                     nil)))))))
+
+(ann checkFFmpeg (Fn [Js] Js))
+(defn checkFFmpeg [signal]
+  (let [cached (boxGet ffmpegAvailableBox)]
+    (if (some? cached)
+        (promiseResolve cached)
+        (let [checked (runProcess "ffmpeg" ["-version"] {:timeoutMs 5000 :signal signal})
+              available (checked.then
+                         (fn [_]
+                           (do
+                             (boxSet ffmpegAvailableBox true)
+                             true)))]
+          (available.catch
+           (fn [error]
+             (if (isThumbnailAbortError error)
+                 (promiseReject error)
+                 (do
+                   (boxSet ffmpegAvailableBox false)
+                   false))))))))
+
+(ann getVideoDuration (Fn [String Js] Js))
+(defn getVideoDuration [videoPath signal]
+  (let [probed (runProcess
+                "ffprobe"
+                ["-v"
+                 "error"
+                 "-show_entries"
+                 "format=duration"
+                 "-of"
+                 "default=noprint_wrappers=1:nokey=1"
+                 videoPath]
+                {:timeoutMs 5000 :signal signal})
+        parsed (probed.then
+                (fn [result]
+                  (let [duration (jsParseFloat (trim result.stdout))]
+                    (if (jsNumber.isNaN duration) 0 duration))))]
+    (parsed.catch
+     (fn [error]
+       (if (isThumbnailAbortError error)
+           (promiseReject error)
+           0)))))
+
+(ann generateVideoThumbnail (Fn [String String Js] Js))
+(defn generateVideoThumbnail [videoPath outputPath signal]
+  (let [availablePromise (checkFFmpeg signal)]
+    (availablePromise.then
+     (fn [hasFfmpeg]
+       (if (not hasFfmpeg)
+           (promiseReject (makeError "ffmpeg not available"))
+           (let [durationPromise (getVideoDuration videoPath signal)]
+             (durationPromise.then
+              (fn [duration]
+                (let [startTime (if (> duration 0) (min (* duration 0.05) 3.0) 3.0)]
+                  (runProcess
+                   "ffmpeg"
+                   ["-ss"
+                    (str startTime)
+                    "-i"
+                    videoPath
+                    "-vf"
+                    "thumbnail=n=100,scale='min(300,iw)':-1"
+                    "-frames:v"
+                    "1"
+                    outputPath
+                    "-y"]
+                   {:timeoutMs 15000 :signal signal}))))))))))
+
+(ann unlinkTempThenAbort (Fn [String] Js))
+(defn unlinkTempThenAbort [outputPath]
+  (let [unlinkPromise (unlinkPath outputPath)
+        removed (unlinkPromise.catch (fn [_error] jsUndefined))]
+    (removed.then (fn [_] (promiseReject (abortError))))))
+
+(ann generateImageThumbnail (Fn [String String Js] Js))
+(defn generateImageThumbnail [imagePath outputPath signal]
+  (if (signalAborted? signal)
+      (promiseReject (abortError))
+      (let [reader (sharp imagePath {:pages 1 :animated false :failOn "none"})
+            rotated (reader.rotate)
+            resized (rotated.resize {:width 300 :withoutEnlargement true})
+            jpeg (resized.jpeg {:quality 82})
+            written (jpeg.toFile outputPath)]
+        (written.then
+         (fn [_]
+           (if (signalAborted? signal)
+               (unlinkTempThenAbort outputPath)
+               jsUndefined))))))
+
+(ann extensionOfPath (Fn [String] String))
+(defn extensionOfPath [filePath]
+  (let [ext (path.extname filePath)]
+    (lower-case (string-slice ext 1 (count ext)))))
+
+(ann generateThumbnail (Fn [String String Js] Js))
+(defn generateThumbnail [filePath outputPath signal]
+  (let [mediaType (getMediaType (extensionOfPath filePath))]
+    (if (= mediaType MediaType.IMAGE)
+        (generateImageThumbnail filePath outputPath signal)
+        (if (= mediaType MediaType.VIDEO)
+            (generateVideoThumbnail filePath outputPath signal)
+            (promiseReject (makeError "Unsupported thumbnail media type"))))))
+
+(ann makeQueueJob (Fn [String String] Js))
+(defn makeQueueJob [filePath cachePath]
+  {:filePath filePath
+   :cachePath cachePath
+   :tempPath (thumbnailTempPath cachePath)
+   :waiters (unsafe-cast Js [])
+   :controller (new (js-global AbortController))
+   :started (unsafe-cast Js [false])})
+
+(ann queueJobFor (Fn [Js String String] Js))
+(defn queueJobFor [state filePath cachePath]
+  (let [existing (state.jobs.get cachePath)]
+    (if (some? existing)
+        existing
+        (let [job (makeQueueJob filePath cachePath)]
+          (do
+            (state.jobs.set cachePath job)
+            (state.pending.push job)
+            job)))))
+
+(ann removeWaiter (Fn [Js Js Js Js] Js))
+(defn removeWaiter [state job waiter error]
+  (let [index (job.waiters.indexOf waiter)]
+    (if (= index -1)
+        nil
+        (do
+          (job.waiters.splice index 1)
+          (if (and (some? waiter.abortListener) (some? waiter.signal))
+              (waiter.signal.removeEventListener "abort" waiter.abortListener)
+              nil)
+          (if (some? error) (waiter.reject error) nil)
+          (if (> (count job.waiters) 0)
+              nil
+              (if (boxGet job.started)
+                  (job.controller.abort)
+                  (let [pendingIndex (state.pending.indexOf job)]
+                    (do
+                      (if (not (= pendingIndex -1))
+                          (state.pending.splice pendingIndex 1)
+                          nil)
+                      (state.jobs.delete job.cachePath)))))))))
+
+(ann settleWaiter (Fn [Js Js] Js))
+(defn settleWaiter [waiter error]
+  (do
+    (if (and (some? waiter.abortListener) (some? waiter.signal))
+        (waiter.signal.removeEventListener "abort" waiter.abortListener)
+        nil)
+    (if (some? error)
+        (waiter.reject error)
+        (waiter.resolve))))
+
+(ann settleJob (Fn [Js Js] Js))
+(defn settleJob [job error]
+  (do
+    (map job.waiters (fn [waiter] (settleWaiter waiter error)))
+    (job.waiters.splice 0 (count job.waiters))))
+
+(ann nextPendingJob (Fn [Js] Js))
+(defn nextPendingJob [state]
+  (if (= (count state.pending) 0)
+      nil
+      (let [job (state.pending.shift)]
+        (if (= (count job.waiters) 0)
+            (nextPendingJob state)
+            job))))
+
+(ann generateJobFile (Fn [Js Js] Js))
+(defn generateJobFile [state job]
+  (let [generated (state.generate job.filePath job.tempPath job.controller.signal)]
+    (generated.then
+     (fn [_]
+       (if job.controller.signal.aborted
+           (promiseReject (abortError))
+          (let [renamed (renamePath job.tempPath job.cachePath)]
+             (renamed.then
+              (fn [_]
+                (do
+                  (markCachePathExists job.cachePath)
+                  jsUndefined)))))))))
+
+(ann workJob (Fn [Js Js] Js))
+(defn workJob [state job]
+  (if (cachePathExists job.cachePath)
+      (promiseResolve jsUndefined)
+      (generateJobFile state job)))
+
+(ann runJob (Fn [Js Js] Js))
+(defn runJob [state job]
+  (do
+    (boxSet state.activeJob job)
+    (boxSet job.started true)
+    (let [worked (workJob state job)
+          settled (worked.then
+                   (fn [_] (settleJob job nil)))
+          handled (settled.catch
+                   (fn [error] (settleJob job error)))]
+      (handled.finally
+       (fn []
+        (let [unlinkPromise (unlinkPath job.tempPath)
+              removed (unlinkPromise.catch (fn [_error] jsUndefined))]
+           (removed.then
+            (fn [_]
+              (do
+                (state.jobs.delete job.cachePath)
+                (boxSet state.activeJob nil)
+                (let [nextJob (nextPendingJob state)]
+                  (if (some? nextJob)
+                      (runJob state nextJob)
+                      nil)))))))))))
+
+(ann drainQueue (Fn [Js] Js))
+(defn drainQueue [state]
+  (if (some? (boxGet state.activeJob))
+      nil
+      (let [nextJob (nextPendingJob state)]
+        (if (some? nextJob)
+            (runJob state nextJob)
+            nil))))
+
+(ann queueGetOrGenerate (Fn [Js String String Js] Js))
+(defn queueGetOrGenerate [state filePath cachePath signal]
+  (if (cachePathExists cachePath)
+      (promiseResolve jsUndefined)
+      (if (signalAborted? signal)
+          (promiseReject (abortError))
+          (let [job (queueJobFor state filePath cachePath)
+                promise (new jsPromise
+                             (fn [resolve reject]
+                               (let [waiterBox (unsafe-cast Js [nil])
+                                     abortListener (fn []
+                                                     (removeWaiter
+                                                      state
+                                                      job
+                                                      (boxGet waiterBox)
+                                                      (abortError)))
+                                     waiter {:resolve resolve
+                                             :reject reject
+                                             :signal signal
+                                             :abortListener abortListener}]
+                                 (do
+                                   (boxSet waiterBox waiter)
+                                   (if (some? signal)
+                                       (signal.addEventListener "abort" abortListener {:once true})
+                                       nil)
+                                   (job.waiters.push waiter)))))]
+            (do
+              (drainQueue state)
+              promise)))))
+
+(ann makeThumbnailGenerationQueue (Fn [Js] Js))
+(defn makeThumbnailGenerationQueue [generate]
+  (let [state {:activeJob (unsafe-cast Js [nil])
+               :jobs (new (js-global Map))
+               :pending (unsafe-cast Js [])
+               :generate (if (some? generate) generate generateThumbnail)}]
+    {:getOrGenerate (fn [filePath cachePath signal]
+                      (queueGetOrGenerate state filePath cachePath signal))}))
+
+(ann ThumbnailGenerationQueue (Fn [Js] Js))
+(defn ThumbnailGenerationQueue [generate]
+  (makeThumbnailGenerationQueue generate))
+
+(def thumbnailGenerationQueue (ThumbnailGenerationQueue nil))
+
+(ann readThumbnail (Fn [String Js Js] Js))
+(defn readThumbnail [filePath mtime signal]
+  (let [ensured (ensureCacheDir)]
+    (ensured.then
+     (fn [_]
+       (let [cachePath (path.join CACHE_DIR (getCacheKey filePath mtime))
+             ready (if (cachePathExists cachePath)
+                       (promiseResolve jsUndefined)
+                       (thumbnailGenerationQueue.getOrGenerate filePath cachePath signal))]
+         (ready.then
+          (fn [_]
+            (if (signalAborted? signal)
+                (promiseReject (abortError))
+                (readFileBytes cachePath)))))))))
+
+(def PLACEHOLDER_PNG
+  (Buffer.from
+   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+   "base64"))
+
+(ann sendPlaceholder (Fn [Js String] Js))
+(defn sendPlaceholder [reply maxAge]
+  (sendRawResponse reply
+                   200
+                   {"Content-Type" "image/png"
+                    "Content-Length" PLACEHOLDER_PNG.length
+                    "Cache-Control" maxAge}
+                   PLACEHOLDER_PNG))
+
+(ann sendThumbnailData (Fn [Js Js] Js))
+(defn sendThumbnailData [reply data]
+  (sendRawResponse reply
+                   200
+                   {"Content-Type" "image/jpeg"
+                    "Content-Length" data.length
+                    "Cache-Control" "public, max-age=31536000"}
+                   data))

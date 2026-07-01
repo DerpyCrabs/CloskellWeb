@@ -1,0 +1,214 @@
+(import "path" [(default path)])
+(import "../../fs-tasks.clsk" [readDirWithFileTypes readFileUtf8 statPath])
+(import "../../http-routes.clsk" [HttpRoute registerHttpRoutes])
+(import "../../../lib/knowledge-base.clsk" [getKnowledgeBases getKnowledgeBaseRootForPath])
+(import "../../../lib/file-system.clsk" [resolveMediaPath
+                                      shouldExcludeFolder
+                                      toLogicalMediaPath])
+
+(def TEXT_EXTENSIONS [".md" ".txt"])
+(def SNIPPET_MAX 220)
+(def RECENT_LIMIT 10)
+(def SEARCH_RESULT_LIMIT 50)
+(def jsPromise (js-global Promise))
+
+(ann normalizeSlashes (Fn [String] String))
+(defn normalizeSlashes [value]
+  (join (split value "\\") "/"))
+
+(ann codeSend (Fn [Js Number Js] Js))
+(defn codeSend [reply code payload]
+  (let [codedReply (reply.code code)]
+    (codedReply.send payload)))
+
+(ann queryString (Fn [Js String] String))
+(defn queryString [query name]
+  (let [value (object-get query name)]
+    (if (string? value) value "")))
+
+(ann textFile? (Fn [String] Bool))
+(defn textFile? [name]
+  (includes? TEXT_EXTENSIONS (lower-case (path.extname name))))
+
+(ann walkTextFiles (Fn [String Js Js] Js))
+(defn walkTextFiles [dirPath root results]
+  (let [walkRoot {:path root.path :currentDir dirPath :base root}
+        entriesPromise (readDirWithFileTypes dirPath)]
+    (entriesPromise.then
+     (fn [entries]
+       (jsPromise.all
+        (map entries
+             (fn [entry]
+               (let [fullPath (path.join walkRoot.currentDir entry.name)
+                     relPath (normalizeSlashes (path.relative walkRoot.path fullPath))]
+                 (if (entry.isDirectory)
+                     (if (shouldExcludeFolder entry.name)
+                         nil
+                         (walkTextFiles fullPath walkRoot.base results))
+                     (if (textFile? entry.name)
+                         (results.push {:path (toLogicalMediaPath walkRoot.base relPath)
+                                        :fullPath fullPath})
+                         nil))))))))))
+
+(ann walkMarkdownFiles (Fn [String Js Js] Js))
+(defn walkMarkdownFiles [dirPath root results]
+  (let [walkRoot {:path root.path :currentDir dirPath :base root}
+        entriesPromise (readDirWithFileTypes dirPath)]
+    (entriesPromise.then
+     (fn [entries]
+       (jsPromise.all
+        (map entries
+             (fn [entry]
+               (let [fullPath (path.join walkRoot.currentDir entry.name)
+                     relPath (normalizeSlashes (path.relative walkRoot.path fullPath))]
+                 (if (entry.isDirectory)
+                     (if (shouldExcludeFolder entry.name)
+                         nil
+                         (walkMarkdownFiles fullPath walkRoot.base results))
+                     (if (= (lower-case (path.extname entry.name)) ".md")
+                         (let [statPromise (statPath fullPath)]
+                           (statPromise.then
+                            (fn [stat]
+                              (results.push {:path (toLogicalMediaPath walkRoot.base relPath)
+                                             :mtime stat.mtimeMs}))))
+                         nil))))))))))
+
+(ann matchingLineIndex (Fn [Js String] Number))
+(defn matchingLineIndex [lines lowerQuery]
+  (reduce-indexed lines
+                  -1
+                  (fn [found line index]
+                    (if (>= found 0)
+                        found
+                        (if (includes? (lower-case line) lowerQuery)
+                            index
+                            -1)))))
+
+(ann lineIndexOf (Fn [String String] Number))
+(defn lineIndexOf [line query]
+  (let [lineJs (unsafe-cast Js line)]
+    (lineJs.indexOf query)))
+
+(ann truncateMatchLine (Fn [String String] String))
+(defn truncateMatchLine [matchLine lowerQuery]
+  (if (<= (count matchLine) SNIPPET_MAX)
+      matchLine
+      (let [matchPos (lineIndexOf (lower-case matchLine) lowerQuery)
+            half (floor (/ SNIPPET_MAX 2))
+            maxFrom (- (count matchLine) SNIPPET_MAX)
+            from (max 0 (min (- matchPos half) maxFrom))
+            end (+ from SNIPPET_MAX)
+            sliceText (string-slice matchLine from end)]
+        (str (if (> from 0) "..." "")
+             sliceText
+             (if (< end (count matchLine)) "..." "")))))
+
+(ann extractSnippet (Fn [String String] String))
+(defn extractSnippet [content query]
+  (let [lowerQuery (lower-case (trim query))]
+    (if (= lowerQuery "")
+        ""
+        (let [lines (split content "\n")
+              matchLineIdx (matchingLineIndex lines lowerQuery)]
+          (if (< matchLineIdx 0)
+              ""
+              (let [matchLine (nth lines matchLineIdx)
+                    start (max 0 (- matchLineIdx 1))
+                    end (min (count lines) (+ matchLineIdx 2))
+                    snippet (trim (join (slice lines start end) "\n"))]
+                (if (<= (count snippet) SNIPPET_MAX)
+                    snippet
+                    (truncateMatchLine matchLine lowerQuery))))))))
+
+(ann searchTextFile (Fn [String String Js] Js))
+(defn searchTextFile [lowerQuery rawQuery file]
+  (let [contentPromise (readFileUtf8 file.fullPath)]
+    (contentPromise.then
+     (fn [content]
+       (if (includes? (lower-case content) lowerQuery)
+           {:path (normalizeSlashes file.path)
+            :name (path.basename file.path)
+            :snippet (extractSnippet content (trim rawQuery))}
+           nil)))))
+
+(ann sendSearchResults (Fn [Js String String Js] Js))
+(defn sendSearchResults [reply rawQuery root resolvedRoot]
+  (let [textFiles (unsafe-cast Js [])
+        walked (walkTextFiles resolvedRoot.fullPath resolvedRoot.root textFiles)]
+    (walked.then
+     (fn [_]
+       (let [lowerQuery (lower-case (trim rawQuery))
+             resultPromises (map textFiles
+                                 (fn [file]
+                                   (searchTextFile lowerQuery rawQuery file)))
+             resultsPromise (jsPromise.all resultPromises)]
+         (resultsPromise.then
+          (fn [results]
+            (reply.send
+             {:results (slice (filter results (fn [item] (some? item)))
+                              0
+                              SEARCH_RESULT_LIMIT)}))))))))
+
+(ann handleKbSearch (Fn [Js Js] Js))
+(defn handleKbSearch [request reply]
+  (let [q (queryString request.query "q")
+        root (queryString request.query "root")]
+    (if (or (= (trim q) "") (= root ""))
+        (reply.send {:results []})
+        (let [knowledgeBasesPromise (getKnowledgeBases)]
+          (knowledgeBasesPromise.then
+           (fn [knowledgeBases]
+             (if (not (includes? knowledgeBases (normalizeSlashes root)))
+                 (codeSend reply 400 {:error "Not a knowledge base"})
+                 (sendSearchResults reply
+                                    q
+                                    root
+                                    (resolveMediaPath root)))))))))
+
+(ann modifiedAtIso (Fn [Number] String))
+(defn modifiedAtIso [mtime]
+  (let [date (new (js-global Date) mtime)]
+    (date.toISOString)))
+
+(ann recentFilePayload (Fn [Js] Js))
+(defn recentFilePayload [file]
+  {:path file.path
+   :name (path.basename file.path)
+   :modifiedAt (modifiedAtIso file.mtime)})
+
+(ann sendRecentResults (Fn [Js String Js] Js))
+(defn sendRecentResults [reply root resolvedRoot]
+  (let [files (unsafe-cast Js [])
+        walked (walkMarkdownFiles resolvedRoot.fullPath resolvedRoot.root files)]
+    (walked.then
+     (fn [_]
+       (reply.send
+        {:results (map (slice (sort-by-desc files (fn [file] file.mtime))
+                              0
+                              RECENT_LIMIT)
+                       recentFilePayload)})))))
+
+(ann handleKbRecent (Fn [Js Js] Js))
+(defn handleKbRecent [request reply]
+  (let [root (queryString request.query "root")]
+    (if (= root "")
+        (reply.send {:results []})
+        (let [knowledgeBasesPromise (getKnowledgeBases)]
+          (knowledgeBasesPromise.then
+           (fn [knowledgeBases]
+             (let [normalizedRoot (normalizeSlashes root)]
+               (if (not (some? (getKnowledgeBaseRootForPath normalizedRoot
+                                                             knowledgeBases)))
+                   (codeSend reply 400 {:error "Not within a knowledge base"})
+                   (sendRecentResults reply
+                                      root
+                                      (resolveMediaPath root))))))))))
+
+(ann kbApiRouteDefinitions (Fn [] (Vector HttpRoute)))
+(defn kbApiRouteDefinitions []
+  [{:method "GET" :path "/api/kb/search" :handler handleKbSearch}
+   {:method "GET" :path "/api/kb/recent" :handler handleKbRecent}])
+
+(ann registerKbApiRoutes (Fn [Js] Js))
+(defn registerKbApiRoutes [app]
+  (registerHttpRoutes app (kbApiRouteDefinitions)))

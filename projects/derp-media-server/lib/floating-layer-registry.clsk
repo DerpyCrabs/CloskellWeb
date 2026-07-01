@@ -1,0 +1,177 @@
+(def jsGlobalThis (js-global globalThis))
+(def jsMap (js-global Map))
+(def jsArray (js-global Array))
+
+(type FloatingDismissLayer
+  {:zIndex Number
+   :isInside Js
+   :dismiss Js})
+
+(type FloatingDismissEntry
+  {:id Number
+   :zIndex Number
+   :isInside Js
+   :dismiss Js})
+
+(def entries (new jsMap))
+(def seqBox (unsafe-cast Js [1]))
+(def attachedBox (unsafe-cast Js [false]))
+(def documentPointerDownHandlerBox (unsafe-cast Js [nil]))
+
+(ann boxGet (Fn [Js] Js))
+(defn boxGet [box]
+  (nth box 0))
+
+(ann boxSet (Fn [Js Js] Js))
+(defn boxSet [box value]
+  (box.splice 0 1 value))
+
+(ann nextSeq (Fn [] Number))
+(defn nextSeq []
+  (let [id (boxGet seqBox)]
+    (do
+      (boxSet seqBox (+ id 1))
+      id)))
+
+(ann globalConstructor (Fn [String] Js))
+(defn globalConstructor [name]
+  (object-get jsGlobalThis name))
+
+(ann isInstanceOfConstructor (Fn [Js Js] Bool))
+(defn isInstanceOfConstructor [value ctor]
+  (and (some? value)
+       (some? ctor)
+       (some? ctor.prototype)
+       (ctor.prototype.isPrototypeOf value)))
+
+(ann eventPath (Fn [Js] Js))
+(defn eventPath [event]
+  (jsArray.from (event.composedPath)))
+
+(ann nodeInConnectedRoot (Fn [Js Js] Bool))
+(defn nodeInConnectedRoot [event root]
+  (if (or (not (some? root)) (not root.isConnected))
+      false
+      (let [nodeCtor (globalConstructor "Node")]
+        (reduce (eventPath event)
+                false
+                (fn [found node]
+                  (or found
+                      (and (isInstanceOfConstructor node nodeCtor)
+                           (root.contains node))))))))
+
+(ann connectedSelectorHitForNode (Fn [String Js] Bool))
+(defn connectedSelectorHitForNode [selector node]
+  (let [elementCtor (globalConstructor "Element")]
+    (if (not (isInstanceOfConstructor node elementCtor))
+        false
+        (try
+         (let [hit (node.closest selector)]
+           (and (some? hit) hit.isConnected))
+         (catch _error false)))))
+
+(ann connectedMatchInComposedPath (Fn [Js String] Bool))
+(defn connectedMatchInComposedPath [event selector]
+  (reduce (eventPath event)
+          false
+          (fn [found node]
+            (or found (connectedSelectorHitForNode selector node)))))
+
+(ann extraRootContainsEvent? (Fn [Js Js] Bool))
+(defn extraRootContainsEvent? [event extraRoots]
+  (reduce extraRoots
+          false
+          (fn [found root]
+            (or found (nodeInConnectedRoot event root)))))
+
+(ann floatingPointerInsideSurface (Fn [Js Js Js Js Js] Bool))
+(defn floatingPointerInsideSurface [event surface extraRoots ignoreSelector ignoreActive]
+  (if (or (not (some? surface)) (not surface.isConnected))
+      false
+      (if (nodeInConnectedRoot event surface)
+          true
+          (if (extraRootContainsEvent? event extraRoots)
+              true
+              (let [useIgnore (or (not (some? ignoreActive))
+                                  (not (= (ignoreActive) false)))]
+                (and useIgnore
+                     (some? ignoreSelector)
+                     (not (= ignoreSelector ""))
+                     (connectedMatchInComposedPath event ignoreSelector)))))))
+
+(ann sortTopFirst (Fn [FloatingDismissEntry FloatingDismissEntry] Number))
+(defn sortTopFirst [a b]
+  (let [z (- b.zIndex a.zIndex)]
+    (if (not (= z 0)) z (- b.id a.id))))
+
+(ann sortedEntries (Fn [] Js))
+(defn sortedEntries []
+  (sort-with (jsArray.from (entries.values)) sortTopFirst))
+
+(ann dismissOutsideLayers (Fn [Js Number] Nil))
+(defn dismissOutsideLayers [event remaining]
+  (if (<= remaining 0)
+      nil
+      (let [list (sortedEntries)
+            top (if (> (count list) 0)
+                    (unsafe-cast Js (nth list 0))
+                    nil)]
+        (if (not (some? top))
+            nil
+            (let [current (unsafe-cast FloatingDismissEntry top)]
+            (if (not (entries.has current.id))
+                nil
+                (if (current.isInside event)
+                    nil
+                    (let [id current.id]
+                      (do
+                        (try
+                         (current.dismiss)
+                         (catch _error nil))
+                        (entries.delete id)
+                        (dismissOutsideLayers event (- remaining 1)))))))))))
+
+(ann syncDocumentListener (Fn [] Nil))
+(defn syncDocumentListener []
+  (let [doc jsGlobalThis.document
+        attached (boxGet attachedBox)
+        handler (boxGet documentPointerDownHandlerBox)]
+    (if (or (not (some? doc)) (not (some? handler)))
+        nil
+        (if (and (> entries.size 0) (not attached))
+            (do
+              (doc.addEventListener "pointerdown" handler true)
+              (boxSet attachedBox true)
+              nil)
+            (if (and (= entries.size 0) attached)
+                (do
+                  (doc.removeEventListener "pointerdown" handler true)
+                  (boxSet attachedBox false)
+                  nil)
+                nil)))))
+
+(ann onDocumentPointerDownCapture (Fn [Js] Nil))
+(defn onDocumentPointerDownCapture [event]
+  (do
+    (dismissOutsideLayers event 64)
+    (syncDocumentListener)
+    nil))
+
+(def documentPointerDownHandlerInit
+  (boxSet documentPointerDownHandlerBox onDocumentPointerDownCapture))
+
+(ann registerFloatingDismissLayer (Fn [FloatingDismissLayer] Js))
+(defn registerFloatingDismissLayer [layer]
+  (let [id (nextSeq)
+        row {:id id
+             :zIndex layer.zIndex
+             :isInside layer.isInside
+             :dismiss layer.dismiss}]
+    (do
+      (entries.set id row)
+      (syncDocumentListener)
+      (fn []
+        (do
+          (entries.delete id)
+          (syncDocumentListener)
+          nil)))))

@@ -1,0 +1,65 @@
+(import "../../lib/file-system.clsk" [getFilePath])
+(import "../http-capabilities.clsk" [fileExistsSync
+                                     fileStatsSync
+                                     replyAbortSignal])
+(import "../http-routes.clsk" [HttpRoute registerHttpRoutes])
+(import "../lib/thumbnails.clsk" [isThumbnailAbortError
+                                   readThumbnail
+                                   sendPlaceholder
+                                   sendThumbnailData])
+(import "node:console" [(error as consoleError)])
+
+(ann sendLongPlaceholder (Fn [Js] Js))
+(defn sendLongPlaceholder [reply]
+  (do
+    (sendPlaceholder reply "public, max-age=31536000")
+    reply))
+
+(ann sendShortPlaceholder (Fn [Js] Js))
+(defn sendShortPlaceholder [reply]
+  (do
+    (sendPlaceholder reply "public, max-age=3600")
+    reply))
+
+(ann sendThumbnailOrPlaceholder (Fn [Js Js String Js] Js))
+(defn sendThumbnailOrPlaceholder [request reply fullPath stats]
+  (let [thumbnailPromise (readThumbnail
+                          fullPath
+                          stats.mtime
+                          (replyAbortSignal request reply))
+        sent (thumbnailPromise.then
+              (fn [thumbnailData]
+                (do
+                  (sendThumbnailData reply thumbnailData)
+                  reply)))]
+    (sent.catch
+     (fn [error]
+       (if (isThumbnailAbortError error)
+           reply
+           (do
+             (consoleError "Error generating thumbnail:" error)
+             (sendShortPlaceholder reply)))))))
+
+(ann handleThumbnail (Fn [Js Js] Js))
+(defn handleThumbnail [request reply]
+  (try
+   (let [filePath (object-get request.params "*")
+         fullPath (getFilePath filePath)]
+     (if (not (fileExistsSync fullPath))
+         (sendLongPlaceholder reply)
+         (let [stats (fileStatsSync fullPath)]
+           (if (not (stats.isFile))
+               (sendLongPlaceholder reply)
+               (sendThumbnailOrPlaceholder request reply fullPath stats)))))
+   (catch error
+     (do
+       (consoleError "Error in thumbnail endpoint:" error)
+       (sendShortPlaceholder reply)))))
+
+(ann thumbnailRouteDefinitions (Fn [] (Vector HttpRoute)))
+(defn thumbnailRouteDefinitions []
+  [{:method "GET" :path "/api/thumbnail/*" :handler handleThumbnail}])
+
+(ann registerThumbnailRoutes (Fn [Js] Js))
+(defn registerThumbnailRoutes [app]
+  (registerHttpRoutes app (thumbnailRouteDefinitions)))

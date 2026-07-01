@@ -332,6 +332,21 @@ const BROWSER_COMMAND_SCHEMAS: &[BrowserCommandSchemaBuilder] = &[
     browser_theme_apply_command_schema,
     browser_clipboard_write_command_schema,
     browser_set_cookie_command_schema,
+    browser_history_push_command_schema,
+    browser_history_replace_command_schema,
+    browser_location_assign_command_schema,
+    browser_open_url_command_schema,
+    browser_download_url_command_schema,
+    browser_document_title_command_schema,
+    browser_scroll_to_command_schema,
+    event_source_open_command_schema,
+    event_source_close_command_schema,
+    media_play_selector_command_schema,
+    media_restore_current_time_command_schema,
+    media_sync_audio_element_command_schema,
+    dom_breadcrumb_adaptive_command_schema,
+    dom_focus_selector_command_schema,
+    dom_document_set_attribute_command_schema,
     storage_get_command_schema,
     storage_set_command_schema,
     storage_remove_command_schema,
@@ -340,6 +355,7 @@ const BROWSER_COMMAND_SCHEMAS: &[BrowserCommandSchemaBuilder] = &[
     file_download_command_schema,
     file_import_command_schema,
     file_read_selected_command_schema,
+    file_read_blob_command_schema,
     bluetooth_request_device_command_schema,
     bluetooth_connect_heart_rate_command_schema,
     bluetooth_disconnect_command_schema,
@@ -350,6 +366,7 @@ const BROWSER_COMMAND_SCHEMAS: &[BrowserCommandSchemaBuilder] = &[
     dom_ref_focus_command_schema,
     dom_ref_click_command_schema,
     dom_ref_measure_command_schema,
+    dom_input_set_selection_command_schema,
     dom_scroll_into_view_command_schema,
     dom_ref_resize_watch_command_schema,
     dom_ref_resize_unwatch_command_schema,
@@ -375,6 +392,21 @@ const BROWSER_EFFECT_COMMAND_SCHEMAS: &[BrowserEffectCommandSchemaBuilder] = &[
     browser_theme_apply_effect_schema,
     browser_clipboard_write_effect_schema,
     browser_set_cookie_effect_schema,
+    browser_history_push_effect_schema,
+    browser_history_replace_effect_schema,
+    browser_location_assign_effect_schema,
+    browser_open_url_effect_schema,
+    browser_download_url_effect_schema,
+    browser_document_title_effect_schema,
+    browser_scroll_to_effect_schema,
+    event_source_open_effect_schema,
+    event_source_close_effect_schema,
+    media_play_selector_effect_schema,
+    media_restore_current_time_effect_schema,
+    media_sync_audio_element_effect_schema,
+    dom_breadcrumb_adaptive_effect_schema,
+    dom_focus_selector_effect_schema,
+    dom_document_set_attribute_effect_schema,
     storage_get_effect_schema,
     storage_set_effect_schema,
     storage_remove_effect_schema,
@@ -383,6 +415,7 @@ const BROWSER_EFFECT_COMMAND_SCHEMAS: &[BrowserEffectCommandSchemaBuilder] = &[
     file_download_effect_schema,
     file_import_effect_schema,
     file_read_selected_effect_schema,
+    file_read_blob_effect_schema,
     bluetooth_request_device_effect_schema,
     bluetooth_connect_heart_rate_effect_schema,
     bluetooth_disconnect_effect_schema,
@@ -393,6 +426,7 @@ const BROWSER_EFFECT_COMMAND_SCHEMAS: &[BrowserEffectCommandSchemaBuilder] = &[
     dom_ref_focus_effect_schema,
     dom_ref_click_effect_schema,
     dom_ref_measure_effect_schema,
+    dom_input_set_selection_effect_schema,
     dom_scroll_into_view_effect_schema,
     dom_ref_resize_watch_effect_schema,
     dom_ref_resize_unwatch_effect_schema,
@@ -458,6 +492,21 @@ const BROWSER_COMMAND_KINDS: &[&str] = &[
     "browser/theme-apply",
     "browser/clipboard-write",
     "browser/set-cookie",
+    "browser/history-push",
+    "browser/history-replace",
+    "browser/location-assign",
+    "browser/open-url",
+    "browser/download-url",
+    "browser/document-title",
+    "browser/scroll-to",
+    "event-source/open",
+    "event-source/close",
+    "media/play-selector",
+    "media/restore-current-time",
+    "media/sync-audio-element",
+    "dom/breadcrumb-adaptive",
+    "dom/focus-selector",
+    "dom/document-set-attribute",
     "storage/get",
     "storage/set",
     "storage/remove",
@@ -466,6 +515,7 @@ const BROWSER_COMMAND_KINDS: &[&str] = &[
     "file/download",
     "file/import",
     "file/read-selected",
+    "file/read-blob",
     "bluetooth/request-device",
     "bluetooth/connect-heart-rate",
     "bluetooth/disconnect",
@@ -476,6 +526,7 @@ const BROWSER_COMMAND_KINDS: &[&str] = &[
     "dom-ref/focus",
     "dom-ref/click",
     "dom-ref/measure",
+    "dom/input-set-selection",
     "dom/scroll-into-view",
     "dom-ref/resize-watch",
     "dom-ref/resize-unwatch",
@@ -1927,6 +1978,113 @@ fn browser_set_cookie_command_schema() -> typecheck::CommandSchemaRule {
         .field("value", typecheck::CheckType::String)
 }
 
+fn browser_history_push_command_schema() -> typecheck::CommandSchemaRule {
+    typecheck::CommandSchemaRule::new("browser/history-push")
+        .required_fields(["url"])
+        .field("url", typecheck::CheckType::String)
+}
+
+fn browser_history_replace_command_schema() -> typecheck::CommandSchemaRule {
+    typecheck::CommandSchemaRule::new("browser/history-replace")
+        .required_fields(["url"])
+        .field("url", typecheck::CheckType::String)
+}
+
+fn browser_location_assign_command_schema() -> typecheck::CommandSchemaRule {
+    typecheck::CommandSchemaRule::new("browser/location-assign")
+        .required_fields(["url"])
+        .field("url", typecheck::CheckType::String)
+}
+
+fn browser_open_url_command_schema() -> typecheck::CommandSchemaRule {
+    typecheck::CommandSchemaRule::new("browser/open-url")
+        .required_fields(["url"])
+        .field("url", typecheck::CheckType::String)
+        .field("target", typecheck::CheckType::String)
+}
+
+fn browser_download_url_command_schema() -> typecheck::CommandSchemaRule {
+    typecheck::CommandSchemaRule::new("browser/download-url")
+        .required_fields(["url", "filename"])
+        .field("url", typecheck::CheckType::String)
+        .field("filename", typecheck::CheckType::String)
+        .field("name", typecheck::CheckType::String)
+}
+
+fn browser_document_title_command_schema() -> typecheck::CommandSchemaRule {
+    typecheck::CommandSchemaRule::new("browser/document-title")
+        .required_fields(["title"])
+        .field("title", typecheck::CheckType::String)
+}
+
+fn browser_scroll_to_command_schema() -> typecheck::CommandSchemaRule {
+    typecheck::CommandSchemaRule::new("browser/scroll-to")
+        .required_fields(["x", "y"])
+        .field("x", typecheck::CheckType::Number)
+        .field("y", typecheck::CheckType::Number)
+}
+
+fn event_source_open_command_schema() -> typecheck::CommandSchemaRule {
+    typecheck::CommandSchemaRule::new("event-source/open")
+        .required_fields(["id", "url", "eventType"])
+        .field("id", typecheck::CheckType::String)
+        .field("url", typecheck::CheckType::String)
+        .field("eventType", typecheck::CheckType::String)
+        .field("dispatchEvent", typecheck::CheckType::String)
+        .field("refreshMs", typecheck::CheckType::Number)
+        .field("intervalMs", typecheck::CheckType::Number)
+        .field("logMessage", typecheck::CheckType::String)
+}
+
+fn event_source_close_command_schema() -> typecheck::CommandSchemaRule {
+    typecheck::CommandSchemaRule::new("event-source/close")
+        .required_fields(["id"])
+        .field("id", typecheck::CheckType::String)
+        .field("url", typecheck::CheckType::String)
+}
+
+fn media_play_selector_command_schema() -> typecheck::CommandSchemaRule {
+    typecheck::CommandSchemaRule::new("media/play-selector")
+        .required_fields(["selector"])
+        .field("selector", typecheck::CheckType::String)
+}
+
+fn media_restore_current_time_command_schema() -> typecheck::CommandSchemaRule {
+    typecheck::CommandSchemaRule::new("media/restore-current-time")
+        .required_fields(["selector", "currentTime"])
+        .field("selector", typecheck::CheckType::String)
+        .field("currentTime", typecheck::CheckType::Number)
+}
+
+fn media_sync_audio_element_command_schema() -> typecheck::CommandSchemaRule {
+    typecheck::CommandSchemaRule::new("media/sync-audio-element")
+        .required_fields(["selector", "key", "url", "duration", "play"])
+        .field("selector", typecheck::CheckType::String)
+        .field("key", typecheck::CheckType::String)
+        .field("url", typecheck::CheckType::String)
+        .field("duration", typecheck::CheckType::Number)
+        .field("play", typecheck::CheckType::Bool)
+}
+
+fn dom_document_set_attribute_command_schema() -> typecheck::CommandSchemaRule {
+    typecheck::CommandSchemaRule::new("dom/document-set-attribute")
+        .required_fields(["name", "value"])
+        .field("name", typecheck::CheckType::String)
+        .field("value", typecheck::CheckType::String)
+}
+
+fn dom_breadcrumb_adaptive_command_schema() -> typecheck::CommandSchemaRule {
+    typecheck::CommandSchemaRule::new("dom/breadcrumb-adaptive")
+}
+
+fn dom_focus_selector_command_schema() -> typecheck::CommandSchemaRule {
+    typecheck::CommandSchemaRule::new("dom/focus-selector")
+        .required_fields(["selector", "defer", "whenBody"])
+        .field("selector", typecheck::CheckType::String)
+        .field("defer", typecheck::CheckType::Bool)
+        .field("whenBody", typecheck::CheckType::Bool)
+}
+
 fn storage_get_command_schema() -> typecheck::CommandSchemaRule {
     typecheck::CommandSchemaRule::new("storage/get")
         .required_fields(["key"])
@@ -2003,6 +2161,16 @@ fn file_read_selected_command_schema() -> typecheck::CommandSchemaRule {
         .require_success()
         .success_value_from_payload_format_fields(["format", "parse"])
         .supported_continuations(["onCancel"])
+}
+
+fn file_read_blob_command_schema() -> typecheck::CommandSchemaRule {
+    typecheck::CommandSchemaRule::new("file/read-blob")
+        .required_fields(["blob"])
+        .field("blob", typecheck::CheckType::Js)
+        .field("format", browser_keyword_or_string_check_type())
+        .field("parse", browser_keyword_or_string_check_type())
+        .require_success()
+        .success_value(typecheck::CheckType::String)
 }
 
 fn bluetooth_request_device_command_schema() -> typecheck::CommandSchemaRule {
@@ -2134,6 +2302,14 @@ fn dom_ref_measure_command_schema() -> typecheck::CommandSchemaRule {
         .field("ref", typecheck::CheckType::String)
         .require_success()
         .success_value(browser_dom_ref_measure_payload_check_type())
+}
+
+fn dom_input_set_selection_command_schema() -> typecheck::CommandSchemaRule {
+    typecheck::CommandSchemaRule::new("dom/input-set-selection")
+        .required_fields(["target", "start", "end"])
+        .field("target", typecheck::CheckType::Js)
+        .field("start", typecheck::CheckType::Number)
+        .field("end", typecheck::CheckType::Number)
 }
 
 fn dom_scroll_into_view_command_schema() -> typecheck::CommandSchemaRule {
@@ -2459,6 +2635,75 @@ fn browser_set_cookie_effect_schema() -> effects::EffectCommandSchemaRule {
     effects::EffectCommandSchemaRule::new("browser/set-cookie").required_fields(["name", "value"])
 }
 
+fn browser_history_push_effect_schema() -> effects::EffectCommandSchemaRule {
+    effects::EffectCommandSchemaRule::new("browser/history-push").required_fields(["url"])
+}
+
+fn browser_history_replace_effect_schema() -> effects::EffectCommandSchemaRule {
+    effects::EffectCommandSchemaRule::new("browser/history-replace").required_fields(["url"])
+}
+
+fn browser_location_assign_effect_schema() -> effects::EffectCommandSchemaRule {
+    effects::EffectCommandSchemaRule::new("browser/location-assign").required_fields(["url"])
+}
+
+fn browser_open_url_effect_schema() -> effects::EffectCommandSchemaRule {
+    effects::EffectCommandSchemaRule::new("browser/open-url").required_fields(["url"])
+}
+
+fn browser_download_url_effect_schema() -> effects::EffectCommandSchemaRule {
+    effects::EffectCommandSchemaRule::new("browser/download-url")
+        .required_fields(["url", "filename"])
+}
+
+fn browser_document_title_effect_schema() -> effects::EffectCommandSchemaRule {
+    effects::EffectCommandSchemaRule::new("browser/document-title").required_fields(["title"])
+}
+
+fn browser_scroll_to_effect_schema() -> effects::EffectCommandSchemaRule {
+    effects::EffectCommandSchemaRule::new("browser/scroll-to").required_fields(["x", "y"])
+}
+
+fn event_source_open_effect_schema() -> effects::EffectCommandSchemaRule {
+    effects::EffectCommandSchemaRule::new("event-source/open").required_fields([
+        "id",
+        "url",
+        "eventType",
+    ])
+}
+
+fn event_source_close_effect_schema() -> effects::EffectCommandSchemaRule {
+    effects::EffectCommandSchemaRule::new("event-source/close").required_fields(["id"])
+}
+
+fn media_play_selector_effect_schema() -> effects::EffectCommandSchemaRule {
+    effects::EffectCommandSchemaRule::new("media/play-selector").required_fields(["selector"])
+}
+
+fn media_restore_current_time_effect_schema() -> effects::EffectCommandSchemaRule {
+    effects::EffectCommandSchemaRule::new("media/restore-current-time")
+        .required_fields(["selector", "currentTime"])
+}
+
+fn media_sync_audio_element_effect_schema() -> effects::EffectCommandSchemaRule {
+    effects::EffectCommandSchemaRule::new("media/sync-audio-element")
+        .required_fields(["selector", "key", "url", "duration", "play"])
+}
+
+fn dom_document_set_attribute_effect_schema() -> effects::EffectCommandSchemaRule {
+    effects::EffectCommandSchemaRule::new("dom/document-set-attribute")
+        .required_fields(["name", "value"])
+}
+
+fn dom_breadcrumb_adaptive_effect_schema() -> effects::EffectCommandSchemaRule {
+    effects::EffectCommandSchemaRule::new("dom/breadcrumb-adaptive")
+}
+
+fn dom_focus_selector_effect_schema() -> effects::EffectCommandSchemaRule {
+    effects::EffectCommandSchemaRule::new("dom/focus-selector")
+        .required_fields(["selector", "defer", "whenBody"])
+}
+
 fn storage_get_effect_schema() -> effects::EffectCommandSchemaRule {
     effects::EffectCommandSchemaRule::new("storage/get")
         .required_fields(["key"])
@@ -2499,6 +2744,12 @@ fn file_read_selected_effect_schema() -> effects::EffectCommandSchemaRule {
         .required_fields(["ref"])
         .require_success()
         .supported_continuations(["onCancel"])
+}
+
+fn file_read_blob_effect_schema() -> effects::EffectCommandSchemaRule {
+    effects::EffectCommandSchemaRule::new("file/read-blob")
+        .required_fields(["blob"])
+        .require_success()
 }
 
 fn bluetooth_request_device_effect_schema() -> effects::EffectCommandSchemaRule {
@@ -2555,6 +2806,11 @@ fn dom_ref_measure_effect_schema() -> effects::EffectCommandSchemaRule {
     effects::EffectCommandSchemaRule::new("dom-ref/measure")
         .required_fields(["ref"])
         .require_success()
+}
+
+fn dom_input_set_selection_effect_schema() -> effects::EffectCommandSchemaRule {
+    effects::EffectCommandSchemaRule::new("dom/input-set-selection")
+        .required_fields(["target", "start", "end"])
 }
 
 fn dom_scroll_into_view_effect_schema() -> effects::EffectCommandSchemaRule {
@@ -3377,6 +3633,9 @@ fn window_event_field_expr(field: &str) -> Option<&'static str> {
         "ctrlKey" => Some("!!event.ctrlKey"),
         "metaKey" => Some("!!event.metaKey"),
         "shiftKey" => Some("!!event.shiftKey"),
+        "targetEditable" => Some(
+            "(() => { const el = event.target; const tag = String(el?.tagName || \"\").toLowerCase(); const fileBrowser = el?.getAttribute?.(\"data-testid\") === \"file-browser\"; return tag === \"input\" || tag === \"textarea\" || tag === \"select\" || (!!el?.isContentEditable && !fileBrowser); })()",
+        ),
         _ => None,
     }
 }
@@ -3887,6 +4146,20 @@ const APP_RUNTIME_REGISTRATIONS: &[AppRuntimeRegistration] = &[
             "browser/theme-apply",
             "browser/clipboard-write",
             "browser/set-cookie",
+            "browser/history-push",
+            "browser/history-replace",
+            "browser/location-assign",
+            "browser/open-url",
+            "browser/download-url",
+            "browser/scroll-to",
+            "event-source/open",
+            "event-source/close",
+            "media/play-selector",
+            "media/restore-current-time",
+            "media/sync-audio-element",
+            "dom/breadcrumb-adaptive",
+            "dom/focus-selector",
+            "dom/document-set-attribute",
         ],
     },
     AppRuntimeRegistration {
@@ -3899,7 +4172,12 @@ const APP_RUNTIME_REGISTRATIONS: &[AppRuntimeRegistration] = &[
     },
     AppRuntimeRegistration {
         import_name: "registerCompiledDomRefCommandHandlers",
-        kinds: &["dom-ref/focus", "dom-ref/click", "dom-ref/measure"],
+        kinds: &[
+            "dom-ref/focus",
+            "dom-ref/click",
+            "dom-ref/measure",
+            "dom/input-set-selection",
+        ],
     },
     AppRuntimeRegistration {
         import_name: "registerCompiledDomResizeCommandHandlers",
@@ -3927,7 +4205,7 @@ const APP_RUNTIME_REGISTRATIONS: &[AppRuntimeRegistration] = &[
     },
     AppRuntimeRegistration {
         import_name: "registerCompiledFileReadSelectedCommandHandlers",
-        kinds: &["file/read-selected"],
+        kinds: &["file/read-selected", "file/read-blob"],
     },
     AppRuntimeRegistration {
         import_name: "registerHttpCommandHandlers",

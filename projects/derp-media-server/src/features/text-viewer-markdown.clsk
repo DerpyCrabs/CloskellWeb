@@ -1,0 +1,112 @@
+(import "markdown-it" [(default MarkdownIt)])
+
+(def jsObject (js-global Object))
+
+(def imageFileExtensions ["png" "jpg" "jpeg" "gif" "webp" "svg" "bmp" "ico" "tif" "tiff" "avif"])
+
+(ann markdownImageFileName? (Fn [String] Bool))
+(defn markdownImageFileName? [fileName]
+  (let [parts (split fileName ".")]
+    (if (<= (count parts) 1)
+        false
+        (includes? imageFileExtensions (lower-case (last parts))))))
+
+(ann obsidianImageAlt (Fn [String String Bool] String))
+(defn obsidianImageAlt [inner fileName hasPipe]
+  (if hasPipe
+      (let [pipeParts (split inner "|")
+            rawAlt (trim (join (slice pipeParts 1 (count pipeParts)) "|"))]
+        (if (= rawAlt "") fileName rawAlt))
+      fileName))
+
+(ann rewriteObsidianImageInner (Fn [String] String))
+(defn rewriteObsidianImageInner [inner]
+  (let [pipeParts (split inner "|")
+        hasPipe (> (count pipeParts) 1)
+        fileName (trim (nth pipeParts 0))]
+    (if (not (markdownImageFileName? fileName))
+        (str "![[" inner "]]")
+        (str "![" (obsidianImageAlt inner fileName hasPipe) "](<" fileName ">)"))))
+
+(ann rewriteObsidianImageSegment (Fn [String] String))
+(defn rewriteObsidianImageSegment [segment]
+  (let [pieces (split segment "]]")]
+    (if (<= (count pieces) 1)
+        (str "![[" segment)
+        (let [inner (nth pieces 0)
+              tail (join (slice pieces 1 (count pieces)) "]]")]
+          (str (rewriteObsidianImageInner inner) tail)))))
+
+(ann preprocessObsidianImages (Fn [String] String))
+(defn preprocessObsidianImages [content]
+  (let [parts (split content "![[" )]
+    (if (<= (count parts) 1)
+        content
+        (reduce (slice parts 1 (count parts))
+                (nth parts 0)
+                (fn [out segment]
+                  (str out (rewriteObsidianImageSegment segment)))))))
+
+(ann stripAngleSrc (Fn [String] String))
+(defn stripAngleSrc [src]
+  (let [value (trim src)
+        len (count value)]
+    (if (and (>= len 2)
+             (= (string-slice value 0 1) "<")
+             (= (string-slice value (- len 1) len) ">"))
+        (trim (string-slice value 1 (- len 1)))
+        value)))
+
+(ann defaultRenderToken (Fn [Js Number Js Js Js] String))
+(defn defaultRenderToken [tokens idx options _env self]
+  (self.renderToken tokens idx options))
+
+(ann markdownImageRenderer (Fn [Js Js] Js))
+(defn markdownImageRenderer [resolveImageUrl defaultImageRender]
+  (fn [tokens idx options env self]
+    (let [token (nth tokens idx)
+          raw (token.attrGet "src")]
+      (if (not (some? raw))
+          ""
+          (let [stripped (stripAngleSrc raw)
+                firstResolved (resolveImageUrl stripped)
+                resolved (if (some? firstResolved) firstResolved (resolveImageUrl raw))]
+            (if (not (some? resolved))
+                ""
+                (do
+                  (token.attrSet "src" resolved)
+                  (defaultImageRender tokens idx options env self))))))))
+
+(ann markdownLinkOpenRenderer (Fn [Js] Js))
+(defn markdownLinkOpenRenderer [defaultLinkOpen]
+  (fn [tokens idx options env self]
+    (let [token (nth tokens idx)
+          href (token.attrGet "href")]
+      (do
+        (if (and (string? href)
+                 (or (starts-with? href "http://") (starts-with? href "https://")))
+            (do
+              (token.attrSet "target" "_blank")
+              (token.attrSet "rel" "noopener noreferrer")
+              nil)
+            nil)
+        (defaultLinkOpen tokens idx options env self)))))
+
+(ann createMarkdownRenderer (Fn [Js] Js))
+(defn createMarkdownRenderer [resolveImageUrl]
+  (let [md (new MarkdownIt {:html false :linkify true})
+        rules md.renderer.rules
+        imageRule (object-get rules "image")
+        defaultImageRender (if (some? imageRule) imageRule defaultRenderToken)
+        linkRule (object-get rules "link_open")
+        defaultLinkOpen (if (some? linkRule) linkRule defaultRenderToken)]
+    (do
+      (jsObject.defineProperty rules "image"
+                               {:value (markdownImageRenderer resolveImageUrl defaultImageRender)
+                                :configurable true
+                                :writable true})
+      (jsObject.defineProperty rules "link_open"
+                               {:value (markdownLinkOpenRenderer defaultLinkOpen)
+                                :configurable true
+                                :writable true})
+      md)))

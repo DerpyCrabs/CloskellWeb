@@ -1,0 +1,57 @@
+(def fileDragMime "application/x-derp-file-drag")
+
+(type FileDragData
+  {:path String
+   :isDirectory Bool
+   :sourceKind String
+   :sourceToken (Option String)})
+
+(type FileDragTarget
+  {:sourceKind String
+   :sourceToken (Option String)})
+
+(ann fileDragPayloadText (Fn [Js] String))
+(defn fileDragPayloadText [data]
+  (json-stringify data))
+
+(ann validFileDragData? (Fn [Js] Bool))
+(defn validFileDragData? [value]
+  (and (object? value)
+       (string? (get value :path))
+       (bool? (get value :isDirectory))))
+
+(ann parseFileDragData (Fn [String] (Option FileDragData)))
+(defn parseFileDragData [raw]
+  (let [result (json-parse-result raw)
+        parsed (unwrap-or result nil)]
+    (if (and (ok? result) (validFileDragData? parsed))
+        (unsafe-cast FileDragData parsed)
+        nil)))
+
+(ann setFileDragData (Fn [Js FileDragData] Js))
+(defn setFileDragData [dt data]
+  (let [_ (dt.setData fileDragMime (fileDragPayloadText data))
+        _ (dt.setData "text/plain" data.path)]
+    nil))
+
+(ann getFileDragData (Fn [Js] (Option FileDragData)))
+(defn getFileDragData [dt]
+  (let [raw (dt.getData fileDragMime)]
+    (if (not (string? raw))
+        nil
+        (if (= raw "")
+            nil
+            (parseFileDragData raw)))))
+
+(ann hasFileDragData (Fn [Js] Bool))
+(defn hasFileDragData [dt]
+  (includes? dt.types fileDragMime))
+
+(ann isCompatibleSource (Fn [FileDragTarget FileDragData] Bool))
+(defn isCompatibleSource [target dragged]
+  (if (not (= target.sourceKind dragged.sourceKind))
+      false
+      (if (and (= dragged.sourceKind "share")
+               (not (= target.sourceToken dragged.sourceToken)))
+          false
+          true)))

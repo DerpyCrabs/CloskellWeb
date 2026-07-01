@@ -1,0 +1,387 @@
+(import "path" [(default path)])
+(import "crypto" [randomBytes
+                  createHmac
+                  timingSafeEqual
+                  createCipheriv
+                  createDecipheriv
+                  scryptSync])
+(import "node:buffer" [Buffer])
+(import "./config.clsk" [config getDataFilePath])
+(import "./file-system.clsk" [resolveMediaPath])
+(import "../server/fs-tasks.clsk" [readFileUtf8 statPath writeFileUtf8])
+(import "../src/features/media-utils.clsk" [getMediaType])
+(import "./types.clsk" [MediaType])
+(import "./mutex.clsk" [Mutex])
+(import "../src/features/share-path.clsk" [(resolveShareSubPath as closkellResolveShareSubPath)])
+(import "../src/features/share-restrictions.clsk" [(checkUploadQuota as closkellCheckUploadQuota)
+                                                   (getEffectiveRestrictions as closkellGetEffectiveRestrictions)])
+
+(def SHARES_FILE (getDataFilePath "shares.json"))
+(def SHARE_SESSION_MAX_AGE (* 60 60 24 7))
+(def sharesMutex (new Mutex))
+(def ENCRYPTION_SALT "derp-media-server-passcode-v1")
+(def encKeyCache (new (js-global Map)))
+(def jsPromise (js-global Promise))
+(def jsMath (js-global Math))
+(def jsDate (js-global Date))
+(def jsProcess (js-global process))
+
+(ann getEffectiveRestrictions (Fn [Js] Js))
+(defn getEffectiveRestrictions [share]
+  (closkellGetEffectiveRestrictions share))
+
+(ann checkUploadQuota (Fn [Js Number] Js))
+(defn checkUploadQuota [share contentSizeBytes]
+  (closkellCheckUploadQuota share contentSizeBytes))
+
+(ann getEncryptionKey (Fn [] Js))
+(defn getEncryptionKey []
+  (let [cached (encKeyCache.get "value")]
+    (if (some? cached)
+        cached
+        (let [password (if (string? config.auth.password)
+                           config.auth.password
+                           "derp-media-server-default")
+              key (scryptSync password ENCRYPTION_SALT 32)]
+          (do
+            (encKeyCache.set "value" key)
+            key)))))
+
+(ann encryptPasscode (Fn [String] String))
+(defn encryptPasscode [passcode]
+  (let [key (getEncryptionKey)
+        iv (randomBytes 12)
+        cipher (createCipheriv "aes-256-gcm" key iv)
+        encrypted (Buffer.concat [(cipher.update passcode "utf8") (cipher.final)])
+        authTag (cipher.getAuthTag)
+        combined (Buffer.concat [iv authTag encrypted])]
+    (combined.toString "base64url")))
+
+(ann decryptPasscode (Fn [String] Js))
+(defn decryptPasscode [encrypted]
+  (try
+   (let [key (getEncryptionKey)
+         data (Buffer.from encrypted "base64url")]
+     (if (< data.length 28)
+         nil
+         (let [iv (data.subarray 0 12)
+               authTag (data.subarray 12 28)
+               ciphertext (data.subarray 28)
+               decipher (createDecipheriv "aes-256-gcm" key iv)]
+           (do
+             (decipher.setAuthTag authTag)
+             (let [updated (decipher.update ciphertext)]
+               (str (updated.toString "utf8")
+                    (decipher.final "utf8")))))))
+   (catch _error nil)))
+
+(ann generateToken (Fn [] String))
+(defn generateToken []
+  (let [bytes (randomBytes 16)]
+    (bytes.toString "base64url")))
+
+(def PASSCODE_CHARS "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789")
+
+(ann passcodeChar (Fn [Js Number] String))
+(defn passcodeChar [bytes index]
+  (let [charIndex (mod (nth bytes index) (count PASSCODE_CHARS))]
+    (string-slice PASSCODE_CHARS charIndex (+ charIndex 1))))
+
+(ann generatePasscode (Fn [] String))
+(defn generatePasscode []
+  (let [bytes (randomBytes 6)]
+    (join (map (range 0 6) (fn [index] (passcodeChar bytes index))) "")))
+
+(ann readSharesFile (Fn [] Js))
+(defn readSharesFile []
+  (let [readPromise (readFileUtf8 SHARES_FILE)
+        parsed (readPromise.then (fn [raw] (json-parse raw)))]
+    (parsed.catch (fn [_error] {}))))
+
+(ann writeSharesFile (Fn [Js] Js))
+(defn writeSharesFile [allShares]
+  (writeFileUtf8 SHARES_FILE (json-stringify allShares 2)))
+
+(ann readSharesRaw (Fn [] Js))
+(defn readSharesRaw []
+  (let [allPromise (readSharesFile)]
+    (allPromise.then
+     (fn [all]
+       (let [data (object-get all config.libraryKey)]
+         (if (object? data) data {:shares []}))))))
+
+(ann writeSharesData (Fn [Js] Js))
+(defn writeSharesData [data]
+  (let [allPromise (readSharesFile)]
+    (allPromise.then
+     (fn [all]
+       (let [nextAll (object-assoc all config.libraryKey data)]
+         (writeSharesFile nextAll))))))
+
+(ann decryptSharePasscode (Fn [Js] Js))
+(defn decryptSharePasscode [share]
+  (if (string? share.passcode)
+      (let [plain (decryptPasscode share.passcode)]
+        (if (string? plain)
+            (object-assoc share "passcode" plain)
+            share))
+      share))
+
+(ann withSharesLock (Fn [Js] Js))
+(defn withSharesLock [work]
+  (let [releasePromise (sharesMutex.acquire)]
+    (releasePromise.then
+     (fn [release]
+       (let [resultPromise (work)]
+         (resultPromise.finally release))))))
+
+(ann createShare (Fn [String Bool Bool Js] Js))
+(defn createShare [sharePath isDirectory editable restrictions]
+  (withSharesLock
+   (fn []
+     (let [dataPromise (readSharesRaw)]
+       (dataPromise.then
+        (fn [data]
+          (let [plainPasscode (if (= config.auth.enabled true) (generatePasscode) nil)
+                encryptedPasscode (if (string? plainPasscode)
+                                      (encryptPasscode plainPasscode)
+                                      nil)
+                base {:token (generateToken)
+                      :path sharePath
+                      :isDirectory isDirectory
+                      :editable editable
+                      :passcode encryptedPasscode
+                      :createdAt (jsDate.now)}
+                share (if (and editable (object? restrictions))
+                          (object-assoc base "restrictions" restrictions)
+                          base)]
+            (let [shares (unsafe-cast Js data.shares)]
+              (do
+                (shares.push share)
+                (let [writePromise (writeSharesData data)]
+                  (writePromise.then
+                   (fn [_]
+                     (if (string? plainPasscode)
+                         (object-assoc share "passcode" plainPasscode)
+                         share)))))))))))))
+
+(ann updateShare (Fn [String Js] Js))
+(defn updateShare [token updates]
+  (withSharesLock
+   (fn []
+     (let [dataPromise (readSharesRaw)]
+       (dataPromise.then
+        (fn [data]
+          (let [shares (unsafe-cast Js data.shares)
+                index (shares.findIndex (fn [share] (= share.token token)))]
+            (if (= index -1)
+                nil
+                (let [current (nth shares index)
+                      withRestrictions (if (contains? updates "restrictions")
+                                           (object-assoc current "restrictions" updates.restrictions)
+                                           current)
+                      nextShare (if (contains? updates "editable")
+                                    (object-assoc withRestrictions "editable" updates.editable)
+                                    withRestrictions)]
+                  (do
+                    (shares.splice index 1 nextShare)
+                    (let [writePromise (writeSharesData data)]
+                      (writePromise.then
+                       (fn [_] (decryptSharePasscode nextShare))))))))))))))
+
+(ann updateShareWorkspaceTaskbarPins (Fn [String Js] Js))
+(defn updateShareWorkspaceTaskbarPins [token pins]
+  (withSharesLock
+   (fn []
+     (let [dataPromise (readSharesRaw)]
+       (dataPromise.then
+        (fn [data]
+          (let [shares (unsafe-cast Js data.shares)
+                index (shares.findIndex (fn [share] (= share.token token)))]
+            (if (= index -1)
+                false
+                (let [nextShare (object-assoc (nth shares index) "workspaceTaskbarPins" pins)]
+                  (do
+                    (shares.splice index 1 nextShare)
+                    (let [writePromise (writeSharesData data)]
+                      (writePromise.then (fn [_] true)))))))))))))
+
+(ann updateShareWorkspaceLayoutPresets (Fn [String Js] Js))
+(defn updateShareWorkspaceLayoutPresets [token presets]
+  (withSharesLock
+   (fn []
+     (let [dataPromise (readSharesRaw)]
+       (dataPromise.then
+        (fn [data]
+          (let [shares (unsafe-cast Js data.shares)
+                index (shares.findIndex (fn [share] (= share.token token)))]
+            (if (= index -1)
+                false
+                (let [nextShare (object-assoc (nth shares index) "workspaceLayoutPresets" presets)]
+                  (do
+                    (shares.splice index 1 nextShare)
+                    (let [writePromise (writeSharesData data)]
+                      (writePromise.then (fn [_] true)))))))))))))
+
+(ann addShareUsedBytes (Fn [String Number] Js))
+(defn addShareUsedBytes [token bytes]
+  (withSharesLock
+   (fn []
+     (let [dataPromise (readSharesRaw)]
+       (dataPromise.then
+        (fn [data]
+          (let [shares (unsafe-cast Js data.shares)
+                index (shares.findIndex (fn [share] (= share.token token)))]
+            (if (= index -1)
+                false
+                (let [current (nth shares index)
+                      used (if (number? current.usedBytes) current.usedBytes 0)
+                      nextShare (object-assoc current "usedBytes" (+ used bytes))]
+                  (do
+                    (shares.splice index 1 nextShare)
+                    (let [writePromise (writeSharesData data)]
+                      (writePromise.then (fn [_] true)))))))))))))
+
+(ann getShare (Fn [String] Js))
+(defn getShare [token]
+  (let [dataPromise (readSharesRaw)]
+    (dataPromise.then
+     (fn [data]
+       (let [share (data.shares.find (fn [item] (= item.token token)))]
+         (if (some? share) (decryptSharePasscode share) nil))))))
+
+(ann deleteShare (Fn [String] Js))
+(defn deleteShare [token]
+  (withSharesLock
+   (fn []
+     (let [dataPromise (readSharesRaw)]
+       (dataPromise.then
+        (fn [data]
+          (let [shares (unsafe-cast Js data.shares)
+                index (shares.findIndex (fn [share] (= share.token token)))]
+            (if (= index -1)
+                false
+                (do
+                  (shares.splice index 1)
+                  (let [writePromise (writeSharesData data)]
+                    (writePromise.then (fn [_] true))))))))))))
+
+(ann getAllShares (Fn [] Js))
+(defn getAllShares []
+  (let [dataPromise (readSharesRaw)]
+    (dataPromise.then (fn [data] (map data.shares decryptSharePasscode)))))
+
+(ann shareFileCandidate (Fn [Js Number] Js))
+(defn shareFileCandidate [share index]
+  (let [normalized (join (split share.path "\\") "/")]
+    (try
+     (let [resolved (resolveMediaPath share.path)
+           fullPath resolved.fullPath
+           statPromise (statPath fullPath)]
+       (statPromise.then
+        (fn [stat]
+          (let [fileName (path.basename share.path)
+                extension (lower-case (string-slice (path.extname fileName) 1))
+                mediaType (if (stat.isDirectory) MediaType.FOLDER (getMediaType extension))]
+            {:index index
+             :normalized normalized
+             :item {:name fileName
+                    :path share.path
+                    :type mediaType
+                    :size (if (stat.isDirectory) 0 stat.size)
+                    :extension extension
+                    :isDirectory share.isDirectory
+                    :shareToken share.token}}))))
+     (catch _error (jsPromise.resolve nil)))))
+
+(ann appendUniqueShareItem (Fn [Js Js] Js))
+(defn appendUniqueShareItem [state candidate]
+  (if (state.seen.has candidate.normalized)
+      state
+      (do
+        (state.seen.add candidate.normalized)
+        (state.items.push candidate.item)
+        state)))
+
+(ann getSharesAsFileItems (Fn [] Js))
+(defn getSharesAsFileItems []
+  (let [sharesPromise (getAllShares)]
+    (sharesPromise.then
+     (fn [shares]
+       (let [sortedShares (sort-with shares (fn [a b] (- b.createdAt a.createdAt)))
+             candidatePromises (map-indexed sortedShares shareFileCandidate)
+             candidatesPromise (jsPromise.all candidatePromises)]
+         (candidatesPromise.then
+          (fn [candidates]
+            (let [valid (sort-with (filter candidates (fn [item] (some? item)))
+                                   (fn [a b] (- a.index b.index)))
+                  state (reduce valid
+                                {:seen (new (js-global Set)) :items []}
+                                appendUniqueShareItem)]
+              state.items))))))))
+
+(ann resolveShareSubPath (Fn [Js String] Js))
+(defn resolveShareSubPath [share subPath]
+  (closkellResolveShareSubPath share subPath))
+
+(ann signShareSession (Fn [String String] String))
+(defn signShareSession [token payload]
+  (let [secret (str token (if (string? config.auth.password)
+                              config.auth.password
+                              "share-secret"))
+        hmac (createHmac "sha256" secret)
+        updated (hmac.update payload)]
+    (updated.digest "base64url")))
+
+(ann verifyShareSignedCookie (Fn [String String] Bool))
+(defn verifyShareSignedCookie [value token]
+  (let [valueJs (unsafe-cast Js value)
+        dot (valueJs.indexOf ".")]
+    (if (or (<= dot 0) (>= dot (- (count value) 1)))
+        false
+        (let [payload (string-slice value 0 dot)
+              sig (string-slice value (+ dot 1))
+              expected (signShareSession token payload)]
+          (if (not (= (count sig) (count expected)))
+              false
+              (try
+               (timingSafeEqual (Buffer.from sig "base64url")
+                                (Buffer.from expected "base64url"))
+               (catch _error false)))))))
+
+(ann getShareCookieName (Fn [String] String))
+(defn getShareCookieName [token]
+  (str "share_" (string-slice token 0 8)))
+
+(ann createShareSessionValue (Fn [String] Js))
+(defn createShareSessionValue [token]
+  (let [timestamp (str (jsMath.floor (/ (jsDate.now) 1000)))
+        signature (signShareSession token timestamp)
+        value (str timestamp "." signature)]
+    {:name (getShareCookieName token)
+     :value value
+     :options {:httpOnly true
+               :secure (= jsProcess.env.NODE_ENV "production")
+               :sameSite "lax"
+               :maxAge SHARE_SESSION_MAX_AGE
+               :path "/"}}))
+
+(ann verifyShareSessionValue (Fn [String Js] Bool))
+(defn verifyShareSessionValue [token value]
+  (if (not (string? value))
+      false
+      (if (not (verifyShareSignedCookie value token))
+          false
+          (let [valueJs (unsafe-cast Js value)
+                dot (valueJs.indexOf ".")
+                timestamp ((js-global parseInt) (string-slice value 0 dot) 10)
+                now (jsMath.floor (/ (jsDate.now) 1000))]
+            (<= (- now timestamp) SHARE_SESSION_MAX_AGE)))))
+
+(ann isShareAccessAuthorized (Fn [Js Js] Bool))
+(defn isShareAccessAuthorized [share requestCookies]
+  (if (not (string? share.passcode))
+      true
+      (let [cookie (requestCookies.get (getShareCookieName share.token))
+            value (if (object? cookie) cookie.value nil)]
+        (verifyShareSessionValue share.token value))))

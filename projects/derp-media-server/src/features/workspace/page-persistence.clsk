@@ -1,0 +1,99 @@
+(import "./geometry.clsk" [createDefaultBounds createWindowLayout])
+(import "./titles.clsk" [workspaceBrowserDirTitle])
+(import "./state-core.clsk" [normalizePersistedWorkspaceState
+                             serializeWorkspaceLayoutState
+                             serializeWorkspacePersistedState])
+(import "./types.clsk" [WorkspaceState])
+
+(def jsJSON (js-global JSON))
+(type WorkspaceStateCast WorkspaceState)
+
+(def DEFAULT_WORKSPACE_SOURCE {:kind "local" :rootPath nil})
+
+(type WorkspaceSource
+  {:kind String
+   :rootPath (Option String)
+   :token (Option String)
+   :sharePath (Option String)})
+
+(type WorkspaceBounds
+  {:x Number
+   :y Number
+   :width Number
+   :height Number})
+
+(ann isWorkspaceRoute (Fn [String] Bool))
+(defn isWorkspaceRoute [pathname]
+  (or (= pathname "/workspace")
+      (regex-test? pathname "^/share/[^/]+/workspace/?$" "")))
+
+(ann defaultInitialBrowserTitle (Fn [WorkspaceSource] String))
+(defn defaultInitialBrowserTitle [source]
+  (if (= source.kind "share")
+      (workspaceBrowserDirTitle (if (some? source.sharePath) source.sharePath ""))
+      "Browser 1"))
+
+(ann defaultPersistedStateWithBounds (Fn [WorkspaceSource WorkspaceBounds] WorkspaceState))
+(defn defaultPersistedStateWithBounds [source defaultBounds]
+  {:windows [{:id "workspace-window-1"
+              :type "browser"
+              :title (defaultInitialBrowserTitle source)
+              :iconName nil
+              :iconPath ""
+              :iconType "folder"
+              :iconIsVirtual false
+              :source source
+              :initialState {}
+              :tabGroupId nil
+              :layout (createWindowLayout nil defaultBounds 1)}]
+   :activeWindowId "workspace-window-1"
+   :activeTabMap (hash-map)
+   :nextWindowId 2
+   :pinnedTaskbarItems []
+   :tabGroupSplits (hash-map)
+   :browserTabTitle nil
+   :browserTabIcon nil
+   :browserTabIconColor nil
+   :fileOpenTarget nil})
+
+(ann defaultPersistedState (Fn [WorkspaceSource] WorkspaceState))
+(defn defaultPersistedState [source]
+  (defaultPersistedStateWithBounds source (createDefaultBounds 0 "browser")))
+
+(ann stateForStorage (Fn [WorkspaceState] Js))
+(defn stateForStorage [state]
+  (let [pinned (if (some? state.pinnedTaskbarItems) state.pinnedTaskbarItems [])
+        withPinned (object-assoc state "pinnedTaskbarItems" pinned)]
+    (if (some? state.fileOpenTarget)
+        (object-assoc withPinned "fileOpenTarget" state.fileOpenTarget)
+        withPinned)))
+
+(ann workspaceStateStorageValue (Fn [WorkspaceState] String))
+(defn workspaceStateStorageValue [state]
+  (serializeWorkspacePersistedState (stateForStorage state)))
+
+(ann workspaceStateFromNormalizedJs (Fn [Js] WorkspaceState))
+(defn workspaceStateFromNormalizedJs [value]
+  (unsafe-cast WorkspaceStateCast value))
+
+(ann normalizeWorkspaceStateValue (Fn [Js Js] (Option WorkspaceState)))
+(defn normalizeWorkspaceStateValue [value options]
+  (let [normalized (normalizePersistedWorkspaceState value options)]
+    (if (some? normalized)
+        (workspaceStateFromNormalizedJs normalized)
+        nil)))
+
+(ann workspaceLayoutSnapshotState (Fn [WorkspaceState] WorkspaceState))
+(defn workspaceLayoutSnapshotState [state]
+  (let [raw (unwrap-or (json-parse-result (serializeWorkspaceLayoutState state)) nil)]
+    (match (normalizeWorkspaceStateValue raw {:reconcileSnapZones false})
+      nil state
+      (some snapshot) snapshot)))
+
+(ann parsePersistedWorkspaceState (Fn [String] (Option WorkspaceState)))
+(defn parsePersistedWorkspaceState [raw]
+  (if (= raw "")
+      nil
+      (try
+       (normalizeWorkspaceStateValue (jsJSON.parse raw) {:reconcileSnapZones false})
+       (catch _error nil))))

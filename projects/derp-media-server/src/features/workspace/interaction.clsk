@@ -1,0 +1,239 @@
+(import "../../model.clsk" [AppState])
+(import "../../messages.clsk" [AppMsg])
+(import "./assist-grid.clsk" [assistGridSpanToBounds])
+(import "./geometry.clsk" [getViewportSize])
+(import "./state.clsk" [boundsForWindow
+                       layoutForWindow
+                       workspaceWindowId
+                       workspaceWindowTitle
+                       workspaceWindows])
+(import "./tab-group-ops.clsk" [tabsInGroup])
+(import "./tab-groups-core.clsk" [WorkspaceTabWindow])
+
+(def jsDocument (js-global document))
+(def jsNumber (js-global Number))
+(def jsParseInt (js-global parseInt))
+
+(ann callEventMethod (Fn [Js String] Nil))
+(defn callEventMethod [event name]
+  (let [fnValue (object-get event name)]
+    (if (some? fnValue)
+        (do
+          (fnValue.call event)
+          nil)
+        nil)))
+
+(ann workspaceGroupTabs (Fn [AppState String] Js))
+(defn workspaceGroupTabs [state groupId]
+  (tabsInGroup (workspaceWindows state) groupId))
+
+(ann workspaceWindowSnappedOrFullscreen? (Fn [WorkspaceTabWindow] Bool))
+(defn workspaceWindowSnappedOrFullscreen? [win]
+  (let [layout (layoutForWindow win)]
+    (or (= layout.fullscreen true)
+        (some? layout.snapZone))))
+
+(ann workspaceDragRestoreBounds (Fn [Js Js Js Number] Js))
+(defn workspaceDragRestoreBounds [win currentBounds canvasRect clientX]
+  (let [layout (layoutForWindow win)
+        restore (if (object? layout.restoreBounds) layout.restoreBounds nil)
+        restoreW (if (object? restore) (get restore :width) nil)
+        restoreH (if (object? restore) (get restore :height) nil)
+        restoredW (if (number? restoreW) restoreW currentBounds.width)
+        restoredH (if (number? restoreH) restoreH currentBounds.height)
+        currentW (if (number? currentBounds.width) currentBounds.width restoredW)
+        localX (- (- clientX canvasRect.left) currentBounds.x)
+        grabRatio (if (> currentW 0)
+                      (min (max (/ localX currentW) 0) 1)
+                      0.5)]
+    {:x (- (- clientX canvasRect.left) (* restoredW grabRatio))
+     :y currentBounds.y
+     :width restoredW
+     :height restoredH}))
+
+(ann startWorkspaceResize (Fn [AppState String String Js Js] Js))
+(defn startWorkspaceResize [state windowId direction win event]
+  (let [startBounds (boundsForWindow win)
+        canvas (getViewportSize)]
+    (do
+      (callEventMethod event "preventDefault")
+      (callEventMethod event "stopPropagation")
+      {:kind :workspace-resize-start
+       :id windowId
+       :direction direction
+       :startX event.clientX
+       :startY event.clientY
+       :canvasWidth canvas.width
+       :canvasHeight canvas.height
+       :x startBounds.x
+       :y startBounds.y
+       :width startBounds.width
+       :height startBounds.height})))
+
+(ann workspaceGroupTabCount (Fn [AppState String] Number))
+(defn workspaceGroupTabCount [state groupId]
+  (count (workspaceGroupTabs state groupId)))
+
+(ann workspaceTaskbarGroupLabel (Fn [AppState String WorkspaceTabWindow] String))
+(defn workspaceTaskbarGroupLabel [state groupId win]
+  (let [tabsCount (workspaceGroupTabCount state groupId)
+        title (workspaceWindowTitle win)]
+    (if (> tabsCount 1)
+        (str title " (+" (- tabsCount 1) ")")
+        title)))
+
+(ann workspaceCanvasElementFromEvent (Fn [Js] Js))
+(defn workspaceCanvasElementFromEvent [event]
+  (let [target event.currentTarget]
+    (if (some? target)
+        (target.closest "[data-workspace-canvas]")
+        nil)))
+
+(ann workspaceDragBlocked? (Fn [Js] Bool))
+(defn workspaceDragBlocked? [event]
+  (let [target event.target]
+    (if (not (some? target))
+        true
+        (or (some? (target.closest ".workspace-window-content"))
+            (some? (target.closest "input, textarea, select, a, audio, video, img"))
+            (some? (target.closest "[data-no-window-drag]"))
+            (some? (target.closest ".workspace-window-buttons"))))))
+
+(ann showWorkspaceSnapPreview (Fn [Js] Nil))
+(defn showWorkspaceSnapPreview [span]
+  (let [preview (jsDocument.querySelector "[data-snap-preview]")]
+    (if (some? preview)
+        (let [bounds (assistGridSpanToBounds (getViewportSize) span)]
+          (do
+            (preview.setAttribute
+             "style"
+             (str "display:block;z-index:99999;left:" bounds.x "px;top:" bounds.y "px;width:" bounds.width "px;height:" bounds.height "px"))
+            nil))
+        nil)))
+
+(ann parseAssistSpanElement (Fn [Js] Js))
+(defn parseAssistSpanElement [el]
+  (if (not (some? el))
+      nil
+      (let [gc0 (jsParseInt (el.getAttribute "data-gc0") 10)
+            gc1 (jsParseInt (el.getAttribute "data-gc1") 10)
+            gr0 (jsParseInt (el.getAttribute "data-gr0") 10)
+            gr1 (jsParseInt (el.getAttribute "data-gr1") 10)
+            cols (jsParseInt (el.getAttribute "data-grid-cols") 10)
+            rows (jsParseInt (el.getAttribute "data-grid-rows") 10)]
+        (if (or (jsNumber.isNaN gc0)
+                (jsNumber.isNaN gc1)
+                (jsNumber.isNaN gr0)
+                (jsNumber.isNaN gr1)
+                (jsNumber.isNaN cols)
+                (jsNumber.isNaN rows))
+            nil
+            {:gridCols cols :gridRows rows :gc0 gc0 :gc1 gc1 :gr0 gr0 :gr1 gr1}))))
+
+(ann startWorkspaceWindowDrag (Fn [AppState String Js Js] Js))
+(defn startWorkspaceWindowDrag [state groupId win event]
+  (if (or (not (= event.button 0)) (workspaceDragBlocked? event))
+      {:kind :workspace-focus-window-id :id (workspaceWindowId win)}
+	      (let [windowId (workspaceWindowId win)
+	            canvasValue (workspaceCanvasElementFromEvent event)]
+	        (if (not (some? canvasValue))
+	            {:kind :workspace-focus-window-id :id windowId}
+	            (let [canvas (unsafe-cast Js canvasValue)
+	                  rect (canvas.getBoundingClientRect)
+	                  rectLeft (if (number? rect.left) rect.left 0)
+	                  rectTop (if (number? rect.top) rect.top 0)
+	                  rectWidth (if (number? rect.width) rect.width 0)
+	                  rectHeight (if (number? rect.height) rect.height 0)
+                  startX event.clientX
+                  startY event.clientY
+	                  rawBounds (boundsForWindow win)
+	                  restoreDrag? (workspaceWindowSnappedOrFullscreen? win)
+	                  bounds (if restoreDrag?
+	                             (workspaceDragRestoreBounds win rawBounds rect startX)
+	                             rawBounds)
+	                  boundsX (if (number? bounds.x) bounds.x 0)
+	                  boundsY (if (number? bounds.y) bounds.y 0)
+	                  boundsWidth (match bounds.width nil 435 (some value) value)
+	                  boundsHeight (match bounds.height nil 399 (some value) value)
+                  grabDx (- (- startX rectLeft) boundsX)
+                  grabDy (- (- startY rectTop) boundsY)]
+              (do
+                (callEventMethod event "preventDefault")
+                (callEventMethod event "stopPropagation")
+	                {:kind :workspace-window-drag-start
+	                 :groupId groupId
+	                 :id windowId
+	                 :grabDx grabDx
+	                 :grabDy grabDy
+	                 :canvasLeft rectLeft
+	                 :canvasTop rectTop
+	                 :canvasWidth rectWidth
+	                 :canvasHeight rectHeight
+	                 :x boundsX
+	                 :y boundsY
+	                 :width boundsWidth
+	                 :height boundsHeight
+		                 :restore restoreDrag?}))))))
+
+(ann workspaceDragHandleMouseDownMessage (Fn [String] AppMsg))
+(defn workspaceDragHandleMouseDownMessage [windowId]
+  {:kind :admin-text-save-if-needed})
+
+(ann workspaceTabClickMessage (Fn [String String] AppMsg))
+(defn workspaceTabClickMessage [groupId tabId]
+  {:kind :workspace-select-tab
+   :groupId groupId
+   :tabId tabId})
+
+(ann workspaceTabDragBlocked? (Fn [Js] Bool))
+(defn workspaceTabDragBlocked? [event]
+  (let [target event.target]
+    (if (not (some? target))
+        true
+        (some? (target.closest "[data-testid='workspace-tab-close'], input, textarea, select, a")))))
+
+(ann startWorkspaceTabDrag (Fn [AppState String String Js] Js))
+(defn startWorkspaceTabDrag [state groupId tabId event]
+  (if (or (not (= event.button 0)) (workspaceTabDragBlocked? event))
+      {:kind :workspace-select-tab :groupId groupId :tabId tabId}
+      (if (<= (workspaceGroupTabCount state groupId) 1)
+          {:kind :workspace-select-tab :groupId groupId :tabId tabId}
+          (let [canvasValue (workspaceCanvasElementFromEvent event)]
+            (if (not (some? canvasValue))
+                {:kind :workspace-select-tab :groupId groupId :tabId tabId}
+                (let [canvas (unsafe-cast Js canvasValue)
+                      rect (canvas.getBoundingClientRect)
+                      rectLeft (if (number? rect.left) rect.left 0)
+                      rectTop (if (number? rect.top) rect.top 0)
+                      rectWidth (if (number? rect.width) rect.width 0)
+                      rectHeight (if (number? rect.height) rect.height 0)]
+                  (do
+                    (callEventMethod event "preventDefault")
+                    (callEventMethod event "stopPropagation")
+                    {:kind :workspace-tab-drag-start
+                     :groupId groupId
+                     :tabId tabId
+                     :startX event.clientX
+                     :startY event.clientY
+                     :canvasLeft rectLeft
+                     :canvasTop rectTop
+                     :canvasWidth rectWidth
+                     :canvasHeight rectHeight})))))))
+
+(ann startWorkspaceSplitResize (Fn [String Js] Js))
+(defn startWorkspaceSplitResize [groupId event]
+  (let [target event.currentTarget
+        groupEl (if (some? target) (target.closest "[data-window-group]") nil)]
+    (do
+      (callEventMethod event "preventDefault")
+      (callEventMethod event "stopPropagation")
+      (if (not (some? groupEl))
+          {:kind :noop}
+          (let [groupNode (unsafe-cast Js groupEl)
+                rect (groupNode.getBoundingClientRect)
+                left (if (number? rect.left) rect.left 0)
+                width (if (number? rect.width) rect.width 0)]
+            {:kind :workspace-split-resize-start
+             :groupId groupId
+             :groupLeft left
+             :groupWidth width})))))

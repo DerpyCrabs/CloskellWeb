@@ -1,0 +1,31 @@
+(def clients (new (js-global Set)))
+
+(ann addFileClient (Fn [Js] Js))
+(defn addFileClient [callback]
+  (clients.add callback))
+
+(ann removeFileClient (Fn [Js] Js))
+(defn removeFileClient [callback]
+  (clients.delete callback))
+
+(ann normalizeBroadcastPath (Fn [String] String))
+(defn normalizeBroadcastPath [value]
+  (let [normalized (join (split value "\\") "/")]
+    (if (= normalized ".") "" normalized)))
+
+(ann broadcastFileChange (Fn [String Js] Nil))
+(defn broadcastFileChange [directory changedPath]
+  (if (= clients.size 0)
+      nil
+      (let [base {:directory (normalizeBroadcastPath directory)}
+            event (if (string? changedPath)
+                      (object-assoc base "path" (normalizeBroadcastPath changedPath))
+                      base)]
+        (do
+          (clients.forEach
+           (fn [cb]
+             (try
+              (cb event)
+              (catch _error
+                (clients.delete cb)))))
+          nil))))

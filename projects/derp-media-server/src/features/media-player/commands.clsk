@@ -1,0 +1,61 @@
+(import "../../model.clsk" [AppState AudioMetadataResponse])
+(import "../../messages.clsk" [AppMsg])
+(import "./state.clsk" [workspaceAudioKey
+	                       workspaceAudioMetadataUrlForPath
+	                       workspaceAudioUrlForPath])
+
+(type AudioMetadataResponseCast AudioMetadataResponse)
+
+(ann playMediaSelectorCommand (Fn [String] (Cmd AppMsg)))
+(defn playMediaSelectorCommand [selector]
+  {:kind :media/play-selector
+   :selector selector})
+
+(ann restoreMediaCurrentTimeCommand (Fn [String Number] (Cmd AppMsg)))
+(defn restoreMediaCurrentTimeCommand [selector currentTime]
+  {:kind :media/restore-current-time
+   :selector selector
+   :currentTime currentTime})
+
+(ann syncWorkspaceTaskbarAudioCommand (Fn [String String Number Bool] (Cmd AppMsg)))
+(defn syncWorkspaceTaskbarAudioCommand [key url duration play]
+  {:kind :media/sync-audio-element
+   :selector "[data-workspace-taskbar-media-audio]"
+   :key key
+   :url url
+   :duration duration
+   :play play})
+
+(ann fetchWorkspaceAudioMetadataCommand (Fn [String String] (Cmd AppMsg)))
+(defn fetchWorkspaceAudioMetadataCommand [key metadataUrl]
+  {:kind :http/request
+   :request {:url metadataUrl
+             :method "GET"}
+   :response :json
+   :toMessage (fn [response]
+	                {:kind :workspace-audio-metadata-loaded
+	                 :key key
+	                 :value (unsafe-cast AudioMetadataResponseCast response)})
+   :onError :workspace-audio-metadata-failed})
+
+(ann fetchMediaAudioMetadataCommand (Fn [String String] (Cmd AppMsg)))
+(defn fetchMediaAudioMetadataCommand [key metadataUrl]
+  {:kind :http/request
+   :request {:url metadataUrl
+             :method "GET"}
+   :response :json
+   :toMessage (fn [response]
+                {:kind :media-audio-metadata-loaded
+                 :key key
+                 :value (unsafe-cast AudioMetadataResponseCast response)})
+   :onError :media-audio-metadata-failed})
+
+(ann workspaceAudioStartCommands (Fn [AppState Bool] (Cmd AppMsg)))
+(defn workspaceAudioStartCommands [state play]
+  (if (= state.workspaceAudioPath "")
+      Cmd.none
+      (let [url (workspaceAudioUrlForPath state state.workspaceAudioPath)
+            key (workspaceAudioKey state.workspaceAudioPath url)
+            metadataUrl (workspaceAudioMetadataUrlForPath state state.workspaceAudioPath)]
+        (Cmd.batch [(syncWorkspaceTaskbarAudioCommand key url state.workspaceAudioDuration play)
+                    (fetchWorkspaceAudioMetadataCommand key metadataUrl)]))))

@@ -1,0 +1,897 @@
+(import "../../model.clsk" [AppState])
+(import "../../../lib/types.clsk" [FileItem MediaType])
+(import "../browser/state.clsk" [cardClass
+                                  fileThumbnailTestId
+                                  rowClass
+                                  showThumbnail?
+                                  viewModeButtonClass])
+(import "../media-utils.clsk" [formatFileSize])
+(import "../media-player/state.clsk" [selectedShareViewingFile
+                                      shareFileMediaUrl
+                                      shareFileThumbnailUrl])
+(import "../text-editor/views.clsk" [ShareTextViewer])
+
+(ann shareViewPathParts (Fn [String] (Vector String)))
+(defn shareViewPathParts [path]
+  (filter (split (if (string? path) path "") "/") (fn [part] (not (= part "")))))
+
+(ann shareParentDir (Fn [String] String))
+(defn shareParentDir [path]
+  (let [parts (shareViewPathParts path)]
+    (if (<= (count parts) 1)
+        ""
+        (join (slice parts 0 (- (count parts) 1)) "/"))))
+
+(ann shareCrumbPathAt (Fn [String Number] String))
+(defn shareCrumbPathAt [path index]
+  (join (slice (shareViewPathParts path) 0 (+ index 1)) "/"))
+
+(ann shareFileIconLabel (Fn [FileItem] String))
+(defn shareFileIconLabel [file]
+  (if file.isDirectory
+      "DIR"
+      (if (= file.type MediaType.IMAGE)
+          "IMG"
+          (if (= file.type MediaType.VIDEO)
+              "VID"
+              (if (= file.type MediaType.AUDIO)
+                  "AUD"
+                  (if (= file.type MediaType.PDF)
+                      "PDF"
+                      (if (= file.type MediaType.TEXT) "TXT" "FILE")))))))
+
+(ann shareFileSubtitle (Fn [FileItem] String))
+(defn shareFileSubtitle [file]
+  (if file.isDirectory
+      "Folder"
+      (str (if (= file.extension "") file.type file.extension)
+           " - "
+           (formatFileSize file.size))))
+
+(ann IconArrowUp (Fn [String] Html))
+(defn IconArrowUp [className]
+  #html <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class={(str className)} aria-hidden="true">
+          <path d="m5 12 7-7 7 7"></path>
+          <path d="M12 19V5"></path>
+        </svg>)
+
+(ann IconDownload (Fn [String] Html))
+(defn IconDownload [className]
+  #html <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class={(str className)} aria-hidden="true">
+          <path d="M12 15V3"></path>
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+          <path d="m7 10 5 5 5-5"></path>
+        </svg>)
+
+(ann IconSettings (Fn [String] Html))
+(defn IconSettings [className]
+  #html <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class={(str className)} aria-hidden="true">
+          <path d="M9.671 4.136a2.34 2.34 0 0 1 4.659 0 2.34 2.34 0 0 0 3.319 1.915 2.34 2.34 0 0 1 2.33 4.033 2.34 2.34 0 0 0 0 3.831 2.34 2.34 0 0 1-2.33 4.033 2.34 2.34 0 0 0-3.319 1.915 2.34 2.34 0 0 1-4.659 0 2.34 2.34 0 0 0-3.32-1.915 2.34 2.34 0 0 1-2.33-4.033 2.34 2.34 0 0 0 0-3.831A2.34 2.34 0 0 1 6.35 6.051a2.34 2.34 0 0 0 3.319-1.915"></path>
+          <circle cx="12" cy="12" r="3"></circle>
+        </svg>)
+
+(ann IconZoomOut (Fn [String] Html))
+(defn IconZoomOut [className]
+  #html <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class={(str "lucide lucide-zoom-out " className)} aria-hidden="true">
+          <circle cx="11" cy="11" r="8"></circle>
+          <line x1="21" x2="16.65" y1="21" y2="16.65"></line>
+          <line x1="8" x2="14" y1="11" y2="11"></line>
+        </svg>)
+
+(ann IconZoomIn (Fn [String] Html))
+(defn IconZoomIn [className]
+  #html <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class={(str "lucide lucide-zoom-in " className)} aria-hidden="true">
+          <circle cx="11" cy="11" r="8"></circle>
+          <line x1="21" x2="16.65" y1="21" y2="16.65"></line>
+          <line x1="11" x2="11" y1="8" y2="14"></line>
+          <line x1="8" x2="14" y1="11" y2="11"></line>
+        </svg>)
+
+(ann IconMaximize2 (Fn [String] Html))
+(defn IconMaximize2 [className]
+  #html <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class={(str "lucide lucide-maximize-2 " className)} aria-hidden="true">
+          <path d="M15 3h6v6"></path>
+          <path d="m21 3-7 7"></path>
+          <path d="m3 21 7-7"></path>
+          <path d="M9 21H3v-6"></path>
+        </svg>)
+
+(ann IconRotateCw (Fn [String] Html))
+(defn IconRotateCw [className]
+  #html <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class={(str "lucide lucide-rotate-cw " className)} aria-hidden="true">
+          <path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"></path>
+          <path d="M21 3v5h-5"></path>
+        </svg>)
+
+(ann IconX (Fn [String] Html))
+(defn IconX [className]
+  #html <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class={(str "lucide lucide-x " className)} aria-hidden="true">
+          <path d="M18 6 6 18"></path>
+          <path d="m6 6 12 12"></path>
+        </svg>)
+
+(ann IconBook (Fn [String] Html))
+(defn IconBook [className]
+  #html <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class={(str className)} aria-hidden="true">
+          <path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H19a1 1 0 0 1 1 1v18a1 1 0 0 1-1 1H6.5a1 1 0 0 1 0-5H20"></path>
+        </svg>)
+
+(ann IconChevronRight (Fn [String] Html))
+(defn IconChevronRight [className]
+  #html <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class={(str className)} aria-hidden="true">
+          <path d="m9 18 6-6-6-6"></path>
+        </svg>)
+
+(ann IconFilePlus (Fn [String] Html))
+(defn IconFilePlus [className]
+  #html <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class={(str className)} aria-hidden="true">
+          <path d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z"></path>
+          <path d="M14 2v5a1 1 0 0 0 1 1h5"></path>
+          <path d="M9 15h6"></path>
+          <path d="M12 18v-6"></path>
+        </svg>)
+
+(ann IconFileQuestion (Fn [String] Html))
+(defn IconFileQuestion [className]
+  #html <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class={(str className)} aria-hidden="true">
+          <path d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z"></path>
+          <path d="M12 17h.01"></path>
+          <path d="M9.1 9a3 3 0 0 1 5.82 1c0 2-3 3-3 3"></path>
+        </svg>)
+
+(ann IconFileText (Fn [String] Html))
+(defn IconFileText [className]
+  #html <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class={(str className)} aria-hidden="true">
+          <path d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z"></path>
+          <path d="M14 2v5a1 1 0 0 0 1 1h5"></path>
+          <path d="M10 9H8"></path>
+          <path d="M16 13H8"></path>
+          <path d="M16 17H8"></path>
+        </svg>)
+
+(ann IconFolder (Fn [String] Html))
+(defn IconFolder [className]
+  #html <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class={(str className)} aria-hidden="true">
+          <path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"></path>
+        </svg>)
+
+(ann IconFolderPlus (Fn [String] Html))
+(defn IconFolderPlus [className]
+  #html <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class={(str className)} aria-hidden="true">
+          <path d="M12 10v6"></path>
+          <path d="M9 13h6"></path>
+          <path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"></path>
+        </svg>)
+
+(ann IconImage (Fn [String] Html))
+(defn IconImage [className]
+  #html <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class={(str className)} aria-hidden="true">
+          <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+          <circle cx="9" cy="9" r="2"></circle>
+          <path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"></path>
+        </svg>)
+
+(ann IconLayoutGrid (Fn [String] Html))
+(defn IconLayoutGrid [className]
+  #html <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class={(str "lucide lucide-layout-grid " className)} aria-hidden="true">
+          <rect width="7" height="7" x="3" y="3" rx="1"></rect>
+          <rect width="7" height="7" x="14" y="3" rx="1"></rect>
+          <rect width="7" height="7" x="14" y="14" rx="1"></rect>
+          <rect width="7" height="7" x="3" y="14" rx="1"></rect>
+        </svg>)
+
+(ann IconList (Fn [String] Html))
+(defn IconList [className]
+  #html <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class={(str "lucide lucide-list " className)} aria-hidden="true">
+          <path d="M3 5h.01"></path>
+          <path d="M3 12h.01"></path>
+          <path d="M3 19h.01"></path>
+          <path d="M8 5h13"></path>
+          <path d="M8 12h13"></path>
+          <path d="M8 19h13"></path>
+        </svg>)
+
+(ann IconMusic (Fn [String] Html))
+(defn IconMusic [className]
+  #html <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class={(str className)} aria-hidden="true">
+          <path d="M9 18V5l12-2v13"></path>
+          <circle cx="6" cy="18" r="3"></circle>
+          <circle cx="18" cy="16" r="3"></circle>
+        </svg>)
+
+(ann IconUpload (Fn [String] Html))
+(defn IconUpload [className]
+  #html <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class={(str className)} aria-hidden="true">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+          <path d="m17 8-5-5-5 5"></path>
+          <path d="M12 3v12"></path>
+        </svg>)
+
+(ann IconVideo (Fn [String] Html))
+(defn IconVideo [className]
+  #html <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class={(str className)} aria-hidden="true">
+          <path d="m16 13 5.223 3.482a.5.5 0 0 0 .777-.416V7.87a.5.5 0 0 0-.752-.432L16 10.5"></path>
+          <rect x="2" y="6" width="14" height="12" rx="2"></rect>
+        </svg>)
+
+(ann shareBrowserFileIconClass (Fn [FileItem] String))
+(defn shareBrowserFileIconClass [file]
+  (if file.isDirectory
+      "h-5 w-5 text-blue-500"
+      (if (= file.type MediaType.IMAGE)
+          "h-5 w-5 text-green-500"
+          (if (= file.type MediaType.VIDEO)
+              "h-5 w-5 text-red-500"
+              (if (= file.type MediaType.AUDIO)
+                  "h-5 w-5 text-purple-500"
+                  (if (= file.type MediaType.TEXT)
+                      "h-5 w-5 text-cyan-500"
+                      (if (= file.type MediaType.PDF)
+                          "h-5 w-5 text-orange-500"
+                          "h-5 w-5 text-yellow-500")))))))
+
+(ann ShareBrowserFileIcon (Fn [FileItem String] Html))
+(defn ShareBrowserFileIcon [file className]
+  #html <span class="contents">
+          {(if file.isDirectory (IconFolder className) #html <span class="hidden"></span>)}
+          {(if (and (not file.isDirectory) (= file.type MediaType.IMAGE)) (IconImage className) #html <span class="hidden"></span>)}
+          {(if (and (not file.isDirectory) (= file.type MediaType.VIDEO)) (IconVideo className) #html <span class="hidden"></span>)}
+          {(if (and (not file.isDirectory) (= file.type MediaType.AUDIO)) (IconMusic className) #html <span class="hidden"></span>)}
+          {(if (and (not file.isDirectory) (= file.type MediaType.TEXT)) (IconFileText className) #html <span class="hidden"></span>)}
+          {(if (and (not file.isDirectory) (= file.type MediaType.PDF)) (IconBook className) #html <span class="hidden"></span>)}
+          {(if (and (not file.isDirectory)
+                    (not (= file.type MediaType.IMAGE))
+                    (not (= file.type MediaType.VIDEO))
+                    (not (= file.type MediaType.AUDIO))
+                    (not (= file.type MediaType.TEXT))
+                    (not (= file.type MediaType.PDF))) (IconFileQuestion className) #html <span class="hidden"></span>)}
+        </span>)
+
+(ann shareImageZoomLabel (Fn [Number] String))
+(defn shareImageZoomLabel [zoom]
+  (if (= zoom 0) "Fit" (str zoom "%")))
+
+(ann shareImageZoomScale (Fn [Number] Number))
+(defn shareImageZoomScale [zoom]
+  (if (= zoom 0) 1 (/ zoom 100)))
+
+(ann shareImageStyle (Fn [Number Number] String))
+(defn shareImageStyle [zoom rotation]
+  (let [base (if (= zoom 0)
+                 "width:100%;height:100%;object-fit:contain;"
+                 "max-width:100%;max-height:100%;width:auto;height:auto;object-fit:none;")]
+    (str base "transform: scale(" (shareImageZoomScale zoom) ") rotate(" rotation "deg);")))
+
+(ann shareImageViewerImages (Fn [AppState] (Vector FileItem)))
+(defn shareImageViewerImages [state]
+  (filter state.shareFiles (fn [item] (= item.type MediaType.IMAGE))))
+
+(ann shareImageViewerIndex (Fn [AppState (Vector FileItem) FileItem] Number))
+(defn shareImageViewerIndex [state images file]
+  (let [path (match state.viewingPath nil file.path (some value) value)
+        hit (find (map (range 0 (count images))
+                       (fn [index] {:index index :file (nth images index)}))
+                  (fn [entry] (= entry.file.path path)))]
+    (if (some? hit) hit.index -1)))
+
+(ann ShareFloatingThemeButton (Fn [] Html))
+(defn ShareFloatingThemeButton []
+  #html <button type="button"
+                class="fixed bottom-4 right-4 z-50 inline-flex size-8 items-center justify-center rounded-md border border-border bg-background text-sm font-medium text-foreground shadow-sm"
+                aria-label="Open theme settings"
+                title="Theme settings"
+                on:click={{:kind :theme-menu-toggle}}>
+          {(IconSettings "h-4 w-4")}
+        </button>)
+
+(ann ShareLoadingView (Fn [] Html))
+(defn ShareLoadingView []
+  #html <div class="relative flex min-h-screen items-center justify-center bg-background">
+          {(ShareFloatingThemeButton)}
+          <p class="text-sm text-muted-foreground">Loading...</p>
+        </div>)
+
+(ann ShareNotFoundView (Fn [] Html))
+(defn ShareNotFoundView []
+  #html <div class="relative flex min-h-screen items-center justify-center bg-background p-4"
+             data-testid="share-not-found">
+          {(ShareFloatingThemeButton)}
+          <div class="w-full max-w-md rounded-xl border border-destructive p-6">
+            <h1 class="text-lg font-semibold text-destructive">Share Not Found</h1>
+            <p class="mt-2 text-sm text-muted-foreground">This share link is invalid or has been revoked.</p>
+          </div>
+        </div>)
+
+(ann SharePasscodeView (Fn [AppState] Html))
+(defn SharePasscodeView [state]
+  #html <div class="relative flex min-h-screen items-center justify-center bg-background p-4">
+          {(ShareFloatingThemeButton)}
+          <div class="w-full max-w-sm rounded-xl border border-border bg-card p-6 shadow-sm">
+            <div class="mb-4 text-center">
+              <div class="mx-auto mb-2 flex h-12 w-12 items-center justify-center rounded-full bg-muted">
+                <span class="text-lg font-semibold text-muted-foreground">Lock</span>
+              </div>
+              <h1 class="text-xl font-semibold">Protected Share</h1>
+              <p class="mt-1 text-sm text-muted-foreground">{(str "Enter the passcode to access \"" state.shareName "\"")}</p>
+            </div>
+            {(if state.sharePasscodePending
+                 #html <p class="text-center text-sm text-muted-foreground">Verifying...</p>
+                 #html <form class="space-y-4"
+                             on:submit={(Event.prevent {:kind :share-passcode-submit})}>
+                         <input type="text"
+                                placeholder="Enter passcode"
+                                class="flex h-10 w-full rounded-md border border-input bg-background px-3 text-center font-mono text-lg tracking-widest shadow-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                                autocomplete="off"
+                                autofocus
+                                value={state.sharePasscodeInput}
+                                on:input={{:kind :share-passcode-input :value event.currentTarget.value}}></input>
+                         {(if (some? state.sharePasscodeError)
+                              #html <p class="text-sm text-destructive">{state.sharePasscodeError}</p>
+                              #html <p class="hidden"></p>)}
+                         <button type="submit"
+                                 class="h-9 w-full rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground shadow-sm hover:bg-primary/90 disabled:opacity-50"
+                                 disabled={(or state.sharePasscodePending (= state.sharePasscodeInput ""))}>Access Share</button>
+                       </form>)}
+          </div>
+        </div>)
+
+(ann ShareBreadcrumbsView (Fn [AppState] Html))
+(defn ShareBreadcrumbsView [state]
+  #html <nav class="flex min-h-0 min-w-0 items-center gap-1 overflow-hidden"
+             aria-label="Breadcrumb">
+	          <button type="button"
+	                  data-breadcrumb-segment="share-root"
+	                  data-breadcrumb-path=""
+	                  class={(str "inline-flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-md px-2.5 text-sm font-medium transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none "
+	                              (if (= state.currentDir "") "bg-primary text-primary-foreground shadow-sm hover:bg-primary/90" "text-foreground hover:bg-accent hover:text-accent-foreground"))}
+	                  on:click={{:kind :share-navigate-dir :path ""}}
+	                  on:contextmenu={(Event.prevent {:kind :breadcrumb-context-menu
+	                                                  :path ""
+	                                                  :x event.clientX
+	                                                  :y event.clientY})}>
+	            {(IconFolder "h-4 w-4 shrink-0")}
+	            {state.shareName}
+	          </button>
+          {(for [part (shareViewPathParts state.currentDir) index :key (str "share-" index "-" part)]
+             #html <div class="flex min-w-0 items-center gap-1">
+                     {(IconChevronRight "h-4 w-4 shrink-0 text-muted-foreground")}
+                     <button type="button"
+                             data-breadcrumb-path={(shareCrumbPathAt state.currentDir index)}
+                             class={(str "inline-flex h-8 min-w-0 shrink items-center justify-center gap-1.5 truncate whitespace-nowrap rounded-md px-2.5 text-sm font-medium transition-colors "
+                                         (if (= (+ index 1) (count (shareViewPathParts state.currentDir))) "bg-primary text-primary-foreground shadow-sm" "text-foreground hover:bg-accent hover:text-accent-foreground"))}
+                             on:click={{:kind :share-navigate-dir :path (shareCrumbPathAt state.currentDir index)}}
+                             on:contextmenu={(Event.prevent {:kind :breadcrumb-context-menu
+                                                             :path (shareCrumbPathAt state.currentDir index)
+                                                             :x event.clientX
+                                                             :y event.clientY})}>{part}</button>
+                   </div>)}
+        </nav>)
+
+(ann ShareParentRow (Fn [AppState] Html))
+(defn ShareParentRow [state]
+  #html <tr class="cursor-pointer select-none border-b border-border transition-colors hover:bg-muted/50"
+            on:click={{:kind :share-navigate-dir :path (shareParentDir state.currentDir)}}>
+          <td class="w-[40px] min-w-[40px] max-w-[40px] box-border p-2 align-middle">
+            <div class="flex items-center justify-center">
+              {(IconArrowUp "h-5 w-5 text-muted-foreground")}
+            </div>
+          </td>
+          <td class="min-w-0 p-2 align-middle font-medium">..</td>
+          <td class="min-w-0 p-2 align-middle text-right text-muted-foreground"></td>
+        </tr>)
+
+(ann ShareFilesListView (Fn [AppState] Html))
+(defn ShareFilesListView [state]
+  #html <div class="py-2 sm:px-4">
+          <table class="directory-table w-full table-fixed caption-bottom text-sm">
+            <colgroup>
+              <col class="w-[40px]"></col>
+              <col></col>
+              <col class="w-24"></col>
+            </colgroup>
+            <tbody class="[&_tr:last-child]:border-0">
+              {(if (not (= state.currentDir ""))
+                   (ShareParentRow state)
+                   #html <template></template>)}
+              {(for [file state.shareFiles index :key file.path]
+                 #html <tr data-file-path={file.path}
+                           class={(rowClass state file)}
+                           style={(if (= index (- (count state.shareFiles) 1)) "border-bottom-width:0" nil)}
+                           tabindex="0"
+                           role="button"
+                           on:click={{:kind :share-open-file :file file}}
+                           on:contextmenu={(Event.prevent {:kind :file-context-menu
+	                                                           :file file
+	                                                           :x event.clientX
+	                                                           :y event.clientY})}>
+                         <td class="w-[40px] min-w-[40px] max-w-[40px] box-border p-2 align-middle">
+                           <div class="flex items-center justify-center">
+                             {(ShareBrowserFileIcon file (shareBrowserFileIconClass file))}
+                           </div>
+                         </td>
+                         <td class="min-w-0 p-2 align-middle font-medium">
+                           <span class="truncate">{file.name}</span>
+                         </td>
+                         <td class="min-w-0 p-2 align-middle text-right text-muted-foreground tabular-nums">
+                           <span class="inline-block w-20">{(if file.isDirectory "" (formatFileSize file.size))}</span>
+                         </td>
+                       </tr>)}
+              {(if (= (count state.shareFiles) 0)
+                   #html <tr data-testid="directory-empty">
+                           <td colspan="3" class="p-8 text-center">
+                             <div>
+                               <p class="text-sm font-medium text-foreground">This folder is empty</p>
+                               <p class="mt-1 text-xs text-muted-foreground">There are no files in this folder.</p>
+                             </div>
+                           </td>
+                         </tr>
+                   #html <template></template>)}
+            </tbody>
+          </table>
+        </div>)
+
+(ann ShareFileCard (Fn [AppState FileItem] Html))
+(defn ShareFileCard [state file]
+  #html <div data-file-path={file.path}
+             class={(cardClass state file)}
+             role="button"
+             tabindex="0"
+             on:click={{:kind :share-open-file :file file}}
+             on:contextmenu={(Event.prevent {:kind :file-context-menu
+                                             :file file
+	                                             :x event.clientX
+	                                             :y event.clientY})}>
+          <div class="group relative flex aspect-video items-center justify-center overflow-hidden bg-muted">
+            {(if (showThumbnail? file)
+                 #html <img data-testid={(fileThumbnailTestId file)}
+                            src={(shareFileThumbnailUrl state file)}
+                            alt={file.name}
+                            class="h-full w-full object-cover"></img>
+	                 #html <div class="scale-[2.5] [&_svg]:h-6 [&_svg]:w-6">{(ShareBrowserFileIcon file (shareBrowserFileIconClass file))}</div>)}
+          </div>
+          <div class="flex min-w-0 flex-col gap-1 p-3">
+            <p class="truncate text-sm font-medium" title={file.name}>{file.name}</p>
+            <div class="flex items-center justify-end text-xs text-muted-foreground">
+              <span>{(if file.isDirectory "" (formatFileSize file.size))}</span>
+            </div>
+          </div>
+        </div>)
+
+(ann ShareFilesGridView (Fn [AppState] Html))
+(defn ShareFilesGridView [state]
+  #html <div class="file-browser-grid gap-4 px-4 py-4">
+          {(if (not (= state.currentDir ""))
+               #html <div class="ring-foreground/10 bg-card text-card-foreground flex cursor-pointer flex-col overflow-hidden rounded-xl py-0 text-left shadow-xs ring-1 transition-colors select-none hover:bg-muted/50"
+                          role="button"
+                          tabindex="0"
+                          on:click={{:kind :share-navigate-dir :path (shareParentDir state.currentDir)}}>
+                       <div class="flex aspect-video flex-col items-center justify-center bg-muted/80 p-4">
+                         {(IconArrowUp "mb-2 h-12 w-12 text-muted-foreground")}
+                         <p class="text-center text-sm font-medium">..</p>
+                       </div>
+                     </div>
+               #html <span class="hidden"></span>)}
+          {(for [file state.shareFiles :key file.path]
+             #html <div class="contents">{(ShareFileCard state file)}</div>)}
+          {(if (= (count state.shareFiles) 0)
+               #html <div data-testid="directory-empty"
+                          class="col-span-full flex min-h-52 items-center justify-center p-8 text-center text-sm text-muted-foreground">
+                       <div>
+                         <p class="font-medium text-foreground">This folder is empty</p>
+                         <p class="mt-1">No files to show here.</p>
+                       </div>
+                     </div>
+               #html <span class="hidden"></span>)}
+        </div>)
+
+(ann ShareUploadControls (Fn [AppState] Html))
+(defn ShareUploadControls [state]
+  #html <div class="relative flex items-center gap-1">
+	          <button type="button"
+	                  title="Create new file"
+	                  aria-label="Create new file"
+	                  class="inline-flex size-8 shrink-0 items-center justify-center rounded-md border border-border bg-background text-sm font-medium shadow-xs transition-colors hover:bg-muted hover:text-foreground dark:bg-input/30 dark:border-input dark:hover:bg-input/50"
+	                  on:click={{:kind :share-open-create :createKind "file"}}>
+	            {(IconFilePlus "h-4 w-4")}
+	          </button>
+	          <button type="button"
+	                  title="Create new folder"
+	                  aria-label="Create new folder"
+	                  class="inline-flex size-8 shrink-0 items-center justify-center rounded-md border border-border bg-background text-sm font-medium shadow-xs transition-colors hover:bg-muted hover:text-foreground dark:bg-input/30 dark:border-input dark:hover:bg-input/50"
+	                  on:click={{:kind :share-open-create :createKind "folder"}}>
+	            {(IconFolderPlus "h-4 w-4")}
+	          </button>
+	          <button type="button"
+	                  title="Upload"
+	                  aria-label="Upload"
+	                  class="inline-flex size-8 shrink-0 items-center justify-center rounded-md border border-border bg-background text-sm font-medium shadow-xs transition-colors hover:bg-muted hover:text-foreground dark:bg-input/30 dark:border-input dark:hover:bg-input/50"
+	                  on:click={{:kind :share-upload-menu-toggle}}>
+	            {(IconUpload "h-4 w-4")}
+	          </button>
+          {(if state.shareUploadMenuOpen
+               #html <div class="absolute right-0 top-9 z-40 min-w-40 rounded-md border border-border bg-popover p-1 text-popover-foreground shadow-md">
+                       <label class="flex w-full cursor-pointer items-center gap-2 rounded-sm px-2 py-1.5 text-left text-sm outline-none select-none hover:bg-accent hover:text-accent-foreground">
+                         Upload files
+                         <input type="file"
+                                class="sr-only"
+                                data-testid="request-body-multipart-files"
+                                on:change={{:kind :share-upload-file-selected
+                                            :selected? (> event.currentTarget.files.length 0)}}></input>
+                       </label>
+                       <button type="button"
+                               class="flex w-full cursor-pointer items-center gap-2 rounded-sm px-2 py-1.5 text-left text-sm outline-none select-none hover:bg-accent hover:text-accent-foreground">Upload folder</button>
+                     </div>
+               #html <span class="hidden"></span>)}
+        </div>)
+
+(ann ShareViewModeToggle (Fn [AppState] Html))
+(defn ShareViewModeToggle [state]
+  #html <div class="flex items-center gap-1">
+	          <button type="button"
+	                  aria-label="List view"
+		                  aria-pressed={(= state.viewMode "list")}
+	                  class={(viewModeButtonClass (= state.viewMode "list"))}
+	                  on:click={{:kind :share-view-mode-picked :value "list"}}>
+	            {(IconList "h-4 w-4")}
+	          </button>
+		          <button type="button"
+		                  aria-label="Grid view"
+		                  aria-pressed={(= state.viewMode "grid")}
+	                  class={(viewModeButtonClass (= state.viewMode "grid"))}
+	                  on:click={{:kind :share-view-mode-picked :value "grid"}}>
+	            {(IconLayoutGrid "h-4 w-4")}
+	          </button>
+	        </div>)
+
+(ann ShareErrorPanel (Fn [String] Html))
+(defn ShareErrorPanel [message]
+  #html <div class="m-4 rounded-xl border border-destructive/40 bg-destructive/10 p-4 text-sm text-destructive">
+          {message}
+        </div>)
+
+(ann ShareLoadingPanel (Fn [] Html))
+(defn ShareLoadingPanel []
+  #html <div class="flex min-h-52 items-center justify-center p-8 text-sm text-muted-foreground">
+          Loading...
+        </div>)
+
+(ann ShareFolderBody (Fn [AppState] Html))
+(defn ShareFolderBody [state]
+  #html <div>
+          {(if (some? state.shareFilesError)
+               (ShareErrorPanel state.shareFilesError)
+               (if state.shareFilesPending
+                   (ShareLoadingPanel)
+                   (if (= state.viewMode "grid")
+                       (ShareFilesGridView state)
+                       (ShareFilesListView state))))}
+        </div>)
+
+(ann ShareDialogLayer (Fn [AppState] Html))
+(defn ShareDialogLayer [state]
+  #html <div>
+          {(if (not (= state.shareCreateKind "none"))
+               #html <div role="dialog"
+                          aria-label={(if (= state.shareCreateKind "folder") "Create folder" "Create file")}
+                          aria-modal="true"
+                          class="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+                       <div class="w-full max-w-sm rounded-xl border border-border bg-card p-5 text-card-foreground shadow-lg">
+                         <h2 class="text-lg font-semibold">{(if (= state.shareCreateKind "folder") "Create folder" "Create file")}</h2>
+                         <form class="mt-4 space-y-4"
+                               on:submit={(Event.prevent {:kind :share-create-submit})}>
+                           <input type="text"
+                                  class="flex h-9 w-full rounded-md border border-input bg-background px-3 text-sm shadow-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                                  placeholder={(if (= state.shareCreateKind "folder") "Folder name" "File name")}
+                                  value={state.shareCreateName}
+                                  autofocus
+                                  on:input={{:kind :share-create-name :value event.currentTarget.value}}></input>
+                           {(if (some? state.shareCreateError)
+                                #html <p class="text-sm text-destructive">{state.shareCreateError}</p>
+                                #html <p class="hidden"></p>)}
+                           <div class="flex justify-end gap-2">
+                             <button type="button"
+                                     class="h-9 rounded-md border border-border px-4 text-sm font-medium"
+                                     on:click={{:kind :share-close-dialog}}>Cancel</button>
+                             <button type="submit"
+                                     class="h-9 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground disabled:opacity-50"
+                                     disabled={(or state.shareCreatePending (= (trim state.shareCreateName) ""))}>Create</button>
+                           </div>
+                         </form>
+                       </div>
+                     </div>
+               #html <span class="hidden"></span>)}
+          {(if state.shareRenameOpen
+               #html <div role="dialog"
+                          aria-modal="true"
+                          class="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+                       <div class="w-full max-w-sm rounded-xl border border-border bg-card p-5 text-card-foreground shadow-lg">
+                         <h2 class="text-lg font-semibold">Rename</h2>
+                         <form class="mt-4 space-y-4"
+                               on:submit={(Event.prevent {:kind :share-rename-submit})}>
+                           <input type="text"
+                                  class="flex h-9 w-full rounded-md border border-input bg-background px-3 text-sm shadow-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                                  placeholder="New name"
+                                  value={state.shareRenameName}
+                                  autofocus
+                                  on:input={{:kind :share-rename-name :value event.currentTarget.value}}></input>
+                           {(if (some? state.shareRenameError)
+                                #html <p class="text-sm text-destructive">{state.shareRenameError}</p>
+                                #html <p class="hidden"></p>)}
+                           <div class="flex justify-end gap-2">
+                             <button type="button"
+                                     class="h-9 rounded-md border border-border px-4 text-sm font-medium"
+                                     on:click={{:kind :share-close-dialog}}>Cancel</button>
+                             <button type="submit"
+                                     class="h-9 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground disabled:opacity-50"
+                                     disabled={(or state.shareRenamePending (= (trim state.shareRenameName) ""))}>Rename</button>
+                           </div>
+                         </form>
+                       </div>
+                     </div>
+               #html <span class="hidden"></span>)}
+          {(if state.shareDeleteOpen
+               #html <div role="presentation"
+                          class="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+                       <div role="alertdialog"
+                            aria-label="Delete file"
+                            aria-modal="true"
+                            class="w-full max-w-sm rounded-xl border border-border bg-card p-5 text-card-foreground shadow-lg">
+                         <h2 class="text-lg font-semibold">Delete file</h2>
+                         <p class="mt-2 text-sm text-muted-foreground">{(str "Delete " state.shareDeleteName "?")}</p>
+                         {(if (some? state.shareDeleteError)
+                              #html <p class="mt-3 text-sm text-destructive">{state.shareDeleteError}</p>
+                              #html <p class="hidden"></p>)}
+                         <div class="mt-4 flex justify-end gap-2">
+                           <button type="button"
+                                   class="h-9 rounded-md border border-border px-4 text-sm font-medium"
+                                   on:click={{:kind :share-close-dialog}}>Cancel</button>
+                           <button type="button"
+                                   class="h-9 rounded-md bg-destructive px-4 text-sm font-medium text-destructive-foreground disabled:opacity-50"
+                                   disabled={state.shareDeletePending}
+                                   on:click={{:kind :share-delete-submit}}>Delete</button>
+                         </div>
+                       </div>
+                     </div>
+               #html <span class="hidden"></span>)}
+        </div>)
+
+(ann ShareUploadToast (Fn [AppState] Html))
+(defn ShareUploadToast [state]
+  #html <div>
+          {(if (some? state.shareUploadStatus)
+               #html <div class="fixed bottom-4 right-4 z-50 rounded-md border border-border bg-popover px-4 py-3 text-sm text-popover-foreground shadow-lg">
+                       {state.shareUploadStatus}
+                     </div>
+               #html <span class="hidden"></span>)}
+        </div>)
+
+(ann shareFileRelativeDownloadPath (Fn [AppState FileItem] String))
+(defn shareFileRelativeDownloadPath [state file]
+  (if state.shareIsDirectory
+      (if (= state.sharePath "")
+          file.path
+          (if (= file.path state.sharePath)
+              "."
+              (if (starts-with? file.path (str state.sharePath "/"))
+                  (string-slice file.path (+ (count state.sharePath) 1) (count file.path))
+                  file.path)))
+      "."))
+
+(ann shareFileDownloadHref (Fn [AppState FileItem] String))
+(defn shareFileDownloadHref [state file]
+  (match state.shareToken
+    nil "#"
+    (some token)
+      (let [base (str "/api/share/" token "/download")
+            relative (shareFileRelativeDownloadPath state file)]
+        (if (or (= relative "") (= relative "."))
+            base
+            (str base "?path=" (encode-uri-component relative))))))
+
+(ann ShareImageViewer (Fn [AppState FileItem] Html))
+(defn ShareImageViewer [state file]
+  (let [images (shareImageViewerImages state)
+        total (count images)
+        index (shareImageViewerIndex state images file)
+        currentNumber (if (< index 0) 1 (+ index 1))]
+  #html <div role="dialog"
+             aria-modal="true"
+             aria-labelledby="share-image-viewer-title"
+             class="fixed inset-0 z-50 flex flex-col bg-black/95">
+          <span class="sr-only">
+            <h2 id="share-image-viewer-title">{file.name}</h2>
+          </span>
+          <div class="flex items-center justify-between bg-black/50 p-4 backdrop-blur-sm">
+            <div class="flex-1">
+              <h2 class="max-w-md truncate text-lg font-medium text-white">{file.name}</h2>
+            </div>
+            {(if (> total 0)
+                 #html <div class="shrink-0 px-4">
+                         <span class="text-sm font-medium text-white">{(str currentNumber " of " total)}</span>
+                       </div>
+                 #html <span class="hidden"></span>)}
+            <div class="flex flex-1 items-center justify-end gap-2">
+              <button type="button"
+                      aria-label="Zoom out"
+                      title="Zoom out"
+                      class="inline-flex h-9 w-9 items-center justify-center rounded-md text-white hover:bg-white/10"
+                      on:click={{:kind :share-image-zoom-out}}>
+                {(IconZoomOut "h-5 w-5")}
+              </button>
+              <span class="min-w-16 text-center text-sm text-white">{(shareImageZoomLabel state.shareImageZoom)}</span>
+              <button type="button"
+                      aria-label="Zoom in"
+                      title="Zoom in"
+                      class="inline-flex h-9 w-9 items-center justify-center rounded-md text-white hover:bg-white/10"
+                      on:click={{:kind :share-image-zoom-in}}>
+                {(IconZoomIn "h-5 w-5")}
+              </button>
+              <button type="button"
+                      aria-label="Fit to screen"
+                      title="Fit to screen"
+                      class="inline-flex h-9 w-9 items-center justify-center rounded-md text-white hover:bg-white/10"
+                      on:click={{:kind :share-image-fit}}>
+                {(IconMaximize2 "h-5 w-5")}
+              </button>
+              <button type="button"
+                      aria-label="Rotate"
+                      title="Rotate"
+                      class="inline-flex h-9 w-9 items-center justify-center rounded-md text-white hover:bg-white/10"
+                      on:click={{:kind :share-image-rotate}}>
+                {(IconRotateCw "h-5 w-5")}
+              </button>
+              <div class="mx-2 h-6 w-px bg-white/20"></div>
+              <a href={(shareFileDownloadHref state file)}
+                 download={file.name}
+                 aria-label="Download"
+                 title="Download"
+                 class="inline-flex h-9 w-9 items-center justify-center rounded-md text-white hover:bg-white/10">
+                {(IconDownload "h-5 w-5")}
+              </a>
+              <button type="button"
+                      title="Close"
+                      aria-label="Close"
+                      class="inline-flex h-9 w-9 items-center justify-center rounded-md text-white hover:bg-white/10"
+                      on:click={{:kind :share-close-viewer}}>
+                {(IconX "h-5 w-5")}
+              </button>
+            </div>
+          </div>
+	          <div class="relative flex min-h-0 flex-1 items-center justify-center overflow-auto p-4">
+	            <img src={(shareFileMediaUrl state file)}
+	                 alt={file.name}
+	                 class="pointer-events-none transition-transform duration-200"
+	                 style={(shareImageStyle state.shareImageZoom state.shareImageRotation)}></img>
+	          </div>
+	        </div>))
+
+(ann SharePdfViewer (Fn [AppState FileItem] Html))
+(defn SharePdfViewer [state file]
+  #html <div class="fixed inset-0 z-40 flex flex-col bg-background text-foreground">
+          <div class="flex h-12 shrink-0 items-center justify-between border-b border-border px-3">
+            <div class="truncate text-sm font-medium">{file.name}</div>
+            <button type="button"
+                    title="Close"
+                    aria-label="Close"
+                    class="inline-flex h-8 items-center rounded-md border border-border px-3 text-sm"
+                    on:click={{:kind :share-close-viewer}}>Close</button>
+          </div>
+          <embed src={(shareFileMediaUrl state file)}
+                 type="application/pdf"
+                 class="min-h-0 flex-1"></embed>
+        </div>)
+
+(ann ShareViewerLayer (Fn [AppState] Html))
+(defn ShareViewerLayer [state]
+  (match (selectedShareViewingFile state)
+    nil #html <div><span class="hidden"></span></div>
+    (some current)
+      #html <div>
+              {(if (= current.type MediaType.IMAGE)
+                   (ShareImageViewer state current)
+                   (if (= current.type MediaType.PDF)
+                       (SharePdfViewer state current)
+                       (if (= current.type MediaType.TEXT)
+                           (ShareTextViewer state current)
+                           #html <span class="hidden"></span>)))}
+            </div>))
+
+(ann shareFileTypeLabel (Fn [AppState] String))
+(defn shareFileTypeLabel [state]
+  (if (= state.shareExtension "txt")
+      "TXT File"
+      (if (= state.shareExtension "")
+          "File"
+          (str state.shareExtension " File"))))
+
+(ann shareFilePreviewable? (Fn [AppState] Bool))
+(defn shareFilePreviewable? [state]
+  (or (= state.shareMediaType MediaType.TEXT)
+      (= state.shareMediaType MediaType.IMAGE)
+      (= state.shareMediaType MediaType.PDF)
+      (= state.shareMediaType MediaType.AUDIO)
+      (= state.shareMediaType MediaType.VIDEO)))
+
+(ann shareDirectTextDownloadHref (Fn [AppState] String))
+(defn shareDirectTextDownloadHref [state]
+  (str "/api/share/" (match state.shareToken nil "" (some token) token) "/download"))
+
+(ann shareDirectTextLineCount (Fn [String] Number))
+(defn shareDirectTextLineCount [content]
+  (count (split content "\n")))
+
+(ann ShareDirectTextViewer (Fn [AppState] Html))
+(defn ShareDirectTextViewer [state]
+  #html <div role="dialog"
+             aria-labelledby="share-text-viewer-title"
+             aria-modal="true"
+             class="fixed inset-0 z-50 flex flex-col bg-background/95 text-foreground backdrop-blur-sm">
+          <header class="flex h-auto min-h-12 shrink-0 flex-wrap items-center justify-between gap-2 border-b border-border bg-background/90 px-3 py-2">
+            <div class="min-w-0 flex-1">
+              <h2 id="share-text-viewer-title" class="truncate text-lg font-medium">{state.shareName}</h2>
+              <p class="text-sm text-muted-foreground">
+                {(shareFileTypeLabel state)}
+                {(if (not (= state.shareTextContent ""))
+                     #html <span>{(str " • " (shareDirectTextLineCount state.shareTextContent) " lines")}</span>
+                     #html <span class="hidden"></span>)}
+              </p>
+            </div>
+            <div class="flex flex-wrap items-center gap-2">
+              <button type="button"
+                      title="Copy to clipboard"
+                      class="inline-flex h-8 w-8 items-center justify-center rounded-md hover:bg-muted"
+                      on:click={{:kind :share-text-copy}}>
+                <span class="sr-only">Copy to clipboard</span>
+                <span aria-hidden="true">⎘</span>
+              </button>
+              <button type="button"
+                      title="Download"
+                      aria-label="Download"
+                      class="inline-flex h-8 w-8 items-center justify-center rounded-md hover:bg-muted"
+                      on:click={{:kind :download-url
+                                 :url (shareDirectTextDownloadHref state)
+                                 :filename state.shareName}}>
+                {(IconDownload "h-5 w-5")}
+              </button>
+              <button type="button"
+                      title="Close"
+                      class="inline-flex h-8 w-8 items-center justify-center rounded-md hover:bg-muted"
+                      on:click={{:kind :share-close-viewer}}>
+                <span class="sr-only">Close</span>
+                <span aria-hidden="true">×</span>
+              </button>
+            </div>
+          </header>
+          <div class="min-h-0 flex-1 overflow-hidden">
+            {(if state.shareTextPending
+                 #html <p class="p-4 text-sm text-muted-foreground">Loading…</p>
+                 (if (some? state.shareTextError)
+                     #html <p class="p-4 text-sm text-destructive">{state.shareTextError}</p>
+                     #html <div class="h-full overflow-auto p-4">
+                             <pre class="wrap-break-word whitespace-pre-wrap font-sans text-base leading-[1.75] text-foreground">{state.shareTextContent}</pre>
+                           </div>))}
+          </div>
+        </div>)
+
+(ann ShareFilePageView (Fn [AppState] Html))
+(defn ShareFilePageView [state]
+  (if (shareFilePreviewable? state)
+      #html <main class="relative min-h-screen bg-background text-foreground">
+              {(ShareFloatingThemeButton)}
+              {(if (= state.shareMediaType MediaType.TEXT)
+                   (ShareDirectTextViewer state)
+                   #html <span class="hidden"></span>)}
+            </main>
+      #html <main class="relative flex min-h-screen flex-col items-center justify-center bg-background p-8 text-foreground">
+              {(ShareFloatingThemeButton)}
+              <div class="w-full max-w-md space-y-6 text-center">
+                <h2 class="text-2xl font-medium">{state.shareName}</h2>
+                <p class="text-sm text-muted-foreground">This file type cannot be previewed.</p>
+                <a href={(str "/api/share/" (match state.shareToken nil "" (some token) token) "/download")}
+                   download={state.shareName}
+                   class="mx-auto inline-flex h-9 items-center justify-center gap-2 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground hover:bg-primary/90">
+                  {(IconDownload "h-4 w-4")}
+                  <span>Download File</span>
+                </a>
+              </div>
+            </main>))

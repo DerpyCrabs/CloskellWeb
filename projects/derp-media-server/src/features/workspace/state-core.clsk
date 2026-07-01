@@ -1,0 +1,351 @@
+(import "./geometry.clsk" [createDefaultBounds
+                           getViewportSize
+                           reconcileLayoutBoundsFromSnapZones
+                           workspaceWindowMinVisiblePx])
+(import "./tab-icon-colors.clsk" [isWorkspaceTabIconColorKey])
+(import "./taskbar-pins.clsk" [parseWorkspaceTaskbarPins])
+(import "./titles.clsk" [workspaceKbChatWindowTitle])
+
+(def splitPaneFractionMin 0.3)
+(def splitPaneFractionMax 0.7)
+(def splitPaneFractionDefault 0.5)
+(def SPLIT_PANE_FRACTION_MIN splitPaneFractionMin)
+(def SPLIT_PANE_FRACTION_MAX splitPaneFractionMax)
+(def SPLIT_PANE_FRACTION_DEFAULT splitPaneFractionDefault)
+(def MAX_BROWSER_TAB_TITLE_LEN 120)
+(def MAX_BROWSER_TAB_ICON_LEN 64)
+
+(ann clampSplitPaneFraction (Fn [Js] Number))
+(defn clampSplitPaneFraction [fraction]
+  (if (number? fraction)
+      (min splitPaneFractionMax (max splitPaneFractionMin fraction))
+      splitPaneFractionDefault))
+
+(def workspaceStorageKey "workspace-state")
+
+(ann workspaceStorageBaseKey (Fn [(Option String)] String))
+(defn workspaceStorageBaseKey [shareToken]
+  (match shareToken
+    nil workspaceStorageKey
+    (some token)
+      (if (= token "")
+          workspaceStorageKey
+          (str workspaceStorageKey "-share-" token))))
+
+(ann workspaceStorageSessionKey (Fn [String String] String))
+(defn workspaceStorageSessionKey [baseKey workspaceSessionId]
+  (str baseKey "-ws-" workspaceSessionId))
+
+(ann parseWorkspaceFileOpenTargetField (Fn [Js] (Option String)))
+(defn parseWorkspaceFileOpenTargetField [value]
+  (if (or (= value "new-tab") (= value "new-window")) value nil))
+
+(type WorkspaceSource
+  {:kind String
+   :rootPath (Option String)
+   :token (Option String)
+   :sharePath (Option String)})
+
+(type SourceContext
+  {:shareToken (Option String)
+   :sharePath (Option String)})
+
+(type WorkspaceAnchorWindow
+  {:id String
+   :type String
+   :fileOpenTargetWindowId (Option String)})
+
+(type WorkspaceAnchorState
+  {:windows (Vector WorkspaceAnchorWindow)})
+
+(type WorkspaceInitialState
+  {:dir (Option String)
+   :viewing (Option String)
+   :playing (Option String)
+   :kbRoot (Option String)})
+
+(type WorkspaceTitleWindow
+  {:title String
+   :type String
+   :source WorkspaceSource
+   :initialState WorkspaceInitialState})
+
+(ann getSourceLabel (Fn [WorkspaceSource] String))
+(defn getSourceLabel [source]
+  (if (= source.kind "share") "Share" "Browser"))
+
+(ann workspaceSourceToMediaContext (Fn [(Option WorkspaceSource)] (Option SourceContext)))
+(defn workspaceSourceToMediaContext [source]
+  (match source
+    nil nil
+    (some current)
+      (if (= current.kind "share")
+          {:shareToken current.token :sharePath current.sharePath}
+          nil)))
+
+(ann resolveNewTabAnchorWindowId (Fn [WorkspaceAnchorState String] String))
+(defn resolveNewTabAnchorWindowId [state browserWindowId]
+  (let [winDef (find state.windows (fn [win] (= win.id browserWindowId)))]
+    (if (not (some? winDef))
+        browserWindowId
+        (if (not (= winDef.type "browser"))
+            browserWindowId
+            (let [targetId winDef.fileOpenTargetWindowId]
+              (if (or (not (some? targetId)) (= targetId "") (= targetId browserWindowId))
+                  browserWindowId
+                  (let [target (find state.windows (fn [candidate] (= candidate.id targetId)))]
+                    (if (some? target) targetId browserWindowId))))))))
+
+(ann getWorkspaceWindowTitle (Fn [WorkspaceTitleWindow] String))
+(defn getWorkspaceWindowTitle [win]
+  (if (= win.type "chat")
+      (let [rawRoot win.initialState.kbRoot
+            kbRoot (if (some? rawRoot) rawRoot "")
+            derived (workspaceKbChatWindowTitle kbRoot)
+            title (trim win.title)]
+        (if (or (= title "") (= title "KB Chat"))
+            derived
+            (if (not (= title "")) win.title
+                (if (= win.type "viewer")
+                    (str (getSourceLabel win.source) " Viewer")
+                    (getSourceLabel win.source)))))
+      (if (not (= (trim win.title) ""))
+          win.title
+          (if (= win.type "viewer")
+              (str (getSourceLabel win.source) " Viewer")
+              (getSourceLabel win.source)))))
+
+(ann entryKeyCompare (Fn [Js Js] Number))
+(defn entryKeyCompare [a b]
+  (let [keyA (unsafe-cast Js a.key)]
+    (keyA.localeCompare b.key)))
+
+(ann sortTabMapKeys (Fn [Js] Js))
+(defn sortTabMapKeys [tabMap]
+  (reduce (sort-with (object-entries (if (object? tabMap) tabMap {})) entryKeyCompare)
+          {}
+          (fn [out entry] (object-assoc out entry.key entry.value))))
+
+(ann objectHasKeys? (Fn [Js] Bool))
+(defn objectHasKeys? [value]
+  (and (object? value) (> (count (object-keys value)) 0)))
+
+(ann optionalAssocWhen (Fn [Js String Js Bool] Js))
+(defn optionalAssocWhen [target key value include?]
+  (if include? (object-assoc target key value) target))
+
+(ann serializeWorkspaceBase (Fn [Js Bool] String))
+(defn serializeWorkspaceBase [state includeChrome?]
+  (let [base {:windows state.windows
+              :activeWindowId state.activeWindowId
+              :activeTabMap (sortTabMapKeys state.activeTabMap)
+              :nextWindowId state.nextWindowId
+              :pinnedTaskbarItems (if (some? state.pinnedTaskbarItems) state.pinnedTaskbarItems [])}
+        withSplits (optionalAssocWhen base "tabGroupSplits" state.tabGroupSplits (objectHasKeys? state.tabGroupSplits))
+        withTitle (optionalAssocWhen withSplits "browserTabTitle" state.browserTabTitle (and includeChrome? (some? state.browserTabTitle) (not (= state.browserTabTitle ""))))
+        withIcon (optionalAssocWhen withTitle "browserTabIcon" state.browserTabIcon (and includeChrome? (some? state.browserTabIcon) (not (= state.browserTabIcon ""))))
+        withColor (optionalAssocWhen withIcon "browserTabIconColor" state.browserTabIconColor (and includeChrome? (some? state.browserTabIconColor) (not (= state.browserTabIconColor ""))))
+        withTarget (optionalAssocWhen withColor "fileOpenTarget" state.fileOpenTarget (some? state.fileOpenTarget))]
+    (json-stringify withTarget)))
+
+(ann serializeWorkspacePersistedState (Fn [Js] String))
+(defn serializeWorkspacePersistedState [state]
+  (serializeWorkspaceBase state true))
+
+(ann serializeWorkspaceLayoutState (Fn [Js] String))
+(defn serializeWorkspaceLayoutState [state]
+  (serializeWorkspaceBase state false))
+
+(ann groupIdForWorkspaceMember (Fn [Js] String))
+(defn groupIdForWorkspaceMember [win]
+  (let [gid (get win :tabGroupId)]
+    (if (string? gid) gid win.id)))
+
+(ann sanitizeBrowserFileOpenTarget (Fn [Js Js] Js))
+(defn sanitizeBrowserFileOpenTarget [ids win]
+  (if (not (= win.type "browser"))
+      win
+      (let [targetId (get win :fileOpenTargetWindowId)]
+        (if (and (string? targetId)
+                 (not (= targetId ""))
+                 (not (= targetId win.id))
+                 (ids.has targetId))
+            win
+            (object-dissoc win "fileOpenTargetWindowId")))))
+
+(ann sanitizeBrowserFileOpenTargets (Fn [Js] Js))
+(defn sanitizeBrowserFileOpenTargets [windows]
+  (let [ids (new (js-global Set) (map windows (fn [win] win.id)))]
+    (map windows (fn [win] (sanitizeBrowserFileOpenTarget ids win)))))
+
+(ann sanitizeBrowserTabTitle (Fn [Js] (Option String)))
+(defn sanitizeBrowserTabTitle [value]
+  (if (not (string? value))
+      nil
+      (let [trimmed (trim (string-slice value 0 MAX_BROWSER_TAB_TITLE_LEN))]
+        (if (> (count trimmed) 0) trimmed nil))))
+
+(ann sanitizeBrowserTabIcon (Fn [Js] (Option String)))
+(defn sanitizeBrowserTabIcon [value]
+  (if (not (string? value))
+      nil
+      (let [trimmed (trim (string-slice value 0 MAX_BROWSER_TAB_ICON_LEN))]
+        (if (and (> (count trimmed) 0)
+                 (regex-test? trimmed "^[A-Za-z][A-Za-z0-9]*$" ""))
+            trimmed
+            nil))))
+
+(ann sanitizeBrowserTabIconColor (Fn [Js] (Option String)))
+(defn sanitizeBrowserTabIconColor [value]
+  (if (not (string? value))
+      nil
+      (let [trimmed (trim value)]
+        (if (and (> (count trimmed) 0) (isWorkspaceTabIconColorKey trimmed)) trimmed nil))))
+
+(ann membersForGroup (Fn [Js String] Js))
+(defn membersForGroup [windows groupId]
+  (filter windows (fn [win] (= (groupIdForWorkspaceMember win) groupId))))
+
+(ann sanitizeTabGroupSplitEntry (Fn [Js Js] Js))
+(defn sanitizeTabGroupSplitEntry [windows entry]
+  (let [gid entry.key
+        sp entry.value]
+    (if (not (object? sp))
+        nil
+        (let [leftTabId (get sp :leftTabId)]
+          (if (not (string? leftTabId))
+              nil
+              (let [members (membersForGroup windows gid)
+                    leftWin (find members (fn [win] (= win.id leftTabId)))
+                    rightCount (count (filter members (fn [win] (not (= win.id leftTabId)))))
+                    rawFrac (get sp :leftPaneFraction)
+                    frac (if (number? rawFrac)
+                             (clampSplitPaneFraction rawFrac)
+                             splitPaneFractionDefault)]
+                (if (and (some? leftWin) (>= rightCount 1))
+                    {:gid gid :split {:leftTabId leftTabId :leftPaneFraction frac}}
+                    nil)))))))
+
+(ann sanitizeTabGroupSplitsField (Fn [Js Js] Js))
+(defn sanitizeTabGroupSplitsField [windows raw]
+  (if (not (object? raw))
+      nil
+      (let [out (reduce (object-entries raw)
+                        {}
+                        (fn [acc entry]
+                          (let [item (sanitizeTabGroupSplitEntry windows entry)]
+                            (match item
+                              nil acc
+                              (some current) (object-assoc acc current.gid current.split)))))]
+        (if (> (count (object-keys out)) 0) out nil))))
+
+(ann ensureSplitWorkspaceFocus (Fn [Js Js Js Js] Js))
+(defn ensureSplitWorkspaceFocus [windows activeTabMap activeWindowId splits]
+  (if (not (object? splits))
+      {:activeTabMap (if (object? activeTabMap) activeTabMap {}) :activeWindowId activeWindowId}
+      (reduce (object-entries splits)
+              {:activeTabMap (if (object? activeTabMap) activeTabMap {}) :activeWindowId activeWindowId}
+              (fn [state entry]
+                (let [gid entry.key
+                      sp entry.value
+                      members (membersForGroup windows gid)
+                      firstRight (find members (fn [win] (not (= win.id sp.leftTabId))))
+                      currentTab (object-get state.activeTabMap gid)
+                      nextMap (if (and (= currentTab sp.leftTabId) (some? firstRight))
+                                  (object-assoc state.activeTabMap gid firstRight.id)
+                                  state.activeTabMap)
+                      nextActive (if (and (= state.activeWindowId sp.leftTabId) (some? firstRight))
+                                     firstRight.id
+                                     state.activeWindowId)]
+                  {:activeTabMap nextMap :activeWindowId nextActive})))))
+
+(ann validBounds? (Fn [Js] Bool))
+(defn validBounds? [value]
+  (and (object? value)
+       (number? value.x)
+       (number? value.y)
+       (number? value.width)
+       (number? value.height)))
+
+(ann clampBoundsToViewport (Fn [Js Js] Js))
+(defn clampBoundsToViewport [bounds viewport]
+  (let [vis workspaceWindowMinVisiblePx
+        vw (max viewport.width vis)
+        vh (max viewport.height vis)
+        width (min (max bounds.width vis) vw)
+        height (min (max bounds.height vis) vh)
+        minX (- vis width)
+        maxX (- vw vis)
+        minY (- vis height)
+        maxY (- vh vis)]
+    {:x (max minX (min bounds.x maxX))
+     :y (max minY (min bounds.y maxY))
+     :width width
+     :height height}))
+
+(ann isValidSource (Fn [Js] Bool))
+(defn isValidSource [source]
+  (and (object? source)
+       (string? source.kind)
+       (or (= source.kind "local")
+           (and (= source.kind "share") (string? source.token)))))
+
+(ann validWorkspaceWindow? (Fn [Js] Bool))
+(defn validWorkspaceWindow? [win]
+  (and (object? win)
+       (string? win.id)
+       (or (= win.type "browser") (= win.type "viewer") (= win.type "chat"))
+       (isValidSource win.source)))
+
+(ann normalizeWorkspaceWindow (Fn [Js Number Js] Js))
+(defn normalizeWorkspaceWindow [win index viewport]
+  (let [layout (if (object? win.layout) win.layout {})
+        rawBounds (get layout :bounds)
+        bounds (if (validBounds? rawBounds)
+                   (clampBoundsToViewport rawBounds viewport)
+                   (createDefaultBounds index win.type))]
+    (object-assoc win "layout" (object-assoc layout "bounds" bounds))))
+
+(ann isValidPinnedItem (Fn [Js] Bool))
+(defn isValidPinnedItem [pin]
+  (= (count (parseWorkspaceTaskbarPins [pin])) 1))
+
+(ann normalizePersistedWorkspaceState (Fn [Js Js] Js))
+(defn normalizePersistedWorkspaceState [data options]
+  (if (or (not (object? data))
+          (not (vector? data.windows))
+          (= (count data.windows) 0))
+      nil
+      (let [reconcileSnapZones (not (= (get options :reconcileSnapZones) false))
+            viewport (getViewportSize)
+            validatedWindows (map-indexed (filter data.windows validWorkspaceWindow?)
+                                           (fn [win index] (normalizeWorkspaceWindow win index viewport)))]
+        (if (= (count validatedWindows) 0)
+            nil
+            (let [reconciledWindows (if reconcileSnapZones
+                                        (reconcileLayoutBoundsFromSnapZones validatedWindows nil)
+                                        validatedWindows)
+                  withOpenTargets (sanitizeBrowserFileOpenTargets reconciledWindows)
+                  rawPinned (if (vector? data.pinnedTaskbarItems) data.pinnedTaskbarItems [])
+                  pinnedTaskbarItems (filter rawPinned isValidPinnedItem)
+                  browserTabTitle (sanitizeBrowserTabTitle data.browserTabTitle)
+                  browserTabIcon (sanitizeBrowserTabIcon data.browserTabIcon)
+                  browserTabIconColor (sanitizeBrowserTabIconColor data.browserTabIconColor)
+                  fileOpenTarget (parseWorkspaceFileOpenTargetField data.fileOpenTarget)
+                  tabGroupSplits (sanitizeTabGroupSplitsField withOpenTargets data.tabGroupSplits)
+                  focus (ensureSplitWorkspaceFocus withOpenTargets
+                                                   (if (object? data.activeTabMap) data.activeTabMap {})
+                                                   (if (some? data.activeWindowId) data.activeWindowId nil)
+                                                   tabGroupSplits)
+                  base {:windows withOpenTargets
+                        :activeWindowId focus.activeWindowId
+                        :activeTabMap focus.activeTabMap
+                        :nextWindowId (if (some? data.nextWindowId)
+                                          data.nextWindowId
+                                          (+ (count validatedWindows) 1))
+                        :pinnedTaskbarItems pinnedTaskbarItems}
+                  withSplits (optionalAssocWhen base "tabGroupSplits" tabGroupSplits (some? tabGroupSplits))
+                  withTitle (optionalAssocWhen withSplits "browserTabTitle" browserTabTitle (some? browserTabTitle))
+                  withIcon (optionalAssocWhen withTitle "browserTabIcon" browserTabIcon (some? browserTabIcon))
+                  withColor (optionalAssocWhen withIcon "browserTabIconColor" browserTabIconColor (some? browserTabIconColor))]
+              (optionalAssocWhen withColor "fileOpenTarget" fileOpenTarget (some? fileOpenTarget)))))))

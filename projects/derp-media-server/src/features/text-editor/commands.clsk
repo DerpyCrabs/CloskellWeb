@@ -1,0 +1,66 @@
+(import "../../messages.clsk" [AppMsg])
+(import "../media-urls.clsk" [buildMediaUrl])
+
+(def jsJSON (js-global JSON))
+
+(ann adminCreateTextCommand (Fn [String String] (Cmd AppMsg)))
+(defn adminCreateTextCommand [path content]
+  {:kind :http/request
+   :request {:url "/api/files/create"
+             :method "POST"
+             :headers {"Content-Type" "application/json"}
+             :body (jsJSON.stringify {:type "file" :path path :content content})}
+   :response :json
+   :onSuccess :admin-paste-created
+   :onError :admin-paste-failed})
+
+(ann fetchAdminTextCommand (Fn [String] (Cmd AppMsg)))
+(defn fetchAdminTextCommand [path]
+  {:kind :http/request
+   :request {:url (buildMediaUrl path nil)
+             :method "GET"}
+   :response :text
+   :onSuccess :admin-text-loaded
+   :onError :admin-text-failed})
+
+(ann saveAdminTextCommand (Fn [String String] (Cmd AppMsg)))
+(defn saveAdminTextCommand [path content]
+  {:kind :http/request
+   :request {:url "/api/files/edit"
+             :method "POST"
+             :headers {"Content-Type" "application/json"}
+             :body (jsJSON.stringify {:path path :content content})}
+   :response :json
+   :onSuccess :admin-text-saved
+   :onError :admin-text-save-failed})
+
+(ann adminAutoSaveCommand (Fn [String Bool Bool] (Cmd AppMsg)))
+(defn adminAutoSaveCommand [path enabled readOnly]
+  {:kind :http/request
+   :request {:url "/api/settings/autoSave"
+             :method "POST"
+             :headers {"Content-Type" "application/json"}
+             :body (jsJSON.stringify {:filePath path :enabled enabled :readOnly readOnly})}
+   :response :json
+   :onSuccess :admin-text-auto-save-loaded
+   :onError :admin-text-save-failed})
+
+(ann fetchShareTextCommand (Fn [String] (Cmd AppMsg)))
+(defn fetchShareTextCommand [url]
+  {:kind :http/request
+   :request {:url url
+             :method "GET"}
+   :response :text
+   :onSuccess :share-text-loaded
+   :onError :share-text-failed})
+
+(ann shareEditCommand (Fn [String String String] (Cmd AppMsg)))
+(defn shareEditCommand [token path content]
+  {:kind :http/request
+   :request {:url (str "/api/share/" token "/edit")
+             :method "POST"
+             :headers {"Content-Type" "application/json"}
+             :body (jsJSON.stringify {:path path :content content})}
+   :response :json
+   :onSuccess :share-text-saved
+   :onError :share-text-save-failed})

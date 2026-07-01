@@ -1,0 +1,68 @@
+(import "../source-context.clsk" [normalizeSlashes])
+
+(type WorkspaceTaskbarPinSource
+  {:kind String
+   :rootPath (Option String)
+   :token (Option String)
+   :sharePath (Option String)})
+
+(type WorkspaceTaskbarPin
+  {:id String
+   :path String
+   :isDirectory Bool
+   :title String
+   :customIconName (Option String)
+   :source WorkspaceTaskbarPinSource})
+
+(defn validSource? [source]
+  (and (object? source)
+       (string? (get source :kind))
+       (or (= (get source :kind) "local")
+           (and (= (get source :kind) "share")
+                (string? (get source :token))))))
+
+(defn validPin? [pin]
+  (and (object? pin)
+       (string? (get pin :id))
+       (string? (get pin :path))
+       (bool? (get pin :isDirectory))
+       (string? (get pin :title))
+       (validSource? (get pin :source))))
+
+(ann parseWorkspaceTaskbarPins (Fn [Js] (Vector WorkspaceTaskbarPin)))
+(defn parseWorkspaceTaskbarPins [raw]
+  (if (vector? raw)
+      (filter raw validPin?)
+      []))
+
+(ann pathHasDotDot (Fn [String] Bool))
+(defn pathHasDotDot [path]
+  (any? (split (normalizeSlashes path) "/") (fn [segment] (= segment ".."))))
+
+(ann filterAdminWorkspaceTaskbarPins (Fn [(Vector WorkspaceTaskbarPin)] (Vector WorkspaceTaskbarPin)))
+(defn filterAdminWorkspaceTaskbarPins [items]
+  (filter items
+          (fn [pin]
+            (let [path (get pin :path)
+                  source (get pin :source)]
+              (if (string? path)
+                  (and (= (get source :kind) "local")
+                       (not (= path ""))
+                       (not (pathHasDotDot path)))
+                  false)))))
+
+(ann filterShareWorkspaceTaskbarPins (Fn [String String (Vector WorkspaceTaskbarPin)] (Vector WorkspaceTaskbarPin)))
+(defn filterShareWorkspaceTaskbarPins [sharePath token items]
+  (let [root (normalizeSlashes sharePath)]
+    (filter items
+            (fn [pin]
+              (let [path (get pin :path)
+                    source (get pin :source)]
+                (if (string? path)
+                    (let [pathNorm (normalizeSlashes path)]
+                      (and (= (get source :kind) "share")
+                           (= (get source :token) token)
+                           (not (pathHasDotDot pathNorm))
+                           (or (= pathNorm root)
+                               (starts-with? pathNorm (str root "/")))))
+                    false))))))

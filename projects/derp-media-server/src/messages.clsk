@@ -1,0 +1,290 @@
+(import "./model.clsk" [AppState
+                        AudioMetadataResponse
+                        AuthResponse
+                        BasicResponse
+                        FilesResponse
+	                        LoginResponse
+	                        SettingsResponse
+	                        ShareInfoResponse
+	                        SharesResponse
+	                        TextResponse
+	                        ViewStatsResponse
+	                        WindowEventPayload])
+(import "../lib/types.clsk" [FileItem])
+(import "./features/text-editor/messages.clsk" [TextEditorMsg])
+
+(type AppMsg
+  (Union TextEditorMsg
+         {:kind :route-changed :href String}
+	         {:kind :startup-view-mode-loaded :value String}
+	         {:kind :startup-snap-assist-loaded :value String}
+	         {:kind :startup-preferred-snap-loaded :value String}
+	         {:kind :startup-theme-mode-loaded :value String}
+	         {:kind :startup-theme-palette-loaded :value String}
+	         {:kind :startup-preferences-load-failed :error String}
+         {:kind :sse-refresh}
+	         {:kind :login-password :value String}
+         {:kind :login-submit}
+         {:kind :login-ok :value LoginResponse}
+         {:kind :login-failed :error String}
+         {:kind :auth-loaded :value AuthResponse}
+         {:kind :auth-failed :error String}
+         {:kind :settings-loaded :value SettingsResponse}
+         {:kind :settings-failed :error String}
+         {:kind :kb-search-open}
+         {:kind :kb-search-close}
+         {:kind :kb-search-query :value String}
+         {:kind :shares-loaded :value SharesResponse}
+         {:kind :shares-failed :error String}
+         {:kind :files-loaded :value FilesResponse}
+         {:kind :files-failed :error String}
+         {:kind :refresh-files}
+         {:kind :navigate-dir :path String}
+         {:kind :open-file :file FileItem}
+         {:kind :view-mode-picked :value String}
+         {:kind :view-mode-saved :value BasicResponse}
+         {:kind :view-mode-save-failed :error String}
+         {:kind :toggle-favorite :path String}
+         {:kind :favorite-loaded :value BasicResponse}
+         {:kind :favorite-failed :error String}
+	         {:kind :view-stats-loaded :value ViewStatsResponse}
+	         {:kind :view-stats-failed :error String}
+	         {:kind :view-count-loaded :value BasicResponse}
+	         {:kind :view-count-failed :error String}
+	         {:kind :file-context-menu :file FileItem :x Number :y Number}
+	         {:kind :workspace-file-context-menu :windowId String :file FileItem :x Number :y Number}
+	         {:kind :breadcrumb-context-menu :path String :x Number :y Number}
+         {:kind :breadcrumb-path-menu-toggle :mode String}
+         {:kind :breadcrumb-path-menu-close}
+         {:kind :breadcrumb-path-pick :path String}
+         {:kind :close-context-menu}
+         {:kind :admin-upload-menu-toggle}
+         {:kind :admin-upload-file-selected :selected? Bool}
+         {:kind :admin-upload-input-selected :selected? Bool :testId String}
+         {:kind :admin-upload-loaded :value BasicResponse}
+         {:kind :admin-upload-failed :error String}
+         {:kind :admin-drag-enter-upload}
+         {:kind :admin-drag-leave-upload}
+         {:kind :admin-open-create :createKind String}
+         {:kind :admin-create-name :value String}
+         {:kind :admin-create-submit}
+         {:kind :admin-create-loaded :value BasicResponse}
+         {:kind :admin-create-failed :error String}
+         {:kind :admin-open-rename :path String :name String :isDirectory Bool}
+         {:kind :admin-rename-name :value String}
+         {:kind :admin-rename-submit}
+         {:kind :admin-rename-loaded :value BasicResponse}
+         {:kind :admin-rename-failed :error String}
+         {:kind :admin-open-delete :path String :name String :isDirectory Bool}
+         {:kind :admin-delete-submit}
+         {:kind :admin-delete-loaded :value BasicResponse}
+         {:kind :admin-delete-failed :error String}
+         {:kind :admin-open-transfer :mode String :path String :name String :isDirectory Bool}
+         {:kind :admin-transfer-pick :path String}
+         {:kind :admin-transfer-submit}
+         {:kind :admin-transfer-loaded :value BasicResponse}
+         {:kind :admin-transfer-failed :error String}
+         {:kind :admin-close-dialog}
+	         {:kind :admin-open-share :path String :name String :isDirectory Bool}
+	         {:kind :admin-share-show-create}
+	         {:kind :admin-share-editable :editable Bool}
+	         {:kind :admin-share-allow-upload :enabled Bool}
+	         {:kind :admin-share-allow-edit :enabled Bool}
+	         {:kind :admin-share-allow-delete :enabled Bool}
+	         {:kind :admin-share-create}
+	         {:kind :admin-share-created :value BasicResponse}
+	         {:kind :admin-share-create-failed :error String}
+	         {:kind :admin-share-delete :token String}
+	         {:kind :admin-share-deleted :value BasicResponse}
+	         {:kind :admin-share-delete-failed :error String}
+	         {:kind :admin-paste :text String}
+         {:kind :admin-paste-name :value String}
+         {:kind :admin-paste-submit}
+         {:kind :admin-paste-created :value BasicResponse}
+         {:kind :admin-paste-failed :error String}
+	         {:kind :admin-text-loaded :value TextResponse}
+         {:kind :admin-text-failed :error String}
+         {:kind :workspace-admin-text-loaded :value TextResponse}
+         {:kind :workspace-admin-text-failed :error String}
+         {:kind :admin-text-input :value String}
+         {:kind :admin-text-save}
+         {:kind :admin-text-save-if-needed}
+         {:kind :admin-text-saved :value BasicResponse}
+         {:kind :admin-text-save-failed :error String}
+         {:kind :admin-text-read-only :readOnly Bool}
+         {:kind :admin-text-auto-save-toggle}
+         {:kind :admin-text-auto-save-loaded :value BasicResponse}
+         {:kind :admin-markdown-image-open :src String}
+         {:kind :admin-markdown-image-close}
+         {:kind :admin-image-zoom-in}
+         {:kind :admin-image-zoom-out}
+         {:kind :admin-image-fit}
+         {:kind :admin-image-rotate}
+         {:kind :admin-image-next}
+         {:kind :admin-image-previous}
+         {:kind :admin-open-icon :path String :name String}
+         {:kind :admin-icon-pick :name String}
+         {:kind :admin-icon-save}
+         {:kind :admin-icon-saved :value BasicResponse}
+         {:kind :admin-icon-failed :error String}
+	         {:kind :theme-menu-toggle}
+	         {:kind :theme-pick :mode String}
+	         {:kind :theme-palette-pick :palette String}
+         {:kind :window-scroll :y Number}
+         {:kind :scroll-playing-file}
+	         {:kind :global-keydown :key String :ctrlKey Bool :metaKey Bool :targetEditable Bool}
+         {:kind :drag-start :path String}
+         {:kind :drag-end}
+         {:kind :drop-on-folder :sourcePath String :destPath String}
+         {:kind :admin-move-loaded :value BasicResponse}
+         {:kind :admin-move-failed :error String}
+         {:kind :context-favorite}
+         {:kind :context-open-workspace}
+         {:kind :context-toggle-knowledge-base}
+         {:kind :knowledge-base-updated :value BasicResponse}
+         {:kind :knowledge-base-update-failed :error String}
+         {:kind :download-url :url String :filename String}
+         {:kind :open-url-new-tab :url String}
+         {:kind :close-viewer}
+         {:kind :close-player}
+	         {:kind :audio-only :enabled Bool :currentTime Number}
+	         {:kind :toggle-repeat}
+	         {:kind :media-play}
+	         {:kind :media-audio-metadata-loaded :key String :value AudioMetadataResponse}
+	         {:kind :media-audio-metadata-failed :error String}
+	         {:kind :video-compact :compact? Bool}
+         {:kind :share-info-loaded :value ShareInfoResponse}
+         {:kind :share-info-failed :error String}
+         {:kind :share-passcode-input :value String}
+         {:kind :share-passcode-submit}
+         {:kind :share-verify-loaded :value BasicResponse}
+         {:kind :share-verify-failed :error String}
+		         {:kind :share-files-loaded :value FilesResponse}
+		         {:kind :share-files-failed :error String}
+		         {:kind :share-navigate-dir :path String}
+		         {:kind :share-open-file :file FileItem}
+		         {:kind :share-open-workspace}
+		         {:kind :share-view-mode-picked :value String}
+	         {:kind :share-upload-menu-toggle}
+	         {:kind :share-upload-file-selected :selected? Bool}
+	         {:kind :share-upload-submit}
+	         {:kind :share-upload-loaded :value BasicResponse}
+	         {:kind :share-upload-failed :error String}
+	         {:kind :share-open-create :createKind String}
+	         {:kind :share-create-name :value String}
+	         {:kind :share-create-submit}
+	         {:kind :share-create-loaded :value BasicResponse}
+	         {:kind :share-create-failed :error String}
+	         {:kind :share-open-rename :file FileItem}
+	         {:kind :share-rename-name :value String}
+		         {:kind :share-rename-submit}
+		         {:kind :share-rename-loaded :value BasicResponse}
+		         {:kind :share-rename-failed :error String}
+		         {:kind :share-open-delete :file FileItem}
+		         {:kind :share-delete-submit}
+		         {:kind :share-delete-loaded :value BasicResponse}
+		         {:kind :share-delete-failed :error String}
+				         {:kind :share-text-loaded :value TextResponse}
+			         {:kind :share-text-failed :error String}
+			         {:kind :share-text-input :value String}
+			         {:kind :share-text-copy}
+			         {:kind :share-text-save}
+			         {:kind :share-text-saved :value BasicResponse}
+			         {:kind :share-text-save-failed :error String}
+	         {:kind :share-close-dialog}
+	         {:kind :share-close-viewer}
+		         {:kind :share-close-player}
+		         {:kind :workspace-open-browser}
+		         {:kind :workspace-exit-to-share}
+		         {:kind :workspace-storage-loaded :key String :value String}
+	         {:kind :workspace-storage-load-failed :error String}
+	         {:kind :workspace-close-window :index Number}
+	         {:kind :workspace-focus-window :index Number}
+	         {:kind :workspace-close-window-id :id String}
+	         {:kind :workspace-focus-window-id :id String}
+	         {:kind :workspace-minimize-window :id String :minimized Bool}
+	         {:kind :workspace-toggle-fullscreen :id String}
+	         {:kind :workspace-window-drag-start :groupId String :id String :grabDx Number :grabDy Number :canvasLeft Number :canvasTop Number :canvasWidth Number :canvasHeight Number :x Number :y Number :width Number :height Number :restore Bool}
+	         {:kind :workspace-window-drag-move :value WindowEventPayload}
+	         {:kind :workspace-window-drag-end :value WindowEventPayload}
+	         {:kind :workspace-assist-hover :gridCols Number :gridRows Number :gc0 Number :gc1 Number :gr0 Number :gr1 Number}
+	         {:kind :workspace-update-bounds :id String :x Number :y Number :width Number :height Number}
+	         {:kind :workspace-resize-start :id String :direction String :startX Number :startY Number :canvasWidth Number :canvasHeight Number :x Number :y Number :width Number :height Number}
+	         {:kind :workspace-resize-move :value WindowEventPayload}
+	         {:kind :workspace-resize-end :value WindowEventPayload}
+	         {:kind :workspace-snap-window :id String :zone String}
+	         {:kind :workspace-merge-window :sourceId String :targetId String :insertIndex Number}
+	         {:kind :workspace-split-window :id String}
+	         {:kind :workspace-select-tab :groupId String :tabId String}
+	         {:kind :workspace-tab-drag-start :groupId String :tabId String :startX Number :startY Number :canvasLeft Number :canvasTop Number :canvasWidth Number :canvasHeight Number}
+	         {:kind :workspace-tab-drag-end :value WindowEventPayload}
+	         {:kind :workspace-close-tab :id String}
+		         {:kind :workspace-toggle-tab-pinned :id String}
+		         {:kind :workspace-tab-menu-open :id String :x Number :y Number}
+		         {:kind :workspace-tab-menu-close}
+		         {:kind :workspace-tab-use-split-left :id String}
+		         {:kind :workspace-tab-exit-split :groupId String}
+		         {:kind :workspace-split-resize-start :groupId String :groupLeft Number :groupWidth Number}
+		         {:kind :workspace-split-resize-move :value WindowEventPayload}
+		         {:kind :workspace-split-resize-end :value WindowEventPayload}
+		         {:kind :workspace-set-split-fraction :groupId String :fraction Number}
+		         {:kind :workspace-open-layout-picker :id String :x Number :y Number}
+	         {:kind :workspace-close-layout-picker}
+	         {:kind :workspace-tiling-pick :id String :gridCols Number :gridRows Number :gc0 Number :gc1 Number :gr0 Number :gr1 Number}
+		         {:kind :workspace-navigate-dir :path String}
+		         {:kind :workspace-open-file :file FileItem}
+		         {:kind :workspace-navigate-dir-for-window :windowId String :path String}
+		         {:kind :workspace-open-file-for-window :windowId String :file FileItem}
+		         {:kind :workspace-open-in-new-tab :windowId String :file FileItem}
+		         {:kind :workspace-video-metadata-loaded :windowId String :path String :width Number :height Number}
+		         {:kind :workspace-drop-file-tab :windowId String :path String :isDirectory Bool :insertIndex Number}
+		         {:kind :workspace-open-in-split-view :windowId String :file FileItem}
+	         {:kind :workspace-add-taskbar :file FileItem}
+	         {:kind :workspace-pin-context-menu :id String :x Number :y Number}
+	         {:kind :workspace-remove-taskbar-pin :id String}
+	         {:kind :workspace-open-taskbar-pin :path String :isDirectory Bool :title String}
+	         {:kind :workspace-audio-open-toggle}
+	         {:kind :workspace-audio-play :path String :name String :dir String}
+	         {:kind :workspace-audio-metadata-loaded :key String :value AudioMetadataResponse}
+	         {:kind :workspace-audio-metadata-failed :error String}
+	         {:kind :workspace-audio-stop}
+	         {:kind :workspace-audio-repeat-toggle}
+	         {:kind :workspace-audio-repeat-set :enabled Bool}
+	         {:kind :workspace-audio-loop-resume}
+	         {:kind :workspace-audio-loop-check :currentTime Number :duration Number}
+	         {:kind :workspace-listen-only :windowId String :path String :name String :dir String}
+	         {:kind :workspace-show-video}
+	         {:kind :workspace-settings-open}
+	         {:kind :workspace-settings-close}
+	         {:kind :workspace-layout-menu-toggle :x Number :y Number}
+	         {:kind :workspace-layout-menu-close}
+	         {:kind :workspace-layout-save-open}
+	         {:kind :workspace-layout-save-close}
+	         {:kind :workspace-layout-save-name :value String}
+	         {:kind :workspace-layout-save-submit}
+	         {:kind :workspace-layout-presets-saved :value BasicResponse}
+	         {:kind :workspace-layout-presets-save-failed :error String}
+	         {:kind :workspace-layout-restore-preset :id String}
+	         {:kind :workspace-layout-revert-baseline}
+	         {:kind :workspace-layout-update-preset :id String}
+	         {:kind :workspace-layout-delete-preset :id String}
+	         {:kind :workspace-snap-assist-toggle :enabled Bool}
+	         {:kind :workspace-file-open-target :target String}
+	         {:kind :workspace-browser-tab-title :value String}
+	         {:kind :workspace-browser-tab-icon :value String}
+	         {:kind :workspace-browser-tab-icon-color :value String}
+	         {:kind :workspace-browser-tab-reset}
+	         {:kind :share-audio-only :enabled Bool :currentTime Number}
+	         {:kind :share-image-zoom-in}
+	         {:kind :share-image-zoom-out}
+	         {:kind :share-image-fit}
+	         {:kind :share-image-rotate}
+	         {:kind :share-image-next}
+	         {:kind :share-image-previous}
+	         {:kind :share-toggle-repeat}
+	         {:kind :share-media-play}
+	         {:kind :share-video-compact :compact? Bool}
+	         {:kind :noop}))
+
+(type UpdateResult
+  [AppState (Cmd AppMsg)])

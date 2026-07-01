@@ -1,0 +1,31 @@
+(def videoPlayerDefaultX 0)
+(def videoPlayerDefaultY 0)
+(def videoPlayerMinVisiblePx 100)
+(def videoPlayerDefaultWidth 320)
+(def videoPlayerDefaultHeight 300)
+(def videoPlayerDefaultMarginRight 16)
+(def videoPlayerDefaultBottomOffset 80)
+
+(type Position
+  {:x Number
+   :y Number})
+
+(type ViewportSize
+  {:width Number
+   :height Number})
+
+(def defaultVideoPlayerPosition
+  {:x videoPlayerDefaultX
+   :y videoPlayerDefaultY})
+
+(ann validateVideoPlayerPositionInViewport (Fn [Position ViewportSize] Position))
+(defn validateVideoPlayerPositionInViewport [position viewport]
+  {:x (max 0 (min position.x (- viewport.width videoPlayerMinVisiblePx)))
+   :y (max 0 (min position.y (- viewport.height videoPlayerMinVisiblePx)))})
+
+(ann defaultVideoPlayerPositionForViewport (Fn [ViewportSize] Position))
+(defn defaultVideoPlayerPositionForViewport [viewport]
+  (let [defaultX (- viewport.width videoPlayerDefaultWidth videoPlayerDefaultMarginRight)
+        defaultY (- viewport.height videoPlayerDefaultHeight videoPlayerDefaultBottomOffset)]
+    {:x (max 0 defaultX)
+     :y (max 0 defaultY)}))

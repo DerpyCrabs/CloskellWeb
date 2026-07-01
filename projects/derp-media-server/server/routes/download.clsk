@@ -1,0 +1,76 @@
+(import "../../lib/file-system.clsk" [getFilePath])
+(import "archiver" [ZipArchive])
+(import "path" [(default path)])
+(import "node:console" [(error as consoleError)])
+(import "../http-capabilities.clsk" [fileStatsSync
+                                     streamArchiveResponse
+                                     streamFileResponse])
+(import "../http-routes.clsk" [HttpRoute registerHttpRoutes])
+
+(ann errorMessage (Fn [Js String] String))
+(defn errorMessage [error fallback]
+  (if (and (object? error) (string? error.message))
+      error.message
+      fallback))
+
+(ann sendDownloadError (Fn [Js Js] Js))
+(defn sendDownloadError [reply error]
+  (do
+    (consoleError "Download error:" error)
+    (let [codedReply (reply.status 500)]
+      (codedReply.send {:error (errorMessage error "Failed to download")}))))
+
+(ann badPath (Fn [Js] Js))
+(defn badPath [reply]
+  (let [codedReply (reply.status 400)]
+    (codedReply.send {:error "Path is required"})))
+
+(ann downloadHeaders (Fn [String Number] Js))
+(defn downloadHeaders [fileName size]
+  {"Content-Type" "application/octet-stream"
+   "Content-Disposition" (str "attachment; filename*=UTF-8''"
+                              (encode-uri-component fileName))
+   "Content-Length" size})
+
+(ann zipHeaders (Fn [String] Js))
+(defn zipHeaders [folderName]
+  {"Content-Type" "application/zip"
+   "Content-Disposition" (str "attachment; filename*=UTF-8''"
+                              (encode-uri-component (str folderName ".zip")))})
+
+(ann streamFileDownload (Fn [Js String Js] Js))
+(defn streamFileDownload [reply fullPath stats]
+  (let [fileName (path.basename fullPath)]
+    (streamFileResponse reply fullPath 200 (downloadHeaders fileName stats.size))))
+
+(ann streamFolderDownload (Fn [Js String] Js))
+(defn streamFolderDownload [reply fullPath]
+  (let [folderName (path.basename fullPath)
+        archive (new ZipArchive {:zlib {:level 1}})]
+    (do
+      (streamArchiveResponse reply 200 (zipHeaders folderName) archive)
+      (archive.directory fullPath false)
+      (let [finalizePromise (archive.finalize)
+            sent (finalizePromise.then (fn [_] reply))]
+        (sent.catch (fn [error] (sendDownloadError reply error)))))))
+
+(ann handleDownload (Fn [Js Js] Js))
+(defn handleDownload [request reply]
+  (try
+   (let [filePath request.query.path]
+     (if (not (and (string? filePath) (not (= filePath ""))))
+         (badPath reply)
+         (let [fullPath (getFilePath filePath)
+               stats (fileStatsSync fullPath)]
+           (if (stats.isDirectory)
+               (streamFolderDownload reply fullPath)
+               (streamFileDownload reply fullPath stats)))))
+   (catch error (sendDownloadError reply error))))
+
+(ann downloadRouteDefinitions (Fn [] (Vector HttpRoute)))
+(defn downloadRouteDefinitions []
+  [{:method "GET" :path "/api/files/download" :handler handleDownload}])
+
+(ann registerDownloadRoutes (Fn [Js] Js))
+(defn registerDownloadRoutes [app]
+  (registerHttpRoutes app (downloadRouteDefinitions)))

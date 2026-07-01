@@ -1,0 +1,25 @@
+(import "./config.clsk" [config getDataFilePath])
+(import "../server/fs-tasks.clsk" [readFileUtf8])
+(import "../src/features/knowledge-base.clsk" [(getKnowledgeBaseRootForPath as closkellGetKnowledgeBaseRootForPath)
+                                               (isKnowledgeBaseImagePath as closkellIsKnowledgeBaseImagePath)])
+
+(def SETTINGS_FILE (getDataFilePath "settings.json"))
+
+(ann getKnowledgeBases (Fn [] Js))
+(defn getKnowledgeBases []
+  (let [readPromise (readFileUtf8 SETTINGS_FILE)
+        parsed (readPromise.then
+                (fn [raw]
+                  (let [allSettings (json-parse raw)
+                        settings (object-get allSettings config.libraryKey)
+                        knowledgeBases (object-get settings "knowledgeBases")]
+                    (if (vector? knowledgeBases) knowledgeBases []))))]
+    (parsed.catch (fn [_error] []))))
+
+(ann getKnowledgeBaseRootForPath (Fn [String Js] Js))
+(defn getKnowledgeBaseRootForPath [filePath knowledgeBases]
+  (closkellGetKnowledgeBaseRootForPath filePath knowledgeBases))
+
+(ann isKnowledgeBaseImagePath (Fn [String String Js] Bool))
+(defn isKnowledgeBaseImagePath [requestedPath sharePath knowledgeBases]
+  (closkellIsKnowledgeBaseImagePath requestedPath sharePath knowledgeBases))

@@ -1,0 +1,60 @@
+(type PasteData
+  {:type String
+   :content String
+   :suggestedName String
+   :fileType (Option String)
+   :showPreview (Option Bool)
+   :fileSize (Option Number)
+   :isTextContent (Option Bool)})
+
+(ann textFileExtensions (Vector String))
+(def textFileExtensions
+  ["txt"
+   "md"
+   "json"
+   "xml"
+   "csv"
+   "log"
+   "yaml"
+   "yml"
+   "ini"
+   "conf"
+   "sh"
+   "bat"
+   "ps1"
+   "js"
+   "ts"
+   "jsx"
+   "tsx"
+   "css"
+   "scss"
+   "html"
+   "htm"
+   "py"
+   "java"
+   "c"
+   "cpp"
+   "h"
+   "cs"
+   "go"
+   "rs"
+   "php"
+   "rb"
+   "swift"
+   "kt"
+   "sql"])
+
+(ann pastedFileExtension (Fn [String] (Option String)))
+(defn pastedFileExtension [fileName]
+  (let [parts (split fileName ".")]
+    (if (<= (count parts) 1)
+        nil
+        (lower-case (nth parts (- (count parts) 1))))))
+
+(ann isTextFileType (Fn [String String] Bool))
+(defn isTextFileType [mimeType fileName]
+  (if (starts-with? mimeType "text/")
+      true
+      (match (pastedFileExtension fileName)
+        nil false
+        (some extension) (includes? textFileExtensions extension))))

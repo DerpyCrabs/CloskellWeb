@@ -1,0 +1,166 @@
+(import "../source-context.clsk" [normalizeSlashes])
+(import "./taskbar-pins.clsk" [filterAdminWorkspaceTaskbarPins filterShareWorkspaceTaskbarPins parseWorkspaceTaskbarPins])
+
+(def jsGlobalThis (js-global globalThis))
+
+(def maxWorkspaceLayoutPresets 32)
+(def maxLayoutPresetNameLength 120)
+
+(type WorkspaceLayoutPreset
+  {:id String
+   :name String
+   :scope String
+   :snapshot Js
+   :createdAt String
+   :updatedAt (Option String)})
+
+(ann workspaceLayoutScopeFromShareToken (Fn [(Option String)] String))
+(defn workspaceLayoutScopeFromShareToken [token]
+  (match token
+    nil "admin"
+    (some current)
+      (if (= current "") "admin" (str "share:" current))))
+
+(ann makeWorkspaceLayoutPresetId (Fn [] String))
+(defn makeWorkspaceLayoutPresetId []
+  (str "layout-" (jsGlobalThis.crypto.randomUUID)))
+
+(ann pathHasDotDot (Fn [String] Bool))
+(defn pathHasDotDot [path]
+  (any? (split (normalizeSlashes path) "/") (fn [segment] (= segment ".."))))
+
+(ann isUnderShareRoot (Fn [String String] Bool))
+(defn isUnderShareRoot [pathNorm root]
+  (or (= pathNorm root) (starts-with? pathNorm (str root "/"))))
+
+(ann validSourceAdmin? (Fn [Js] Bool))
+(defn validSourceAdmin? [source]
+  (and (object? source) (= (get source :kind) "local")))
+
+(ann validSourceShare? (Fn [Js String] Bool))
+(defn validSourceShare? [source token]
+  (and (object? source)
+       (= (get source :kind) "share")
+       (= (get source :token) token)))
+
+(ann appendNonEmptyString (Fn [(Vector String) Js] (Vector String)))
+(defn appendNonEmptyString [paths value]
+  (if (and (string? value) (> (count value) 0))
+      (conj paths value)
+      paths))
+
+(ann windowPaths (Fn [Js] (Vector String)))
+(defn windowPaths [win]
+  (if (object? win)
+      (let [initial (get win :initialState)
+            withIcon (appendNonEmptyString [] (get win :iconPath))]
+        (if (object? initial)
+            (appendNonEmptyString (appendNonEmptyString withIcon (get initial :dir))
+                                  (get initial :viewing))
+            withIcon))
+      []))
+
+(ann snapshotWindows (Fn [Js] (Vector Js)))
+(defn snapshotWindows [snapshot]
+  (if (object? snapshot)
+      (let [windows (get snapshot :windows)]
+        (if (vector? windows) windows []))
+      []))
+
+(ann snapshotStructurallyOk? (Fn [Js] Bool))
+(defn snapshotStructurallyOk? [snapshot]
+  (> (count (snapshotWindows snapshot)) 0))
+
+(ann adminWindowAllowed? (Fn [Js] Bool))
+(defn adminWindowAllowed? [win]
+  (and (object? win)
+       (validSourceAdmin? (get win :source))
+       (every? (windowPaths win) (fn [path] (not (pathHasDotDot path))))))
+
+(ann shareWindowAllowed? (Fn [Js String String] Bool))
+(defn shareWindowAllowed? [win sharePath token]
+  (let [root (normalizeSlashes sharePath)]
+    (and (object? win)
+         (validSourceShare? (get win :source) token)
+         (every? (windowPaths win)
+                 (fn [path]
+                   (let [normPath (normalizeSlashes path)]
+                     (and (not (pathHasDotDot normPath))
+                          (or (= (count normPath) 0)
+                              (isUnderShareRoot normPath root)))))))))
+
+(ann snapshotAllowedForAdminSnapshot (Fn [Js] Bool))
+(defn snapshotAllowedForAdminSnapshot [snapshot]
+  (let [windows (snapshotWindows snapshot)]
+    (and (snapshotStructurallyOk? snapshot)
+         (every? windows adminWindowAllowed?)
+         (let [pins (parseWorkspaceTaskbarPins (get snapshot :pinnedTaskbarItems))]
+           (= (count (filterAdminWorkspaceTaskbarPins pins)) (count pins))))))
+
+(ann snapshotAllowedForShareSnapshot (Fn [Js String String] Bool))
+(defn snapshotAllowedForShareSnapshot [snapshot sharePath token]
+  (let [windows (snapshotWindows snapshot)]
+    (and (snapshotStructurallyOk? snapshot)
+         (every? windows (fn [win] (shareWindowAllowed? win sharePath token)))
+         (let [pins (parseWorkspaceTaskbarPins (get snapshot :pinnedTaskbarItems))
+               filtered (filterShareWorkspaceTaskbarPins sharePath token pins)]
+           (= (count filtered) (count pins))))))
+
+(ann isLayoutScope (Fn [Js] Bool))
+(defn isLayoutScope [scope]
+  (or (= scope "admin")
+      (and (string? scope) (starts-with? scope "share:"))))
+
+(ann parseWorkspaceLayoutPresetItem (Fn [Js String] (Option WorkspaceLayoutPreset)))
+(defn parseWorkspaceLayoutPresetItem [item nowIso]
+  (if (object? item)
+      (let [id (get item :id)
+            name (get item :name)
+            scope (get item :scope)
+            snapshot (get item :snapshot)]
+        (if (and (string? id)
+                 (string? name)
+                 (contains? item "snapshot")
+                 (isLayoutScope scope)
+                 (<= (count name) maxLayoutPresetNameLength)
+                 (> (count (trim name)) 0))
+            {:id id
+             :name (trim name)
+             :scope (unsafe-cast String scope)
+             :snapshot snapshot
+             :createdAt (let [createdAt (get item :createdAt)]
+                          (if (string? createdAt) createdAt nowIso))
+             :updatedAt (let [updatedAt (get item :updatedAt)]
+                          (if (string? updatedAt) updatedAt nil))}
+            nil))
+      nil))
+
+(ann parseWorkspaceLayoutPresetsListWithNow (Fn [Js String] (Vector WorkspaceLayoutPreset)))
+(defn parseWorkspaceLayoutPresetsListWithNow [raw nowIso]
+  (if (vector? raw)
+      (reduce raw
+              []
+              (fn [out item]
+                (match (parseWorkspaceLayoutPresetItem item nowIso)
+                  nil out
+                  (some preset) (conj out preset))))
+      []))
+
+(ann sanitizeAdminWorkspaceLayoutPresets (Fn [(Vector WorkspaceLayoutPreset)] (Vector WorkspaceLayoutPreset)))
+(defn sanitizeAdminWorkspaceLayoutPresets [presets]
+  (let [filtered (filter presets
+                         (fn [preset]
+                           (and (= preset.scope "admin")
+                                (not (= preset.name ""))
+                                (snapshotAllowedForAdminSnapshot preset.snapshot))))]
+    (slice filtered 0 maxWorkspaceLayoutPresets)))
+
+(ann sanitizeShareWorkspaceLayoutPresets (Fn [String String (Vector WorkspaceLayoutPreset)] (Vector WorkspaceLayoutPreset)))
+(defn sanitizeShareWorkspaceLayoutPresets [sharePath token presets]
+  (let [scope (str "share:" token)
+        filtered (filter presets
+                         (fn [preset]
+                           (and (= preset.scope scope)
+                                (not (= preset.name ""))
+                                (snapshotAllowedForShareSnapshot preset.snapshot sharePath token))))]
+    (slice filtered 0 maxWorkspaceLayoutPresets)))

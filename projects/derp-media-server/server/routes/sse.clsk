@@ -1,0 +1,252 @@
+(import "../../lib/file-change-emitter.clsk" [addFileClient removeFileClient])
+(import "../../lib/share-access.clsk" [validateShareAccess])
+(import "../../lib/config.clsk" [getDataFilePath])
+(import "path" [(default path)])
+(import "../fs-tasks.clsk" [statPath])
+(import "../http-capabilities.clsk" [onRequestClose
+                                     startEventStreamResponse
+                                     writeEventStreamChunk])
+(import "../http-routes.clsk" [HttpRoute registerHttpRoutes])
+
+(def SETTINGS_FILE (getDataFilePath "settings.json"))
+(def jsDate (js-global Date))
+
+(def settingsState
+  (let [state (new (js-global Map))]
+    (do
+      (state.set "clients" (new (js-global Set)))
+      (state.set "lastModified" 0)
+      (state.set "watchInterval" nil)
+      state)))
+
+(ann settingsClients (Fn [] Js))
+(defn settingsClients []
+  (settingsState.get "clients"))
+
+(ann lastModified (Fn [] Number))
+(defn lastModified []
+  (let [value (settingsState.get "lastModified")]
+    (if (number? value) value 0)))
+
+(ann setLastModified (Fn [Number] Js))
+(defn setLastModified [value]
+  (settingsState.set "lastModified" value))
+
+(ann watchInterval (Fn [] Js))
+(defn watchInterval []
+  (settingsState.get "watchInterval"))
+
+(ann setWatchInterval (Fn [Js] Js))
+(defn setWatchInterval [value]
+  (settingsState.set "watchInterval" value))
+
+(ann nowTimestamp (Fn [] Number))
+(defn nowTimestamp []
+  (jsDate.now))
+
+(ann settingsChangedMessage (Fn [] String))
+(defn settingsChangedMessage []
+  (str "data: "
+       (json-stringify {:type "settings-changed"
+                        :timestamp (nowTimestamp)})
+       "\n\n"))
+
+(ann broadcastSettingsChanged (Fn [] Nil))
+(defn broadcastSettingsChanged []
+  (let [clients (settingsClients)
+        message (settingsChangedMessage)]
+    (do
+      (clients.forEach
+       (fn [cb]
+         (try
+          (cb message)
+          (catch _error
+            (clients.delete cb)))))
+      nil)))
+
+(ann watchSettings (Fn [] Js))
+(defn watchSettings []
+  (let [statPromise (statPath SETTINGS_FILE)
+        checked (statPromise.then
+                 (fn [stats]
+                   (let [currentModified stats.mtimeMs
+                         previous (lastModified)]
+                     (do
+                       (if (and (not (= previous 0))
+                                (not (= currentModified previous)))
+                           (broadcastSettingsChanged)
+                           nil)
+                       (setLastModified currentModified)))))]
+    (checked.catch (fn [_error] nil))))
+
+(ann startSettingsWatch (Fn [] Js))
+(defn startSettingsWatch []
+  (let [interval (watchInterval)
+        clients (settingsClients)]
+    (if (and (not (some? interval)) (> clients.size 0))
+        (setWatchInterval ((js-global setInterval) watchSettings 500))
+        nil)))
+
+(ann stopSettingsWatch (Fn [] Js))
+(defn stopSettingsWatch []
+  (let [interval (watchInterval)
+        clients (settingsClients)]
+    (if (and (some? interval) (= clients.size 0))
+        (do
+          ((js-global clearInterval) interval)
+          (setWatchInterval nil))
+        nil)))
+
+(ann initSSE (Fn [Js] Js))
+(defn initSSE [reply]
+  (startEventStreamResponse reply))
+
+(ann writeSSE (Fn [Js String] Js))
+(defn writeSSE [reply data]
+  (writeEventStreamChunk reply data))
+
+(ann encodeSSE (Fn [Js] String))
+(defn encodeSSE [data]
+  (str "data: " (json-stringify data) "\n\n"))
+
+(ann normalizePath (Fn [String] String))
+(defn normalizePath [value]
+  (let [normalized (join (split value "\\") "/")]
+    (if (= normalized ".") "" normalized)))
+
+(ann withinSharePath? (Fn [String String] Bool))
+(defn withinSharePath? [shareRoot target]
+  (or (= target shareRoot) (starts-with? target (str shareRoot "/"))))
+
+(ann maybeNormalizePath (Fn [Js] Js))
+(defn maybeNormalizePath [value]
+  (if (string? value) (normalizePath value) nil))
+
+(ann scopeShareChange (Fn [Js Js] Js))
+(defn scopeShareChange [share event]
+  (let [shareRoot (normalizePath share.path)
+        eventDirectory (normalizePath event.directory)
+        eventPath (maybeNormalizePath event.path)]
+    (if (not share.isDirectory)
+        (if (or (not (string? eventPath)) (not (= eventPath shareRoot)))
+            nil
+            {:type "files-changed"
+             :directory ""
+             :path ""
+             :timestamp (nowTimestamp)})
+        (if (or (and (string? eventPath)
+                     (not (withinSharePath? shareRoot eventPath)))
+                (not (withinSharePath? shareRoot eventDirectory)))
+            nil
+            (let [relativeDirectory (if (= eventDirectory shareRoot)
+                                        ""
+                                        (path.posix.relative shareRoot eventDirectory))
+                  relativePath (if (string? eventPath)
+                                   (if (= eventPath shareRoot)
+                                       ""
+                                       (path.posix.relative shareRoot eventPath))
+                                   nil)
+                  base {:type "files-changed"
+                        :directory (normalizePath relativeDirectory)
+                        :timestamp (nowTimestamp)}]
+              (if (string? relativePath)
+                  (object-assoc base "path" (normalizePath relativePath))
+                  base))))))
+
+(ann connectedMessage (Fn [] String))
+(defn connectedMessage []
+  (encodeSSE {:type "connected" :timestamp (nowTimestamp)}))
+
+(ann startKeepAlive (Fn [Js] Js))
+(defn startKeepAlive [reply]
+  (let [holder (new (js-global Map))
+        tick (fn []
+               (try
+                (writeSSE reply ": keep-alive\n\n")
+                (catch _error
+                  ((js-global clearInterval) (holder.get "id")))))
+        keepAlive ((js-global setInterval) tick 30000)]
+    (do
+      (holder.set "id" keepAlive)
+      keepAlive)))
+
+(ann registerAdminStream (Fn [Js Js] Js))
+(defn registerAdminStream [request reply]
+  (do
+    (initSSE reply)
+    (let [fileCb (fn [event]
+                   (writeSSE reply
+                             (encodeSSE (merge {:type "files-changed"
+                                                :timestamp (nowTimestamp)}
+                                               event))))
+          settingsCb (fn [message] (writeSSE reply message))
+          clients (settingsClients)
+          keepAlive (startKeepAlive reply)]
+      (do
+        (addFileClient fileCb)
+        (clients.add settingsCb)
+        (startSettingsWatch)
+        (writeSSE reply (connectedMessage))
+        (onRequestClose
+         request
+         (fn []
+           (do
+             (removeFileClient fileCb)
+             (clients.delete settingsCb)
+             (stopSettingsWatch)
+             ((js-global clearInterval) keepAlive))))
+        reply))))
+
+(ann errorStatusCode (Fn [Js] Number))
+(defn errorStatusCode [error]
+  (if (and (object? error) (number? error.statusCode))
+      error.statusCode
+      0))
+
+(ann sendShareStreamError (Fn [Js Js] Js))
+(defn sendShareStreamError [reply error]
+  (let [statusCode (errorStatusCode error)]
+    (if (> statusCode 0)
+        (let [codedReply (reply.code statusCode)]
+          (codedReply.send {:error error.message}))
+        (let [codedReply (reply.code 500)]
+          (codedReply.send {:error "Failed to open share stream"})))))
+
+(ann openShareStream (Fn [Js Js Js] Js))
+(defn openShareStream [request reply share]
+  (do
+    (initSSE reply)
+    (let [cb (fn [event]
+               (let [scoped (scopeShareChange share event)]
+                 (if (some? scoped)
+                     (writeSSE reply (encodeSSE scoped))
+                     nil)))
+          keepAlive (startKeepAlive reply)]
+      (do
+        (addFileClient cb)
+        (writeSSE reply (connectedMessage))
+        (onRequestClose
+         request
+         (fn []
+           (do
+             (removeFileClient cb)
+             ((js-global clearInterval) keepAlive))))
+        reply))))
+
+(ann registerShareStream (Fn [Js Js] Js))
+(defn registerShareStream [request reply]
+  (let [token request.params.token
+        cookies (if (object? request.cookies) request.cookies {})
+        accessPromise (validateShareAccess cookies token)
+        opened (accessPromise.then
+                (fn [result] (openShareStream request reply result.share)))]
+    (opened.catch (fn [error] (sendShareStreamError reply error)))))
+
+(ann sseRouteDefinitions (Fn [] (Vector HttpRoute)))
+(defn sseRouteDefinitions []
+  [{:method "GET" :path "/api/events/stream" :handler registerAdminStream}
+   {:method "GET" :path "/api/share/:token/stream" :handler registerShareStream}])
+
+(ann registerSSERoutes (Fn [Js] Js))
+(defn registerSSERoutes [app]
+  (registerHttpRoutes app (sseRouteDefinitions)))

@@ -1,0 +1,134 @@
+(import "../../http-routes.clsk" [HttpRoute registerHttpRoutes])
+(import "../../../lib/shares.clsk" [createShare getAllShares deleteShare updateShare])
+(import "../../../lib/file-system.clsk" [isPathEditable])
+(import "../../../lib/config.clsk" [config])
+
+(ann assocBoolRestriction (Fn [Js Js String] Js))
+(defn assocBoolRestriction [restrictions raw key]
+  (let [value (object-get raw key)]
+    (if (bool? value)
+        (object-assoc restrictions key value)
+        restrictions)))
+
+(ann assocMaxUploadBytes (Fn [Js Js] Js))
+(defn assocMaxUploadBytes [restrictions raw]
+  (let [value raw.maxUploadBytes]
+    (if (and (number? value) (>= value 0))
+        (object-assoc restrictions "maxUploadBytes" value)
+        restrictions)))
+
+(ann parseRestrictions (Fn [Js] Js))
+(defn parseRestrictions [raw]
+  (if (not (object? raw))
+      nil
+      (let [withDelete (assocBoolRestriction {} raw "allowDelete")
+            withUpload (assocBoolRestriction withDelete raw "allowUpload")
+            withEdit (assocBoolRestriction withUpload raw "allowEdit")
+            restrictions (assocMaxUploadBytes withEdit raw)]
+        (if (> (count (object-keys restrictions)) 0) restrictions nil))))
+
+(ann badRequest (Fn [Js String] Js))
+(defn badRequest [reply message]
+  (let [codedReply (reply.code 400)]
+    (codedReply.send {:error message})))
+
+(ann notFound (Fn [Js String] Js))
+(defn notFound [reply message]
+  (let [codedReply (reply.code 404)]
+    (codedReply.send {:error message})))
+
+(ann nonEmptyString? (Fn [Js] Bool))
+(defn nonEmptyString? [value]
+  (and (string? value) (not (= value ""))))
+
+(ann shareBaseUrl (Fn [Js] String))
+(defn shareBaseUrl [request]
+  (if (string? config.shareLinkDomain)
+      config.shareLinkDomain
+      (str request.protocol "://" request.hostname)))
+
+(ann handleListShares (Fn [Js Js] Js))
+(defn handleListShares [_request reply]
+  (let [sharesPromise (getAllShares)]
+    (sharesPromise.then (fn [shares] (reply.send {:shares shares})))))
+
+(ann handleCreateShare (Fn [Js Js] Js))
+(defn handleCreateShare [request reply]
+  (let [body request.body
+        sharePath (if (object? body) body.path nil)]
+    (if (not (nonEmptyString? sharePath))
+        (badRequest reply "Path is required")
+        (let [isDirectory (= body.isDirectory true)
+              wantsEditable (= body.editable true)
+              shouldBeEditable (and wantsEditable
+                                    isDirectory
+                                    (isPathEditable sharePath))
+              restrictions (if shouldBeEditable
+                                (parseRestrictions body.restrictions)
+                                nil)
+              sharePromise (createShare sharePath
+                                        isDirectory
+                                        shouldBeEditable
+                                        restrictions)]
+          (sharePromise.then
+           (fn [share]
+             (let [url (str (shareBaseUrl request) "/share/" share.token)]
+               (reply.send {:share share :url url}))))))))
+
+(ann updatePayload (Fn [Js Bool Js] Js))
+(defn updatePayload [restrictions editableProvided editableVal]
+  (let [base (if (some? restrictions) {:restrictions restrictions} {})]
+    (if editableProvided
+        (object-assoc base "editable" editableVal)
+        base)))
+
+(ann handleUpdateShareResult (Fn [Js Js] Js))
+(defn handleUpdateShareResult [reply share]
+  (if (some? share)
+      (reply.send {:share share})
+      (notFound reply "Share not found")))
+
+(ann handleUpdateShare (Fn [Js Js] Js))
+(defn handleUpdateShare [request reply]
+  (let [body request.body
+        token (if (object? body) body.token nil)]
+    (if (not (nonEmptyString? token))
+        (badRequest reply "Token is required")
+        (let [restrictions (parseRestrictions body.restrictions)
+              editableProvided (contains? body "editable")
+              editableVal body.editable]
+          (if (and (not (some? restrictions)) (not editableProvided))
+              (badRequest reply "No valid updates provided")
+              (let [sharePromise (updateShare token
+                                              (updatePayload restrictions
+                                                             editableProvided
+                                                             editableVal))]
+                (sharePromise.then
+                 (fn [share] (handleUpdateShareResult reply share)))))))))
+
+(ann handleDeleteShareResult (Fn [Js Bool] Js))
+(defn handleDeleteShareResult [reply deleted]
+  (if deleted
+      (reply.send {:success true})
+      (notFound reply "Share not found")))
+
+(ann handleDeleteShare (Fn [Js Js] Js))
+(defn handleDeleteShare [request reply]
+  (let [body request.body
+        token (if (object? body) body.token nil)]
+    (if (not (nonEmptyString? token))
+        (badRequest reply "Token is required")
+        (let [deletePromise (deleteShare token)]
+          (deletePromise.then
+           (fn [deleted] (handleDeleteShareResult reply deleted)))))))
+
+(ann sharesApiRouteDefinitions (Fn [] (Vector HttpRoute)))
+(defn sharesApiRouteDefinitions []
+  [{:method "GET" :path "/api/shares" :handler handleListShares}
+   {:method "POST" :path "/api/shares" :handler handleCreateShare}
+   {:method "PUT" :path "/api/shares" :handler handleUpdateShare}
+   {:method "POST" :path "/api/shares/delete" :handler handleDeleteShare}])
+
+(ann registerSharesApiRoutes (Fn [Js] Js))
+(defn registerSharesApiRoutes [app]
+  (registerHttpRoutes app (sharesApiRouteDefinitions)))
