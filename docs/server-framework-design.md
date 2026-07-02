@@ -1,222 +1,137 @@
-# Closkell Server Framework Design Target
+# Closkell Server Target
 
-This document defines the backend service framework built on top of the
-Closkell language core. It is separate from the browser framework.
+The server target compiles Closkell modules for Node-compatible backend code.
+The `projects/derp-media-server` example exercises that design with a
+Closkell-authored Fastify server, routes, filesystem helpers, streaming
+responses, SSE handlers, upload handlers, auth middleware, and thumbnail/media
+helpers built to `.closkell/build/server/main.mjs`.
 
-The server framework is not a fullstack framework. Browser apps and backend
-services are independent programs. They can share pure modules, types,
-validators, encoders, decoders, and protocol helpers, but they do not share
-implicit routes, hidden RPC, or generated server actions.
+The reusable framework layer in `crates/js_server` provides server-target type
+checking, app wrapping, and route/response/resource data helpers.
+Project-specific host adapters, such as Fastify registration and raw Node
+stream handling, live in application Closkell modules.
 
-## Service Contract
+Server-target compilation is selected with `--target server`.
 
-A backend service module exports:
+## Reusable Framework Boundary
 
-```clojure
-(ann init (Fn [ServerBoot] [ServerState (Cmd ServerMsg)]))
-(ann routes (Fn [ServerState] (Vector Route)))
-(ann resources (Fn [ServerState] (ServerResources ServerMsg)))
-```
+Provided by `crates/js_server`:
 
-`ServerBoot` contains host-provided values:
+- server-only type aliases and helper types,
+- route helper type checking and JS emission,
+- response helper type checking and JS emission,
+- server resource helper type checking and JS emission,
+- rejection of server helpers from non-server targets,
+- `build --app --target server` wrapper for `main`.
 
-- command-line arguments,
-- environment variables,
-- resolved config paths,
-- runtime mode,
-- port and host,
-- working directory,
-- secrets supplied by the host,
-- selected Bun or Node runtime details.
+Handled outside the reusable framework layer:
 
-Pure code cannot read process globals directly.
+- an HTTP listener adapter,
+- request parsing and validation,
+- file/multipart/stream execution,
+- cookie/session helpers,
+- filesystem/process wrappers,
+- automatic client generation,
+- hidden RPC or server actions.
 
-## Routes
+The media server implements several of these concerns in project-local
+Closkell modules by importing Fastify, Node APIs, and JS libraries directly.
+Those adapters remain application code rather than reusable `crates/js_server`
+framework primitives.
 
-Routes are data. A route declares:
+## App Shape
 
-- method,
-- path pattern,
-- typed params,
-- typed query,
-- typed headers,
-- typed cookies,
-- typed body decoder,
-- accepted multipart fields when relevant,
-- handler.
+`build --app --target server` expects an exported `main`.
 
-Handlers are pure functions that return effect descriptions:
+If `main` takes one argument, the generated module exports and passes:
 
 ```clojure
-(ann media-route
-  (Route
-    {:params {:path String}
-     :headers {:range (Option String)}}
-    (Task HttpError Response)))
+ServerBoot
 ```
 
-A handler may return `[ServerState (Cmd ServerMsg) Response]` when it
-intentionally updates process state. Ordinary request handling should prefer
-explicit tasks and stores over mutable module state.
+`ServerBoot`:
 
-## Responses
+```clojure
+{:argv (Vector String)
+ :cwd String
+ :env Js
+ :mode String
+ :runtime String}
+```
 
-Response values include:
+The JS wrapper emits:
 
-- JSON,
-- text,
-- redirects,
-- static files,
-- byte ranges,
-- binary buffers,
-- streaming bodies,
-- server-sent event streams,
-- empty responses with status and headers.
+- `__closkellServerBoot`
+- `__closkellServerResult`
 
-Status codes, headers, cookies, content disposition, content range, and cache
-control are explicit response data.
+## Server Types
 
-## Server Capabilities
+The server target adds:
 
-Backend work is represented as server capabilities, not pure calls.
+- `ServerBoot`
+- `HttpError`
+- `Request`
+- `Response`
+- `(Route RequestType TaskType)`
+- `(ServerResource Msg)`
+- `(ServerResources Msg)`
 
-Core server capabilities include:
+`Request` is opaque at the reusable framework boundary. Typed request bodies,
+params, query, and headers remain application/adapter concerns.
 
-- filesystem read, write, stat, mkdir, rename, copy, remove, and directory walk,
-- file streams and byte-range streams,
-- multipart upload parsing,
-- process spawning for tools such as `ffmpeg`,
-- crypto, hashing, signing, and password verification,
-- cookie signing, setting, and clearing,
-- archive generation,
-- image processing through JS libraries such as sharp,
-- audio metadata through JS libraries such as music-metadata,
-- HTTP client requests,
-- AI SDK calls,
-- MCP client calls,
-- timers, intervals, file watches, and connection keepalives,
-- structured logging,
-- controlled process exit.
+## Route Helpers
 
-Each capability is represented as `Task`, `Cmd`, `ServerResource`, or a typed
-foreign declaration. Impure operations must not be declared `foreign pure`.
+Route helpers:
 
-## Server Resources
+```clojure
+(Route.route method path request handler)
+(Route.get path handler)
+(Route.post path handler)
+(Route.put path handler)
+(Route.patch path handler)
+(Route.delete path handler)
+```
 
-Long-lived backend resources are `ServerResource` values. They are scoped to:
+`Route.get` and the method-specific helpers use opaque `Request` and expect a
+handler returning `(Task HttpError Response)`.
 
-- the service process,
-- a request,
-- a streaming response,
-- a connection.
+The emitted JS route value is data:
 
-Examples:
+```js
+{ kind: Symbol.for("server/route"), method, path, request, handler }
+```
 
-- listening HTTP server,
-- file watcher,
-- polling interval,
-- SSE client,
-- upload stream,
-- download stream,
-- spawned process,
-- MCP client,
-- thumbnail generation worker.
+## Response Helpers
 
-The runtime owns acquisition, reuse, cancellation, and cleanup. Request and
-connection close events cancel scoped resources.
+Response helpers:
 
-## JS Server Libraries
+```clojure
+(Response.json body)
+(Response.json body status)
+(Response.text text)
+(Response.text text status)
+(Response.empty)
+(Response.empty status)
+(Response.redirect location)
+(Response.redirect location status)
+(Response.file path)
+(Response.file path options)
+(Response.status status response)
+```
 
-The backend target compiles to JavaScript ESM for Bun or Node-compatible hosts.
-Reusing JS libraries is expected.
+The emitted JS response values are data with `Symbol.for("response/...")`
+kinds. `Response.status` returns a copy of the response with a changed status.
 
-Useful wrappers include:
+## Resource Helpers
 
-- Fastify-compatible route registration,
-- Bun server adapters,
-- Node stream adapters,
-- sharp,
-- archiver,
-- music-metadata,
-- AI SDK,
-- MCP SDK,
-- JSON-with-comments parsers.
+Resource helpers:
 
-JS libraries remain host capabilities. Their impure operations are visible in
-source and inspection output.
+```clojure
+(Server.resource name config)
+(Server.resource name config onEvent)
+(Server.resources resources)
+```
 
-## Configuration
-
-Configuration is explicit host input. The server framework may provide helpers
-for:
-
-- command-line arguments,
-- environment variables,
-- JSON and JSONC files,
-- resolved data paths,
-- secret values,
-- runtime mode.
-
-Config loading itself is task data. Pure modules receive parsed config values as
-parameters or boot data.
-
-## Frontend Communication
-
-Frontend and backend communication is explicit protocol traffic:
-
-- HTTP requests,
-- server-sent events,
-- WebSocket messages,
-- static files,
-- streamed media.
-
-The browser framework may import shared request and response types, but it calls
-the backend through ordinary command or subscription data. There is no implicit
-client stub generation requirement.
-
-## Inspection
-
-Server framework inspection extends language inspection with:
-
-- routes,
-- request schemas,
-- response schemas,
-- body decoders,
-- multipart schemas,
-- emitted status codes,
-- cookie usage,
-- filesystem capability usage,
-- process capability usage,
-- stream/resource lifetimes,
-- JS interop boundaries,
-- unsafe casts,
-- server tests.
-
-## Testing
-
-The server framework adds test harnesses for:
-
-- route handlers,
-- body decoders,
-- response encoders,
-- filesystem capabilities with fake filesystems,
-- process capabilities with fake processes,
-- fake clock and timers,
-- fake crypto where appropriate,
-- fake network,
-- fake streams,
-- SSE connection cleanup,
-- multipart uploads,
-- config loading.
-
-Pure business logic remains ordinary language-level tests.
-
-## Non-Goals
-
-- Fullstack route coupling.
-- Hidden RPC.
-- Server actions generated from frontend source.
-- Direct process globals in pure code.
-- Direct filesystem calls in pure code.
-- Treating Fastify or Bun APIs as language syntax.
-- Requiring the browser framework to use the server framework.
+`Server.resources` accepts a vector or list of resources. The emitted JS values
+are data with `Symbol.for("server/resource")` and
+`Symbol.for("server/resources")` kinds.

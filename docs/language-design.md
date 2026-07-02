@@ -1,100 +1,74 @@
-# Closkell Language Design Target
+# Closkell Language Core
 
-This document defines the framework-neutral Closkell language core. It is not a
-browser framework design and not a server framework design.
+This document describes the implementation in this repository.
 
-Closkell is a pure functional, Lisp-shaped language that compiles to JavaScript
-ESM. Its job is to provide a small, reviewable, strongly checked core for pure
-data transformation and explicit host boundaries. Browser and server behavior
-is supplied by libraries and runtimes built on top of this core.
+Closkell is a Lisp-shaped language that compiles to JavaScript ESM. The core
+owns parsing, macro expansion, type checking, purity validation, inspection,
+module tests, and JS emission. Browser and server concepts are compiler targets
+layered on top of the core.
 
-## Core Boundary
+## Compiler Crates
 
-The language core owns:
-
-- modules and imports,
-- lexical binding,
-- expressions,
-- pattern matching,
-- immutable records and collections,
-- type declarations and annotations,
-- tagged unions,
-- hygienic macros,
-- purity checking,
-- explicit JS interop declarations,
-- compiler diagnostics,
-- inspection JSON,
-- JavaScript ESM emission.
-
-The language core does not own:
-
-- `Html`,
-- `#html` semantics,
-- DOM events,
-- CSS class or style normalization,
-- browser commands,
-- browser subscriptions,
-- hydration,
-- HTTP route registration,
-- request/reply objects,
-- filesystem access,
-- process spawning,
-- cookies,
-- server streams,
-- server resources.
-
-Frameworks may add reader forms, types, macros, and runtime helpers. Those
-extensions must remain visible in source and inspection output.
-
-## Purity
-
-Ordinary Closkell functions are referentially transparent. They cannot mutate
-objects, mutate DOM, read browser globals, read process globals, start timers,
-fetch, write storage, read files, write files, inspect the clock, read random
-values, spawn processes, or perform hidden I/O.
-
-Host work is represented by explicit values supplied by framework libraries:
-
-- task-like async descriptions,
-- command-like one-shot effect descriptions,
-- resource descriptions for long-lived host resources,
-- boot inputs provided by a host runtime,
-- explicit JS interop declarations.
-
-The core language enforces the boundary. Concrete host capabilities live in
-framework packages such as `closkell/browser` and `closkell/server`.
+- `syntax`: Lisp syntax, literals, source spans, diagnostics, and the `#html`
+  reader form consumed by the browser target.
+- `macro_expand`: deterministic macro expansion for `defmacro`,
+  quasiquote/unquote, `gensym`, `with-gensyms`, and `compile-error`.
+- `typecheck`: local inference, top-level annotations, type declarations,
+  command/subscription checking, and target-specific type hooks.
+- `effects`: purity/effect validation for registered command helpers and
+  forbidden host symbols.
+- `template_ir`: browser template lowering and state-read metadata.
+- `js_emit`: JavaScript ESM emission, source maps, runtime import planning, and
+  app wrappers.
+- `cli`: `check`, `build`, `expand`, `fmt`, `inspect`, `test`, and
+  `dev --watch`.
 
 ## Modules
 
-A `.clsk` file is a module. Top-level forms are:
+A `.clsk` file is a module. Top-level forms:
 
 ```clojure
 (import path [names...])
 (type Name schema)
 (ann name schema)
+(foreign pure importedName schema)
+(foreign task importedName schema)
+(foreign command importedName schema)
 (def name expr)
 (defn name [params...] body...)
 (defmacro name [params...] body...)
-(foreign pure importedName schema)
-(foreign task importedName schema)
 ```
 
-Top-level side effects are forbidden. A top-level `def` may bind pure
-constants, pure functions, macros, types, annotations, and framework data
-constructors. It must not execute host work.
+Imports can reference same-tree Closkell modules or JS/runtime module names.
+Imported names may be aliased with `(name as localName)`.
 
-Imports are explicit. Exported application and framework boundaries should have
-annotations.
+`type`, `ann`, and `foreign` are compile-time declarations. They are checked and
+included in `inspect`, but they do not emit runtime declarations by themselves.
+
+## CLI Targets
+
+The CLI accepts `--target core|browser|server` for `check`, `build`, `inspect`,
+and `dev --watch`. The default target is `browser`.
+
+- `core`: rejects `#html`, browser helpers, and server helpers.
+- `browser`: enables `Html`, `TrustedHtml`, `BrowserBoot`, `Cmd`, `Sub`,
+  browser template checking, browser command schemas, and browser emit rules.
+- `server`: enables `Request`, `Response`, `Route`, `ServerResource`,
+  `ServerResources`, `ServerBoot`, and `HttpError` helpers.
+
+`build --app --target browser` expects `init`, `update`, and `view`.
+`build --app --target server` expects `main`.
+`build --app --target core` is rejected.
 
 ## Syntax
 
-The core syntax includes:
+The parser supports:
 
 ```clojure
 nil true false
 42 60_000 "text" :keyword symbol
 [a b c]
-{:field value "dynamic" value}
+{:field value "dynamic-key" value}
 #{a b c}
 (fn [x] (+ x 1))
 (let [x 1 y 2] (+ x y))
@@ -104,146 +78,121 @@ nil true false
 
 Rules:
 
-- `if` conditions are `Bool`; there is no truthiness.
-- Record field access uses `value.field`.
-- Dynamic lookup uses explicit helper functions.
-- Pattern binding is allowed in `let`, `fn`, `defn`, and `match`.
-- Reader forms such as `#html` are framework extensions, not core language
-  constructs.
+- `if` conditions are checked as `Bool`; there is no truthiness rule.
+- Record field access uses dotted syntax such as `state.user.name`.
+- Dynamic maps use helpers such as `hash-map`, `map-get`, `map-assoc`, and
+  `map-dissoc`.
+- `#html` is parsed by `syntax`, but it is only valid when the browser target
+  enables it.
 
 ## Types
 
-The type system supports:
+Implemented type forms include:
 
-- `Number`, `String`, `Bool`, `Nil`, and `Js`.
-- `Option T`, with `nil` as the none value.
+- `Number`, `String`, `Bool`, `Nil`, `Keyword`, and `Js`.
+- `Option T`, where `nil` is the none value.
 - `Result Ok Err`.
-- `Vector T`, `List T`, `Set T`, `Map K V`.
+- `Decoder T`.
+- `Vector T`, `List T`, `Set T`, and `Map K V`.
+- `Cmd Msg`, `Sub Msg`, `Task Err Ok`, and `Event Msg`.
 - Tuple syntax `[A B C]`.
-- Structural records `{:field Type}`.
-- Tagged unions.
-- Function types with `Fn`.
-- Parametric aliases and annotation-local type variables.
+- Structural records such as `{:id String :label String}`.
+- Tagged unions with `(Union ...)`.
+- Function types with `(Fn [Args...] Return)`.
+- Parametric aliases, for example `(type RemoteData a ...)`.
 
-Example:
+`Js` is an explicit boundary type. `unsafe-cast` marks a source-level escape
+hatch, and unsafe casts are collected by `inspect`.
 
-```clojure
-(type RemoteData a
-  (Union
-    {:kind :idle}
-    {:kind :loading}
-    {:kind :ready :value a}
-    {:kind :failed :error String}))
-```
+## Patterns
 
-`Js` is a type-checker boundary only. It has no runtime wrapper. A value enters
-typed Closkell data through a typed foreign declaration, a decoder, or an
-explicit `unsafe-cast`.
+Patterns are supported in `match`, `let`, anonymous `fn` parameters, and named
+`defn` parameters. Pattern forms:
 
-## Data And Equality
+- wildcard `_`
+- literals and keywords
+- records
+- vectors
+- fixed `(list ...)`
+- `(cons head tail)`
+- `(as pattern name)`
+- `(some pattern)`, `(ok pattern)`, and `(err pattern)`
 
-Records, vectors, lists, sets, and maps are persistent immutable values. Update
-helpers return fresh values and never mutate their inputs.
-
-`=` means Closkell value equality. `identical?` means JavaScript identity or
-`Object.is`. Numeric comparison functions are numeric unless their names say
-otherwise.
-
-Value equality covers records, vectors, lists, sets, maps, keywords, `Option`,
-and `Result`.
-
-## Standard Library
-
-The core standard library contains pure helpers for:
-
-- `Option`,
-- `Result`,
-- immutable records,
-- vectors and lists,
-- sets and maps,
-- strings,
-- numbers,
-- dates when all inputs are explicit,
-- JSON encoding and decoding,
-- URL parsing and formatting when all inputs are explicit.
-
-Host reads and writes are not pure standard library functions. Clipboard,
-current URL, history, storage, filesystem, DOM, current time, random values,
-process environment, and network access belong to framework capabilities.
-
-## JS Interop
-
-Closkell can import JavaScript packages directly:
-
-```clojure
-(import "yaml" [(parse as parseYaml)])
-(foreign pure parseYaml (Fn [String] Js))
-```
-
-Rules:
-
-- Unannotated JS imports have type `Js`.
-- `foreign pure` is allowed only for deterministic functions that do not read
-  or write host state.
-- `foreign task` is for async JS work represented as task data.
-- Impure host APIs are exposed by framework capability wrappers.
-- TypeScript declarations are not trusted as the Closkell type system.
-- `unsafe-cast` is allowed only as an explicit source-level boundary.
+Template component metadata is most precise when component parameters are plain
+symbols. Destructuring works in many places; reusable `#html` components keep
+the clearest update metadata with symbol parameters.
 
 ## Macros
 
-Macros expand before type checking. Macro expansion is deterministic and
-hygienic.
+Macros expand before type checking. Macro-time forms include `do`, `let`,
+`gensym`, `with-gensyms`, quasiquote/unquote, unquote-splicing, and
+`compile-error`.
 
-Macro bodies support compile-time helpers such as `do`, `let`, `with-gensyms`,
-`gensym`, quasiquote, unquote, and `compile-error`.
+Imported macros from same-tree modules are available during expansion. Macro
+definitions do not remain as runtime exports.
 
-Macros may generate framework forms, but generated source remains inspectable
-after expansion.
+## Purity And Effects
 
-## Compiler And Inspection
+The compiler does not allow registered host effects to hide inside ordinary
+pure code. Browser and server targets add their own forbidden symbols and
+allowed command/resource helpers.
 
-The semantic compiler boundary is HIR. Syntax AST remains the parsed source
-shape. HIR owns stable ids, resolved names, type checking, purity checks,
-effect summaries, and public module summaries.
+Effectful work is represented as data:
 
-Inspection JSON is part of the language contract. It includes:
+- browser commands and subscriptions in the browser target,
+- task/command values and foreign declarations,
+- server route/response/resource values in the server target.
 
-- exports,
-- imports,
-- types and annotations,
-- inferred public signatures,
-- macros and expansions,
-- purity summaries,
-- effect and capability summaries supplied by frameworks,
-- JS interop boundaries,
+The boundary is implementation-driven: if a host helper is not registered in
+the target, the compiler cannot give it special effect semantics.
+
+## Implemented Library Surface
+
+Implemented helpers:
+
+- numbers: arithmetic, comparison, `min`, `max`, `sum`, `abs`, `round`,
+  `floor`, `ceil`, `mod`/`%`, `to-number`, and `to-fixed`;
+- strings: `str`, `trim`, `lower-case`, `pad-start`, `to-radix`,
+  `string-slice`, `regex-test?`, `includes?`, and `locale-compare`;
+- vectors/lists: `first`, `second`, `nth`, `last`, `find`, `filter`, `map`,
+  `map-indexed`, `reduce`, `reduce-indexed`, `any?`, `every?`, `slice`,
+  `drop-last`, `take-last`, and sorting helpers;
+- sets/maps: set literals, `set`, `contains?`, `conj`, `disj`, `set-values`,
+  `hash-map`, `map-get`, `map-assoc`, `map-dissoc`, `map-entries`,
+  `map-keys`, and `map-values`;
+- results/options: `ok`, `err`, `ok?`, `err?`, `some?`, `result-value`,
+  `result-error`, and `unwrap-or`;
+- JSON/decoding: `json-parse`, `json-stringify`, `json-parse-result`, and
+  `Decoder` helpers;
+- date formatting through `date-format` when inputs are explicit.
+
+Collections are emitted as fresh JS values on update. The compiler/runtime do
+not rely on mutating persistent data in place.
+
+## Inspection
+
+`closkell inspect` emits JSON containing:
+
+- imports and exports,
+- public signatures,
+- type declarations and annotations,
+- command and subscription schemas,
+- JS interop declarations,
+- component graphs,
+- state-path-to-slot metadata,
+- changed-path summaries,
 - unsafe casts,
-- unused reachable definitions and imports,
-- test cases.
+- collected tests,
+- unused declarations,
+- lowered templates.
 
-Diagnostics are deterministic and machine-readable. They include file, span,
-severity, diagnostic code, concise message, expected and actual types when
-relevant, and safe fix metadata when the compiler can produce it.
+This JSON is used by the Vite plugin and editor tooling.
 
-## Testing
+## Tests
 
-Closkell test modules are ordinary `.clsk` modules. Pure tests do not require a
-browser or server runtime.
+`closkell test <file>` compiles a module to temporary ESM and runs exported
+tests under Node. Tests can be exported as a `tests` vector or authored with the
+helpers from `closkell/test`.
 
-Frameworks can add test harnesses for browser apps, components, routes,
-streams, and host capabilities. Those harnesses are framework APIs, not core
-language features.
-
-## Conformance
-
-The language core conforms to this target when:
-
-- ordinary functions are pure,
-- host work cannot hide inside pure code,
-- top-level forms do not execute host work,
-- data values are immutable,
-- public contracts are type checkable,
-- JS interop boundaries are explicit,
-- framework extensions are visible in source and inspection output,
-- compiler output is deterministic,
-- deleting compiler caches cannot change program meaning.
+The example projects have their own runtime and Playwright suites; they are not
+part of the language core.

@@ -1,113 +1,109 @@
-# Closkell Browser Framework Design Target
+# Closkell Browser Target
 
-This document defines the browser framework built on top of the Closkell
-language core. It owns frontend concepts such as `Html`, `#html`, DOM events,
-browser commands, browser subscriptions, styling, hydration, and no-VDOM DOM
-updates.
+The browser target combines compiler support, a Vite plugin, and the JavaScript
+runtime in `runtime-js`. It is the default CLI target and is also selected by
+`--target browser`.
 
-The browser framework is not part of the language core. It is a framework
-library, compiler extension, and runtime package.
+## App Shape
 
-## Design Influences
-
-Elm contributes the browser app boundary: state, messages, `init`, `update`,
-`view`, commands, subscriptions, explicit modules, and runtime-owned effects.
-
-re-frame contributes data-oriented decomposition: feature modules, event/effect
-separation, derived queries, and an inspectable dataflow graph.
-
-Closkell keeps Elm's purity discipline and re-frame's dataflow clarity while
-using compile-time DOM specialization instead of a virtual DOM, signals, or
-proxy tracking.
-
-## Browser App Contract
-
-A browser app module exports:
+`build --app --target browser` requires an entry module that exports:
 
 ```clojure
-(ann init (Fn [BrowserBoot] [State (Cmd Msg)]))
-(ann update (Fn [State Msg] [State (Cmd Msg)]))
-(ann subscriptions (Fn [State] (Sub Msg)))
-(ann view (Fn [State] Html))
+(def init ...)
+(defn update [state msg] ...)
+(defn view [state] ...)
 ```
 
-Rules:
+`subscriptions` is optional. `init` and `update` return `[State (Cmd Msg)]`.
+`view` returns `Html`. The compiler wraps the module with a browser entry that
+imports the runtime, optional CSS, and starts the app at the selected root id.
 
-- `init` is pure and returns initial state plus command data.
-- `update` is pure and total over its declared message union.
-- `subscriptions` is pure and derives browser resources from state.
-- `view` is pure and returns `Html`.
-- Event handlers return `Msg`, `Event Msg`, or `nil`.
-- Browser work is command or subscription data, not direct host access.
+Browser app build flags:
 
-`BrowserBoot` contains explicit host-provided startup values such as current
-URL, route params, runtime mode, hydrated state, feature flags, or server
-dehydration payloads.
+```text
+--app
+--root <id>
+--css <path>
+--vendor-runtime
+--sourcemap
+```
 
-## Feature Modules
+The Vite plugin lets apps import `.clsk` files directly and exposes the
+inspection report at `/__closkell/inspect` during dev.
 
-Large browser apps decompose into feature modules. A feature module may export:
+## Browser Types
+
+The browser target adds:
+
+- `Html`
+- `TrustedHtml`
+- `BrowserBoot`
+- `Cmd Msg`
+- `Sub Msg`
+- `Event Msg`
+
+The `BrowserBoot` type alias is:
 
 ```clojure
-(type State ...)
-(type Msg ...)
-(ann init (Fn [BrowserBoot] [State (Cmd Msg)]))
-(ann update (Fn [State Msg] [State (Cmd Msg)]))
-(ann subscriptions (Fn [State] (Sub Msg)))
-(ann view (Fn [State] Html))
+{:currentUrl String
+ :host String
+ :path String
+ :query String}
 ```
 
-A parent owns child state as an ordinary field and wraps child messages with
-explicit tagged union variants. Helpers such as `scope-update`,
-`scope-subscriptions`, and `scope-view` are framework helpers that preserve
-state paths, command message mapping, subscription message mapping, and template
-slot metadata.
-
-There is no mutable component-local state.
-
-## Selectors
-
-Browser selectors are pure typed derived queries:
-
-```clojure
-(ann visible-log (Selector AppState (Vector WorkoutEntry)))
-(defn visible-log [state]
-  (filtered-log state.entries state.logTypeFilter))
-```
-
-Selectors:
-
-- are pure functions,
-- cannot return commands or subscriptions,
-- cannot read host state,
-- expose read paths,
-- expose selector dependencies,
-- may be memoized by the framework runtime,
-- feed template slot read-path analysis.
-
-Selectors are framework-level abstraction over pure language functions. The
-language core does not know browser state or template slots.
+The `build --app` wrapper passes `currentUrl`. `host`, `path`, and `query`
+belong to explicitly constructed boot values or to values derived from
+`currentUrl`.
 
 ## Templates
 
-`#html` is a browser framework reader form. It is not core language syntax.
+`#html` lowers to Template IR and then to specialized DOM update code. The
+runtime updates DOM slots directly; it does not allocate virtual DOM nodes.
 
-`#html` lowers to Template IR with:
+Implemented template features include:
 
 - static DOM creation,
-- dynamic text slots,
-- dynamic attribute slots,
-- dynamic class and style slots,
-- dynamic event slots,
-- refs,
-- component slots,
-- conditional slots,
-- keyed list slots,
-- disposal metadata,
-- devtools metadata.
+- dynamic text and attributes,
+- `textContent` and nullable text properties,
+- dynamic `class` strings, vectors, sets, records, and maps,
+- dynamic `style` strings, records, maps, camelCase keys, kebab-case keys, and
+  CSS custom properties,
+- boolean and presence attributes,
+- `ref` registration,
+- event handlers,
+- conditional fragments,
+- component calls,
+- keyed lists with optional loop index,
+- state-read metadata for slot skipping,
+- hydration of matching server/static DOM through `data-closkell-template`.
 
-The generated runtime updates only slots whose read paths overlap changed state
-paths. It does not allocate virtual DOM nodes.
+Bare `ref`, `class`, and `style` attributes are rejected. Static boolean
+strings such as `disabled="false"` are rejected because browsers treat boolean
+attributes as enabled by presence.
+
+`innerHTML` requires `TrustedHtml`; plain strings are rejected.
+
+## Events
+
+Event handlers are expressions in template scope. They can read a typed `event`
+object and return a message, `nil`, or event-control data.
+
+Event-control constructors:
+
+```clojure
+(Event.prevent {:kind :submit})
+(Event.stop {:kind :clicked})
+(Event.prevent-stop {:kind :hotkey})
+```
+
+Direct browser event mutation such as `event.preventDefault` is rejected by the
+browser target.
+
+## State Paths And Slot Updates
+
+Template lowering records the state paths read by each slot. At runtime, app
+dispatch compares old and new state, computes changed paths, and skips slots
+whose reads do not overlap the changed paths.
 
 Path overlap rules:
 
@@ -115,178 +111,95 @@ Path overlap rules:
 - `state.summary.value` overlaps `state.summary`.
 - `state.summary.label` does not overlap `state.summary.value`.
 
-## Event Handlers
+The lowering also projects reads through local `let` bindings, destructuring,
+component calls, and simple helper calls when their read summaries are known.
 
-Template event handlers are pure expressions evaluated with a typed read-only
-event payload.
+## Commands
 
-```clojure
-on:submit={(Event.prevent {:kind :load})}
+`Cmd Msg` is a data description of one-shot browser work. Command helper and
+schema families:
 
-on:keydown={(if (= event.key "Enter")
-                (Event.prevent {:kind :commit
-                                :value event.currentTarget.value})
-                nil)}
-```
+- `Cmd.none`, `Cmd.batch`, and `Cmd.map`;
+- timers and animation frames;
+- time reads and random numbers;
+- storage get/set/remove;
+- HTTP requests;
+- file download, import, selected-file reads, and blob reads;
+- DOM refs: focus, click, measure, resize watch, input selection, and scroll;
+- canvas draw and text measurement;
+- browser navigation, location assignment, URL opening, document title,
+  scrolling, cookies, clipboard, theme helpers, and EventSource open/close;
+- media element helpers;
+- Bluetooth heart-rate connection and disconnect;
+- simulation heart-rate commands for development/tests.
 
-Direct calls such as `event.preventDefault` and `event.stopPropagation` are not
-allowed in Closkell source. Event control is data returned to the runtime.
+Command records must include concrete `:kind` values when they are checked
+against a `Cmd Msg` annotation. Completion messages are checked against the
+declared message type when schemas are registered.
 
-## Browser Commands
+## Subscriptions
 
-`Cmd Msg` describes one-shot browser work. Command helpers are pure
-constructors.
+`Sub Msg` is a data description of long-lived browser resources. Subscription
+families:
 
-Examples include:
+- `Sub.none`
+- `Sub.batch`
+- `Sub.timer/every`
+- `Sub.media-query`
+- `Sub.window/event`
+- `Sub.window/event-with`
+- `Sub.dom-ref/resize`
+- simulation and Bluetooth heart-rate subscriptions
 
-- HTTP requests,
-- storage reads and writes,
-- DOM ref focus and measure,
-- file import and export,
-- clipboard write,
-- canvas draw,
-- time and random values,
-- media query setup,
-- scroll actions,
-- Bluetooth operations,
-- history writes.
+The runtime diffs subscriptions, starts new resources, keeps unchanged
+resources, and cleans them up when they disappear or the app is disposed.
 
-Command records use concrete `:kind` values. Completion messages are checked
-against the app's message type.
+## Feature Composition
 
-## Browser Subscriptions
+The browser target supports explicit parent/child composition:
 
-`Sub Msg` describes long-lived browser resources derived from current state.
+- `scope-update`
+- `scope-subscriptions`
+- `scope-view`
+- `Cmd.map`
+- `Cmd.batch`
+- `Sub.batch`
 
-Examples include:
-
-- timers,
-- animation frames,
-- media queries,
-- resize observers,
-- window events,
-- server-sent events,
-- WebSocket streams.
-
-The browser runtime diffs subscriptions by stable id and kind, starts new
-resources, preserves unchanged resources, stops removed resources, and disposes
-everything when the app is disposed.
-
-## JS Interop
-
-Browser JS libraries may be imported with normal Closkell interop. Pure
-deterministic functions can use `foreign pure`. Browser effects use command or
-subscription wrappers.
-
-`innerHTML` requires `TrustedHtml`. Sanitizers such as DOMPurify can expose
-`TrustedHtml` only through explicit foreign declarations.
-
-## Styling
-
-Templates support:
-
-- static `class` and `style`,
-- dynamic class strings,
-- dynamic class maps, vectors, and sets,
-- dynamic style strings,
-- dynamic style records and maps,
-- CSS custom properties,
-- normalized camelCase and kebab-case style keys.
-
-Boolean attributes are bare or dynamic booleans. Misleading static booleans
-such as `disabled="false"` are errors. `ref` registers a runtime ref and is not
-emitted as a DOM attribute.
+Child state is ordinary parent state. Child messages are wrapped into parent
+message records explicitly. There is no mutable component-local state system.
 
 ## Runtime
 
-The browser runtime surface includes:
-
-- `startApp`,
-- `hydrateApp`,
-- command handler registration,
-- subscription handler registration,
-- compiled template component helpers,
-- slot update helpers,
-- devtools hooks and overlay.
+The runtime exports both general and compiled-template APIs. The generated code
+mainly uses compiled-template helpers such as `createCompiledTemplateComponent`,
+slot setters, keyed list setters, command handler registration, and
+`startCompiledApp`.
 
 Runtime invariants:
 
-- no `update` call after disposal,
-- late async command completions after disposal are ignored,
-- event listeners and refs are removed with template instances,
-- keyed child rows are disposed when removed,
-- slot values are cached to avoid redundant DOM writes,
-- devtools events describe app, state, command, subscription, template, and
-  disposal activity.
-
-## SSR And Hydration
-
-The same Template IR can support client DOM, server rendering, hydration, and
-inspection.
-
-Server rendering produces HTML plus optional serialized initial state and
-template metadata. Browser-only commands and subscriptions do not execute
-during server rendering.
-
-Hydration attaches runtime instances to existing DOM and then uses normal slot
-updates. `view` remains pure and DOM-free in both environments.
-
-## Inspection
-
-Browser framework inspection extends language inspection with:
-
-- app contract exports,
-- message unions,
-- command schemas,
-- subscription schemas,
-- selector graph,
-- component graph,
-- template slots,
-- state paths to slots,
-- changed-path summaries,
-- browser capability usage,
-- trusted and unchecked HTML boundaries.
+- app `dispose()` removes mounted DOM, refs, listeners, command resources, and
+  subscriptions;
+- late async command completions are ignored after disposal;
+- removed keyed rows dispose their component instances;
+- event listeners and refs are tied to template lifetime;
+- devtools hooks receive app, state, command, subscription, template, and
+  disposal events.
 
 ## Testing
 
-The browser framework adds test harnesses for:
+Browser-facing test surfaces:
 
-- reducers,
-- selectors,
-- command constructors,
-- subscriptions,
-- presentational components,
-- mounted apps,
-- event control,
-- slot updates and skipped slots,
-- cleanup after disposal.
+- `closkell test` for pure/runtime tests exported from `.clsk` modules,
+- project-level Playwright suites for the example apps,
+- runtime harness helpers exported by `runtime-js`, including render, rerender,
+  DOM query helpers, event dispatch, collected messages, commands, and
+  subscriptions.
 
-Pure tests remain language tests. DOM and mounted app tests are framework tests.
-
-## Non-Goals
+## Excluded Model
 
 - React hooks.
-- Signals.
-- Proxy-based reactivity.
-- Class components.
-- Mutable component-local state.
-- VDOM reconciliation as the framework core.
-- Browser globals in pure Closkell code.
-- Hidden context as a default abstraction.
-- Fullstack coupling to backend route declarations.
-- Hidden RPC or server actions generated from frontend code.
-
-## Research Sources
-
-- [Elm Guide: The Elm Architecture](https://guide.elm-lang.org/architecture/)
-- [Elm Guide: Commands and Subscriptions](https://guide.elm-lang.org/effects/)
-- [Elm Guide: JavaScript Interop](https://guide.elm-lang.org/interop/)
-- [Elm Guide: Modules](https://guide.elm-lang.org/webapps/modules)
-- [Elm `Browser` package documentation](https://package.elm-lang.org/packages/elm/browser/latest/Browser)
-- [re-frame: The re-frame data loop](https://day8.github.io/re-frame/a-loop/)
-- [re-frame: Application state](https://day8.github.io/re-frame/application-state/)
-- [re-frame API: Event handlers](https://day8.github.io/re-frame/api-re-frame.core/)
-- [re-frame: Effects](https://day8.github.io/re-frame/EffectfulHandlers/)
-- [re-frame: Coeffects](https://day8.github.io/re-frame/Coeffects/)
-- [re-frame: Subscriptions](https://day8.github.io/re-frame/subscriptions/)
-- [re-frame: App structure](https://day8.github.io/re-frame/App-Structure/)
+- Signal or Proxy tracking.
+- Virtual DOM reconciliation as the update strategy.
+- Hidden browser globals in pure code.
+- Hidden fullstack RPC.
+- Server actions generated from frontend source.
