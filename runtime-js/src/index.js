@@ -825,6 +825,9 @@ export function createCompiledTemplateComponent(definition) {
       disposeInstance(instance, detached);
       instance = null;
     },
+    get __closkellInstance() {
+      return instance;
+    },
     get root() {
       return ensureInstance().root;
     },
@@ -909,6 +912,9 @@ function createCompiledHtmlTemplateComponentFromShape(shape, update, metadata = 
     dispose(detached = false) {
       disposeInstance(instance, detached);
       instance = null;
+    },
+    get __closkellInstance() {
+      return instance;
     },
     get root() {
       return ensureInstance().root;
@@ -1028,6 +1034,9 @@ export function bindCompiledComponent(component, arity, bind) {
       dispose(detached = false) {
         component.dispose(detached);
       },
+      get __closkellInstance() {
+        return component.__closkellInstance;
+      },
       get root() {
         return component.root;
       },
@@ -1048,6 +1057,9 @@ export function bindCompiledComponent(component, arity, bind) {
       },
       dispose(detached = false) {
         component.dispose(detached);
+      },
+      get __closkellInstance() {
+        return component.__closkellInstance;
       },
       get root() {
         return component.root;
@@ -1071,6 +1083,9 @@ export function bindCompiledComponent(component, arity, bind) {
     },
     dispose(detached = false) {
       component.dispose(detached);
+    },
+    get __closkellInstance() {
+      return component.__closkellInstance;
     },
     get root() {
       return component.root;
@@ -1309,6 +1324,10 @@ export function setCompiledTextProperty(instance, slot, node, name, value, updat
   const next = String(value);
   if (instance.values[slot] === next) return;
   instance.values[slot] = next;
+  if (name === "textContent") {
+    node.textContent = next;
+    return;
+  }
   node.setAttribute(name, next);
   node[name] = next;
 }
@@ -1318,6 +1337,10 @@ export function setCompiledNullableTextProperty(instance, slot, node, name, valu
   const next = value == null ? null : String(value);
   if (instance.values[slot] === next) return;
   instance.values[slot] = next;
+  if (name === "textContent") {
+    node.textContent = next ?? "";
+    return;
+  }
   if (next == null) {
     node.removeAttribute(name);
     node[name] = false;
@@ -1675,9 +1698,9 @@ function dispatchDelegatedCompiledEvent(eventName, event) {
 function delegatedCompiledEvent(event, currentTarget) {
   if (event.currentTarget === currentTarget) return event;
   return new Proxy(event, {
-    get(target, property, receiver) {
+    get(target, property) {
       if (property === "currentTarget") return currentTarget;
-      const value = Reflect.get(target, property, receiver);
+      const value = Reflect.get(target, property, target);
       return typeof value === "function" ? value.bind(target) : value;
     }
   });
@@ -1808,7 +1831,6 @@ export function setCompiledKeyedList(instance, slot, marker, items, keyForItem, 
   const keyedKind = slotMetadata?.kind || {};
   const itemName = typeof keyedKind.keyed === "string" ? keyedKind.keyed : null;
   const indexName = typeof keyedKind.index === "string" ? keyedKind.index : null;
-  if (updateContext) stableItemUpdate = false;
   const current = instance.keyedSlots[slot] || { byKey: new Map(), duplicateKeys: new Map() };
   if (!current.duplicateKeys) current.duplicateKeys = new Map();
   if (items.length === 0) {
@@ -1847,14 +1869,25 @@ function updateCompiledKeyedListSameOrder(current, items, keyForItem, dispatch, 
 
   let index = 0;
   for (const entry of current.entries) {
-    if (!sameMapKey(entry.key, keyForItem(items[index], index))) return false;
+    const item = items[index];
+    if (
+      !(stableItemUpdate && entry.item === item && entry.index === index) &&
+      !sameMapKey(entry.key, keyForItem(item, index))
+    ) {
+      return false;
+    }
     index += 1;
   }
 
   index = 0;
   for (const entry of current.entries) {
     const item = items[index];
-    if (!canSkipCompiledKeyedEntry(entry, item, index, dispatch, stableItemUpdate)) {
+    const sameStableItem =
+      stableItemUpdate &&
+      entry.item === item &&
+      entry.dispatch === dispatch &&
+      (compiledEntryArity(entry) < 2 || entry.index === index);
+    if (!sameStableItem) {
       updateCompiledKeyedEntry(
         entry,
         item,
@@ -1865,9 +1898,9 @@ function updateCompiledKeyedListSameOrder(current, items, keyForItem, dispatch, 
           : null
       );
       entry.dispatch = dispatch;
+      entry.item = item;
+      entry.index = index;
     }
-    entry.item = item;
-    entry.index = index;
     index += 1;
   }
   return true;
@@ -1880,7 +1913,13 @@ function updateCompiledKeyedListSameSequence(current, parent, marker, items, key
   if (items.length > currentSize) {
     let index = 0;
     for (const entry of current.entries) {
-      if (!sameMapKey(entry.key, keyForItem(items[index], index))) return false;
+      const item = items[index];
+      if (
+        !(stableItemUpdate && entry.item === item && entry.index === index) &&
+        !sameMapKey(entry.key, keyForItem(item, index))
+      ) {
+        return false;
+      }
       index += 1;
     }
 
@@ -1935,7 +1974,14 @@ function updateCompiledKeyedListSameSequence(current, parent, marker, items, key
   const nextByKey = new Map();
   const nextEntries = [];
   for (const entry of current.entries) {
-    if (index < items.length && sameMapKey(entry.key, keyForItem(items[index], index))) {
+    const item = items[index];
+    if (
+      index < items.length &&
+      (
+        (stableItemUpdate && entry.item === item && entry.index === index) ||
+        sameMapKey(entry.key, keyForItem(item, index))
+      )
+    ) {
       nextByKey.set(entry.key, entry);
       nextEntries.push(entry);
       index += 1;
@@ -5634,6 +5680,7 @@ export function startCompiledAppWithoutSubscriptions(options = {}) {
     update,
     view,
     handlers = {},
+    hydrate = false,
     boot = undefined
   } = options;
   const [initialState, initialCommand] = boot === undefined ? init() : init(boot);
@@ -5653,7 +5700,7 @@ export function startCompiledAppWithoutSubscriptions(options = {}) {
   };
   dispatch.__closkellRefs = refs;
 
-  component.mount(root, dispatch);
+  mountAppComponent(root, component, dispatch, hydrate);
   run(initialCommand);
 
   function run(command) {

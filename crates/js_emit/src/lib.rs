@@ -1083,7 +1083,7 @@ fn is_text_attr_type(ty: &str) -> bool {
 }
 
 fn is_html_text_property_attr(name: &str) -> bool {
-    matches!(name, "value")
+    matches!(name, "value" | "textContent")
 }
 
 fn is_html_boolean_property_attr(name: &str) -> bool {
@@ -3702,6 +3702,43 @@ impl Emitter {
         parenthesize_arrow_body(&self.emit_do(body))
     }
 
+    fn emit_callback_assignment_body(&mut self, body: &[Expr], target: &str) -> Vec<String> {
+        if let [single] = body {
+            if let Some((bindings, body)) = let_parts(single) {
+                let mut statements = Vec::new();
+                self.local_types.push(BTreeMap::new());
+                for pair in bindings.chunks(2) {
+                    let [pattern, value] = pair else {
+                        self.diagnostics.push(Diagnostic::error(
+                            single.span,
+                            "let emission requires complete binding pairs",
+                        ));
+                        continue;
+                    };
+                    let value_type = self.expr_type(value).map(str::to_string);
+                    self.emit_let_pattern_statement(pattern, value, &mut statements);
+                    if let Some(scope) = self.local_types.last_mut() {
+                        collect_pattern_type_bindings(pattern, value_type.as_deref(), scope);
+                    }
+                }
+                statements.push(format!("{} = {};", target, self.emit_do(body)));
+                self.local_types.pop();
+                return statements;
+            }
+        }
+
+        if body.len() > 1 {
+            let mut statements = Vec::new();
+            for expr in &body[..body.len() - 1] {
+                statements.push(format!("{};", self.emit_expr(expr)));
+            }
+            statements.push(format!("{} = {};", target, self.emit_expr(&body[body.len() - 1])));
+            return statements;
+        }
+
+        vec![format!("{} = {};", target, self.emit_do(body))]
+    }
+
     fn emit_inline_range_map_transform(
         &mut self,
         collection: &Expr,
@@ -3759,9 +3796,9 @@ impl Emitter {
         }
 
         self.local_types.push(local_type_bindings);
-        let body = self.emit_do(body);
+        let assignment_target = format!("{}[{}]", result_name, index_name);
+        statements.extend(self.emit_callback_assignment_body(body, &assignment_target));
         self.local_types.pop();
-        statements.push(format!("{}[{}] = {};", result_name, index_name, body));
 
         Some(format!(
             "(({}, {}, {}) => {{ if ({} === 0) return []; const {} = Math.max(0, Math.ceil(({} - {}) / {})); const {} = new Array({}); for (let {} = 0, {} = {}; {} < {}; {} += 1, {} += {}) {{ {} }} return {}; }})({}, {}, {})",
@@ -9772,6 +9809,25 @@ mod tests {
         assert!(emitted.code.contains("for (let __closkell_range_index"));
         assert!(!emitted.code.contains("Array.from({ length: __count }"));
         assert!(!emitted.code.contains(".map((__item) =>"));
+    }
+
+    #[test]
+    fn emits_range_map_let_body_without_inner_iife() {
+        let source = syntax::parse_source(
+            "(defn update-labels [rows]\n\
+               (map (range 0 (count rows))\n\
+                    (fn [index]\n\
+                      (let [row (nth rows index)]\n\
+                        (if (= (mod index 10) 0)\n\
+                            (assoc row :label (str row.label \" !!!\"))\n\
+                            row)))))",
+        );
+        let emitted = emit_module_with_html(&source);
+
+        assert!(emitted.diagnostics.is_empty(), "{:?}", emitted.diagnostics);
+        assert!(emitted.code.contains("const row ="));
+        assert!(emitted.code.contains("__closkell_range_result"));
+        assert!(!emitted.code.contains("= (() =>"));
     }
 
     #[test]
